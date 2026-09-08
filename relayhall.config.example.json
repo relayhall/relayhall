@@ -1,0 +1,43 @@
+{
+    "bot": {
+        "name": "Relay",
+        "displayName": "My RelayHall",
+        "emoji": "\ud83e\udd16",
+        "description": "My governed human and AI work hub",
+        "avatarUrl": "/assets/avatar-placeholder.png"
+    },
+    "branding": {
+        "primaryColor": "#6366f1",
+        "accentColor": "#8b5cf6",
+        "backgroundColor": "#0f172a",
+        "surfaceColor": "#1e293b",
+        "textColor": "#e2e8f0",
+        "sidebarTitle": "RelayHall",
+        "loginTitle": "Welcome to RelayHall",
+        "loginSubtitle": "Your governed work hub"
+    },
+    "features": {
+        "taskBoard": true,
+        "projects": true,
+        "skills": true,
+        "auditLog": true
+    },
+    "paths": {
+        "dataDir": "/data",
+        "mediaDir": "/data/media"
+    },
+    "services": {
+        "taskApiUrl": "http://localhost:3001/api"
+    },
+    "deployment": {
+        "domain": "localhost",
+        "port": 8082,
+        "useHttps": false,
+        "corsOrigin": "http://localhost:8082"
+    },
+    "plugins": {
+        "configFile": "./relayhall.plugins.json",
+        "enabled": true,
+        "healthCheckIntervalMs": 60000
+    }
+}

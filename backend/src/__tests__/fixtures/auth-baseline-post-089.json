@@ -1,0 +1,314 @@
+[
+  {
+    "id": "010-none-tasks",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "011-none-reports",
+    "method": "GET",
+    "path": "/reports",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "012-none-principals",
+    "method": "GET",
+    "path": "/principals",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "013-none-projects",
+    "method": "GET",
+    "path": "/projects",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "014-none-health",
+    "method": "GET",
+    "path": "/health",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "015-none-sessions",
+    "method": "GET",
+    "path": "/sessions",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "016-none-personalities",
+    "method": "GET",
+    "path": "/personalities",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "017-none-plugins-registry",
+    "method": "GET",
+    "path": "/plugins",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "020-jwt-principals",
+    "method": "GET",
+    "path": "/principals",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "021-jwt-principals-me",
+    "method": "GET",
+    "path": "/principals/me",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "022-jwt-task-claim",
+    "method": "POST",
+    "path": "/tasks/00000000-0000-0000-0000-000000000000/claim",
+    "status": 404,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"success\":false,\"error\":\"Resource not found\",\"code\":\"RESOURCE_NOT_FOUND\",\"message\":\"Resource not found\"}"
+  },
+  {
+    "id": "023-jwt-task-release",
+    "method": "POST",
+    "path": "/tasks/00000000-0000-0000-0000-000000000000/release",
+    "status": 404,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"success\":false,\"error\":\"Resource not found\",\"code\":\"RESOURCE_NOT_FOUND\",\"message\":\"Resource not found\"}"
+  },
+  {
+    "id": "030-jwt-tasks-owner",
+    "method": "GET",
+    "path": "/tasks?owner=dashboard_user",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "031-jwt-tasks-mine",
+    "method": "GET",
+    "path": "/tasks?mine=true",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "032-jwt-tasks-unassigned",
+    "method": "GET",
+    "path": "/tasks?unassigned=true",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "040-jwt-tasks",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "041-jwt-reports",
+    "method": "GET",
+    "path": "/reports",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "043-jwt-projects",
+    "method": "GET",
+    "path": "/projects",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "044-jwt-health",
+    "method": "GET",
+    "path": "/health",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "046-jwt-browser-session",
+    "method": "POST",
+    "path": "/auth/browser-session",
+    "status": 204,
+    "content_type": "",
+    "body": ""
+  },
+  {
+    "id": "050-unknown-handle-tasks",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "051-unknown-handle-reports",
+    "method": "GET",
+    "path": "/reports",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "060-bearer-garbage",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid token\"}"
+  },
+  {
+    "id": "061-bearer-rh-dev",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid token\"}"
+  },
+  {
+    "id": "062-bearer-rh-live",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid token\"}"
+  },
+  {
+    "id": "063-bearer-capability",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid token\"}"
+  },
+  {
+    "id": "064-bearer-expired",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Token expired\"}"
+  },
+  {
+    "id": "065-capability-browser-session",
+    "method": "POST",
+    "path": "/auth/browser-session",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid token\"}"
+  },
+  {
+    "id": "070-apikey-wrong-alone",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"No token provided\"}"
+  },
+  {
+    "id": "071-apikey-wrong-with-jwt",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "090-reports-key-reports",
+    "method": "GET",
+    "path": "/reports",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "091-reports-key-skills-offscope",
+    "method": "GET",
+    "path": "/skills",
+    "status": 403,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Forbidden\",\"message\":\"Reports read key is invalid or out of scope\"}"
+  },
+  {
+    "id": "092-reports-key-offscope",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 403,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Forbidden\",\"message\":\"Reports read key is invalid or out of scope\"}"
+  },
+  {
+    "id": "093-reports-key-wrong",
+    "method": "GET",
+    "path": "/reports",
+    "status": 403,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Forbidden\",\"message\":\"Reports read key is invalid or out of scope\"}"
+  },
+  {
+    "id": "094-reports-key-post",
+    "method": "POST",
+    "path": "/reports",
+    "status": 403,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Forbidden\",\"message\":\"Reports read key is invalid or out of scope\"}"
+  },
+  {
+    "id": "095-rh-key-tasks-in-scope",
+    "method": "GET",
+    "path": "/tasks",
+    "status": 200,
+    "content_type": "application/json; charset=utf-8",
+    "body": ""
+  },
+  {
+    "id": "096-rh-key-reports-offscope",
+    "method": "GET",
+    "path": "/reports",
+    "status": 403,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"success\":false,\"error\":\"This identity is not authorized for the requested operation\",\"code\":\"FORBIDDEN\",\"message\":\"This identity is not authorized for the requested operation\"}"
+  },
+  {
+    "id": "100-login-empty-body",
+    "method": "POST",
+    "path": "/auth/login",
+    "status": 400,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Bad Request\",\"message\":\"Password is required\"}"
+  },
+  {
+    "id": "101-login-bad-password",
+    "method": "POST",
+    "path": "/auth/login",
+    "status": 401,
+    "content_type": "application/json; charset=utf-8",
+    "body": "{\"error\":\"Unauthorized\",\"message\":\"Invalid password\"}"
+  }
+]

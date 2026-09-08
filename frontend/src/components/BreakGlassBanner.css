@@ -1,0 +1,59 @@
+/* The break-glass announcement (owner ruling 60307311 §1.1).
+   A warning, not an error: nothing is broken and nothing failed — a permanent
+   escape hatch was used where an ordinary door exists. */
+
+.break-glass-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-4) var(--space-4) 0;
+  background: var(--status-warning-soft);
+  border: 1px solid var(--status-warning);
+  border-radius: var(--radius-md);
+}
+
+.break-glass-banner__icon {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  /* The icon repeats the border's meaning; the sentence beside it carries the
+     information, so the icon is the one element that may take the accent. */
+  color: var(--status-warning);
+  padding-top: 2px;
+}
+
+.break-glass-banner__text {
+  flex: 1;
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  /* Informative text on a tinted surface: --text-primary, never a muted or
+     quaternary token. This sentence is the whole point of the banner. */
+  color: var(--text-primary);
+}
+
+.break-glass-banner__dismiss {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.break-glass-banner__dismiss:hover {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+.break-glass-banner__dismiss:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

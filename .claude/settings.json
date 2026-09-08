@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/relayhall-session-start.sh\"",
+            "timeout": 10,
+            "statusMessage": "Loading the RelayHall bootstrap pack"
+          }
+        ]
+      }
+    ]
+  }
+}

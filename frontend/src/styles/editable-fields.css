@@ -1,0 +1,46 @@
+/* Shared field geometry: the content reserves the complete pencil target in
+   every consumer, including a one-line value and a coarse-pointer layout. */
+.editable-frame {
+  --editable-target: var(--control-compact);
+  position: relative;
+  min-width: 0;
+  min-block-size: calc(var(--editable-target) + var(--space-2) + 2px);
+  padding: var(--space-2) var(--space-3);
+  padding-inline-end: calc(var(--editable-target) + var(--space-3));
+  border: 1px dashed var(--text-tertiary);
+  border-radius: var(--radius-sm);
+  overflow-wrap: anywhere;
+  transition: background-color var(--transition-fast) var(--ease-out),
+    border-color var(--transition-fast) var(--ease-out);
+}
+
+.editable-frame:focus-within,
+.editable-frame:has(> .editable-frame-edit:hover:not(:disabled)) {
+  border-style: solid;
+  background: var(--bg-surface);
+}
+
+.editable-frame-edit:is(.editable-frame-edit) {
+  position: absolute;
+  inset-block-start: var(--space-1);
+  inset-inline-end: var(--space-1);
+  inline-size: var(--editable-target);
+  block-size: var(--editable-target);
+  min-inline-size: var(--editable-target);
+  min-block-size: var(--editable-target);
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.editable-frame-edit:is(.editable-frame-edit):hover:not(:disabled),
+.editable-frame-edit:is(.editable-frame-edit):focus-visible {
+  border-color: var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+@media (pointer: coarse), (max-width: 767px) {
+  .editable-frame { --editable-target: var(--control-standard); }
+}

@@ -1,0 +1,194 @@
+/* Routed Task creation (986be411 §7, E6): the create mode borrows the
+   Task-details design language wholesale — this file carries only the
+   create-specific arrangement. */
+
+/* Body-scale base (mirrors .task-detail-page in its own sheet — class
+   ownership stays here): unclassed content inherits 14, not the
+   browser's 16. */
+.task-create-page {
+  font-size: var(--text-sm);
+}
+
+.task-create-page .task-detail-title-editor input {
+  min-width: 320px;
+  font-size: var(--text-xl);
+}
+
+.task-create-page .task-detail-page-header-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* Type and ink come from the canonical details-header rule
+   (TaskDetailPage.css: 12px tertiary — the ONE label language). Only the
+   layout is restated here. */
+.task-create-page .task-detail-page-header-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Beats the 0,1,1 header element rule (.task-detail-page-header button)
+   that was repainting the primary CTA as a surface button (census A6). */
+.task-create-page .task-detail-page-header-controls button.task-create-primary {
+  background: var(--accent-color);
+  color: var(--text-on-fill);
+  border: none;
+  border-radius: var(--radius-control);
+  min-height: var(--control-standard);
+  padding: var(--space-2) var(--space-4);
+  font-weight: var(--font-semibold);
+  cursor: pointer;
+}
+
+.task-create-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.task-create-rail-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Census A4: ONE label language estate-wide - 12px, regular, tertiary
+   (the details-rail convention). The create rail had drifted to
+   sm/secondary for the same DOM. */
+.task-create-rail-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.task-create-page textarea,
+.task-create-page .task-detail-work input,
+.task-create-rail-fields input,
+.task-create-rail-fields select {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.task-create-draft-list {
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.task-create-draft-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.task-create-empty-line {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-3);
+}
+
+.task-create-inline-add {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.task-create-inline-add input {
+  flex: 1 1 200px;
+}
+
+.task-create-blocked {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* Create-page inputs carry the app's control tokens — several rendered
+   browser-native in the live visual pass (owner taste directive 2026-08-15).
+   Buttons are the shared kit <Button> and take their look from Button.css
+   plus the canonical detail-page context rules — no local button recipe. */
+.task-create-page input,
+.task-create-page select,
+.task-create-page textarea {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+/* Single-line controls take the ratified box: zero vertical padding so
+   var(--control-compact) GOVERNS the rendered height instead of merely
+   flooring it. With padding these measured 38px against a 36px min-height
+   (card 465a32c4) — and because this page rule outranks .form-select, fixing
+   the kit recipe alone did not reach them. */
+.task-create-page input,
+.task-create-page select {
+  min-height: var(--control-compact);
+  padding: 0 var(--space-3);
+}
+
+/* A textarea is multi-line and is not on the two-size control scale. */
+.task-create-page textarea {
+  padding: var(--space-2) var(--space-3);
+}
+
+.task-create-page input:focus-visible,
+.task-create-page select:focus-visible,
+.task-create-page textarea:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+  border-color: var(--accent-color);
+}
+
+.task-create-page input::placeholder,
+.task-create-page textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.task-create-page select:disabled,
+.task-create-page input:disabled {
+  color: var(--text-tertiary);
+  background: var(--bg-surface);
+  cursor: not-allowed;
+}
+
+.task-create-details-heading {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-xl);
+}
+
+@media (max-width: 767px) {
+  /* Create mode renders no mobile region tabs, so the base sheet would hide
+     BOTH columns behind data-mobile-region. The create form stacks instead. */
+  .task-create-page .task-detail-left-rail,
+  .task-create-page .task-detail-work {
+    display: block;
+  }
+
+  /* The desktop 320px title floor exceeds the phone header column and shifts
+     the whole page off-canvas; the title spans whatever width remains. */
+  .task-create-page .task-detail-title-editor input {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+/* Creation has two regions: reserve a third column only for an existing
+   Task's Timeline. The content remains readable without a blank rail. */
+@media (min-width: 1280px) {
+  .task-create-page .task-detail-layout {
+    grid-template-columns: minmax(var(--task-detail-left-compact-width), var(--task-detail-left-width)) minmax(0, 1fr);
+  }
+}

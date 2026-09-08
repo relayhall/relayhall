@@ -1,0 +1,166 @@
+name: relayhall
+
+# Generic single-host RelayHall stack: database + backend API + frontend.
+# This is the file `docker compose up -d` uses on a fresh clone.
+#
+# Deployment-specific additions (extra plugin services, host-specific mounts,
+# integrations) belong in a downstream compose file in your fork — see
+# CONTRIBUTING.md for the upstream/downstream workflow and the example plugin
+# service at the bottom of this file.
+
+services:
+  # PostgreSQL Database
+  relayhall-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-relayhall}
+      POSTGRES_USER: ${POSTGRES_USER:-relayhall}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      # Bound to localhost only — not reachable from the network
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    networks:
+      - relayhall-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-relayhall} -d ${POSTGRES_DB:-relayhall}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  relayhall-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        RELEASE_SHA: ${RELEASE_SHA:-unknown}
+        RELEASE_DIRTY: ${RELEASE_DIRTY:-unknown}
+        RELEASE_BUILD_CONTEXT: ${RELEASE_BUILD_CONTEXT:-unknown}
+        RELEASE_BUILT_AT: ${RELEASE_BUILT_AT:-unknown}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      RELAYHALL_ENVIRONMENT: ${RELAYHALL_ENVIRONMENT:-production}
+      RELAYHALL_LIFECYCLE_POLICY_MODE: ${RELAYHALL_LIFECYCLE_POLICY_MODE:-off}
+      RELAYHALL_LIFECYCLE_POLICY_ID: ${RELAYHALL_LIFECYCLE_POLICY_ID:-relayhall.contract-only}
+      RELAYHALL_LIFECYCLE_POLICY_VERSION: ${RELAYHALL_LIFECYCLE_POLICY_VERSION:-1}
+      NODE_OPTIONS: "--max-old-space-size=512"
+      PORT: 3001
+
+      # Database
+      DB_HOST: relayhall-db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-relayhall}
+      DB_USER: ${POSTGRES_USER:-relayhall}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+
+      # Auth
+      JWT_SECRET: ${JWT_SECRET:?JWT secret required}
+      DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:?Dashboard password hash required}
+      TOKEN_EXPIRY: ${TOKEN_EXPIRY:-30d}
+      # Named Accounts and first-administrator setup are part of a new install.
+      RELAYHALL_SESSIONS: ${RELAYHALL_SESSIONS:-on}
+
+      # CORS
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8082}
+
+      # Optional read-only deployment model catalog
+      LITELLM_ADMIN_API_URL: ${LITELLM_ADMIN_API_URL:-}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+
+      # No harness mounts and no gateway URL: the board never observes an
+      # agent runtime (strategy F11) — session data arrives only through
+      # reporter plugins. See docs/observability.md.
+    volumes:
+      # Data directory for RelayHall's own data (read-write)
+      - ${DATA_DIR:-./data}:/data:rw
+      - ./relayhall.config.json:/app/relayhall.config.json:ro
+      - ./relayhall.plugins.json:/app/relayhall.plugins.json:ro
+    ports:
+      # deployments bring their own ingress — rebind to expose (docs/seams.md §3)
+      - "127.0.0.1:${BACKEND_PORT:-3001}:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      relayhall-db:
+        condition: service_healthy
+    networks:
+      - relayhall-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Fresh databases run the complete migration ledger before HTTP starts.
+      # Measured cold initialization exceeds 100s; keep runtime probes unchanged.
+      start_period: 180s
+
+  # Frontend (React + Vite built into nginx)
+  relayhall-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_PUBLIC_BUILD: ${VITE_PUBLIC_BUILD:-false}
+        RELEASE_SHA: ${RELEASE_SHA:-unknown}
+        RELEASE_DIRTY: ${RELEASE_DIRTY:-unknown}
+        RELEASE_BUILD_CONTEXT: ${RELEASE_BUILD_CONTEXT:-unknown}
+        RELEASE_BUILT_AT: ${RELEASE_BUILT_AT:-unknown}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+    depends_on:
+      relayhall-backend:
+        condition: service_healthy
+    networks:
+      - relayhall-network
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8082}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/dashboard/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ========================================
+  # EXAMPLE PLUGIN SERVICE
+  # ========================================
+  # To add a plugin, create a service like this and add it to relayhall.plugins.json
+  #
+  # claw-myplugin:
+  #   build:
+  #     context: ./plugins/claw-myplugin
+  #     dockerfile: Dockerfile
+  #   container_name: claw-myplugin
+  #   restart: unless-stopped
+  #   environment:
+  #     NODE_ENV: production
+  #     PORT: 3020
+  #     # Plugin receives the RelayHall API URL for internal communication
+  #     RELAYHALL_CORE_URL: http://relayhall-backend:3001
+  #   networks:
+  #     - relayhall-network
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3020/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #   # Note: Plugins don't expose ports directly — they're accessed via the backend proxy
+  #   # The backend proxies /api/plugins/{name}/* to the plugin container
+  #
+  # The backend automatically:
+  # - Proxies /api/plugins/{name}/* to the plugin's internal_port
+  # - Performs health checks every 60 seconds
+  # - Reports plugin status via GET /api/plugins
+
+volumes:
+  postgres_data:
+
+networks:
+  relayhall-network:
+    driver: bridge

@@ -1,0 +1,65 @@
+/* THE segmented-control recipe (RH-UI.20, design 77950a97 §7).
+   Shell: grouped-control radius 10, app-background well, 4px padding.
+   Items: compact 36px controls, radius 8, body-scale type; the selected
+   item carries the accent border + soft fill (the Board|Map reference
+   look, extracted verbatim). */
+
+.segmented-control {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: var(--space-1);
+  background: var(--bg-app);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-segmented);
+}
+
+.segmented-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--control-compact);
+  padding: 0 var(--space-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast) ease,
+    border-color var(--transition-fast) ease,
+    color var(--transition-fast) ease;
+}
+
+.segmented-option:hover:not(:disabled):not(.segmented-option--selected) {
+  background: var(--bg-glass-hover);
+  color: var(--text-primary);
+}
+
+.segmented-option--selected {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-primary);
+  font-weight: var(--font-semibold);
+}
+
+.segmented-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.segmented-option:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Touch layouts keep the WCAG target floor. */
+@media (max-width: 767px) {
+  .segmented-option {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}

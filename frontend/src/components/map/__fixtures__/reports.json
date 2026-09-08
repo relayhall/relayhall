@@ -1,0 +1,96 @@
+{
+  "success": true,
+  "reports": [
+    {
+      "id": "c7933d8c-bbde-4a37-b57c-f180f8921d35",
+      "title": "Showcase: alert tuning round 1",
+      "content": "Cut page volume 60%; two noisy checks remain.",
+      "content_hash": "f3027ae41c1d6220269968b0cc3bd06ab52baec9671460e98ea95dd4097fecd4",
+      "summary": "Cut page volume 60%; two noisy checks remain.",
+      "tags": [
+        "showcase"
+      ],
+      "project_id": null,
+      "task_ids": [
+        "2e66d59f-c291-43e9-878e-b62738aa1bc7"
+      ],
+      "author": "system",
+      "author_unverified": "system",
+      "author_actor_id": "dashboard_user",
+      "origin": "api",
+      "visibility": "default",
+      "auto_promoted": false,
+      "source_task_id": null,
+      "source_stream_entry_id": null,
+      "source_outpost_visibility_tier": null,
+      "handover": null,
+      "pinned": false,
+      "status": "active",
+      "created_at": "2026-08-16T10:09:28.118Z",
+      "updated_at": "2026-08-16T10:09:28.118Z",
+      "deleted_at": null
+    },
+    {
+      "id": "82b62eaa-df1e-436d-8877-5d1b8c2785f6",
+      "title": "Showcase: migration inventory",
+      "content": "All 34 services inventoried; owners confirmed. Ranking attached.",
+      "content_hash": "afbbd4376d6357d033850f021ba07a7844f94577766bdd508dcc1c9496d4e102",
+      "summary": "All 34 services inventoried; owners confirmed. Ranking attached.",
+      "tags": [
+        "showcase"
+      ],
+      "project_id": null,
+      "task_ids": [
+        "717413de-f888-4502-9808-bee3e97c2d71",
+        "c9e559a3-1e78-4835-90b3-8a47231ec51e"
+      ],
+      "author": "system",
+      "author_unverified": "system",
+      "author_actor_id": "dashboard_user",
+      "origin": "api",
+      "visibility": "default",
+      "auto_promoted": false,
+      "source_task_id": null,
+      "source_stream_entry_id": null,
+      "source_outpost_visibility_tier": null,
+      "handover": null,
+      "pinned": false,
+      "status": "active",
+      "created_at": "2026-08-16T10:09:28.087Z",
+      "updated_at": "2026-08-16T10:09:28.087Z",
+      "deleted_at": null
+    },
+    {
+      "id": "fc67ad8e-a4e8-4471-80b1-fd6afecd030a",
+      "title": "Showcase: proxy cutover rehearsal notes",
+      "content": "Dry-run went clean; rollback in 40s. Window proposed for Tuesday.",
+      "content_hash": "2016be2d76329933d6f2ac2d4d0cdc05c65b538d35f480783567c2f5123347dd",
+      "summary": "Dry-run went clean; rollback in 40s. Window proposed for Tuesday.",
+      "tags": [
+        "showcase"
+      ],
+      "project_id": null,
+      "task_ids": [
+        "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+        "00915858-41dd-46ac-a08d-885a13c066b8"
+      ],
+      "author": "system",
+      "author_unverified": "system",
+      "author_actor_id": "dashboard_user",
+      "origin": "api",
+      "visibility": "default",
+      "auto_promoted": false,
+      "source_task_id": null,
+      "source_stream_entry_id": null,
+      "source_outpost_visibility_tier": null,
+      "handover": null,
+      "pinned": false,
+      "status": "active",
+      "created_at": "2026-08-16T10:09:28.067Z",
+      "updated_at": "2026-08-16T10:09:28.067Z",
+      "deleted_at": null
+    }
+  ],
+  "total": 3,
+  "hasMore": false
+}

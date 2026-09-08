@@ -1,0 +1,8 @@
+[package]
+name = "relayhall"
+version = "0.0.1"
+edition = "2021"
+description = "RelayHall name reservation package. The governed, self-hosted work hub is developed at github.com/relayhall."
+license = "MIT"
+homepage = "https://relayhall.com"
+repository = "https://github.com/relayhall/relayhall"

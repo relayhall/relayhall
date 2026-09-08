@@ -1,0 +1,1 @@
+router.post('/blueprints/:blueprintId/instances/:instanceId/update',handler);

@@ -1,0 +1,1 @@
+import {buildBlueprintPlan,secondPlan} from '../services/BlueprintPlanService'; class Example {preview(){const plan=secondPlan();return {plan}} instantiate(){const plan=buildBlueprintPlan();return {plan}}}

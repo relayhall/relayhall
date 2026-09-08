@@ -1,0 +1,12 @@
+{
+  "name": "claw-hello",
+  "version": "1.0.0",
+  "description": "Minimal example RelayHall plugin",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  }
+}

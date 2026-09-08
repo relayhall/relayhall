@@ -1,0 +1,1 @@
+import {authenticatedFetch} from '../utils/auth'; async function loadDetail(){return authenticatedFetch('/tasks/'+taskId,{method:'PATCH',body:JSON.stringify(document.tasks[0])})}

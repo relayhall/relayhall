@@ -1,0 +1,64 @@
+/* Principal attribution chip (card 60558599).
+   Colour is derived from the handle at render time, so an identity looks the
+   same everywhere without a stored palette. Kind is carried by the icon and
+   the border weight rather than by hue alone — hue is identity, not meaning. */
+
+.principal-avatar {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  max-width: 100%;
+  border: 1px solid hsl(var(--principal-hue, 220) 45% 55% / 0.4);
+  background: hsl(var(--principal-hue, 220) 45% 55% / 0.1);
+  color: hsl(var(--principal-hue, 220) 45% 62%);
+}
+
+.principal-avatar--sm {
+  font-size: var(--text-xs);
+  padding: 0.15rem 0.5rem;
+}
+
+.principal-avatar--md {
+  font-size: var(--text-xs);
+  padding: 0.25rem 0.65rem;
+}
+
+/* Hue is identity, and it stays on the border, the background and the icon.
+   The label is read, so it takes a text-tier token: the generated hue
+   measured 1.98:1 as ink (walkthrough item R7). */
+.principal-avatar__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-primary);
+}
+
+.principal-avatar--unattributed .principal-avatar__label {
+  color: var(--text-secondary);
+}
+
+/* Humans read as the strongest signal on a board that is mostly automation. */
+.principal-avatar--human {
+  border-width: 1px;
+  border-style: solid;
+  font-weight: 600;
+}
+
+.principal-avatar--service {
+  border-style: dashed;
+}
+
+/* No principal row: real history we deliberately never back-attributed. */
+.principal-avatar--unattributed {
+  border: 1px dashed var(--border-default);
+  background: transparent;
+  color: var(--text-secondary, var(--text-tertiary));
+  font-style: italic;
+}
+
+.principal-avatar--disabled {
+  opacity: 0.55;
+  text-decoration: line-through;
+}

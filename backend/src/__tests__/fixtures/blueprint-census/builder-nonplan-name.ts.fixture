@@ -1,0 +1,1 @@
+import {buildBlueprintPlan} from '../services/BlueprintPlanService'; import {assemble} from '../services/OtherService'; class Example {preview(){const plan=buildBlueprintPlan();return {plan}} instantiate(){buildBlueprintPlan();const plan=assemble();return {plan}}}

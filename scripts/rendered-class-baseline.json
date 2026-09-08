@@ -1,0 +1,65 @@
+{
+  "error-hint": [
+    "frontend/src/components/PluginFrame.tsx"
+  ],
+
+  "execution-profile-error": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "execution-profile-field": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "execution-profile-help": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "execution-profile-option": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "execution-profile-pin": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "personality-category": [
+    "frontend/src/pages/PersonalitiesPage.tsx"
+  ],
+  "plugin-frame-spinner": [
+    "frontend/src/components/PluginFrame.tsx"
+  ],
+  "plugin-nav-link": [
+    "frontend/src/components/Sidebar.tsx"
+  ],
+  "replace-done": [
+    "frontend/src/components/projects/ProjectResourcesEditModal.tsx"
+  ],
+  "replace-review": [
+    "frontend/src/components/projects/ProjectResourcesEditModal.tsx"
+  ],
+  "report-card-time": [
+    "frontend/src/pages/ReportsPage.tsx"
+  ],
+  "report-detail-date": [
+    "frontend/src/pages/ReportDetailPage.tsx"
+  ],
+  "report-detail-updated": [
+    "frontend/src/pages/ReportDetailPage.tsx"
+  ],
+  "search-icon": [
+    "frontend/src/pages/ProjectsPage.tsx",
+    "frontend/src/pages/SkillsPage.tsx"
+  ],
+  "search-input": [
+    "frontend/src/pages/ProjectsPage.tsx",
+    "frontend/src/pages/SkillsPage.tsx"
+  ],
+  "subtask-list-status": [
+    "frontend/src/components/tasks/SubtaskList.tsx"
+  ],
+  "task-detail-ai-field": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "task-detail-hint": [
+    "frontend/src/components/tasks/ExecutionProfileEditor.tsx"
+  ],
+  "tasks-mobile-tab-label": [
+    "frontend/src/pages/TasksPage.tsx"
+  ]
+}

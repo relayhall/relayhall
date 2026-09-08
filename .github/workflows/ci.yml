@@ -1,0 +1,391 @@
+name: CI
+
+# TIER 1 - FAST. Runs on every push of every branch and on pull requests, and
+# is meant to be green in minutes rather than in an hour.
+#
+# Owner ruling 2026-09-07: "Parallelise everything; working on branches run a
+# smaller number of tests focused on the thing being built; run the full tests
+# only on demand, pre-release, when ready for final testing - not on every
+# merge, because there may be multiple merges and one final test when they all
+# come together."
+#
+# WHAT IS NOT HERE HAS NOT BEEN DROPPED. Every real-PostgreSQL gate, mutation
+# drill and red-proof control now lives in `ci-full.yml`, which runs on
+# `workflow_dispatch`, on `release/**` and `ci-full/**` pushes and on `v*`
+# tags. `scripts/check-workflow-shape.py` holds a census of every gate step
+# name on main and fails closed if one is in NEITHER file, so a gate cannot be
+# lost between the two tiers.
+#
+# THE GUARD: a tier-2 green on the EXACT SHA is required before any TST or
+# production deploy and before any release tag. DEV may be deployed from a
+# fast-tier-green `main`. See docs/ci.md.
+#
+# There is no PostgreSQL service in this tier by design: a service container,
+# its readiness wait and `load-base-schema && migrate` cost about 100 seconds
+# before a single assertion, and nothing in this tier needs a database.
+
+on:
+  push:
+    # EVERY branch except the on-demand full-tier refs. This forge cancels a
+    # run to free a runner slot for another one, and a single push that
+    # schedules TWO workflows on ONE ref puts them in that queue against each
+    # other: runs 1025, 1027, 1030 and 1032 - every full-tier attempt - were
+    # cancelled, three of them within seconds of the fast-tier run on the same
+    # ref starting. One ref, one workflow. A `ci-full/**` ref never carries new
+    # code; it is a SHA that has already had its fast-tier run on the branch it
+    # came from.
+    branches: ['**', '!ci-full/**']
+    # A branch filter alone does not schedule tag refs, so without this a
+    # release tag would run no CI at all. Tags keep the fast tier, all of them:
+    # the publication, terminology and residue gates live here, and a release
+    # is the last ref that should lose them.
+    tags: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseded iteration runs are cancelled. Runs on main and on tags are not:
+  # both are promotion gates, and each needs its own recorded fast-tier result
+  # rather than being discarded by whatever arrives next.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  # PATH FOCUS. This job answers one question - which areas did this push
+  # touch - and the frontend and CLI jobs wait on the answer. It is the only
+  # job anything waits on, and it takes about fifteen seconds.
+  #
+  # It fails OPEN, towards running more: `main`, any tag, any pull request, an
+  # unresolvable merge base, and any change to a path outside `backend/`,
+  # `frontend/`, `cli/` and the documentation set all set every area to true.
+  # The two shared trees - `scripts/` and the workflows themselves - are in
+  # that "outside" set on purpose, because a change there can alter what any
+  # job measures.
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      frontend: ${{ steps.areas.outputs.frontend }}
+      cli: ${{ steps.areas.outputs.cli }}
+      docs_only: ${{ steps.areas.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The merge base with origin/main is not reachable from a shallow
+          # clone, and an unresolvable base makes this job answer "everything
+          # changed" - correct, but it would answer that on every push.
+          fetch-depth: 0
+      - name: Compute which areas this push changed
+        id: areas
+        run: |
+          set -euo pipefail
+          everything() {
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            echo "cli=true"      >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "AREAS: everything ($1)"
+            exit 0
+          }
+          # `set -u` is on, and a shell that dies here would take the whole tier
+          # with it, so every runner-supplied variable is read with a default.
+          ref="${GITHUB_REF:-}"
+          case "$ref" in
+            refs/heads/main|refs/tags/*) everything "$ref is a promotion ref" ;;
+          esac
+          if ! base=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$base" ]; then
+            everything "no merge base with origin/main"
+          fi
+          files=$(git diff --name-only "$base" HEAD)
+          if [ -z "$files" ]; then
+            everything "no files differ from the merge base"
+          fi
+          echo "CHANGED FILES:"
+          echo "$files" | sed 's/^/  /'
+          frontend=false; cli=false; docs=false; other=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              frontend/*)          frontend=true ;;
+              cli/*)               cli=true ;;
+              backend/*|database/*) : ;;
+              docs/*|*.md)         docs=true ;;
+              *)                   other=true ;;
+            esac
+          done <<< "$files"
+          if [ "$other" = true ]; then
+            everything "a path outside backend/, frontend/, cli/ and the docs changed"
+          fi
+          docs_only=false
+          if [ "$docs" = true ] && [ "$frontend" = false ] && [ "$cli" = false ]; then
+            if [ -z "$(echo "$files" | grep -v -e '^docs/' -e '\.md$' || true)" ]; then
+              docs_only=true
+            fi
+          fi
+          echo "frontend=$frontend"   >> "$GITHUB_OUTPUT"
+          echo "cli=$cli"             >> "$GITHUB_OUTPUT"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "AREAS: frontend=$frontend cli=$cli docs_only=$docs_only"
+
+  # ALWAYS RUNS, and never waits on the change detector: it is the critical
+  # path of this tier (about 5-7 minutes, paced by the publication gate) and
+  # it is the one job a documentation-only push still needs.
+  repository-contract:
+    name: Repository and deployment contract
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep GitHub and Gitea CI definitions identical
+        run: cmp .github/workflows/ci.yml .gitea/workflows/ci.yml
+      # The shape gate parses with a loader that REFUSES duplicate keys, which
+      # needs PyYAML - and the runner image (gitea/runner-images:ubuntu-latest)
+      # does not ship it. Without this step the gate dies on `import yaml` and
+      # takes the whole contract job with it, which is exactly what runs 874
+      # and 908 did: the gate written to end CI silence could not run in CI at
+      # all, and the steps after it were never reached. Guarded, so an image
+      # that does ship PyYAML costs nothing.
+      - name: Install the workflow-shape gate's YAML parser
+        run: python3 -c 'import yaml' 2>/dev/null || pip install --quiet --break-system-packages pyyaml
+      # Identical is not the same as VALID. A workflow the runner cannot parse
+      # schedules no run at all, which reads as "CI has not started yet" rather
+      # than as a failure - card 50e74c1d lost two commits' worth of CI to
+      # exactly that silence after a rebase welded two steps together.
+      - name: Enforce workflow shape (a malformed workflow runs NOTHING)
+        run: python3 scripts/check-workflow-shape.py
+      - name: Prove the workflow-shape gate itself
+        run: python3 scripts/test-workflow-shape-gate.py
+      - name: Validate shell scripts
+        run: bash -n setup.sh backend/entrypoint.sh database/backup.sh database/restore.sh scripts/test-deployment-safety.sh scripts/publish-to-github.sh scripts/test-publish-gate.sh scripts/configure-github-repository.sh scripts/test-github-config.sh
+      - name: Validate secret-scan preprocessor
+        run: python3 scripts/prepare-secret-scan-inputs.py --help >/dev/null
+      # Same comparison the publication gate makes, but in under a second and
+      # naming the exact paths. The gate below still enforces it; this only
+      # moves the most common failure ahead of ~71s of clone-and-scan work.
+      - name: Check publication allowlist matches the tree
+        run: python3 scripts/check-public-allowlist.py
+      - name: Test setup and backup failure boundaries
+        run: scripts/test-deployment-safety.sh
+      - name: Test publication failure boundaries
+        run: scripts/test-publish-gate.sh
+      - name: Test GitHub configuration contract
+        run: scripts/test-github-config.sh
+      - name: Enforce public terminology
+        run: python3 scripts/check-doc-terminology.py
+      - name: Prove the terminology gate itself (A15.2)
+        run: python3 scripts/test-terminology-gate.py
+      - name: Keep semantic and API version truth centralized
+        run: python3 scripts/check-version-truth.py
+      - name: Prove the version-truth gate itself
+        run: python3 scripts/test-version-truth-gate.py
+      - name: Enforce design tokens (existence + literal-colour ratchet)
+        run: python3 scripts/check-design-tokens.py
+      - name: Prove the design-token gate itself
+        run: python3 scripts/test-design-token-gate.py
+      - name: Enforce the contrast pairing matrix (relay-dark)
+        run: python3 scripts/check-design-contrast.py --theme relay-dark
+      - name: Enforce the contrast pairing matrix (relay-light)
+        run: python3 scripts/check-design-contrast.py --theme relay-light
+      - name: Enforce the contrast pairing matrix (high-contrast)
+        run: python3 scripts/check-design-contrast.py --theme high-contrast
+      - name: Prove the design-contrast gate itself
+        run: python3 scripts/test-design-contrast-gate.py
+      - name: Keep one Theme value space across CSS, engine, plugins and schema
+        run: python3 scripts/check-theme-parity.py
+      - name: Prove the theme-parity gate itself
+        run: python3 scripts/test-theme-parity-gate.py
+      - name: Pin the theme boot snippet to its recorded CSP hash
+        run: python3 scripts/check-theme-boot-hash.py
+      - name: Prove the theme boot-hash gate itself
+        run: python3 scripts/test-theme-boot-hash-gate.py
+      - name: Keep exceptions out of logs (ratchet)
+        run: python3 scripts/check-error-log-hygiene.py
+      - name: Prove the error-log hygiene gate itself
+        run: python3 scripts/test-error-log-hygiene-gate.py
+      - name: Prove the colour-sweep mapping semantics
+        run: python3 scripts/test-colour-sweep-map.py
+      - name: Reject cross-stylesheet class collisions
+        run: python3 scripts/audit-css-collisions.py --check
+      - name: Every rendered class must be owned by a stylesheet
+        run: python3 scripts/check-rendered-classes.py
+      - name: Prove the rendered-class gate itself
+        run: python3 scripts/test-rendered-class-gate.py
+      # The same question, backwards (card 3da6b116). The gate above keeps a
+      # rendered class from losing its rule; this one keeps a stylesheet from
+      # carrying rules nothing renders — which is not merely weight, because
+      # every measurement taken over that file (spacing counts, contrast
+      # counts) then reports on text nobody reads.
+      - name: Every class a guarded stylesheet OWNS must have a renderer
+        run: python3 scripts/audit-dead-css.py --check
+      - name: Prove the dead-selector census itself
+        run: python3 scripts/test-dead-css-audit.py
+      - name: Prove the sweep scripts themselves
+        run: python3 scripts/test-sweep-scripts.py
+      - name: Enforce semantic/brand token separation
+        run: python3 scripts/check-semantic-tokens.py
+      - name: Prove the semantic-token gate itself
+        run: python3 scripts/test-semantic-token-gate.py
+      - name: Reject emoji in chrome
+        run: python3 scripts/check-emoji-chrome.py
+      - name: Prove the emoji-chrome gate itself
+        run: python3 scripts/test-emoji-chrome-gate.py
+      - name: Enforce the type scale and control metrics
+        run: python3 scripts/check-type-scale.py
+      - name: Prove the type-scale gate itself
+        run: python3 scripts/test-type-scale-gate.py
+      - name: Check the brand asset set
+        run: python3 scripts/check-brand-assets.py
+      - name: Prove the brand-asset gate itself
+        run: python3 scripts/test-brand-asset-gate.py
+      - name: Reject private deployment residue
+        env:
+          RELAYHALL_RESIDUE_PATTERNS: ${{ secrets.RELAYHALL_RESIDUE_PATTERNS }}
+        run: python3 scripts/check-public-residue.py
+      - name: Prove the residue gate's pattern loader
+        run: python3 scripts/test-public-residue-gate.py
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          cp relayhall.config.example.json relayhall.config.json
+          docker compose config --quiet
+
+  # Type check and the mocked suite only. Every gate that needs a real
+  # PostgreSQL moved to `ci-full.yml`; what is left here is the check that
+  # catches the largest share of ordinary mistakes in the shortest time.
+  #
+  # It has no `if:` of its own beyond the docs-only case: a backend change is
+  # not the only thing that can break the backend, so this runs whatever
+  # changed - except on a push that touches nothing but documentation, which
+  # the repository-contract job already covers.
+  backend:
+    name: Backend type check and mocked tests
+    needs: changes
+    if: ${{ needs.changes.outputs.docs_only != 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Type check the backend
+        run: npx tsc --noEmit
+      # `--runInBand` cost about four minutes: 225s against 43s for
+      # `--maxWorkers=4` over the same 253 suites and 4,547 tests. Four
+      # workers, not thirty-two, because the runner takes four jobs at once on
+      # a 32-core host, and eight was measured at the same 43s.
+      #
+      # ONE FILE STAYS IN BAND, and the class matters more than the file. CI
+      # run 1031 reddened two assertions in `kw1KnowledgeFanout.test.ts` that
+      # measure REAL ELAPSED TIME - a slow source must not spend an admitted
+      # source's budget - while the same commit passed on run 1029. Nothing
+      # about fixtures broke; the suite simply took 52.9s instead of 40.7s
+      # because three other jobs were on the host, and a wall-clock budget
+      # cannot tell a slow source from a busy CPU. A file whose assertions
+      # measure elapsed time belongs in the serial list below; a file that is
+      # merely slow does not.
+      #
+      # THE SPLIT IS PROVEN, NOT ASSUMED. A regex that quietly matched nothing
+      # would drop a whole suite and still look green, so the two passes are
+      # required to name exactly the files `--listTests` names before either
+      # runs.
+      - name: Mocked backend test suite
+        run: |
+          set -euo pipefail
+          serial='src/__tests__/kw1KnowledgeFanout.test.ts'
+          parallel='src/__tests__/(?!kw1KnowledgeFanout\.test\.ts$).*\.test\.ts$'
+          here=$(pwd)
+          all=$(npx jest --listTests | sed "s|^$here/||" | sort)
+          split=$( { npx jest --listTests "$parallel" | sed "s|^$here/||"; echo "$serial"; } | sort -u )
+          if [ "$all" != "$split" ]; then
+            echo "The parallel/serial split does not cover every test file:"
+            diff <(echo "$all") <(echo "$split") || true
+            exit 1
+          fi
+          echo "split covers $(echo "$all" | wc -l) test files"
+          npx jest --maxWorkers=4 --silent "$parallel"
+          npx jest --runInBand --silent --runTestsByPath "$serial"
+
+  # Skipped when nothing under frontend/ changed. A change to `scripts/` or to
+  # a workflow counts as "everything changed", so the isolated-source proofs
+  # below cannot be skipped by editing the script they drill.
+  frontend:
+    name: Frontend build and tests
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit
+      - run: npx vite build
+      # The CSP admits the boot snippet by hash, so the hash has to match what
+      # the BUILD emits, not only the source: Vite minifies inline scripts.
+      - name: Pin the BUILT theme boot snippet to the same CSP hash
+        run: python3 ../scripts/check-theme-boot-hash.py --html dist/index.html
+      - run: npm run test:unit
+      - name: Accessibility smoke set (axe)
+        run: npm run test:a11y
+      - name: Blueprint interview real-red controls in isolated source (7e202fca)
+        run: python3 ../scripts/blueprints-isolated-proof.py --kind frontend --output /tmp/blueprint-frontend-proof
+      # Card 7d38a6e0, round-1 review F4. The Task deadline is an INSTANT and the
+      # control that edits it edits a local WALL CLOCK; the two differ exactly
+      # where a timezone has a daylight-saving fold, and CI runs in UTC, which
+      # has none. So this step runs one file in a zone that has one. The file
+      # FAILS - never skips - if its timezone has no fold, because a control
+      # that reports success by not looking is the defect one level up.
+      #
+      # Round-2 review: the zone is now Europe/Warsaw, which has BOTH halves of
+      # the hazard on the same clock reading - a GAP at 02:30 on 29 March 2026,
+      # where a wall clock names no instant, and a FOLD at 02:30 on 25 October,
+      # where it names two. The file asserts the zone has each of them before
+      # measuring either.
+      - name: The deadline control across a daylight-saving gap and fold (7d38a6e0)
+        run: npm run test:unit:tz
+      - name: FEAT-A frontend red proofs (7d38a6e0)
+        run: python3 ../scripts/feata-mutation-drill.py --suite frontend
+
+  # Skipped when nothing under cli/ changed, on the same terms.
+  cli:
+    name: CLI tests
+    needs: changes
+    if: ${{ needs.changes.outputs.cli == 'true' }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q
+      - name: Blueprint CLI real-red controls in isolated source (7e202fca)
+        run: python3 ../scripts/blueprints-isolated-proof.py --kind transport --output /tmp/blueprint-cli-proof D26-four-registrations CLI-retry-key CLI-confirmation-bypass CLI-pattern-bypass

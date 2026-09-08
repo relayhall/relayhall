@@ -1,0 +1,63 @@
+{
+  "success": true,
+  "lod": "task",
+  "nodes": [],
+  "edges": [
+    {
+      "from": "00915858-41dd-46ac-a08d-885a13c066b8",
+      "to": "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+      "kind": "dependency"
+    },
+    {
+      "from": "3f78da2c-045d-43b2-8cff-e77a49acc939",
+      "to": "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+      "kind": "dependency"
+    },
+    {
+      "from": "74467ae1-3b26-4540-8a7a-87bddd3825a7",
+      "to": "00915858-41dd-46ac-a08d-885a13c066b8",
+      "kind": "dependency"
+    },
+    {
+      "from": "74467ae1-3b26-4540-8a7a-87bddd3825a7",
+      "to": "3f78da2c-045d-43b2-8cff-e77a49acc939",
+      "kind": "dependency"
+    },
+    {
+      "from": "2e66d59f-c291-43e9-878e-b62738aa1bc7",
+      "to": "702d14b6-1cb9-4629-b591-b17d4c801ff2",
+      "kind": "dependency"
+    },
+    {
+      "from": "d444f8c1-ab5e-48a5-844a-8a3c7c91f5d7",
+      "to": "2e66d59f-c291-43e9-878e-b62738aa1bc7",
+      "kind": "dependency"
+    }
+  ],
+  "phases": [
+    {
+      "id": "32536558-1be2-48cc-95f8-47d41686285c",
+      "name": "Discovery",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    },
+    {
+      "id": "68656943-cdcb-416f-a0be-5c37e378a463",
+      "name": "Cutover",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    },
+    {
+      "id": "b49877aa-fef6-4c6c-acde-14149a87a8cd",
+      "name": "Decommission",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    }
+  ],
+  "generatedAt": "2026-08-16T21:05:54.298Z",
+  "fullCount": 14,
+  "deltaOf": "2026-08-16T21:05:54.278Z"
+}

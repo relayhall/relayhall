@@ -1,0 +1,10 @@
+{
+  "name": "relayhall",
+  "version": "0.0.1",
+  "description": "RelayHall name reservation package. The governed, self-hosted work hub is developed at github.com/relayhall.",
+  "keywords": ["relayhall", "agents", "mcp", "coordination", "harness"],
+  "homepage": "https://relayhall.com",
+  "repository": { "type": "git", "url": "https://github.com/relayhall/relayhall.git" },
+  "license": "MIT",
+  "main": "index.js"
+}

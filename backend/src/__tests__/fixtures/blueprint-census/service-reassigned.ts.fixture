@@ -1,0 +1,1 @@
+import {taskManagerDB} from '../services/TaskManagerDB';import {grantService} from '../services/GrantService';let writer=taskManagerDB;writer=grantService;writer.createTask({});

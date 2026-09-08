@@ -1,0 +1,402 @@
+/* ========================================
+   RESPONSIVE PHASE 3 — All Remaining Pages
+   Dashboard, Images, Audit, Stats, Projects
+   + Modals full-screen on mobile + Touch targets
+   ======================================== */
+
+/* ========================================
+   1 & 2. DASHBOARD HOME
+   ======================================== */
+
+/* Tablet: stats 3x2, system status 2-col */
+@media (max-width: 1023px) {
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .dashboard-system-status-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* Mobile: stats 6 compact in single row */
+@media (max-width: 767px) {
+  .dashboard-page {
+    padding: var(--space-4);
+    gap: var(--space-5);
+  }
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(6, 1fr);
+    gap: var(--space-1);
+  }
+  .dashboard-stats-grid .stats-card {
+    padding: var(--space-1) var(--space-1);
+    min-width: 0;
+  }
+  .dashboard-stats-grid .stats-card-icon {
+    font-size: var(--text-sm);
+  }
+  .dashboard-stats-grid .stats-card-label {
+    font-size: var(--text-xs);
+  }
+  .dashboard-stats-grid .stats-card-value {
+    font-size: var(--text-xs);
+  }
+  .dashboard-stats-grid .stats-card-description {
+    display: none;
+  }
+  .dashboard-system-status-grid {
+    grid-template-columns: 1fr;
+  }
+  /* Hero card is already full-width by default */
+  .hero-card {
+    padding: var(--space-6);
+  }
+  .hero-greeting,
+.hero-card-hero-greeting {
+    font-size: var(--text-xl);
+  }
+  .hero-tagline,
+.hero-card-hero-tagline {
+    font-size: var(--text-sm);
+    margin-bottom: var(--space-5);
+  }
+  .hero-quick-actions {
+    flex-direction: column;
+  }
+  .hero-action-btn {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
+  }
+}
+
+/* ========================================
+   4. IMAGES PAGE — gallery 4→2→1
+   ======================================== */
+/* Images: 4 cols desktop, 2 cols tablet */
+@media (min-width: 1024px) {
+  .image-gen-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+@media (max-width: 1023px) and (min-width: 768px) {
+  .image-gen-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .image-gen-page {
+    padding: var(--space-4);
+    gap: var(--space-4);
+  }
+  .image-gen-grid {
+    grid-template-columns: 1fr;
+    gap: var(--space-4);
+  }
+  .image-gen-controls {
+    flex-direction: column;
+  }
+  .image-gen-model-select {
+    width: 100%;
+  }
+  .image-gen-button {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
+  }
+  .image-gen-filters {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .search-group {
+    min-width: unset;
+    width: 100%;
+  }
+  /* Lightbox full-screen on mobile */
+  .image-gen-lightbox {
+    padding: 0;
+  }
+  .image-gen-lightbox-content {
+    max-width: 100%;
+    max-height: 100vh;
+    border-radius: 0;
+    height: 100%;
+  }
+  .image-gen-lightbox-image {
+    max-height: 60vh;
+  }
+  .image-gen-lightbox-close {
+    width: 44px;
+    height: 44px;
+    top: var(--space-2);
+    right: var(--space-2);
+  }
+}
+
+/* ========================================
+   5. AUDIT PAGE (empty-state core surface)
+   ======================================== */
+@media (max-width: 767px) {
+  .audit-page {
+    padding: var(--space-3) var(--space-2);
+  }
+  .audit-header,
+.audit-page-audit-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+/* ========================================
+   6. STATS PAGE (empty-state core surface)
+   ======================================== */
+@media (max-width: 767px) {
+  .stats-page {
+    padding: var(--space-3) var(--space-2);
+  }
+  .stats-header,
+.stats-page-stats-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+/* ========================================
+   7. PROJECTS PAGE — 3→2→1 columns
+   ======================================== */
+/* Projects: auto-fill handles 3 cols at desktop via minmax(320px, 1fr) */
+
+@media (max-width: 1023px) and (min-width: 768px) {
+  .projects-grid,
+.projects-page-projects-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6);
+  }
+}
+
+@media (max-width: 767px) {
+  .projects-grid,
+.projects-page-projects-grid {
+    grid-template-columns: 1fr;
+    padding: var(--space-4);
+  }
+  .projects-page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    padding-left: 76px; /* Space for fixed hamburger (44px @ left:16px) + gap; offset negative page margin */
+  }
+  .projects-page-header-actions {
+    width: 100%;
+  }
+  .projects-page-header-actions button {
+    width: 100%;
+    min-height: 44px;
+  }
+  .projects-page-controls {
+    flex-direction: column;
+    padding: var(--space-4);
+    gap: var(--space-3);
+  }
+  .projects-search,
+.projects-page-projects-search {
+    max-width: 100%;
+  }
+  .projects-sort,
+.projects-page-projects-sort {
+    width: 100%;
+  }
+  .filter-toggle,
+.projects-page-filter-toggle {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
+  }
+}
+
+/* ========================================
+   8. ALL MODALS — full-screen on mobile (<768px)
+   ======================================== */
+@media (max-width: 767px) {
+  /* Task Detail Modal */
+  .task-detail-overlay,
+/* Task Detail Modal */
+  .task-detail-modal-task-detail-overlay {
+    padding: 0;
+  }
+  .task-detail-modal {
+    max-width: 100%;
+    max-height: 100%;
+    height: 100%;
+    border-radius: 0;
+  }
+  .task-detail-header,
+.task-detail-modal-task-detail-header {
+    padding: var(--space-4) var(--space-5);
+  }
+  .task-detail-content,
+.task-detail-modal-task-detail-content {
+    padding: var(--space-4) var(--space-5);
+  }
+  .task-detail-close-btn,
+.task-detail-modal-task-detail-close-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Create Task Modal */
+  .create-task-overlay,
+/* Create Task Modal */
+  .create-task-modal-create-task-overlay {
+    padding: 0;
+  }
+  .create-task-modal {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+    margin: 0 !important;
+  }
+
+  /* Edit Task Modal */
+  .edit-task-modal {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+  }
+
+  /* Project Create Modal */
+  .modal-overlay,
+/* Project Create Modal */
+  .create-project-modal-modal-overlay {
+    padding: 0;
+  }
+  .modal-content,
+.create-project-modal-modal-content {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+    margin: 0 !important;
+  }
+
+  /* Project Detail Modal */
+  .project-detail-overlay {
+    padding: 0;
+  }
+  .project-detail-modal {
+    width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+  }
+  .modal-overlay,
+.create-project-modal-modal-overlay {
+    z-index: 10000 !important; /* Above sidebar on all mobile browsers */
+  }
+  .project-detail-header,
+.project-detail-modal-project-detail-header {
+    padding-top: calc(var(--space-6) + 12px); /* Extra breathing room on mobile */
+  }
+
+  /* Brief Modal */
+  .brief-modal-overlay,
+/* Brief Modal */
+  .project-detail-modal-brief-modal-overlay {
+    padding: 0;
+  }
+  .brief-modal,
+.project-detail-modal-brief-modal {
+    width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+  }
+
+  /* Screenshot viewer / file viewer modals */
+  .screenshot-overlay,
+  .file-viewer-overlay {
+    padding: 0;
+  }
+  .screenshot-modal,
+  .file-viewer-modal {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+  }
+}
+
+/* ========================================
+   9. TOUCH TARGETS — min 44px on mobile
+   ======================================== */
+@media (max-width: 767px) {
+  /* Buttons */
+  button,
+  [role="button"],
+  .audit-btn,
+  .stats-btn,
+  .hero-action-btn,
+  .image-gen-button,
+  .filter-toggle,
+  .filter-option,
+  .retry-button,
+  .retry-btn,
+.projects-page-filter-option,
+.projects-page-filter-toggle,
+.context-preview-retry-btn,
+.projects-page-retry-btn,
+.dashboard-page-retry-button {
+    min-height: 44px;
+  }
+
+  /* Links that act as buttons */
+  a.hero-action-btn,
+  .lightbox-download {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  /* Select elements */
+  select,
+  .sort-select,
+  .audit-header-actions select,
+  .stats-header-actions select,
+  .audit-filters select {
+    min-height: 44px;
+  }
+
+  /* Input elements */
+  input[type="text"],
+  input[type="search"],
+  textarea,
+  .search-input,
+  .image-gen-prompt,
+  .audit-search-form input {
+    min-height: 44px;
+  }
+
+  /* Pagination buttons */
+  .audit-pagination button {
+    min-height: 44px;
+    padding: 10px 16px;
+  }
+
+  /* Clickable event items */
+  .audit-event-header {
+    min-height: 44px;
+  }
+
+  /* Dashboard status items */
+  .dashboard-status-item {
+    min-height: 44px;
+    padding: var(--space-3);
+  }
+}
+

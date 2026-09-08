@@ -1,0 +1,491 @@
+/**
+ * RelayHall — Animation Library
+ * Delightful micro-interactions and motion
+ */
+
+/* ========================================
+   REFRESH & UPDATE ANIMATIONS
+   ======================================== */
+
+/* Delicate pulse on content refresh */
+@keyframes refresh-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+  50% {
+    opacity: 0.95;
+    transform: scale(1.01);
+    box-shadow: 0 0 20px 8px var(--accent-soft);
+  }
+}
+
+.refresh-pulse {
+  animation: refresh-pulse 1.2s var(--ease-in-out);
+}
+
+/* Shimmer effect on update */
+@keyframes shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--overlay-weak) 50%,
+    transparent 100%
+  );
+  background-size: 1000px 100%;
+  animation: shimmer 2s ease-in-out;
+}
+
+/* Breathing animation for idle widgets */
+@keyframes breathe {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.92;
+    transform: scale(0.995);
+  }
+}
+
+.breathe {
+  animation: breathe 4s var(--ease-in-out) infinite;
+}
+
+/* ========================================
+   LOADING STATES
+   ======================================== */
+
+/* Skeleton pulse */
+@keyframes skeleton-pulse {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-surface) 25%,
+    var(--bg-surface-hover) 50%,
+    var(--bg-surface) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-pulse 2s ease-in-out infinite;
+  border-radius: var(--radius-md);
+}
+
+/* Spinning loader */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Slow spin for sync indicators */
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
+
+/* Pulse (for icons, status indicators) */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.pulse {
+  animation: pulse 2s var(--ease-in-out) infinite;
+}
+
+/* Ping (for notifications, updates) */
+@keyframes ping {
+  75%, 100% {
+    transform: scale(2);
+    opacity: 0;
+  }
+}
+
+.ping {
+  animation: ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* ========================================
+   ENTRANCE ANIMATIONS
+   ======================================== */
+
+/* Fade in */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.fade-in {
+  animation: fade-in var(--transition-base) var(--ease-out);
+}
+
+/* Slide in from top */
+@keyframes slide-in-top {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.slide-in-top {
+  animation: slide-in-top var(--transition-base) var(--ease-out);
+}
+
+/* Slide in from bottom */
+@keyframes slide-in-bottom {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.slide-in-bottom {
+  animation: slide-in-bottom var(--transition-base) var(--ease-out);
+}
+
+/* Scale in */
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.scale-in {
+  animation: scale-in var(--transition-base) var(--ease-out);
+}
+
+/* Card entrance (combined slide + scale) */
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.card-enter {
+  animation: card-enter 250ms var(--ease-out);
+}
+
+/* ========================================
+   EXIT ANIMATIONS
+   ======================================== */
+
+/* Fade out */
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.fade-out {
+  animation: fade-out var(--transition-base) var(--ease-in);
+}
+
+/* Scale out */
+@keyframes scale-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+}
+
+.scale-out {
+  animation: scale-out var(--transition-base) var(--ease-in);
+}
+
+/* ========================================
+   INTERACTION FEEDBACK
+   ======================================== */
+
+/* Bounce (for success feedback) */
+@keyframes bounce {
+  0%, 100% {
+    transform: scale(1);
+  }
+  30% {
+    transform: scale(1.15);
+  }
+  60% {
+    transform: scale(0.95);
+  }
+}
+
+.bounce {
+  animation: bounce 400ms var(--ease-out);
+}
+
+/* Wiggle (for errors, attention) */
+@keyframes wiggle {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-4px);
+  }
+  75% {
+    transform: translateX(4px);
+  }
+}
+
+.wiggle {
+  animation: wiggle 300ms var(--ease-in-out);
+}
+
+/* Shake (for validation errors) */
+@keyframes shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  10%, 30%, 50%, 70%, 90% {
+    transform: translateX(-4px);
+  }
+  20%, 40%, 60%, 80% {
+    transform: translateX(4px);
+  }
+}
+
+.shake {
+  animation: shake 500ms var(--ease-in-out);
+}
+
+/* Rubber band (playful bounce) */
+@keyframes rubber-band {
+  0% {
+    transform: scale(1);
+  }
+  30% {
+    transform: scaleX(1.25) scaleY(0.75);
+  }
+  40% {
+    transform: scaleX(0.75) scaleY(1.25);
+  }
+  50% {
+    transform: scaleX(1.15) scaleY(0.85);
+  }
+  65% {
+    transform: scaleX(0.95) scaleY(1.05);
+  }
+  75% {
+    transform: scaleX(1.05) scaleY(0.95);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.rubber-band {
+  animation: rubber-band 800ms var(--ease-out);
+}
+
+/* ========================================
+   HOVER & ACTIVE STATES
+   ======================================== */
+
+/* Lift on hover (for cards) */
+.hover-lift {
+  transition: transform var(--transition-base) var(--ease-out),
+              box-shadow var(--transition-base) var(--ease-out);
+}
+
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-3);
+}
+
+/* Glow on hover */
+.hover-glow-orange {
+  transition: box-shadow var(--transition-base) var(--ease-out);
+}
+
+.hover-glow-orange:hover {
+  box-shadow: var(--glow-accent);
+}
+
+.hover-glow-blue {
+  transition: box-shadow var(--transition-base) var(--ease-out);
+}
+
+.hover-glow-blue:hover {
+  box-shadow: var(--glow-info);
+}
+
+/* Scale on active (for buttons) */
+.active-scale {
+  transition: transform var(--transition-fast) var(--ease-out);
+}
+
+.active-scale:active {
+  transform: scale(0.95);
+}
+
+/* ========================================
+   SPECIAL EFFECTS
+   ======================================== */
+
+/* Typing indicator */
+@keyframes typing {
+  0%, 60%, 100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-8px);
+  }
+}
+
+.typing-dot {
+  animation: typing 1.4s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+/* Sparkle effect */
+@keyframes sparkle {
+  0%, 100% {
+    opacity: 0;
+    transform: scale(0) rotate(0deg);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1) rotate(180deg);
+  }
+}
+
+.sparkle {
+  animation: sparkle 2s ease-in-out infinite;
+}
+
+/* Progress pulse */
+@keyframes progress-pulse {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.progress-pulse {
+  background-size: 200% 200%;
+  animation: progress-pulse 3s ease infinite;
+}
+
+/* Confetti (for celebrations) */
+@keyframes confetti-fall {
+  0% {
+    transform: translateY(-100vh) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(100vh) rotate(720deg);
+    opacity: 0;
+  }
+}
+
+.confetti {
+  animation: confetti-fall 3s ease-out forwards;
+}
+
+/* ========================================
+   UTILITY CLASSES
+   ======================================== */
+
+/* Legacy utility name, with an explicit set of inexpensive properties. */
+.transition-all {
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+}
+
+/* Disable animations (for reduced motion).
+   The OS preference is the default; `data-reduced-motion` (RH-UI.2) lets a
+   principal override it in either direction, and is ABSENT while their
+   preference is `system` so the media query keeps its authority. */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-reduced-motion="no-preference"]) *,
+  html:not([data-reduced-motion="no-preference"]) *::before,
+  html:not([data-reduced-motion="no-preference"]) *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+[data-reduced-motion="reduce"] *,
+[data-reduced-motion="reduce"] *::before,
+[data-reduced-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}

@@ -1,0 +1,82 @@
+/* The day-one connection flow (card 653be44f).
+   Every colour is a semantic token, and every pairing here is one the Access
+   manager already proves in relay-dark, relay-light and high-contrast — this
+   surface introduces no colour pair the contrast matrix has not seen.
+   `--text-tertiary` carries only decorative or duplicated text; nothing
+   informative is rendered in `--text-quaternary`. */
+
+.conn-wizard { margin: var(--space-4) 0; padding: var(--space-5); border: 1px solid var(--border-default); border-radius: var(--radius-lg); background: var(--bg-surface); box-shadow: var(--shadow-1); }
+.conn-wizard-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
+.conn-wizard-head h2 { display: flex; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--text-xl); color: var(--text-primary); }
+.conn-wizard-head h2 svg { color: var(--text-accent); }
+.conn-wizard-step { margin: 0; color: var(--text-secondary); font-size: var(--text-sm); }
+
+.conn-step { margin-top: var(--space-4); }
+.conn-step-title { margin: 0 0 var(--space-3); font-size: var(--text-xl); color: var(--text-primary); }
+
+.conn-templates { list-style: none; margin: 0 0 var(--space-4); padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3); }
+.conn-template { display: flex; }
+.conn-template-btn { display: flex; flex-direction: column; gap: var(--space-1); width: 100%; min-height: var(--control-standard); padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-primary); text-align: left; cursor: pointer; transition: border-color var(--transition-fast) var(--ease-out); }
+.conn-template-btn:hover:not(:disabled) { border-color: var(--border-accent); }
+.conn-template-btn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+.conn-template-btn:disabled { cursor: not-allowed; background: var(--bg-app); color: var(--text-secondary); }
+.conn-template-btn--on { border-color: var(--border-accent); background: var(--accent-soft); }
+.conn-template-label { font-weight: var(--font-semibold); }
+.conn-template-blurb { color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+.conn-template-note { color: var(--text-secondary); font-family: var(--font-mono); font-size: var(--text-xs); }
+
+.conn-authority { margin: var(--space-4) 0; padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-elevated); }
+.conn-authority-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin: 0; color: var(--text-primary); font-size: var(--text-sm); }
+.conn-authority-line svg { color: var(--text-accent); }
+
+.conn-linkbtn { padding: 0; border: 0; background: none; color: var(--text-accent); font-size: var(--text-sm); text-decoration: underline; cursor: pointer; }
+.conn-linkbtn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+
+.conn-scopes { margin-top: var(--space-3); }
+.conn-scopes-tools { display: flex; gap: var(--space-3); margin-bottom: var(--space-2); }
+.conn-scopelist { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.conn-scopeitem { display: flex; }
+.conn-scope { display: inline-flex; align-items: center; gap: var(--space-1); width: max-content; padding: var(--space-1) var(--space-2); border: 1px solid var(--border-default); border-radius: var(--radius-full); color: var(--text-secondary); background: var(--bg-surface); font-family: var(--font-mono); font-size: var(--text-xs); cursor: pointer; }
+.conn-scope input { accent-color: var(--focus-ring-color); }
+.conn-scope--on { border-color: var(--border-accent); color: var(--text-accent); background: var(--accent-soft); }
+
+.conn-field { display: block; max-width: 480px; margin-bottom: var(--space-3); }
+.conn-field-label { display: block; margin-bottom: var(--space-1); color: var(--text-secondary); font-size: var(--text-sm); }
+
+.conn-check { display: flex; align-items: flex-start; gap: var(--space-2); margin-top: var(--space-2); color: var(--text-primary); font-size: var(--text-sm); line-height: var(--leading-normal); cursor: pointer; }
+.conn-check input { margin-top: 3px; accent-color: var(--focus-ring-color); }
+.conn-fieldset { margin: var(--space-3) 0 0; padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+
+.conn-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-4); }
+
+.conn-note { max-width: 82ch; margin: var(--space-2) 0 0; color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+.conn-warn { display: flex; align-items: flex-start; gap: var(--space-2); max-width: 82ch; margin: var(--space-3) 0 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--status-warning); border-radius: var(--radius-md); color: var(--status-warning); background: var(--status-warning-soft); font-size: var(--text-sm); line-height: var(--leading-normal); }
+.conn-error { margin: var(--space-3) 0; padding: var(--space-3); border: 1px solid var(--status-danger); border-radius: var(--radius-md); color: var(--text-error); background: var(--status-danger-soft); font-size: var(--text-sm); }
+.conn-notice { margin: var(--space-3) 0; padding: var(--space-3); border: 1px solid var(--status-success); border-radius: var(--radius-md); color: var(--text-success); background: var(--status-success-soft); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.conn-inline-code { padding: 0 var(--space-1); border-radius: var(--radius-sm); background: var(--bg-elevated); font-family: var(--font-mono); font-size: var(--text-xs); }
+.conn-spin { animation: conn-spin var(--transition-slower) linear infinite; }
+@keyframes conn-spin { to { transform: rotate(360deg); } }
+
+.conn-bootstrap { margin-top: var(--space-3); }
+.conn-bootstrap-lede { margin: 0 0 var(--space-3); color: var(--text-primary); font-size: var(--text-sm); }
+.conn-bootstrap-tabs { margin-bottom: var(--space-3); }
+.conn-bootstrap-hint { margin: 0 0 var(--space-2); color: var(--text-secondary); font-size: var(--text-sm); }
+.conn-bootstrap-line { margin-top: var(--space-3); padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-elevated); }
+.conn-bootstrap-line-label { display: block; margin-bottom: var(--space-1); color: var(--text-secondary); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: .04em; }
+.conn-bootstrap-line-text { margin: 0; color: var(--text-primary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+
+.conn-copyblock { border: 1px solid var(--border-default); border-radius: var(--radius-md); overflow: hidden; }
+.conn-copyblock-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-subtle); background: var(--bg-elevated); }
+.conn-copyblock-title { display: inline-flex; align-items: center; gap: var(--space-2); color: var(--text-secondary); font-size: var(--text-sm); }
+.conn-copybtn { display: inline-flex; align-items: center; gap: var(--space-1); min-height: var(--control-compact); padding: 0 var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-control); background: var(--bg-surface); color: var(--text-primary); font-size: var(--text-sm); cursor: pointer; }
+.conn-copybtn:hover { border-color: var(--border-accent); }
+.conn-copybtn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+.conn-copyblock-body { margin: 0; padding: var(--space-3); max-height: 320px; overflow: auto; background: var(--bg-surface); color: var(--text-primary); font-family: var(--font-mono); font-size: var(--text-xs); line-height: var(--leading-normal); }
+
+.conn-state { display: flex; align-items: center; justify-content: center; gap: var(--space-2); min-height: 120px; color: var(--text-secondary); font-size: var(--text-sm); }
+
+@media (max-width: 640px) {
+  .conn-wizard { padding: var(--space-3); }
+  .conn-templates { grid-template-columns: 1fr; }
+  .conn-actions { justify-content: stretch; }
+}

@@ -1,0 +1,408 @@
+/* App Container with Sidebar */
+.app-container {
+  display: flex;
+  min-height: 100vh;
+  max-width: 100vw;
+  overflow-x: hidden;
+  background: var(--bg-app);
+}
+
+/* Main App Area (with sidebar offset) */
+.app {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  min-height: 100vh;
+  min-width: 0; /* Allow flex child to shrink below content size */
+  max-width: 100%;
+  overflow-x: hidden;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+  display: flex;
+  flex-direction: column;
+  transition: margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Sidebar collapsed via toggle button */
+.sidebar-is-collapsed .app {
+  margin-left: var(--sidebar-collapsed-width);
+}
+
+/* Legacy status badges (kept for component reuse) */
+.status-badge {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  border-radius: 12px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  margin-top: 0.25rem;
+}
+
+.status-badge.connected {
+  background: var(--status-success-soft);
+  color: var(--text-success);
+}
+
+.status-badge.disconnected {
+  background: var(--status-danger-soft);
+  color: var(--text-error);
+}
+
+.status-badge.checking {
+  background: var(--status-warning-soft);
+  color: var(--text-warning);
+}
+
+/* Main Content */
+.main-content {
+  --page-inset: var(--space-8);
+  flex: 1;
+  padding: var(--page-inset);
+  overflow-y: auto;
+  min-width: 0;
+  position: relative;
+}
+
+/* ==============================================
+   FADE-IN ANIMATION & LOADING STATES
+   ============================================== */
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.fade-in {
+  animation: fadeIn var(--transition-base) var(--ease-out);
+}
+
+/* Route transition wrapper */
+.route-transition {
+  animation: fadeIn var(--transition-fast) var(--ease-out);
+}
+
+/* Only the desktop Task workspace consumes a fixed viewport budget. The
+   session banner remains a flex sibling, so it never overlaps its header. */
+@media (min-width: 1280px) and (min-height: 480px) {
+  .app-container:has(.task-detail-page) {
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .app:has(.task-detail-page) {
+    min-height: 0;
+  }
+
+  .main-content:has(.task-detail-page),
+  .route-transition:has(.task-detail-page) {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+}
+
+/* Centered loading spinner for main-content area */
+.page-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  gap: 1rem;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.page-loading .loading-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border-subtle);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.welcome-card {
+  background: var(--overlay-weak);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-default);
+  border-radius: 16px;
+  padding: 2rem;
+  box-shadow: 0 8px 32px var(--shadow-color);
+}
+
+.welcome-card h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 2rem;
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-color) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.welcome-card p {
+  margin: 0 0 1.5rem 0;
+  color: var(--text-tertiary);
+}
+
+.api-info,
+.api-error,
+.next-steps {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border-radius: 12px;
+}
+
+.api-info {
+  background: var(--status-success-soft);
+  color: var(--text-on-fill);
+  border: 1px solid var(--status-success-soft);
+}
+
+.api-error {
+  background: var(--status-danger-soft);
+  color: var(--text-on-fill);
+  border: 1px solid var(--status-danger-soft);
+}
+
+.next-steps {
+  background: var(--status-info-soft);
+  color: var(--text-on-fill);
+  border: 1px solid var(--status-info-soft);
+}
+
+.api-info h3,
+.api-error h3,
+.next-steps h3 {
+  margin: 0 0 1rem 0;
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+}
+
+.api-info pre {
+  background: var(--scrim-weak);
+  padding: 1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: var(--text-sm);
+}
+
+.next-steps ul {
+  margin: 0;
+  padding-left: 1.5rem;
+}
+
+.next-steps li {
+  margin: 0.5rem 0;
+  color: var(--text-secondary);
+}
+
+/* Persistent private audio stays outside route transitions so mobile browsers can
+   keep one media element for the lifetime of the authenticated app. */
+.private-audio-player {
+  position: fixed;
+  z-index: 1200;
+  right: 1rem;
+  bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+  left: calc(var(--sidebar-width) + 1rem);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 420px) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border: 1px solid var(--accent-color);
+  border-radius: 14px;
+  box-shadow: 0 16px 45px var(--shadow-color);
+  backdrop-filter: blur(16px);
+}
+
+.private-audio-player[hidden] { display: none; }
+.private-audio-player > div { display: flex; min-width: 0; flex-direction: column; }
+.private-audio-player strong,
+.private-audio-player span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.private-audio-player span { color: var(--text-tertiary); font-size: var(--text-xs); }
+.private-audio-player audio { width: 100%; }
+.private-audio-player button {
+  padding: 0.55rem 0.8rem;
+  color: var(--text-primary);
+  background: var(--overlay-medium);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* Status Test Section */
+.status-test {
+  margin-top: 1.5rem;
+  padding: 1.5rem;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft);
+}
+
+.status-test h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+}
+
+.status-test h4 {
+  margin: 1.5rem 0 0.5rem 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.status-test p {
+  margin: 0 0 1rem 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.control-section {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.control-section:last-of-type {
+  border-bottom: none;
+}
+
+.info-box {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  background: var(--status-info-soft);
+  color: var(--text-on-fill);
+  border: 1px solid var(--status-info-soft);
+  border-radius: 8px;
+}
+
+.info-box p {
+  margin: 0 0 0.5rem 0;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.info-box ul {
+  margin: 0.5rem 0 0 0;
+  padding-left: 1.5rem;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.info-box li {
+  margin: 0.25rem 0;
+}
+
+.button-group {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.test-button {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: 8px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.test-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px var(--shadow-color);
+}
+
+.test-button:active {
+  transform: translateY(0);
+}
+
+.idle-btn {
+  background: var(--overlay-medium);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-default);
+}
+
+.idle-btn:hover {
+  background: var(--overlay-medium);
+}
+
+.thinking-btn {
+  background: var(--accent-soft);
+  color: var(--text-accent);
+  border: 1px solid var(--accent-color);
+}
+
+.thinking-btn:hover {
+  background: var(--accent-soft);
+}
+
+.working-btn {
+  background: var(--status-warning-soft);
+  color: var(--text-warning);
+  border: 1px solid var(--status-warning-strong);
+}
+
+.working-btn:hover {
+  background: var(--status-warning-soft);
+  color: var(--text-on-fill);
+}
+
+/* ==============================================
+   RESPONSIVE BREAKPOINTS - Must be at the end!
+   ============================================== */
+
+/* Tablet + mobile: sidebar becomes off-canvas */
+@media (max-width: 1279px) {
+  .app,
+  .sidebar-is-collapsed .app {
+    margin-left: 0 !important;
+  }
+
+  .main-content {
+    --page-inset: var(--space-4);
+  }
+
+  .private-audio-player {
+    left: 1rem;
+  }
+}
+
+/* Small mobile */
+@media (max-width: 639px) {
+  .main-content {
+    --page-inset: var(--space-3);
+  }
+
+  .private-audio-player {
+    right: 0.5rem;
+    bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+    left: 0.5rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.6rem;
+    padding: 0.7rem;
+  }
+
+  .private-audio-player audio {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}

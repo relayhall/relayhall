@@ -1,0 +1,1 @@
+import {BlueprintRegistryService} from '../services/BlueprintRegistryService';const registry=new BlueprintRegistryService({limit:102400});export async function getForRenderer(id,caller){return registry.get(id,caller)}

@@ -1,0 +1,455 @@
+/* SubtaskList - Phase 4 Step 6 */
+@import '../../styles/variables.css';
+
+.subtask-list {
+  margin-top: var(--space-4);
+}
+
+/* Progress bar */
+.subtask-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.subtask-progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--overlay-medium);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.subtask-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.subtask-progress-bar {
+  position: relative;
+}
+
+.subtask-progress-completed {
+  background: linear-gradient(90deg, var(--status-success-strong), var(--status-success-strong));
+  color: var(--text-on-fill);
+  z-index: 5;
+}
+
+.subtask-progress-skipped {
+  background: linear-gradient(90deg, var(--overlay-strong), var(--overlay-strong));
+  z-index: 4;
+}
+
+.subtask-progress-review {
+  background: linear-gradient(90deg, var(--status-warning-strong), var(--accent-color));
+  color: var(--text-on-fill);
+  z-index: 3;
+}
+
+.subtask-progress-in-progress {
+  background: linear-gradient(90deg, var(--status-info), var(--status-info));
+  color: var(--text-on-fill);
+  z-index: 2;
+}
+
+.subtask-progress-blocked {
+  background: linear-gradient(90deg, var(--danger-color), var(--danger-color));
+  color: var(--text-on-fill);
+  z-index: 1;
+}
+
+.subtask-progress-text {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  min-width: 44px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.progress-completed {
+  color: var(--text-success);
+}
+
+.progress-skipped {
+  color: var(--text-tertiary);
+}
+
+.progress-review {
+  color: var(--text-warning);
+}
+
+.progress-in-progress {
+  color: var(--text-info);
+}
+
+.progress-blocked {
+  color: var(--text-error);
+}
+
+.progress-empty {
+  color: var(--text-tertiary);
+}
+
+/* Subtask items */
+.subtask-items {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.subtask-item {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-radius: var(--radius-sm);
+  transition: background-color 0.15s ease;
+}
+
+.subtask-item:hover {
+  background: var(--overlay-weak);
+}
+
+.subtask-editing:is(.subtask-item) {
+  background: var(--accent-soft);
+}
+
+/* Checkbox */
+.subtask-checkbox {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  min-height: 18px;
+  aspect-ratio: 1;
+  box-sizing: border-box;
+  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-on-fill);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition-base) ease;
+  padding: 0;
+  margin-top: 1px;
+}
+
+.subtask-checkbox:hover {
+  border-color: var(--accent-color);
+  background: var(--accent-soft);
+}
+
+/* Phase 4: 6-state checkbox styles */
+.subtask-checkbox.subtask-status-completed {
+  background: linear-gradient(135deg, var(--status-success-strong), var(--status-success-strong));
+  border-color: var(--status-success-strong);
+  color: var(--text-on-fill);
+}
+
+.subtask-checkbox.subtask-status-skipped {
+  background: linear-gradient(135deg, var(--overlay-strong), var(--overlay-strong));
+  border-color: var(--text-quaternary);
+  color: var(--text-on-fill);
+}
+
+.subtask-checkbox.subtask-status-review {
+  background: linear-gradient(135deg, var(--status-warning-strong), var(--accent-color));
+  border-color: var(--status-warning-strong);
+  color: var(--text-on-fill);
+  animation: pulse-review 2s ease-in-out infinite;
+}
+
+.subtask-checkbox.subtask-status-in-progress {
+  background: linear-gradient(135deg, var(--status-info), var(--status-info));
+  border-color: var(--status-info);
+  color: var(--text-on-fill);
+  animation: spin-in-progress 2s linear infinite;
+}
+
+.subtask-checkbox.subtask-status-blocked {
+  background: linear-gradient(135deg, var(--danger-color), var(--danger-color));
+  border-color: var(--danger-color);
+  color: var(--text-on-fill);
+}
+
+.subtask-checkbox.subtask-status-empty {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+
+@keyframes pulse-review {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes spin-in-progress {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* Legacy support */
+.subtask-completed .subtask-checkbox {
+  background: linear-gradient(135deg, var(--status-success-strong), var(--status-success-strong));
+  border-color: var(--status-success-strong);
+}
+
+/* Text */
+.subtask-text {
+  flex: 1;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.subtask-text-editable {
+  cursor: text;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: var(--radius-sm);
+  transition: background-color 0.15s ease;
+}
+
+.subtask-text-editable:hover {
+  background: var(--overlay-weak);
+}
+
+/* Phase 4: 6-state text styles */
+.subtask-status-completed .subtask-text {
+  /* line-through carries the state; opacity multiplied the tertiary token
+     down to 2.91:1 on the page background (live-axe finding at 2fbd271) */
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.subtask-status-skipped .subtask-text {
+  /* same class of live-axe failure as completed: informative struck text
+     takes the gated tertiary token */
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.subtask-status-review .subtask-text {
+  color: var(--text-warning);
+}
+
+.subtask-status-in-progress .subtask-text {
+  color: var(--text-info);
+}
+
+.subtask-status-blocked .subtask-text {
+  color: var(--text-error);
+}
+
+.subtask-status-empty .subtask-text {
+  color: var(--text-secondary);
+}
+
+/* Legacy support */
+.subtask-completed .subtask-text {
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+  opacity: 0.6;
+}
+
+/* Blocked reason indicator */
+.subtask-blocked-reason {
+  margin-left: 6px;
+  cursor: help;
+  opacity: 0.8;
+}
+
+/* Has blocked subtasks indicator */
+.has-blocked:is(.subtask-list) {
+  border-left: 3px solid var(--danger-color);
+  padding-left: var(--space-2);
+}
+
+/* Visible lifecycle context and role-aware action control */
+.subtask-review-note {
+  color: var(--text-warning);
+}
+
+.subtask-status-select {
+  flex: 0 0 190px;
+  max-width: 100%;
+  min-height: var(--control-compact);
+  padding: var(--space-1) var(--space-2);
+  color: var(--text-primary);
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  font: inherit;
+  font-size: var(--text-xs);
+}
+
+.subtask-status-select:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+.subtask-status-select:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.subtask-status-indicator {
+  flex: 0 0 24px;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.subtask-lifecycle-context {
+  /* Owner ruling 2026-08-16: the notes align with the subtask TEXT column.
+     The indent equals the select basis + row gap, and collapses with the
+     select on the narrow-viewport stack below. */
+  flex: 1 0 calc(100% - 214px);
+  min-width: 220px;
+  margin-left: calc(190px + var(--space-3));
+  margin-top: calc(-1 * var(--space-2));
+  display: grid;
+  gap: 3px;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+}
+
+.subtask-blocked-reason {
+  margin-left: 0;
+  color: var(--text-error);
+  cursor: default;
+  opacity: 1;
+}
+
+.subtask-skipped-note {
+  color: var(--text-tertiary);
+}
+
+.subtask-transition-error {
+  margin: var(--space-2) 0;
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+  border: 1px solid var(--danger-color);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+}
+
+/* Inline edit input */
+.subtask-edit-input {
+  flex: 1;
+  background: var(--scrim-weak);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  padding: var(--space-1) var(--space-2);
+  outline: none;
+  font-family: inherit;
+}
+
+.subtask-edit-input:focus {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* Action buttons */
+.subtask-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.subtask-item:hover .subtask-actions {
+  opacity: 1;
+}
+
+.subtask-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* RH-UI.20: requested 28x28, but 28px sits ON the type-scale gate's
+     control band (28-56px) for btn selectors — promoted to the compact
+     control token per design 77950a97 §7. */
+  width: var(--control-compact);
+  height: var(--control-compact);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 0;
+}
+
+.subtask-action-btn:hover:not(:disabled) {
+  background: var(--overlay-strong);
+  color: var(--text-secondary);
+}
+
+.subtask-action-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.subtask-edit-btn:hover:not(:disabled) {
+  color: var(--text-accent);
+}
+
+.subtask-move-btn:hover:not(:disabled) {
+  color: var(--text-info);
+}
+
+/* Compact mode — show fewer items */
+.subtask-list-compact .subtask-items {
+  max-height: 120px;
+  overflow: hidden;
+}
+
+.subtask-list-compact .subtask-item {
+  padding: var(--space-1) 0;
+}
+
+.subtask-list-compact .subtask-text {
+  font-size: var(--text-xs);
+}
+
+.subtask-list-compact .subtask-actions {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .subtask-status-select {
+    flex-basis: 100%;
+    width: 100%;
+  }
+
+  .subtask-lifecycle-context {
+    margin-left: 0;
+  }
+
+  .subtask-lifecycle-context {
+    flex-basis: 100%;
+    min-width: 0;
+    margin-left: 0;
+    margin-top: 0;
+  }
+}

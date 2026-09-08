@@ -1,0 +1,121 @@
+/* Button Component Styles */
+@import '../styles/variables.css';
+
+/* THE control-kit button (RH-UI.20, design 77950a97 §7): exactly two
+   sizes — standard 48px (page headers, primary flows) and compact 36px
+   (toolbars, dense surfaces) — radius 8, type on the scale. Every button
+   in the estate is this recipe or a documented exception. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--control-standard);
+  padding: 0 var(--space-5);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  border: none;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+  position: relative;
+  overflow: hidden;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.btn-compact {
+  min-height: var(--control-compact);
+  padding: 0 var(--space-3);
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  z-index: 1;
+}
+
+.btn-text {
+  position: relative;
+  z-index: 1;
+}
+
+/* Primary Button (Orange) */
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-color) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 4px 12px var(--accent-soft),
+    0 2px 4px var(--shadow-color-soft);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-color) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 6px 20px var(--accent-soft),
+    0 2px 4px var(--shadow-color-soft);
+  transform: translateY(-1px);
+}
+
+/* Secondary Button (Gray) */
+.btn-secondary {
+  background: var(--bg-surface-hover);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px var(--shadow-color-soft),
+    inset 0 1px 0 var(--overlay-weak);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--overlay-medium);
+  border-color: var(--border-default);
+  box-shadow: 0 4px 12px var(--shadow-color),
+    inset 0 1px 0 var(--overlay-medium);
+  transform: translateY(-1px);
+}
+
+/* Success Button (Green) */
+.btn-success {
+  background: linear-gradient(135deg, var(--status-success-strong) 0%, var(--status-success-strong) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 4px 12px var(--status-success-soft),
+    0 2px 4px var(--shadow-color-soft);
+}
+
+.btn-success:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--status-success) 0%, var(--status-success-strong) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 6px 20px var(--status-success-soft),
+    0 2px 4px var(--shadow-color-soft);
+  transform: translateY(-1px);
+}
+
+/* Danger Button (Red) */
+.btn-danger {
+  background: linear-gradient(135deg, var(--danger-color) 0%, var(--danger-color) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 4px 12px var(--status-danger-soft),
+    0 2px 4px var(--shadow-color-soft);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, var(--status-danger) 0%, var(--danger-color) 100%);
+  color: var(--text-on-fill);
+  box-shadow: 0 6px 20px var(--status-danger-soft),
+    0 2px 4px var(--shadow-color-soft);
+  transform: translateY(-1px);
+}

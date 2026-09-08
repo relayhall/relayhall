@@ -1,0 +1,170 @@
+/* Shared form vocabulary (P1.5c).
+   Moved verbatim from components/skills/SkillDetailModal.css so every page can
+   adopt the same markup (.form-group / .form-input / .form-textarea /
+   .form-select / .form-actions / .btn-cancel / .btn-save) without importing a
+   modal's stylesheet. Loaded globally via index.css. */
+
+.form-group {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 1;
+}
+
+.form-group label {
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--text-secondary);
+}
+
+.form-row {
+  display: flex;
+  gap: var(--space-4);
+  align-items: flex-end;
+}
+
+.form-input {
+  min-width: 0;
+  max-width: 100%;
+  min-height: var(--control-compact);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  transition: background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.form-textarea {
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-3);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: var(--font-body);
+  resize: vertical;
+  transition: background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+  line-height: var(--leading-relaxed);
+}
+
+.form-textarea:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+.form-textarea-lg {
+  min-height: 120px;
+}
+
+.form-textarea-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* Native selects share the input surface; the option rules keep the popup
+   readable — without a color-scheme declaration the OS may render it light. */
+.form-select {
+  min-width: 0;
+  max-width: 100%;
+  /* Zero vertical padding so the height token GOVERNS rather than merely
+     floors: with padding the content box grew to 38px against a 36px
+     min-height (card 465a32c4). Same recipe as .btn-compact and .icon-btn. */
+  min-height: var(--control-compact);
+  padding: 0 var(--space-3);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+}
+
+.form-select:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-select option {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+/* Form Actions */
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.btn-cancel {
+  min-height: var(--control-compact);
+  padding: 0 var(--space-4);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+}
+
+.btn-cancel:hover {
+  border-color: var(--text-tertiary);
+  color: var(--text-primary);
+}
+
+.btn-save {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-compact);
+  padding: 0 var(--space-4);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-control);
+  color: var(--text-accent);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+}
+
+.btn-save:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+}
+
+.btn-save:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Kit modifier (components/ui/Select.tsx): the standard 48px control size
+   for page-header contexts; the base .form-select is compact 36px. */
+.form-select-standard {
+  min-height: var(--control-standard);
+}

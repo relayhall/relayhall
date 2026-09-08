@@ -1,0 +1,53 @@
+{
+  "success": true,
+  "lod": "project",
+  "nodes": [
+    {
+      "kind": "project",
+      "project": "Atlas Migration",
+      "total": 6,
+      "byStatus": {
+        "completed": 1,
+        "stuck": 1,
+        "ideas": 1,
+        "in-progress": 1,
+        "review": 1,
+        "todo": 1
+      },
+      "progress": 0.1667
+    },
+    {
+      "kind": "project",
+      "project": "Coral Docs",
+      "total": 3,
+      "byStatus": {
+        "todo": 1,
+        "in-progress": 2
+      },
+      "progress": 0
+    },
+    {
+      "kind": "project",
+      "project": null,
+      "total": 3,
+      "byStatus": {
+        "ideas": 2,
+        "review": 1
+      },
+      "progress": 0
+    },
+    {
+      "kind": "project",
+      "project": "Beacon Observability",
+      "total": 2,
+      "byStatus": {
+        "review": 1,
+        "todo": 1
+      },
+      "progress": 0
+    }
+  ],
+  "edges": [],
+  "generatedAt": "2026-08-16T21:05:54.307Z",
+  "fullCount": 14
+}

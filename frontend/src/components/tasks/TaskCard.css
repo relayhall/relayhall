@@ -1,0 +1,1080 @@
+/* Compact Task Card - Glass Morphism Design */
+@import '../../styles/variables.css';
+
+.task-card {
+  position: relative;
+  /* No backdrop-filter here: nesting it inside the column's blur causes GPU tile seams */
+  background: var(--overlay-weak);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: default;
+  transition: border-color var(--transition-base) ease, transform var(--transition-base) ease,
+    box-shadow var(--transition-base) ease, opacity var(--transition-base) ease,
+    filter var(--transition-base) ease;
+  box-shadow: 0 2px 8px var(--shadow-color-soft),
+    inset 0 1px 0 var(--overlay-weak);
+  max-width: 100%;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.task-card[draggable="true"] {
+  cursor: grab;
+}
+
+.task-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: var(--radius-md);
+  background: linear-gradient(
+    135deg,
+    var(--overlay-weak) 0%,
+    transparent 100%
+  );
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+/* Hover Effect - Subtle highlight */
+.task-card:hover {
+  border-color: var(--accent-color);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px var(--shadow-color-soft),
+    inset 0 1px 0 var(--overlay-medium);
+}
+
+.task-card:hover::before {
+  opacity: 1;
+}
+
+.task-card:active:not(.dragging) {
+  transform: scale(0.98);
+}
+
+/* Dragging State */
+.dragging:is(.task-card) {
+  opacity: 0.6;
+  transform: rotate(2deg) scale(1.02);
+  box-shadow: 0 16px 40px var(--shadow-color),
+    0 0 0 2px var(--focus-ring-color);
+  cursor: grabbing;
+  z-index: 100;
+}
+
+/* Agent Active State - Pulsing Glow */
+.agent-active:is(.task-card) {
+  animation: agent-pulse 2s ease-in-out infinite;
+  border-color: var(--status-warning-strong);
+}
+
+@keyframes agent-pulse {
+  0%, 100% {
+    box-shadow: 0 2px 8px var(--shadow-color-soft),
+      0 0 5px var(--status-warning-soft);
+  }
+  50% {
+    box-shadow: 0 2px 8px var(--shadow-color-soft),
+      0 0 20px var(--status-warning-soft);
+  }
+}
+
+/* Session Activity: Active (activity <10min) — orange left border */
+.session-active:is(.task-card) {
+  border-left: 3px solid var(--status-warning-strong);
+}
+
+/* Session Activity: Stale (in-progress, no activity >10min) — dimmed */
+.session-stale:is(.task-card) {
+  opacity: 0.5;
+  filter: grayscale(0.25);
+}
+
+.session-stale:is(.task-card):hover {
+  opacity: 0.75;
+  filter: grayscale(0.1);
+}
+
+/* Compact Card Layout */
+.task-card-compact {
+  /* Geometry rule (C2 §2.1): content padding-left is 48px so no secondary
+     control starts inside the handle's 44px hit band. */
+  padding: var(--space-4);
+  /* Left as a literal on purpose: the ratified geometry pin in
+     pages/TasksPage.boardKeyboard.test.tsx (C2 2.1, review 324cebef B2) reads
+     this value out of the stylesheet TEXT, and --space-12 -- though exactly
+     48px -- would defeat it. Changing that pin is that review's call, not this
+     lane's. The exemption is named in src/spacingScale.test.ts. */
+  padding-left: 48px;
+}
+
+/* Left-edge grip-strip drag handle (C2 §2.1): 24px visible strip, 44px hit
+   width via a transparent inward extension. Topmost in the z-order. */
+.task-card-drag-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0 0 0 var(--space-1);
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: grab;
+  z-index: 4;
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+}
+.task-card-drag-handle:active { cursor: grabbing; }
+.task-card-drag-handle:hover,
+.task-card-drag-handle:focus-visible {
+  color: var(--text-secondary);
+  /* the highlight renders across the FULL hit area (accepted-tradeoff
+     mitigation, §2.1) */
+  background: var(--accent-soft);
+}
+.task-card-drag-handle:focus-visible {
+  /* inset focus treatment: --focus-ring is an outer shadow that would clip
+     under the card's overflow (§2.1) */
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+}
+
+/* Stretched open surface: non-interactive overlay above content, below the
+   secondary controls and the handle (§2.1 z-order). */
+.task-card-open-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  cursor: pointer;
+}
+
+/* Secondary controls stay independently operable above the overlay — but
+   the raised LAYERS are pointer-transparent so every non-control card-body
+   pixel falls through to the stretched open surface (§2.1 hit-testing).
+   Only real controls inside them take pointer events back. */
+.task-card-compact-header,
+.task-card-interactive-row,
+.task-card-project-badge,
+.task-card-tags,
+.task-card-subtask-progress,
+.task-card-blocked,
+.task-card-depends,
+.task-card-blocks,
+.task-card-agent-compact,
+.task-card-owner,
+.task-card-footer {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
+}
+.task-card-compact-header button,
+.task-card-compact-header a,
+.task-card-tags button,
+.task-card-project-badge {
+  pointer-events: auto;
+}
+
+/* The lucide replacement for the retired emoji flag (§2.1 / D20). */
+.task-card-subtask-blocked-flag {
+  display: inline-flex;
+  align-items: center;
+  color: var(--status-danger);
+  flex-shrink: 0;
+}
+
+/* Move menu (portal; APG menu pattern). */
+.task-card-move-menu {
+  z-index: 1000;
+  min-width: 200px;
+  padding: var(--space-1);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+.task-card-move-menu-item {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.task-card-move-menu-item:hover:not(:disabled),
+.task-card-move-menu-item:focus-visible {
+  background: var(--bg-surface-hover);
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+}
+.task-card-move-menu-item:disabled {
+  color: var(--text-quaternary);
+  cursor: default;
+}
+
+.task-card-compact-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* Priority Badge (Compact - Single Letter) */
+.task-card-priority-compact {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-primary) !important;
+  flex-shrink: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.priority-urgent {
+  background: var(--danger-color);
+  color: var(--text-on-fill);
+}
+
+.task-card .priority-high{
+  background: var(--status-success-strong);
+  color: var(--text-on-fill);
+}
+
+.priority-normal {
+  background: var(--accent-hover);
+  color: var(--text-on-fill);
+}
+
+.task-card .priority-low{
+  background: var(--overlay-strong);
+}
+
+.priority-someday {
+  background: var(--accent-hover);
+  color: var(--text-on-fill);
+}
+
+/* Title (compact — up to two lines).
+   One ellipsised line showed about twenty-five characters at five columns on
+   a 1440 board, which is not enough to tell two Tasks apart. It is the same
+   two-line clamp the map densities already use; on the board it lives on the
+   opener below, because on the board the opener is what holds the text. */
+.task-card-title-compact {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--text-primary);
+  margin: 0;
+  line-height: var(--leading-tight);
+  overflow: hidden;
+  flex: 1;
+  min-inline-size: 0;
+}
+
+/* The board density puts the title INSIDE this button, so the clamp has to be
+   here: a rule on the <h3> clamps the button as one block and changes nothing.
+   The map densities render the title as a bare <p> with no opener inside, so
+   their own clamp (further down this file) already works and is untouched. */
+.task-card-open-button {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+/* Agent Session Link Button */
+.task-card-session-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--status-warning-soft);
+  border: 1px solid var(--status-warning-strong);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1);
+  color: var(--text-warning);
+  cursor: pointer;
+  transition: all var(--transition-base) ease;
+  flex-shrink: 0;
+}
+
+.task-card-session-link:hover {
+  background: var(--status-warning-soft);
+  border-color: var(--status-warning-strong);
+  transform: scale(1.05);
+}
+
+.task-card-session-link:active {
+  transform: scale(0.95);
+}
+
+/* Interactive Session Badge + Status Row */
+.task-card-interactive-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 6px;
+  margin-top: var(--space-1);
+  flex-wrap: wrap;
+}
+
+/* Owner ruling 2026-08-16: on narrow cards the timer WRAPS as a tidy
+   left-aligned line instead of floating right on its own — the auto margin
+   only right-aligns it while it still shares the pills' line. */
+.task-card-interactive-row > :first-child {
+  margin-right: 0;
+}
+
+.task-card-interactive-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 8px;
+  background: var(--status-success-soft);
+  border: 1px solid var(--status-success);
+  border-radius: 10px;
+  font-size: var(--text-xs);
+  color: var(--text-success);
+  font-weight: 600;
+}
+
+.task-card-session-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.session-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.session-status-running {
+  color: var(--text-success);
+}
+
+.session-status-running .session-status-dot {
+  background: var(--status-success-strong);
+  color: var(--text-on-fill);
+  animation: statusPulse 1.5s ease-in-out infinite;
+}
+
+/* Review 3ed95da6 F1. This colours the parent span, and the parent holds the
+   readable word "Idle" — the dot beside it is painted by `background` on
+   .session-status-dot and never took this ink. The label is text, so it takes
+   a text tier; the dot stays exactly as recessive as it was. */
+.session-status-idle {
+  color: var(--text-tertiary);
+}
+
+.session-status-idle .session-status-dot {
+  background: var(--overlay-strong);
+}
+
+.session-status-waiting {
+  color: var(--text-warning);
+}
+
+.session-status-waiting .session-status-dot {
+  background: var(--status-warning-strong);
+  color: var(--text-on-fill);
+  animation: statusPulse 1.5s ease-in-out infinite;
+}
+
+/* --text-info is bound as an alias of --status-info in all three Themes, so
+   this is a rename to the tier that says what it is, with no pixel change. */
+.session-status-completed {
+  color: var(--text-info);
+}
+
+.session-status-completed .session-status-dot {
+  background: var(--status-info);
+  color: var(--text-on-fill);
+}
+
+@keyframes statusPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.task-card-session-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* Agent Indicator (Compact) */
+/* Project Badge */
+.task-card-project-badge {
+  font: inherit;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 8px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft);
+  border-radius: 10px;
+  font-size: var(--text-xs);
+  color: var(--text-accent);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-top: 2px;
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.task-card-project-badge:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+}
+
+.task-card-project-badge span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tags Display */
+.task-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.task-card-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  background: var(--status-info-soft);
+  border: 1px solid var(--status-info-soft);
+  border-radius: 8px;
+  font-size: var(--text-xs);
+  color: var(--status-info);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.task-card-tag:hover {
+  background: var(--status-info-soft);
+  border-color: var(--status-info);
+  transform: scale(1.05);
+}
+
+.task-card-tag:active {
+  transform: scale(0.95);
+}
+
+.task-card-tag span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.task-card-tag-more {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  padding: 2px 4px;
+}
+
+.task-card-agent-compact {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-accent);
+  animation: agentPulse 2s ease-in-out infinite;
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.task-card-agent-compact span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+@keyframes agentPulse {
+  0%, 100% { border-color: var(--accent-soft); }
+  50% { border-color: var(--accent-color); }
+}
+
+/* Thinking Level Indicator */
+.task-card-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  width: fit-content;
+}
+
+.task-card-thinking span {
+  white-space: nowrap;
+}
+
+.thinking-low {
+  background: var(--overlay-medium);
+  border: 1px solid var(--border-default);
+  color: var(--text-quaternary);
+}
+
+.thinking-medium {
+  background: var(--status-warning-soft);
+  border: 1px solid var(--status-warning-soft);
+  color: var(--status-warning);
+}
+
+.thinking-high {
+  background: var(--status-danger-soft);
+  border: 1px solid var(--status-danger-soft);
+  color: var(--danger-color);
+}
+
+.task-card-thinking-auto {
+  font-size: var(--text-xs);
+  opacity: 0.6;
+}
+
+.task-card-attempt {
+  font-size: var(--text-xs);
+  opacity: 0.8;
+  margin-left: 2px;
+}
+
+/* Dependency Badges */
+.task-card-blocked {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--status-danger-soft);
+  border: 1px solid var(--danger-color);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--danger-color);
+  width: fit-content;
+  cursor: help;
+}
+
+.task-card-depends,
+.task-card-blocks {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--status-info-soft);
+  border: 1px solid var(--status-info-soft);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--status-info);
+  width: fit-content;
+  cursor: help;
+}
+
+.task-card-depends {
+  background: var(--status-warning-soft);
+  border-color: var(--status-warning-soft);
+  color: var(--text-warning);
+}
+
+.task-card-blocked span,
+.task-card-depends span,
+.task-card-blocks span {
+  white-space: nowrap;
+}
+
+/* Blocked/Dimmed State */
+.task-blocked:is(.task-card) {
+  opacity: 0.6;
+  filter: grayscale(0.3);
+}
+
+.task-blocked:is(.task-card)::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--overlay-weak);
+  pointer-events: none;
+  border-radius: var(--radius-md);
+}
+
+/* Subtask Blocked State - red border */
+.subtask-blocked:is(.task-card) {
+  border-left: 3px solid var(--danger-color);
+  box-shadow: 0 0 12px var(--status-danger-soft);
+}
+
+
+
+/* Card Footer — Priority + Thinking at bottom */
+.task-card-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.task-card-footer .task-card-thinking {
+  margin-top: 0;
+}
+
+/* Header Icons: Auto-start Flag, Blocked/Review Alert */
+.task-card-icon-flag {
+  display: flex;
+  align-items: center;
+  color: var(--text-success);
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+.task-card-icon-alert {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.is-blocked:is(.task-card-icon-alert) {
+  color: var(--text-error);
+}
+
+.needs-review:is(.task-card-icon-alert) {
+  color: var(--text-warning);
+}
+
+/* Subtask Progress Bar */
+.task-card-subtask-progress {
+  margin-top: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.subtask-bar {
+  display: flex;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--overlay-medium);
+  width: 100%;
+}
+
+.subtask-bar-segment {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.bar-completed { background: var(--status-success-strong);
+  color: var(--text-on-fill); }
+.bar-in-progress { background: var(--status-info);
+  color: var(--text-on-fill); }
+.bar-review { background: var(--status-warning-strong);
+  color: var(--text-on-fill); }
+.bar-blocked { background: var(--danger-color);
+  color: var(--text-on-fill); }
+.bar-skipped { background: var(--overlay-strong); }
+
+.subtask-counts {
+  display: flex;
+  gap: 6px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  line-height: 1;
+}
+
+.subtask-counts span {
+  white-space: nowrap;
+}
+
+/* Accessibility */
+.task-card-open-button:focus-visible {
+  /* inset focus treatment (§2.1): an outer ring clips under the card's
+     overflow — the offset must stay negative */
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Mobile Responsive */
+@media (max-width: 767px) {
+  .task-card-compact {
+    /* geometry rule holds at every breakpoint: left padding stays 48px so
+       no content starts inside the handle's hit band (§2.1) */
+    padding: var(--space-3) var(--space-3) var(--space-3) 48px;
+  }
+
+  .task-card-compact-header {
+    gap: var(--space-2);
+  }
+
+  .task-card-priority-compact {
+    width: 20px;
+    height: 20px;
+  }
+
+  .task-card-title-compact {
+    font-size: var(--text-xs);
+  }
+
+  .task-card-project-badge,
+  .task-card-tag,
+  .task-card-agent-compact,
+  .task-card-interactive-badge {
+    padding: 2px 6px;
+  }
+
+  .task-card-tags {
+    gap: 3px;
+    margin-top: var(--space-1);
+  }
+
+  /* Ensure stacking order on mobile - prevent overlaps */
+  .task-card-thinking,
+  .task-card-blocked,
+  .task-card-depends,
+  .task-card-blocks {
+    margin-top: var(--space-1);
+    padding: 2px 6px;
+  }
+
+  .task-card-footer {
+    margin-top: 6px;
+    padding-top: var(--space-1);
+    gap: var(--space-1);
+  }
+
+  .subtask-counts {
+    gap: var(--space-1);
+  }
+
+  .subtask-bar {
+    height: 3px;
+  }
+}
+
+/* Assignee attribution row (card 60558599). Sits with the agent indicator so a
+   card reads "whose task this is" and "who is on it" in the same glance. */
+.task-card-owner {
+  display: flex;
+  align-items: center;
+  margin-top: 0.35rem;
+  min-width: 0;
+}
+
+/* ---- A7 map density variants (design 77950a97 §6/§7) --------------------
+   The map tile IS this board card, at a smaller density: same class language,
+   board-only machinery (handle, move menu, footer) simply not rendered.
+
+   The width is fixed and the HEIGHT IS NEVER DECLARED — the layout engine
+   measures each tile's real box, so a tile must be free to grow with its
+   content. Any block-size here would silently lie to the measurement. */
+
+.task-card--map-tile,
+.task-card--map-detail {
+  position: relative;
+  inline-size: 170px;
+  max-inline-size: 170px;
+  /* the board's 48px handle gutter would eat a third of a 170px tile, and
+     map density renders no handle to gutter for */
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  /* the opener's focus ring is an OUTWARD box-shadow; the board card clips
+     its children, so map density opts out of that clip */
+  overflow: visible;
+}
+
+/* Title: one or two lines, ellipsised — still content-driven height. */
+.task-card--map-tile .task-card-title-compact,
+.task-card--map-detail .task-card-title-compact {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  flex: none;
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.task-card-map-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-block-start: var(--space-1);
+  min-inline-size: 0;
+}
+
+.task-card-map-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
+  white-space: nowrap;
+}
+
+.task-card-map-status--in-progress { color: var(--text-info); border-color: var(--status-info); }
+.task-card-map-status--review { color: var(--text-warning); border-color: var(--status-warning); }
+.task-card-map-status--stuck { color: var(--text-error); border-color: var(--status-danger); }
+.task-card-map-status--completed { color: var(--text-success); border-color: var(--status-success); }
+
+.task-card-map-project {
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+/* Status drives the tile's border and a soft tint, so the map reads as state
+   at a glance without a legend. Neutral states keep the surface default. */
+.task-card--map-tile[data-status="in-progress"],
+.task-card--map-detail[data-status="in-progress"] {
+  border-color: var(--status-info);
+  background: var(--status-info-soft);
+}
+
+.task-card--map-tile[data-status="review"],
+.task-card--map-detail[data-status="review"] {
+  border-color: var(--status-warning);
+  background: var(--status-warning-soft);
+}
+
+/* §3: stuck is danger AND an alarm ring. §1 names STUCK as one of the four
+   questions the Map answers, so it gets a signal of its own rather than just
+   another tint the eye has to decode. */
+.task-card--map-tile[data-status="stuck"],
+.task-card--map-detail[data-status="stuck"] {
+  border-color: var(--status-danger);
+  background: var(--status-danger-soft);
+  box-shadow: 0 0 0 3px var(--status-danger-soft);
+  animation: task-card-map-alarm 2.4s var(--ease-in-out) infinite;
+}
+
+@keyframes task-card-map-alarm {
+  0%, 100% { box-shadow: 0 0 0 3px var(--status-danger-soft); }
+  50% { box-shadow: 0 0 0 6px var(--status-danger-soft); }
+}
+
+.task-card--map-tile[data-status="ideas"],
+.task-card--map-detail[data-status="ideas"] {
+  border-color: var(--status-idea);
+  background: var(--status-idea-soft);
+}
+
+.task-card--map-tile[data-status="completed"],
+.task-card--map-detail[data-status="completed"] {
+  border-color: var(--status-success);
+  background: var(--status-success-soft);
+  /* done work recedes without disappearing (§6) */
+  opacity: 0.7;
+}
+
+/* The whole tile opens through ONE real control. No role="button" on the
+   article, no second tab stop: this button IS the opener. */
+.task-card-map-open {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.task-card-map-open:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-md);
+}
+
+/* ============================================================
+   §3 MAP DENSITY — live agent badge and progress bar
+   The badge is the "who works now" signal and must read at EVERY zoom,
+   so it is deliberately excluded from the far-detail fade (see
+   MapView.css) and keeps a solid pill against the tile surface.
+   ============================================================ */
+
+.task-card-map-agent {
+  position: absolute;
+  inset-block-start: -8px;
+  inset-inline-end: -6px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-inline-size: 90%;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--status-info);
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  color: var(--text-info);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-card-map-agent-dot {
+  flex: none;
+  inline-size: 6px;
+  block-size: 6px;
+  border-radius: var(--radius-full);
+  background: var(--status-info);
+  animation: task-card-map-agent-pulse 1.8s var(--ease-in-out) infinite;
+}
+
+.task-card-map-agent-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-card-map-progress {
+  display: block;
+  block-size: 4px;
+  margin-block-start: var(--space-1);
+  border-radius: var(--radius-full);
+  background: var(--border-subtle);
+  overflow: hidden;
+}
+
+.task-card-map-progress-fill {
+  display: block;
+  block-size: 100%;
+  border-radius: var(--radius-full);
+  background: var(--status-success);
+}
+
+@keyframes task-card-map-agent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-card-map-agent-dot {
+    animation: none;
+  }
+
+  /* The alarm ring stays — it is a state signal — but stops moving. */
+  .task-card--map-tile[data-status="stuck"],
+  .task-card--map-detail[data-status="stuck"] {
+    animation: none;
+  }
+}
+
+/* The footer was a single non-wrapping flex row of short chips - one priority
+   letter, one thinking level. The deadline chip is WORDS ("Overdue by 3 d"),
+   which on a narrow board column pushes the row past the card edge and clips
+   whatever sits last. Wrapping is the honest answer: truncating a deadline
+   into an ellipsis would hide the very thing the chip exists to say. */
+.task-card-footer {
+  flex-wrap: wrap;
+  row-gap: var(--space-1);
+}
+
+/* The deadline chip (card 7d38a6e0).
+   Text only: the words already say "Due in" or "Overdue by", so the tone is
+   reinforcement, never the sole carrier of the state (WCAG 1.4.1). Every
+   colour is a matrix-tested pairing on the card's own surface, so all three
+   Themes are covered by the contrast gate rather than by inspection. */
+.task-card-due {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  pointer-events: auto;
+}
+
+.task-card-due--later {
+  color: var(--text-tertiary);
+}
+
+.task-card-due--soon {
+  color: var(--text-warning);
+}
+
+.task-card-due--overdue {
+  color: var(--text-error);
+  font-weight: 600;
+}
+
+/* A Task with no deadline renders no chip at all, so this state exists only
+   so the modifier set is complete and a stray 'none' can never be unstyled. */
+.task-card-due--none {
+  color: var(--text-tertiary);
+}

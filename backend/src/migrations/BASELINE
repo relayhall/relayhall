@@ -1,0 +1,45 @@
+# BASELINE manifest — task 475a54c9
+#
+# Every file listed here is already contained in database/init.sql (the
+# authoritative fresh-install baseline, regenerated from the live schema
+# through migration 042). migrate.ts STAMPS these into schema_migrations
+# without executing them:
+#   - fresh DB: init.sql first, then `npm run migrate` stamps all of these
+#   - existing DB (prod/dev): any entry missing from the ledger is stamped,
+#     repairing ledgers where migrations were applied out-of-band
+# These files are NEVER re-executed by migrate.ts.
+#
+# When cutting a new baseline: regenerate database/init.sql from the live
+# schema and append the newly-absorbed migration filenames here.
+006_journal_entries.sql
+007_project_resources.sql
+008_link_categories.sql
+009_tools_table.sql
+010_project_tools.sql
+011_seed_tools.sql
+012_seed_additional_tools.sql
+013_task_history.sql
+014_user_preferences.sql
+015_journal_multiple_per_day.sql
+016_seed_generic_tools.sql
+017_journal_voice_path.sql
+023_reports.sql
+024_seed_reports.sql
+025_session_messages.sql
+026_phase5_retention_optimization.sql
+027_session_messages_dedup.sql
+028_ingester_state.sql
+029_sessions_kind_constraint.sql
+030_delete_ghost_sessions.sql
+031_acp_session_key.sql
+032_discord_thread_id.sql
+033_sessions_redesign.sql
+034_agent_types.sql
+035_cleanup_empty_run_sessions.sql
+035_task_execution_profile.sql
+036_task_prompt_metadata.sql
+037_task_history_title_compat.sql
+039_task_timeline_events.sql
+040_archive_disposition.sql
+041_task_notes.sql
+042_agent_type_provenance_and_retire.sql

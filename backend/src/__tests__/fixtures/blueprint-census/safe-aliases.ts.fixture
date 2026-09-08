@@ -1,0 +1,5 @@
+import {projectService} from '../services/ProjectService';
+import {phaseService} from '../services/PhaseService';
+import {taskManagerDB} from '../services/TaskManagerDB';
+import {reportManager} from '../services/ReportManager';
+const {query:read}=client;read('SELECT id FROM tasks WHERE id=$1'); const creator=taskManagerDB;const {createTask:make}=creator;make({});projectService.create({});

@@ -1,0 +1,958 @@
+name: CI (full)
+
+# TIER 2. The complete real-PostgreSQL chain, every mutation drill and every
+# red-proof control that used to run serially inside the `backend` job of
+# `ci.yml`, plus the carriage and scale jobs.
+#
+# Owner ruling 2026-09-07: "Parallelise everything; working on branches run a
+# smaller number of tests focused on the thing being built; run the full tests
+# only on demand, pre-release, when ready for final testing - not on every
+# merge, because there may be multiple merges and one final test when they all
+# come together."
+#
+# THE GUARD ON THAT RULING, and the reason this file is not merely optional: a
+# tier-2 green ON THE EXACT SHA is required before any TST or production
+# deploy and before any release tag. DEV may be deployed from a fast-tier-green
+# `main`. See docs/ci.md.
+#
+# NOTHING IN THIS FILE CARRIES AN `if:`. A gate that can be skipped by a
+# condition is a gate that will be skipped on the promotion it was written for,
+# and `scripts/check-workflow-shape.py` fails this file if one appears. The
+# trigger is the only thing that decides whether these gates run.
+
+# TRIGGERS, and why they are only these two. `release/**` and `v*` were the
+# obvious third and fourth, and they are deliberately absent: this forge
+# cancels a run to free a runner slot, and a push that schedules BOTH
+# workflows on ONE ref puts them in that queue against each other. Four
+# full-tier runs were destroyed that way (1025, 1027, 1030, 1032) before the
+# rule was found. A release ref and a tag keep the FAST tier - it owns the
+# publication, terminology and residue gates, and a release is the last ref
+# that should lose them - so the full tier stays off those refs and is asked
+# for by name instead:
+#
+#     git push origin <sha>:refs/heads/ci-full/<name>
+#
+# which is what the promotion guard requires anyway: a full-tier green on the
+# exact SHA, recorded BEFORE the tag exists. See docs/ci.md.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'ci-full/**'
+
+permissions:
+  contents: read
+
+# NO `concurrency:` BLOCK, deliberately. Every ref this workflow fires on is a
+# promotion ref, and a discarded full run is indistinguishable from one that was
+# never required - so there is nothing here to opt out of, and no group for a
+# later run to evict an earlier one from. Two runs of this workflow on two refs
+# are two independent promotion records and both are meant to complete.
+
+jobs:
+
+  # DEFINITION ORDER IS LOAD ORDER. The runner has four job slots and this
+  # workflow has six jobs, so the two dispatched last decide the wall clock.
+  # The carriage drill is the longest single step in the repository (17-29
+  # minutes on runs 1019-1021) and cannot be split, so it goes first; the two
+  # shortest jobs go last.
+  #
+  # Keep the complete carriage mutation drill in its own job with an isolated
+  # database, so it does not share that budget with the live gates.
+  carriage_controls:
+    name: Directory carriage mutation controls
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      # RH-LENSES-a obligation B-L10a. Every control this card ships carries at
+      # least one RED MUTATION, proven HERE - at build time - to redden that
+      # control while every other control in the drill stays green. A mutation
+      # that reddens nothing FAILS THE BUILD, and so does one that reddens
+      # something the table does not name: collateral is how one over-sensitive
+      # assertion stands in for an independently broken control. The design
+      # record deliberately names no mutations, because whether one reddens is a
+      # runtime property no design round can measure.
+      - name: Red-proof drill for the carriage controls (74e02a05, B-L10a)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run drill:lenses-a
+
+  mutation_controls:
+    name: Inheritance and Blueprint document mutation controls
+    # The two heaviest red-proof drills on main (about 17 and 8 minutes) shared
+    # one serial job with everything else. Neither reads rows another gate
+    # wrote: each drives its own suite under mutation, so both start from this
+    # job's own freshly migrated database, in the order they hold on main.
+    # The runner's own job timeout is 75m; this matches it.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      - name: Project to Task inheritance semantic controls
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/project-task-inheritance-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Blueprint document policy and census real-red controls (7e202fca)
+        run: |
+          python3 ../scripts/blueprints-document-mutations.py --output-dir /tmp/blueprint-document-proof
+          python3 ../scripts/blueprints-descriptor-mutations.py --output-dir /tmp/blueprint-descriptor-proof
+          python3 ../scripts/blueprints-schema-mutations.py --output-dir /tmp/blueprint-schema-proof
+          python3 ../scripts/blueprints-setup-mutations.py --output-dir /tmp/blueprint-setup-proof
+          python3 ../scripts/blueprints-census-mutations.py --root .. --output /tmp/blueprint-census-proof
+
+  blueprint_controls:
+    name: Blueprint runtime, gate and installation controls
+    # The Blueprint runtime, isolated-source and clean-installation controls, in
+    # their main order. `npm run build` is deliberately NOT run here: the two
+    # steps that read `backend/dist` (the SETGOV census and the orchestration
+    # reachability drill) sit after the boot check in `live_gates`, which is
+    # where they are on main too.
+    # The runner's own job timeout is 75m; this matches it.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      - name: Blueprint canonical runtime and gate real-red controls (7e202fca)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          CI=true npm run test:blueprints:descriptor
+          CI=true npm run test:blueprints:setup
+          python3 ../scripts/blueprints-runtime-mutations.py --output-dir /tmp/blueprint-runtime-proof
+          python3 ../scripts/blueprints-gate-authority-mutations.py .. /tmp/blueprint-authority-proof
+          python3 ../scripts/blueprints-lifecycle-mutations.py --output-dir /tmp/blueprint-lifecycle-proof
+          # Exact inventory: 22 runtime checks plus five Phase-capture checks.
+          CI=true python3 ../scripts/blueprints-replay-order-mutations.py --profile ci --expected-tests 27 --output-dir /tmp/blueprint-replay-order-proof
+      - name: Blueprint MCP real-red controls in isolated source (7e202fca)
+        run: python3 ../scripts/blueprints-isolated-proof.py --kind transport --output /tmp/blueprint-mcp-proof D15-forbidden-MCP-publish MCP-required-key MCP-header-forwarding MCP-complete-receipt MCP-target-closed
+      - name: Three clean Blueprint installations and portability (7e202fca)
+        env:
+          CI: 'true'
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: python3 ../scripts/blueprints-examples-live.py --profile ci --root .. --output /tmp/blueprint-examples-proof --with-exporter-mutation
+
+  live_gates:
+    name: Live authorization gates against a real PostgreSQL
+    # The order-sensitive live chain, unbroken and in its main order. The
+    # list/point parity gate stays FIRST on a freshly migrated database because
+    # its assertions are equalities over counts, and the boot check keeps its
+    # position ahead of the two steps that read `backend/dist`.
+    # The runner's own job timeout is 75m; this matches it.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      # Card 08f42f36. Every Task list must answer what GET /tasks/:id answers,
+      # measured through the production router. It runs FIRST of the two, on a
+      # freshly migrated database, because its assertions are equalities over
+      # counts. No `if:` guard: a runner that cannot provide PostgreSQL is an
+      # infrastructure defect, not an excuse for a list-authorization gate to
+      # skip.
+      - name: List/point authorization parity (08f42f36)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:list-parity
+      # RH-AZ.PROJ-b (card 95572530). Which ROWS a project-bounded selector
+      # reaches is a property of SQL over real rows: two principals through the
+      # production router, expected sets read back from GET /tasks/:id, a Task
+      # created inside the perimeter AFTER publication and one created outside
+      # it. It also drills the two write closures separately - the migration 125
+      # CHECK against raw SQL, and the evaluator with that CHECK dropped inside
+      # a transaction. Same reasoning as the step above: no `if:` guard.
+      - name: Project-bounded selector form, live (95572530)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:project-bounded
+      # Card 9c177e6a. POST /tasks carried a caller-named `project` into the
+      # INSERT with no authorization anywhere, so an outsider to a PRIVATE
+      # Project could file a Task inside it, and PATCH /tasks/:id and
+      # PATCH /tasks/batch could move one in through the same helper. Whether
+      # a create lands where its author may reach is a SQL decision over real
+      # Project, grant and delegation rows, and this gate reads its expected
+      # set back from the Project point route rather than re-deriving the
+      # predicate. No `if:` guard, for the same reason the gates above carry
+      # none.
+      - name: Task create/move target Project authorization (9c177e6a)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:project-target
+      # 8e254c6a / approved 0e6f09a0: live exact Project Grant inheritance.
+      # No skip or conditional: scope/revocation/list parity requires real SQL.
+      - name: Project to Task Grant inheritance
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:project-task-inheritance
+      # Card f9b7febe. For a Task the caller may not read, GET /tasks/{id}
+      # answered 404 while PATCH /tasks/{id} answered 403, so an id could be
+      # confirmed by writing to it: concealment was a property of the VERB
+      # rather than of what the caller can see. The census is DERIVED from
+      # routes/tasks.ts and classified by the production classifier, so a route
+      # added later enters it, and the partition between the route ceiling and
+      # the point stage is measured from the ABSENT answer rather than
+      # predicted. No `if:` guard, for the same reason the gates above carry
+      # none.
+      - name: Task point-route refusal shape (f9b7febe)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:point-refusal
+      # C9 measures canonical transactions and authority through real routes.
+      # Both suites fail closed without this exact disposable database URL.
+      - name: Blueprint atomic creation, transport and retry contract (7e202fca)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: npm run test:blueprints
+      - name: Blueprint gates and role authority contract (7e202fca)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: npm run test:blueprints:authority
+      # Card 8491557e. An unthrottled per-request write to one auth_sessions row
+      # convoyed on a tuple lock and spent the connection pool, so unrelated
+      # requests answered 503 on the AUTHORIZATION path. What broke is a tuple
+      # lock and a connection ceiling; a mocked pool has neither, so the bound is
+      # measured through the production router against a real PostgreSQL, with
+      # the concurrency read out of pg_stat_activity on a connection outside the
+      # pool. No `if:` guard, for the same reason the gates above carry none.
+      - name: Session touch burst bound (8491557e)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:touch-burst
+      # Card 45e7110a. The session mint enforced the Account's own effective
+      # authority for scopes and for object rules and for nothing about the
+      # TARGET, so an Account could mint an Agent bound to - and receive the
+      # compiled Brief of - a Task GET /tasks/:id refuses it. The gate reads its
+      # expected set back from that point route over real rows, so it cannot be
+      # edited into agreement with a broken predicate. No `if:` guard, for the
+      # same reason the gates above carry none.
+      - name: Mint target authorization (45e7110a)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mint-target
+      # Cards aad1894b and 91af25a6. The own-Report arm of the Task/Report link
+      # compared the UNTAGGED provenance string to a principal UUID, and got
+      # both answers wrong: the author of a REST-filed Report could not link its
+      # own Report, and a principal whose id another principal's HANDLE spells
+      # could link a Report it did not write. The collision is resolved by
+      # PostgreSQL, so the arm is measured through the production router against
+      # a real database. No `if:` guard, for the same reason the gates above
+      # carry none.
+      - name: Report link authorization (aad1894b, 91af25a6)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:report-link
+      # Card 50e74c1d (RH-TW1c). The telemetry projection is a READ surface over
+      # rows two different Accounts wrote, and the narrowing that keeps them
+      # apart is a SQL conjunct. The gate pushes envelopes from two Connectors
+      # through the production ingest route, reads every projection surface back
+      # through the production router as three callers, and takes its expected
+      # set from the POINT ROUTE rather than from the rule - so it cannot be
+      # edited into agreement with a broken predicate. It also replays the whole
+      # batch and requires every surface to be unchanged. No `if:` guard, for the
+      # same reason the gates above carry none.
+      - name: Telemetry projection authorization and replay (50e74c1d)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:telemetry-projection
+      # Cards 6e25ae48 and 3f145fa3. "Connect your agent" is the headline card on
+      # the dashboard of a fresh install and could not succeed for the person who
+      # created it. Both halves of the repair are properties of stored rows — the
+      # credential a role receives has to AUTHENTICATE, and a refused connection
+      # has to leave nothing behind — so they are measured through the production
+      # router against a real PostgreSQL. No `if:` guard, for the same reason the
+      # two gates above carry none.
+      - name: Day-one connection acceptance (6e25ae48, 3f145fa3)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:day-one-connection
+      # Card bc5cd9f0. On a default install with SSO off, no shipped interface
+      # could give a second human Account its first password. The acceptance is
+      # that a person can SIGN IN afterwards, and the authority around it is the
+      # thing that must not be reachable by the wrong caller -- both measured
+      # through the production router against a real PostgreSQL, with no `if:`
+      # guard for the same reason the gates above carry none.
+      - name: The password act (bc5cd9f0)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:password-act
+      # Card 0b4b779b (RH-KW1 candidate C). The knowledge fan-out set is a
+      # SELECTOR property and the board adapter is an in-query predicate;
+      # both need real rows, and the suite fails rather than skips without a
+      # database. No `if:` guard, for the same reason the parity gate has none.
+      - name: Knowledge fan-out set and board authorization (0b4b779b)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:knowledge-board
+      # RH-LENSES-a (card 74e02a05). Derived membership is a FUNCTION of directory
+      # carriage, held by a three-level advisory lock order across two producers
+      # and a binding act. What that claim is about is rows, locks and
+      # transactions: the phantom it closes is a set discovered before the lock
+      # that would have completed the discovery, and the schedule that exposes it
+      # needs two real connections and a real barrier. So it is measured against a
+      # real PostgreSQL through the production router. No `if:` guard, for the
+      # same reason the gates above carry none.
+      - name: Directory group carriage, live (74e02a05)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:carriage
+      # Cards 9c3a1aa4 and 7d38a6e0. `notes` in a POST /tasks body was accepted
+      # with 201 and never persisted, because the route forwarded a field the
+      # INSERT did not name. What is measured here is the property the repair is
+      # for - what create stores and what update stores are the same value, and
+      # a value either surface refuses the other refuses with the same code -
+      # plus the authorization every new Task field is a new place to omit: two
+      # principals, one Task, and an outsider who can neither read nor alter it.
+      # A mocked pool replays an INSERT that names no column, so this runs
+      # against real PostgreSQL. No `if:` guard, for the same reason the gates
+      # above carry none.
+      - name: Task write-field contract (9c3a1aa4, 7d38a6e0)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:task-write-fields -- --silent
+      # Card 4287af8a (RH-LENSES-b). The creation default is decided by SERVER
+      # STATE re-read inside the project's own transaction, under a FOR SHARE on
+      # the Group row. Whether that lock BLOCKS, whether each re-derived clause
+      # refuses on its own when it is flipped while the act waits, and whether a
+      # failed second grant insert takes the project row with it are properties
+      # of a real transaction that a mocked pool cannot have. Four named barrier
+      # schedules on a second connection, driven through the production router,
+      # with the expected sets read back from GET /projects/{id}. No `if:` guard,
+      # for the same reason the gates above carry none.
+      - name: Featured, home group and the creation default, live (4287af8a)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:lenses-home-group
+      - name: Retry contract against a real PostgreSQL (fb06c930, owner ruling 94ecf329)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:idempotency
+      - name: Prove the SSO login-drill oracles (cba66ebb, 533db731)
+        run: node --test ../scripts/sso-login-drill-oracles.test.mjs
+      # SETGOV candidate A (card bbec04de). The LIVE drill needs a real
+      # migrated PostgreSQL and runs against a disposable database on the VM;
+      # its ORACLES are pure and run here, each handed the exact bad state the
+      # acceptance annex 85a2218d names as that drill's red mutation - and
+      # including the three vacuity controls a passing drill was hiding: a
+      # bearer credential that never authenticated, an arm never invoked, and a
+      # control that refuses on both sides.
+      - name: Prove the SETGOV drill oracles (bbec04de, annex 85a2218d)
+        run: node --test ../scripts/setgov-drill-oracles.test.mjs
+      # The container runs the COMPILED build, whose CommonJS output keeps the
+      # source order of this file's interleaved imports and statements. tsx
+      # hoists imports and hides a use-before-import; `node dist/server.js`
+      # does not. A candidate once passed every gate and crashed at boot on
+      # DEV with a TDZ ReferenceError — this step is that defect, kept.
+      - name: Immutable Personality versions and production API contract
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:personality-versions
+          python3 ../scripts/personality-live-mutations.py --output-dir "$(mktemp -d)/proof"
+      - name: Boot check on the compiled build (the artefact the container runs)
+        run: npm run build && RELAYHALL_BOOT_CHECK=1 JWT_SECRET=ci-boot-check-secret-not-for-production-0123456789 PORT=3997 node dist/server.js
+      # SETGOV candidate A round 4 (cards 2bf39bb7, 2a8087c3, 1324ba78,
+      # 18d170f4, e3f57d06, 2eb2061c, c179b66b, 93a7cbdb). Every expected set
+      # the SETGOV drill layer compares against is DERIVED from the compiled
+      # production modules and from migration 109's seeded catalogue. This step
+      # prints each derived count with the command that produced it, and FAILS
+      # if the drill layer's path normaliser has drifted from production's
+      # `normalizePathForScope` - the anchor five of those findings depend on.
+      # It runs after `npm run build` because it reads `backend/dist`.
+      - name: Prove the SETGOV contract census and its normaliser anchor (bbec04de)
+        run: node ../scripts/setgov-contract-census.mjs
+      # Card 590c638a: the claim/lease surface once answered ORCHESTRATION_DISABLED
+      # on every deployment because a switch never reached the process. The
+      # drill starts the COMPILED server with a bound and requires its live
+      # endpoint to answer that bound (and "unlimited" when handed nothing);
+      # the oracle controls prove a dropped field or a wrong value goes red.
+      - name: Prove the orchestration-configuration drill oracles (590c638a)
+        run: node --test ../scripts/orchestration-config-drill-oracles.test.mjs
+      - name: Orchestration configuration reaches the compiled process (590c638a)
+        run: node ../scripts/orchestration-config-reachability-drill.mjs
+
+  feata_drills:
+    name: FEAT-A mutation drills
+    # The FEAT-A drills own this job. On main the backend drill runs directly
+    # after the Task write-field contract on the shared database; it drives that
+    # same suite under mutation and builds its own fixtures, so a freshly
+    # migrated database is the stricter starting state, not a weaker one.
+    # The runner's own job timeout is 75m; this matches it.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      - name: FEAT-A backend red proofs (7d38a6e0)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: python3 ../scripts/feata-mutation-drill.py --suite backend
+      - name: FEAT-A MCP receipt and schema red proofs
+        run: python3 ../scripts/feata-mcp-mutations.py
+
+  # The scale gate measures a small estate against a much larger one, and needs
+  # a fivefold size difference between them. It keeps a job-owned database so
+  # that no earlier gate can inflate the small population - which is also why
+  # it is the ONLY step in its group, and therefore trivially the last one.
+  scale_load:
+    name: Task read-load contract
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+        options: >-
+          --health-cmd "pg_isready -U relayhall_ci"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend dependencies
+        run: npm ci --no-audit --no-fund
+      # The service container's own health-check gates nothing in THIS job. The
+      # backend job reaches its bootstrap only after `tsc` and a full jest run,
+      # so PostgreSQL has always been listening by the time it connects; here a
+      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
+      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
+      # on. The readiness is waited for rather than left to that accident of
+      # ordering, and a database that never arrives still fails the job.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A socket answering is not readiness: the postgres image runs a
+        # temporary server during first-boot initialisation, stops it, and
+        # starts the real one, so a TCP probe (or a single pg_isready) can pass
+        # and the very next connection is told "the database system is
+        # starting up". Readiness here is TWO successful `SELECT 1` queries two
+        # seconds apart, through the same driver the gate uses.
+        run: |
+          node -e '
+            const { Client } = require("pg");
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            (async () => {
+              let ok = 0;
+              for (let attempt = 1; attempt <= 45; attempt++) {
+                const c = new Client();
+                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
+                try { await c.end(); } catch (e) {}
+                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
+                await sleep(2000);
+              }
+              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
+              process.exit(1);
+            })();
+          '
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      # Card 590e88cc. GET /tasks computed its dependency fields with a
+      # `Promise.all` over the UNPAGINATED estate — three point reads per Task,
+      # each re-reading Tasks through `getTask` — so ONE request against a
+      # 5,200-Task estate offered the pool 9,186 connection acquisitions
+      # against `max: 20` / `connectionTimeoutMillis: 2000`. The acquisitions
+      # that waited longer than two seconds threw, and every OTHER caller
+      # sharing those twenty connections failed with them: that is the reported
+      # "intermittent 500s across five task-read paths and the AutoArchive
+      # job". What broke is a connection ceiling and a per-row fan-out; a
+      # mocked pool acquires nothing, so the property is measured through the
+      # production router against a real PostgreSQL at estate scale. Its
+      # database starts fresh: rows from earlier live gates would inflate the
+      # small population and invalidate the required fivefold size difference.
+      # The command, fixture guards and assertions stay unchanged and unconditional.
+      - name: Task read paths under load at estate scale (590e88cc)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:scale-load

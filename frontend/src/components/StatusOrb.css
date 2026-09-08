@@ -1,0 +1,63 @@
+/* StatusOrb - Simple animated status indicator */
+
+.status-orb {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+
+.status-orb-inner {
+  width: 60%;
+  height: 60%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, var(--status-orb-highlight), var(--status-orb-color));
+  transition: background 0.4s ease;
+}
+
+.status-orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--status-orb-color);
+  opacity: 0.4;
+  transition: border-color 0.4s ease, opacity 0.4s ease;
+}
+
+.status-orb-pulse {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--status-orb-color);
+  opacity: 0;
+  animation: orb-pulse 2s ease-out infinite;
+}
+
+/* State colors — layer-3 component tokens bound to the semantic layer only
+   (RH-DESIGN.6 D17: calmer idle on slate; states from the semantic set) */
+.status-orb--idle {
+  --status-orb-color: var(--text-quaternary);
+  --status-orb-highlight: var(--text-tertiary);
+}
+
+.status-orb--active {
+  --status-orb-color: var(--accent-color);
+  --status-orb-highlight: var(--accent-hover);
+}
+
+.status-orb--error {
+  --status-orb-color: var(--status-danger-strong);
+  --status-orb-highlight: var(--status-danger);
+}
+
+@keyframes orb-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}

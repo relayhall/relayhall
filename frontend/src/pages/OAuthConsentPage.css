@@ -1,0 +1,236 @@
+/* OAuthConsentPage — RH-P3.C6. Semantic tokens only; no opacity-multiplied
+   token colours (they drop below AA), no --text-quaternary on informative
+   text. The page is one centred card because it is a decision, not a
+   workspace: nothing else on screen competes with it. */
+
+.oauth-consent {
+  width: min(100%, 44rem);
+  margin: 0 auto;
+  padding: var(--space-8);
+}
+
+.oauth-consent__status {
+  color: var(--text-secondary);
+}
+
+.oauth-consent__card {
+  padding: var(--space-6);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+}
+
+.oauth-consent__card--problem {
+  display: flex;
+  gap: var(--space-4);
+  align-items: flex-start;
+  border-color: var(--status-danger);
+  color: var(--text-error);
+}
+
+.oauth-consent__card--problem h1,
+.oauth-consent__card--problem p {
+  color: var(--text-primary);
+}
+
+.oauth-consent__header {
+  display: flex;
+  gap: var(--space-4);
+  align-items: flex-start;
+  margin-bottom: var(--space-6);
+}
+
+.oauth-consent__header h1 {
+  margin: 0 0 var(--space-2);
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+  font-weight: var(--font-semibold);
+}
+
+.oauth-consent__header p {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.oauth-consent__facts {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-6);
+}
+
+.oauth-consent__facts > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.35fr) 1fr;
+  gap: var(--space-4);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.oauth-consent__facts dt {
+  color: var(--text-tertiary);
+  font-weight: var(--font-semibold);
+}
+
+.oauth-consent__facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* The recurring default-link-class defect, caught by live axe on this very
+   page: an unstyled <a> inherits the browser blue, which fails contrast on
+   relay-dark and high-contrast alike. Links here carry the accent token like
+   every other link in the product. */
+.oauth-consent__facts dd a {
+  color: var(--text-accent);
+}
+
+.oauth-consent__facts dd a:hover {
+  color: var(--accent-hover);
+}
+
+.oauth-consent__facts dd a:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.oauth-consent__facts code,
+.oauth-consent__unavailable code,
+.oauth-consent__scope-text code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.oauth-consent__scopes {
+  margin: 0 0 var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.oauth-consent__scopes legend {
+  padding: 0 var(--space-2);
+  color: var(--text-primary);
+  font-weight: var(--font-semibold);
+}
+
+.oauth-consent__scopes ul {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.oauth-consent__scopes label {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.oauth-consent__scopes input {
+  margin-top: 0.2rem;
+  accent-color: var(--accent-color);
+}
+
+.oauth-consent__scopes input:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.oauth-consent__scope-text {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.oauth-consent__scope-title {
+  color: var(--text-primary);
+}
+
+.oauth-consent__unavailable {
+  margin: var(--space-4) 0 0;
+  color: var(--text-secondary);
+}
+
+.oauth-consent__error {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  background: var(--status-danger-soft);
+  border: 1px solid var(--status-danger);
+  border-radius: var(--radius-md);
+  color: var(--text-error);
+}
+
+.oauth-consent__actions {
+  display: flex;
+  gap: var(--space-3);
+  justify-content: flex-end;
+  margin-bottom: var(--space-4);
+}
+
+.oauth-consent__approve,
+.oauth-consent__decline {
+  min-height: var(--control-standard);
+  padding: 0 var(--space-5);
+  border-radius: var(--radius-control);
+  font-weight: var(--font-medium);
+  cursor: pointer;
+  transition: background var(--transition-fast) var(--ease-out);
+}
+
+.oauth-consent__approve {
+  background: var(--accent-color);
+  border: 1px solid var(--accent-color);
+  color: var(--text-on-fill);
+}
+
+.oauth-consent__approve:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.oauth-consent__decline {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+}
+
+.oauth-consent__decline:hover:not(:disabled) {
+  background: var(--bg-surface-hover);
+}
+
+.oauth-consent__approve:disabled,
+.oauth-consent__decline:disabled {
+  cursor: not-allowed;
+}
+
+.oauth-consent__approve:focus-visible,
+.oauth-consent__decline:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.oauth-consent__hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 640px) {
+  .oauth-consent {
+    padding: var(--space-4);
+  }
+
+  .oauth-consent__facts > div {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+
+  .oauth-consent__actions {
+    flex-direction: column-reverse;
+  }
+}

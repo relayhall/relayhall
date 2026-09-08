@@ -1,0 +1,1 @@
+import {blueprintRequest} from '../components/blueprints/api'; async function refreshInstance(){return blueprintRequest('/blueprints/'+blueprintId)}

@@ -1,0 +1,183 @@
+/* CreateProjectModal - Modal styles matching existing modals */
+@import '../../styles/variables.css';
+
+.create-project-modal-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--scrim);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: var(--space-4);
+}
+
+.create-project-modal-modal-content {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  width: 100%;
+  max-width: 500px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px var(--shadow-color);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.modal-header h2 {
+  font-size: var(--text-xl);
+  font-weight: var(--font-semibold);
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  width: var(--control-compact);
+  height: var(--control-compact);
+  padding: 0;
+  border-radius: var(--radius-control);
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-close:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+/* Form */
+form {
+  padding: var(--space-6);
+}
+
+.create-project-modal-form-group {
+  margin-bottom: var(--space-5);
+}
+
+.create-project-modal-form-group label {
+  display: block;
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--text-secondary);
+  margin-bottom: var(--space-2);
+}
+
+.create-project-modal-form-group input,
+.create-project-modal-form-group textarea,
+.create-project-modal-form-group select {
+  width: 100%;
+  padding: var(--space-3);
+  min-height: var(--control-compact);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  transition: all 0.2s ease;
+}
+
+.create-project-modal-form-group input:focus,
+.create-project-modal-form-group textarea:focus,
+.create-project-modal-form-group select:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.create-project-modal-form-group textarea {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.input-error {
+  border-color: var(--danger-color) !important;
+}
+
+.create-project-modal-error-message {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--text-error);
+  margin-top: var(--space-2);
+}
+
+/* Modal Actions */
+.modal-actions {
+  display: flex;
+  gap: var(--space-3);
+  justify-content: flex-end;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.modal-actions .btn {
+  padding: var(--space-3) var(--space-5);
+  min-height: var(--control-compact);
+  border-radius: var(--radius-control);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: none;
+}
+
+.modal-actions .btn-primary {
+  background: var(--accent-color);
+  color: var(--text-on-fill);
+}
+
+.modal-actions .btn-primary:hover {
+  background: var(--accent-hover);
+  color: var(--text-on-fill);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px var(--focus-ring-color);
+}
+
+.modal-actions .btn-secondary {
+  background: var(--bg-app);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+}
+
+.modal-actions .btn-secondary:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .create-project-modal-modal-content {
+    max-width: 100%;
+    margin: var(--space-4);
+  }
+  
+  .modal-header,
+  form {
+    padding: var(--space-4);
+  }
+  
+  .modal-actions {
+    flex-direction: column;
+  }
+  
+  .modal-actions button {
+    width: 100%;
+  }
+}

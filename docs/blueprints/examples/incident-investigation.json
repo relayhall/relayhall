@@ -1,0 +1,282 @@
+{
+  "schemaVersion": "rh.blueprint/1.0",
+  "blueprint": {
+    "key": "incident-investigation",
+    "name": "Incident investigation",
+    "version": 1,
+    "summary": "Investigate an incident through an explicit fix-deployment decision.",
+    "description": "A portable interview-driven plan. Tasks begin parked; human decisions and ordinary write authority govern subsequent work.",
+    "tags": [
+      "governed-work"
+    ],
+    "provenance": "human-authored"
+  },
+  "parameters": [
+    {
+      "key": "incident_number",
+      "label": "Incident number",
+      "promptText": "What is the incident number?",
+      "type": "string",
+      "required": true,
+      "constraints": {
+        "pattern": "^INC-[0-9]{1,6}$"
+      },
+      "order": 0
+    },
+    {
+      "key": "incident_title",
+      "label": "Incident title",
+      "promptText": "One line: what happened?",
+      "type": "string",
+      "required": true,
+      "order": 1
+    },
+    {
+      "key": "severity",
+      "label": "Severity",
+      "promptText": "How severe is it?",
+      "type": "enum",
+      "required": true,
+      "constraints": {
+        "enum": [
+          "sev1",
+          "sev2",
+          "sev3"
+        ]
+      },
+      "order": 2
+    },
+    {
+      "key": "affected_hostname",
+      "label": "Affected hostname",
+      "promptText": "Which host or service is affected?",
+      "type": "string",
+      "required": false,
+      "order": 3
+    },
+    {
+      "key": "incident_commander",
+      "label": "Incident commander",
+      "promptText": "Who is the incident commander?",
+      "type": "principal-ref",
+      "required": true,
+      "order": 4
+    },
+    {
+      "key": "scribe",
+      "label": "Scribe",
+      "promptText": "Who records the incident?",
+      "type": "principal-ref",
+      "required": false,
+      "order": 5
+    },
+    {
+      "key": "detected_at",
+      "label": "Detected at",
+      "promptText": "When was it detected?",
+      "type": "date",
+      "required": true,
+      "order": 6
+    }
+  ],
+  "target": {
+    "mode": "new-project",
+    "project": {
+      "name": "Incident {{incident_number}} — {{incident_title}}"
+    }
+  },
+  "phases": [
+    {
+      "key": "phase-triage",
+      "name": "Triage",
+      "position": 0
+    },
+    {
+      "key": "phase-contain",
+      "name": "Contain",
+      "position": 1
+    },
+    {
+      "key": "phase-remediate",
+      "name": "Remediate",
+      "position": 2
+    },
+    {
+      "key": "phase-learn",
+      "name": "Learn",
+      "position": 3
+    }
+  ],
+  "tasks": [
+    {
+      "key": "triage",
+      "title": "Triage {{incident_number}}",
+      "phase": "phase-triage",
+      "description": "{{incident_title}}; severity {{severity}}; affected {{affected_hostname}}; detected {{detected_at}}",
+      "roles": {
+        "shepherd": "{{incident_commander}}"
+      },
+      "references": [
+        "incident-triage"
+      ],
+      "subtasks": [
+        {
+          "text": "Capture the alert payload"
+        },
+        {
+          "text": "Establish blast radius"
+        },
+        {
+          "text": "Name the commander"
+        }
+      ]
+    },
+    {
+      "key": "contain",
+      "title": "Contain",
+      "phase": "phase-contain",
+      "roles": {
+        "shepherd": "{{incident_commander}}"
+      }
+    },
+    {
+      "key": "identify-fix",
+      "title": "Identify the fix",
+      "phase": "phase-remediate"
+    },
+    {
+      "key": "verify-fix",
+      "title": "Verify the fix in staging",
+      "phase": "phase-remediate"
+    },
+    {
+      "key": "deploy-fix",
+      "title": "Deploy the fix",
+      "phase": "phase-remediate",
+      "defaults": {
+        "executionProfile": {
+          "service": "hermes",
+          "options": {}
+        }
+      }
+    },
+    {
+      "key": "schedule-window",
+      "title": "Schedule the remediation window",
+      "phase": "phase-remediate"
+    },
+    {
+      "key": "announce",
+      "title": "Announce",
+      "phase": "phase-remediate"
+    },
+    {
+      "key": "postmortem",
+      "title": "Write the postmortem",
+      "phase": "phase-learn",
+      "roles": {
+        "shepherd": "{{scribe}}"
+      },
+      "references": [
+        "postmortem-template"
+      ]
+    },
+    {
+      "key": "postmortem-review",
+      "title": "Postmortem review",
+      "phase": "phase-learn",
+      "roles": {
+        "verifier": "{{incident_commander}}"
+      }
+    }
+  ],
+  "humanGates": [
+    {
+      "key": "fix-decision",
+      "title": "Fix-deployment decision",
+      "phase": "phase-remediate",
+      "decider": "{{incident_commander}}",
+      "decisionPrompt": "The candidate fix is verified in staging. Deploy to production now, or hold and schedule a window?",
+      "arms": [
+        {
+          "key": "deploy",
+          "label": "Deploy",
+          "tasks": [
+            "deploy-fix",
+            "announce"
+          ]
+        },
+        {
+          "key": "hold",
+          "label": "Hold",
+          "tasks": [
+            "schedule-window",
+            "announce"
+          ]
+        }
+      ]
+    }
+  ],
+  "references": [
+    {
+      "kind": "skill",
+      "name": "incident-triage",
+      "requirement": "required"
+    },
+    {
+      "kind": "skill",
+      "name": "postmortem-template",
+      "requirement": "optional"
+    },
+    {
+      "kind": "service",
+      "name": "hermes",
+      "requirement": "optional"
+    }
+  ],
+  "dependencies": [
+    {
+      "task": "identify-fix",
+      "dependsOn": "triage"
+    },
+    {
+      "task": "identify-fix",
+      "dependsOn": "contain"
+    },
+    {
+      "task": "verify-fix",
+      "dependsOn": "identify-fix"
+    },
+    {
+      "task": "fix-decision",
+      "dependsOn": "verify-fix"
+    },
+    {
+      "task": "postmortem",
+      "dependsOn": "announce"
+    },
+    {
+      "task": "postmortem-review",
+      "dependsOn": "postmortem"
+    }
+  ],
+  "reports": [
+    {
+      "key": "incident-record",
+      "title": "Incident {{incident_number}} - record",
+      "content": "# Incident {{incident_number}}\n\n{{incident_title}}\n\nSeverity: {{severity}}\nDetected: {{detected_at}}\nAffected: {{affected_hostname}}\n\n## Timeline\n\n## Evidence\n\n## Decisions\n\n## Follow-up",
+      "tasks": [
+        "triage",
+        "contain",
+        "identify-fix",
+        "verify-fix",
+        "deploy-fix",
+        "schedule-window",
+        "announce",
+        "postmortem",
+        "postmortem-review",
+        "fix-decision"
+      ]
+    }
+  ]
+}
