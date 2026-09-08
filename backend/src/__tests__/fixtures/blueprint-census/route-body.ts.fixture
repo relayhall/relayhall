@@ -1,0 +1,1 @@
+router.patch('/apply',async(req,res)=>{const input=req.body; await update(input['blueprint'+'Id'],input.instanceId);res.json({})});

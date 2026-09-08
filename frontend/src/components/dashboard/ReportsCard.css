@@ -1,0 +1,155 @@
+/* ReportsCard — Dashboard compact report list */
+
+.reports-card {
+  min-block-size: calc(var(--space-20) * 3);
+  background: var(--bg-surface);
+  border: 2px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  transition: border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out);
+}
+
+.reports-card:hover {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.reports-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+}
+
+.reports-card-header h2 {
+  font-size: var(--text-xl);
+  font-weight: var(--font-semibold);
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.reports-card-view-all {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-accent);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+  font-weight: var(--font-medium);
+}
+
+.reports-card-view-all:hover {
+  color: var(--text-accent);
+}
+
+.reports-card-view-all:hover .reports-card-arrow {
+  transform: translateX(3px);
+}
+
+.reports-card-arrow {
+  transition: transform var(--transition-fast);
+}
+
+.reports-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.reports-card-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out);
+}
+
+.reports-card-row:hover {
+  background: var(--bg-surface-hover);
+}
+
+
+.reports-card-row-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.reports-card-row-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reports-card-row-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.reports-card-row-date {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.reports-card-tag {
+  font-size: var(--text-xs);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  color: var(--text-accent);
+  font-weight: var(--font-medium);
+  white-space: nowrap;
+}
+
+/* Empty state */
+.reports-card-empty {
+  padding: var(--space-4);
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+/* Mobile */
+@media (max-width: 640px) {
+  .reports-card {
+    padding: var(--space-3);
+  }
+
+  .reports-card-row {
+    padding: var(--space-2);
+  }
+
+  .reports-card-view-all span {
+    font-size: var(--text-xs);
+  }
+}
+
+.reports-card-view-all,
+.reports-card-row {
+  text-decoration: none;
+}
+.reports-card-row:focus-visible,
+.reports-card-view-all:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+
+.reports-card-placeholders {
+  display: grid;
+  gap: var(--space-2);
+}
+.reports-card-placeholders > div {
+  min-block-size: var(--control-compact);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}

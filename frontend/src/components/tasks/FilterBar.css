@@ -1,0 +1,489 @@
+.filter-bar-toggle-mobile {
+  display: none;
+}
+
+/* Active Tag Filter Indicator */
+.filter-bar-tag-active:is(.filter-bar) {
+  border-color: var(--status-info);
+  box-shadow: 0 0 0 1px var(--status-info-soft);
+}
+
+.filter-bar-active-tags {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  background: var(--status-info-soft);
+  color: var(--text-on-fill);
+  border-radius: 6px;
+  border: 1px solid var(--status-info-soft);
+}
+
+.filter-bar-active-tags-label {
+  font-size: var(--text-xs);
+  /* 837264c7: tertiary ink sat at 3.67:1 on the tag-active tint; informative
+     text on the tinted strip needs the AA body tier. */
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.filter-bar-active-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  /* A second translucent tint drops light-theme information ink below AA. */
+  background: var(--bg-elevated);
+  border: 1px solid var(--status-info);
+  border-radius: 12px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-info);
+}
+
+.filter-bar-active-tag-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-info);
+  cursor: pointer;
+  padding: 0;
+  margin-left: 2px;
+  border-radius: 50%;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out);
+}
+
+.filter-bar-active-tag-remove:hover {
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+}
+
+.filter-bar-clear-tags {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  margin-left: auto;
+  border-radius: 4px;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out);
+}
+
+.filter-bar-clear-tags:hover {
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+}
+
+.filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+  padding: var(--space-4);
+  background: var(--bg-elevated);
+  border-radius: 8px;
+  border: 1px solid var(--border-default, var(--text-quaternary));
+}
+
+.filter-bar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.filter-bar-search-icon {
+  position: absolute;
+  left: 12px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.filter-bar-search-input {
+  flex: 1;
+  padding: 10px 40px 10px 40px;
+  min-height: var(--control-compact);
+  box-sizing: border-box;
+  background: var(--bg-app);
+  border: 1px solid var(--border-default, var(--text-quaternary));
+  border-radius: var(--radius-control);
+  color: var(--text-primary, var(--text-secondary));
+  font-size: var(--text-sm);
+  transition: border-color var(--transition-base) var(--ease-out), box-shadow var(--transition-base) var(--ease-out);
+}
+
+.filter-bar-search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.filter-bar-search-input::placeholder {
+  color: var(--text-quaternary);
+}
+
+.filter-bar-clear-search {
+  position: absolute;
+  right: 10px;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: var(--space-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out);
+}
+
+.filter-bar-clear-search:hover {
+  color: var(--text-primary, var(--text-secondary));
+  background: var(--bg-surface-hover);
+}
+
+.filter-bar-filters {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.filter-dropdown {
+  position: relative;
+}
+
+.filter-dropdown-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 var(--space-3);
+  min-height: var(--control-compact);
+  background: var(--bg-app);
+  border: 1px solid var(--border-default, var(--text-quaternary));
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out);
+}
+
+.filter-dropdown-button:hover:not(:disabled) {
+  border-color: var(--accent-color);
+  background: var(--bg-elevated);
+}
+
+.filter-dropdown-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.filter-dropdown-button--active:is(.filter-dropdown-button) {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+  color: var(--bg-app);
+}
+
+.filter-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  background: var(--bg-app);
+  color: var(--text-accent);
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+
+.filter-dropdown-button--active:is(.filter-dropdown-button) .filter-badge {
+  background: var(--scrim-weak);
+  color: var(--bg-app);
+}
+
+.filter-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 180px;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default, var(--text-quaternary));
+  border-radius: 6px;
+  box-shadow: 0 10px 25px var(--shadow-color);
+  z-index: 100;
+  padding: var(--space-1);
+}
+
+.filter-dropdown-menu-with-search {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.filter-dropdown-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 6px;
+  border-bottom: 1px solid var(--border-default, var(--text-quaternary));
+  flex-shrink: 0;
+}
+
+.filter-dropdown-search-icon {
+  position: absolute;
+  left: 14px;
+  color: var(--text-quaternary);
+  pointer-events: none;
+}
+
+.filter-dropdown-search-input {
+  width: 100%;
+  padding: 6px 28px 6px 28px;
+  min-height: var(--control-compact);
+  box-sizing: border-box;
+  background: var(--bg-app);
+  border: 1px solid var(--border-default, var(--text-quaternary));
+  border-radius: var(--radius-control);
+  color: var(--text-primary, var(--text-secondary));
+  font-size: var(--text-xs);
+  transition: border-color 0.15s;
+}
+
+.filter-dropdown-search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.filter-dropdown-search-input::placeholder {
+  color: var(--text-quaternary);
+}
+
+.filter-dropdown-search-clear {
+  position: absolute;
+  right: 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out);
+}
+
+.filter-dropdown-search-clear:hover {
+  color: var(--text-primary, var(--text-secondary));
+  background: var(--bg-surface-hover);
+}
+
+.filter-dropdown-items {
+  overflow-y: auto;
+  max-height: 220px;
+  padding: var(--space-1) 0;
+}
+
+.filter-dropdown-empty {
+  padding: var(--space-4) var(--space-3);
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  font-style: italic;
+}
+
+.filter-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 10px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.filter-dropdown-item:hover {
+  background: var(--bg-surface-hover);
+}
+
+.filter-dropdown-item input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent-color);
+}
+
+/* Priority dot indicators - subtle colored dots next to checkbox */
+.filter-priority-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.filter-priority-dot.priority-dot-urgent {
+  background-color: var(--danger-color);
+  color: var(--text-on-fill);
+}
+
+.filter-priority-dot.priority-dot-high {
+  background-color: var(--accent-color);
+  color: var(--text-on-fill);
+}
+
+.filter-priority-dot.priority-dot-normal {
+  background-color: var(--accent-hover);
+  color: var(--text-on-fill);
+}
+
+.filter-priority-dot.priority-dot-low {
+  background-color: var(--overlay-strong);
+}
+
+.filter-priority-dot.priority-dot-someday {
+  background-color: var(--overlay-strong);
+}
+
+.filter-clear-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 var(--space-3);
+  min-height: var(--control-compact);
+  background: transparent;
+  border: 1px solid var(--border-default, var(--text-quaternary));
+  border-radius: var(--radius-control);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--transition-fast) var(--ease-out), color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out);
+  margin-left: auto;
+}
+
+.filter-clear-all:hover {
+  border-color: var(--danger-color);
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+}
+
+@media (max-width: 767px) {
+  .filter-bar-toggle-mobile {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: var(--space-3);
+    background: var(--overlay-weak);
+    border: 1px solid var(--border-default, var(--text-quaternary));
+    border-radius: var(--radius-control);
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
+    box-sizing: border-box;
+  }
+
+  .filter-bar-filters {
+    display: none !important;
+  }
+
+  .filter-bar-filters-expanded:is(.filter-bar-filters) {
+    display: flex !important;
+  }
+
+  .filter-bar {
+    padding: var(--space-3);
+    gap: var(--space-2);
+    margin-bottom: 0;
+  }
+
+  .filter-bar-search-input {
+    font-size: var(--text-sm);
+    padding: var(--space-3) 40px;
+    min-height: 44px;
+    box-sizing: border-box;
+  }
+
+  .filter-bar-filters {
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+
+  .filter-dropdown-button,
+  .filter-clear-all {
+    padding: var(--space-3);
+    font-size: var(--text-xs);
+    min-height: 44px;
+    box-sizing: border-box;
+  }
+
+  .filter-clear-all {
+    margin-left: 0;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .filter-dropdown-menu {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    top: auto;
+    bottom: 20px;
+    min-width: auto;
+    max-height: 50vh;
+    z-index: 200;
+  }
+}
+
+/* Assignee filters (card 60558599). Deliberately styled like the existing
+   filter controls rather than as a new visual class — the Assignee is one more
+   way to narrow the board, not a separate concept. */
+.filter-ownership-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0 0.7rem;
+  min-height: var(--control-compact);
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary, var(--text-tertiary));
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.filter-ownership-toggle:hover {
+  color: var(--text-primary, var(--text-secondary));
+}
+
+.filter-ownership-toggle--active:is(.filter-ownership-toggle) {
+  border-color: var(--accent-color, var(--status-info));
+  color: var(--accent-color, var(--text-info));
+}
+
+.filter-owner-select {
+  padding: 0 0.6rem;
+  min-height: var(--control-compact);
+  border-radius: var(--radius-control);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary, var(--text-tertiary));
+  font-size: var(--text-xs);
+  cursor: pointer;
+  max-width: 12rem;
+}

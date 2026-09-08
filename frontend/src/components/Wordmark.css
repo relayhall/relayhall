@@ -1,0 +1,38 @@
+/* Wordmark (RH-UI.3). The two-tone split is the whole point of rendering the
+   mark inline: the fills are semantic tokens, so the wordmark follows the
+   active Theme instead of freezing relay-dark's values into an <img>. */
+
+/* inline-block, not block: the mark sits in a line of text beside "Powered by",
+   and the component's negative bottom margin puts its baseline on the text
+   baseline. `vertical-align: baseline` is the default and is stated anyway,
+   because a stylesheet elsewhere setting `middle` would silently undo it. */
+.wordmark {
+  display: inline-block;
+  vertical-align: baseline;
+  flex-shrink: 0;
+}
+
+.wordmark-ink {
+  fill: var(--text-primary);
+}
+
+.wordmark-accent {
+  fill: var(--accent-color);
+}
+
+/* Monochrome binding: one ink, for surfaces that already carry the accent or
+   where it cannot be trusted to reproduce (D16). */
+.wordmark--mono .wordmark-accent {
+  fill: var(--text-primary);
+}
+
+/* Quiet tone: the recessive ink, NOT an opacity.
+   The sidebar product line was first dimmed with `opacity: 0.45`, which is a
+   fixed multiplier applied identically to every Theme — including
+   high-contrast, whose entire purpose is that nothing is dimmed. A token binds
+   per Theme (slate-300 on dark, slate-400 on light, slate-100 on black), so the
+   line stays recessive without fighting the Theme a person chose. */
+.wordmark--quiet .wordmark-ink,
+.wordmark--quiet .wordmark-accent {
+  fill: var(--text-tertiary);
+}

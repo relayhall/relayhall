@@ -1,0 +1,398 @@
+/* ProjectsPage - Dark theme with cyan/teal accents */
+@import '../styles/variables.css';
+
+.projects-page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  overflow: hidden;
+  margin: calc(-1 * var(--page-inset));
+}
+
+/* Header */
+.projects-page-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--space-6) var(--space-8);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  box-shadow: 0 1px 3px var(--shadow-color-soft);
+}
+
+.projects-page-header-title h1 {
+  font-size: var(--text-2xl);
+  font-weight: var(--font-bold);
+  margin: 0;
+}
+
+.projects-page-header-title p {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  margin: var(--space-2) 0 0 0;
+}
+
+.projects-page-header-actions {
+  display: flex;
+  gap: var(--space-4);
+}
+
+/* Controls (Search & Sort) */
+.projects-page-controls {
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-8);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Search */
+.projects-page-projects-search {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+  max-width: 400px;
+}
+
+/* Scoped under .projects-page-projects-search: bare .search-input/.search-icon collide with
+   other pages' rules in the global bundle (ImageGenerationPage clobbered our padding) */
+.projects-page-projects-search .search-icon {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.projects-page-projects-search .search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-3) var(--space-3) var(--space-3) 2.75rem; /* 44px — clears 18px icon at left:12px */
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+}
+
+.projects-page-projects-search .search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.projects-page-projects-search .search-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+/* Sort */
+.projects-page-projects-sort {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.projects-page-projects-sort label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.projects-page .sort-select{
+  padding: var(--space-3) var(--space-8) var(--space-3) var(--space-3); /* extra right padding for native arrow */
+  min-height: var(--control-compact);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+}
+
+.projects-page .sort-select:focus{
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Filter Toggle */
+.projects-page-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+  white-space: nowrap;
+}
+
+/* Review f187bea5 F1: the hover and active states are text on a tint, so the
+   ink is the text tier. --accent-color stays on the border, where its 3:1 ui
+   threshold is the right one. */
+.projects-page-filter-toggle:hover {
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+.projects-page-filter-toggle.filter-toggle--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* Filter Panel */
+.projects-filters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-8);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.filter-group label {
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.filter-options {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.projects-page-filter-option {
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: color var(--transition-fast) var(--ease-out), background-color var(--transition-fast) var(--ease-out), border-color var(--transition-fast) var(--ease-out), box-shadow var(--transition-fast) var(--ease-out), opacity var(--transition-fast) var(--ease-out), transform var(--transition-fast) var(--ease-out);
+  text-transform: capitalize;
+}
+
+.projects-page-filter-option:hover {
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+.projects-page-filter-option.filter-option--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* Projects Grid */
+.projects-page-projects-grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-6) var(--space-8);
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--space-5);
+  align-content: start;
+}
+
+/* Custom Scrollbar */
+.projects-page-projects-grid::-webkit-scrollbar {
+  width: 10px;
+}
+
+.projects-page-projects-grid::-webkit-scrollbar-track {
+  background: var(--scrim-weak);
+  border-radius: var(--radius-md);
+}
+
+.projects-page-projects-grid::-webkit-scrollbar-thumb {
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+}
+
+.projects-page-projects-grid::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-color);
+  color: var(--text-on-fill);
+}
+
+/* Firefox */
+.projects-page-projects-grid {
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent-color) var(--border-default);
+}
+
+/* Empty State */
+.projects-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.projects-empty p {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.projects-empty .empty-hint {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
+/* Loading State */
+.projects-page-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* Responsive */
+@media (max-width: 1023px) {
+  .projects-page-projects-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: var(--space-4);
+  }
+}
+
+@media (max-width: 768px) {
+  .projects-page {
+    margin: calc(-1 * var(--page-inset));
+    height: 100vh;
+  }
+  
+  .projects-page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-4);
+    padding: var(--space-4);
+    padding-left: 76px; /* Space for fixed hamburger (44px @ left:16px) + gap; extra to offset negative page margin */
+  }
+  
+  .projects-page-header-actions {
+    width: 100%;
+  }
+  
+  .projects-page-header-actions button {
+    width: 100%;
+  }
+  
+  .projects-page-controls {
+    flex-direction: column;
+    padding: var(--space-4);
+    gap: var(--space-3);
+  }
+  
+  .projects-page-projects-search {
+    max-width: 100%;
+  }
+  
+  .projects-page-projects-sort {
+    width: 100%;
+    justify-content: space-between;
+  }
+  
+  .projects-page-filter-toggle {
+    width: 100%;
+    justify-content: center;
+  }
+  
+  .projects-filters {
+    padding: var(--space-4);
+  }
+  
+  .filter-group {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  
+  .projects-page-projects-grid {
+    grid-template-columns: 1fr;
+    padding: var(--space-4);
+  }
+}
+
+/* Loading & Error States */
+.projects-page-loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border-default);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-bottom: var(--space-3);
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.error-message {
+  color: var(--text-error);
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-3);
+}
+
+.projects-page-retry-btn {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-color);
+  color: var(--text-accent);
+  padding: var(--space-2) var(--space-5);
+  min-height: var(--control-compact);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  transition: background 0.2s;
+}
+
+.projects-page-retry-btn:hover {
+  background: var(--accent-soft);
+}
+
+/* Secret filter option — styled slightly different */
+.filter-secret.filter-option--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+.filter-secret:hover {
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}

@@ -1,0 +1,276 @@
+/* The TW1c projection surfaces (card 50e74c1d), shared by Sessions and Stats.
+   ONE stylesheet for both, for the same reason there is one client module: two
+   copies of a state chip are how two pages start disagreeing about what `idle`
+   looks like.
+
+   EVERY colour is a token. Nothing here reads a palette value directly, so
+   both themes are served by `styles/variables.css` and neither is hand-tuned.
+   The chip colours are the SAME tokens the shipped liveness chip uses
+   (`TaskDetailPage.css`: success for active, warning for stale) so the two
+   surfaces cannot drift apart visually either. */
+
+.telemetry-status {
+  margin: var(--space-0) var(--space-0) var(--space-4);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.telemetry-error {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  margin-block-end: var(--space-5);
+  border: 1px solid var(--border-default);
+  /* `--text-error` is the ratified token. This said `--text-danger` with a
+     `--text-warning` fallback: no such token exists, so the fallback was what
+     rendered, and the design-token gate reads it as a reference to a token
+     that is not defined. A fallback is not a definition. */
+  border-inline-start: 3px solid var(--text-error);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.telemetry-error p {
+  margin: var(--space-1) var(--space-0) var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.telemetry-section {
+  margin-block-end: var(--space-6);
+}
+
+.telemetry-section > h2 {
+  margin: var(--space-0) var(--space-0) var(--space-3);
+  font-size: var(--text-xl);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+}
+
+/* ── the state chip ─────────────────────────────────────────────────────── */
+
+.telemetry-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.telemetry-chip--active { color: var(--text-success); }
+.telemetry-chip--idle { color: var(--text-info); }
+.telemetry-chip--stale { color: var(--text-warning); }
+.telemetry-chip--finished { color: var(--text-tertiary); }
+
+/* ── the presence cards ─────────────────────────────────────────────────── */
+
+.telemetry-source-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-0);
+  padding: var(--space-0);
+  list-style: none;
+}
+
+.telemetry-source-card {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.telemetry-source-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-block-end: var(--space-2);
+}
+
+.telemetry-source-product {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.telemetry-source-facts {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-1);
+  margin: var(--space-0);
+  font-size: var(--text-sm);
+}
+
+.telemetry-source-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.telemetry-source-facts dt {
+  color: var(--text-tertiary);
+}
+
+.telemetry-source-facts dd {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.telemetry-source-frame {
+  margin: var(--space-2) var(--space-0) var(--space-0);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+/* ── tables ─────────────────────────────────────────────────────────────── */
+
+/* Wide content scrolls INSIDE its own container; the page body never scrolls
+   horizontally, which is what keeps 390px usable without shrinking type. */
+.telemetry-table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.telemetry-table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.telemetry-table th,
+.telemetry-table td {
+  padding: var(--space-2) var(--space-3);
+  text-align: start;
+  vertical-align: top;
+  border-block-end: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.telemetry-table th {
+  color: var(--text-tertiary);
+  font-weight: 600;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.telemetry-table tbody tr:last-child td {
+  border-block-end: none;
+}
+
+.telemetry-numeric {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.telemetry-mono {
+  font-family: var(--font-mono);
+}
+
+.telemetry-timeline-row > td {
+  padding: var(--space-0);
+  /* Same defect, same repair: `--bg-subtle` does not exist, so `--bg-surface`
+     is what has been rendering. Naming it directly changes no pixel. */
+  background: var(--bg-surface);
+}
+
+.telemetry-table--timeline {
+  border-block-start: 1px solid var(--border-default);
+}
+
+.telemetry-disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.telemetry-disclosure:hover {
+  border-color: var(--border-default);
+}
+
+.telemetry-disclosure:focus-visible {
+  outline: 2px solid var(--text-info);
+  outline-offset: 2px;
+}
+
+/* ── stat grid ──────────────────────────────────────────────────────────── */
+
+.telemetry-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-0);
+}
+
+.telemetry-stat {
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.telemetry-stat dt {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.telemetry-stat dd {
+  margin: var(--space-1) var(--space-0) var(--space-0);
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── inline notes ───────────────────────────────────────────────────────── */
+
+.telemetry-note,
+.telemetry-inline-status {
+  margin: var(--space-2) var(--space-0) var(--space-0);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.telemetry-inline-status {
+  padding: var(--space-3);
+}
+
+.telemetry-inline-status--error {
+  color: var(--text-warning);
+}
+
+@media (max-width: 767px) {
+  .telemetry-source-list,
+  .telemetry-stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* The narrow-width override of `.telemetry-stat dd` is GONE, not silently
+     restated. It stepped the figure down from 20px to `--text-lg` (18px) — a
+     token the type-scale gate has retired, because the ratified scale is
+     24/20/14/12 and there is no 18. The next rung down is 14px, which is body
+     size for a headline figure; a card at this width is the full column and
+     has room for 20px. So the base size stands at every width, and the rule
+     that only existed to reach a retired rung goes with it. */
+}

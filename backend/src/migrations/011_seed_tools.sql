@@ -1,0 +1,1 @@
+-- 011_seed_tools.sql: historical BASELINE ledger stub; installation-specific seed content removed before publication under owner ruling A14/DP-6b.

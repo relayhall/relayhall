@@ -1,0 +1,72 @@
+/* Control-kit icon button (RH-UI.20, §7): square, two sizes, radius 8. */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-compact);
+  height: var(--control-compact);
+  padding: 0;
+  flex-shrink: 0;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background var(--transition-fast) ease,
+    border-color var(--transition-fast) ease,
+    color var(--transition-fast) ease;
+}
+
+.icon-btn-standard {
+  width: var(--control-standard);
+  height: var(--control-standard);
+}
+
+.icon-btn-secondary {
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+}
+
+.icon-btn-secondary:hover:not(:disabled) {
+  background: var(--overlay-medium);
+  color: var(--text-primary);
+}
+
+.icon-btn-danger {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: var(--text-error);
+}
+
+.icon-btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--danger-color);
+}
+
+.icon-btn-ghost {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+}
+
+.icon-btn-ghost:hover:not(:disabled) {
+  background: var(--bg-glass-hover);
+  color: var(--text-primary);
+}
+
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Touch layouts keep the WCAG target floor. */
+@media (max-width: 767px) {
+  .icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}

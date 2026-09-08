@@ -1,0 +1,83 @@
+/* RH-UI.SETTINGS.2 (card d0f030a9) — one shell, one stable left navigation.
+   The tab strip this replaced reflowed its items as entries appeared and
+   disappeared with authority; a column keeps every entry in the same place for
+   every session that can see it, which is what "stable" means here. */
+
+.settings-page { max-width: 1240px; margin: 0 auto; padding: var(--space-6); color: var(--text-primary); }
+.settings-header { display: flex; align-items: center; gap: var(--space-3); }
+.settings-header h1 { margin: 0; font-size: var(--text-xl); }
+.settings-header p { margin: var(--space-1) 0 0; color: var(--text-secondary); font-size: var(--text-sm); }
+
+/* Two columns from the tablet breakpoint up; one column, navigation first, on
+   a phone. The navigation column is fixed-width so the content pane does not
+   jump when a longer label appears. */
+.settings-body { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: var(--space-6); margin-top: var(--space-5); align-items: start; }
+
+.settings-nav { display: flex; flex-direction: column; gap: var(--space-5); }
+.settings-nav-group { display: flex; flex-direction: column; gap: var(--space-2); }
+.settings-nav-heading {
+  margin: 0;
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.settings-nav-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+
+.settings-nav-link {
+  min-height: 44px;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: var(--text-sm);
+}
+.settings-nav-icon { flex: 0 0 auto; margin-top: 2px; }
+.settings-nav-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.settings-nav-label { font-weight: var(--font-medium); }
+.settings-nav-description { font-size: var(--text-xs); color: var(--text-tertiary); }
+
+.settings-nav-link:hover { color: var(--text-primary); background: var(--bg-surface-hover); }
+.settings-nav-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.settings-nav-link--active { color: var(--text-accent); background: var(--accent-soft); }
+.settings-nav-link--active .settings-nav-description { color: var(--text-secondary); }
+
+.settings-content { min-width: 0; }
+.settings-content > .appearance-page, .settings-content > .principals-page { max-width: none; padding: 0; }
+/* The pages keep their own measure; only the outer page padding is dropped,
+   because the shell already supplies it. */
+.settings-content > .preferences-page { padding: 0; }
+
+.settings-state { min-height: 240px; display: flex; align-items: center; justify-content: center; gap: var(--space-2); color: var(--text-secondary); }
+.settings-error { margin-top: var(--space-4); padding: var(--space-3); border: 1px solid var(--status-danger); border-radius: var(--radius-md); color: var(--text-error); background: var(--status-danger-soft); }
+.settings-spin { animation: settings-spin var(--transition-slower) linear infinite; }
+@keyframes settings-spin { to { transform: rotate(360deg); } }
+
+/* Below the two-column threshold the navigation sits above the content, still
+   one column and still in the same order — the tab-strip reflow is not
+   reintroduced on small screens. */
+@media (max-width: 1023px) {
+  .settings-body { grid-template-columns: minmax(0, 1fr); gap: var(--space-5); }
+}
+
+@media (max-width: 640px) {
+  .settings-page { padding: var(--space-4); }
+  .settings-nav { gap: var(--space-4); }
+}
+
+/* The active entry must not rely on colour alone (WCAG 1.4.1): a solid inline
+   marker carries it for a person who cannot separate the accent from the
+   secondary ink, and for high-contrast, where the soft fill is not painted. */
+.settings-nav-link { border-inline-start: 2px solid transparent; }
+.settings-nav-link--active { border-inline-start-color: currentColor; }
+
+/* Match the Sidebar overlay range so its fixed menu owns this leading space. */
+@media (max-width: 1279px) {
+  .settings-header { padding-inline-start: calc(var(--space-6) + var(--space-3)); }
+  .settings-header > svg { display: none; }
+}

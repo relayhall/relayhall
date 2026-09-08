@@ -1,0 +1,5 @@
+import {projectService} from '../services/ProjectService';
+import {phaseService} from '../services/PhaseService';
+import {taskManagerDB} from '../services/TaskManagerDB';
+import {reportManager} from '../services/ReportManager';
+client[queryMethod]('INSERT INTO tasks(title) VALUES ($1)');

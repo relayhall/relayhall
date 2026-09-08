@@ -1,0 +1,246 @@
+{
+  "schemaVersion": "rh.blueprint/1.0",
+  "blueprint": {
+    "key": "governed-deployment",
+    "name": "Governed deployment",
+    "version": 1,
+    "summary": "Governed deployment",
+    "description": "A portable interview-driven plan. Tasks begin parked; human decisions and ordinary write authority govern subsequent work.",
+    "tags": [
+      "governed-work"
+    ],
+    "provenance": "human-authored"
+  },
+  "parameters": [
+    {
+      "key": "change_name",
+      "label": "Change name",
+      "promptText": "What change is being deployed?",
+      "type": "string",
+      "required": true,
+      "order": 0
+    },
+    {
+      "key": "target_environment",
+      "label": "Target environment",
+      "promptText": "Which environment is this deployment for?",
+      "type": "enum",
+      "required": true,
+      "constraints": {
+        "enum": [
+          "dev",
+          "staging",
+          "production"
+        ]
+      },
+      "order": 1
+    },
+    {
+      "key": "repository",
+      "label": "Repository",
+      "promptText": "Which repository?",
+      "type": "string",
+      "required": true,
+      "order": 2
+    },
+    {
+      "key": "approver",
+      "label": "Approver",
+      "promptText": "Who approves the production go/no-go?",
+      "type": "principal-ref",
+      "required": true,
+      "order": 3
+    },
+    {
+      "key": "deployer",
+      "label": "Deployer",
+      "promptText": "Who deploys the change?",
+      "type": "principal-ref",
+      "required": true,
+      "order": 4,
+      "help": "Stewards preparation. The approver stewards both go/no-go arms; later execution and arming use ordinary Task authority."
+    },
+    {
+      "key": "rollback_window_hours",
+      "label": "Rollback window hours",
+      "promptText": "How many hours is the rollback window?",
+      "type": "integer",
+      "required": false,
+      "default": 24,
+      "constraints": {
+        "min": 1,
+        "max": 720
+      },
+      "order": 5
+    }
+  ],
+  "target": {
+    "mode": "new-project",
+    "project": {
+      "name": "Change {{change_name}}"
+    }
+  },
+  "phases": [
+    {
+      "key": "phase-prepare",
+      "name": "Prepare",
+      "position": 0
+    },
+    {
+      "key": "phase-verify",
+      "name": "Verify",
+      "position": 1
+    },
+    {
+      "key": "phase-release",
+      "name": "Release",
+      "position": 2
+    },
+    {
+      "key": "phase-observe",
+      "name": "Observe",
+      "position": 3
+    }
+  ],
+  "tasks": [
+    {
+      "key": "cut-candidate",
+      "title": "Cut the candidate",
+      "phase": "phase-prepare",
+      "description": "Repository: {{repository}}",
+      "roles": {
+        "shepherd": "{{deployer}}"
+      },
+      "references": [
+        "deployment-runbook"
+      ]
+    },
+    {
+      "key": "gate-chain",
+      "title": "Run the gate chain",
+      "phase": "phase-verify"
+    },
+    {
+      "key": "deploy-staging",
+      "title": "Deploy to staging",
+      "phase": "phase-verify"
+    },
+    {
+      "key": "verify-staging",
+      "title": "Staging verification",
+      "phase": "phase-verify",
+      "roles": {
+        "verifier": "{{approver}}"
+      }
+    },
+    {
+      "key": "deploy",
+      "title": "Deploy to {{target_environment}}",
+      "phase": "phase-release",
+      "defaults": {
+        "executionProfile": {
+          "service": "hermes",
+          "options": {}
+        }
+      }
+    },
+    {
+      "key": "observe",
+      "title": "Post-deploy observation",
+      "phase": "phase-observe",
+      "description": "Rollback window: {{rollback_window_hours}} hours"
+    },
+    {
+      "key": "close-change",
+      "title": "Close the change record",
+      "phase": "phase-observe"
+    },
+    {
+      "key": "record-hold",
+      "title": "Record the hold",
+      "phase": "phase-release"
+    },
+    {
+      "key": "new-window",
+      "title": "Schedule a new window",
+      "phase": "phase-release"
+    }
+  ],
+  "humanGates": [
+    {
+      "key": "go-no-go",
+      "title": "Production go/no-go",
+      "phase": "phase-release",
+      "decider": "{{approver}}",
+      "decisionPrompt": "Is the verified candidate approved for the target environment?",
+      "arms": [
+        {
+          "key": "go",
+          "label": "Go",
+          "tasks": [
+            "deploy",
+            "observe"
+          ]
+        },
+        {
+          "key": "no-go",
+          "label": "No-go",
+          "tasks": [
+            "record-hold",
+            "new-window"
+          ]
+        }
+      ]
+    }
+  ],
+  "references": [
+    {
+      "kind": "service",
+      "name": "hermes",
+      "requirement": "optional"
+    },
+    {
+      "kind": "skill",
+      "name": "deployment-runbook",
+      "requirement": "required"
+    }
+  ],
+  "dependencies": [
+    {
+      "task": "gate-chain",
+      "dependsOn": "cut-candidate"
+    },
+    {
+      "task": "deploy-staging",
+      "dependsOn": "gate-chain"
+    },
+    {
+      "task": "verify-staging",
+      "dependsOn": "deploy-staging"
+    },
+    {
+      "task": "go-no-go",
+      "dependsOn": "verify-staging"
+    },
+    {
+      "task": "observe",
+      "dependsOn": "deploy"
+    },
+    {
+      "task": "close-change",
+      "dependsOn": "observe"
+    }
+  ],
+  "reports": [
+    {
+      "key": "change-record",
+      "title": "Change record for {{change_name}}",
+      "content": "# {{change_name}}\n\nRepository: {{repository}}\nEnvironment: {{target_environment}}\n\n## Candidate\n\n## Verification\n\n## Decision\n\n## Rollback",
+      "tasks": [
+        "deploy",
+        "record-hold",
+        "new-window"
+      ]
+    }
+  ]
+}

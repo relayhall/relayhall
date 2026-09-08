@@ -1,0 +1,151 @@
+/**
+ * PluginFrame - Styles for plugin iframe container
+ * Uses glass morphism dark theme from variables.css
+ */
+
+.plugin-frame-container {
+  position: relative;
+  width: 100%;
+  height: calc(100vh - 4rem);
+  min-height: 400px;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  border-radius: var(--radius-md);
+  overflow: auto;
+}
+
+/* Loading overlay */
+.plugin-frame-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  background: var(--scrim);
+  backdrop-filter: blur(var(--glass-blur));
+  z-index: 10;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.plugin-frame-loading-spinner {
+  animation: spin 1s linear infinite;
+  color: var(--text-accent);
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Error state */
+.plugin-frame-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  background: var(--bg-surface);
+  padding: var(--space-8);
+  text-align: center;
+  z-index: 10;
+}
+
+.plugin-frame-error .error-icon {
+  color: var(--text-error);
+  opacity: 0.8;
+}
+
+.plugin-frame-error h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+  font-weight: var(--font-semibold);
+}
+
+.plugin-frame-error p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  max-width: 400px;
+}
+
+.plugin-frame-error .error-hint {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.plugin-reload-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-accent);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  cursor: pointer;
+  transition: all var(--transition-fast) var(--ease-out);
+}
+
+.plugin-reload-button:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+}
+
+.plugin-reload-button:active {
+  transform: scale(0.98);
+}
+
+/* Plugin iframe */
+.plugin-iframe {
+  width: 100%;
+  height: 100%;
+  min-height: 400px;
+  flex: 1;
+  border: none;
+  background: transparent;
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+.loading:is(.plugin-iframe) {
+  opacity: 0;
+}
+
+.hidden:is(.plugin-iframe) {
+  display: none;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .plugin-frame-container {
+    /* JS (iframeResize postMessage) will set the exact height;
+       600px is just the initial minimum before first resize message */
+    min-height: 600px;
+    border-radius: 0;
+  }
+
+  .plugin-iframe {
+    /* Allow the iframe to grow beyond its flex container via inline style */
+    min-height: 600px;
+  }
+
+  .plugin-frame-error {
+    padding: var(--space-4);
+  }
+  
+  .plugin-frame-error h2 {
+    font-size: var(--text-xl);
+  }
+}

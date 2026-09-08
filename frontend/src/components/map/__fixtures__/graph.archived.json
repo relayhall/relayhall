@@ -1,0 +1,198 @@
+{
+  "success": true,
+  "lod": "task",
+  "nodes": [
+    {
+      "id": "717413de-f888-4502-9808-bee3e97c2d71",
+      "title": "Inventory legacy services",
+      "status": "completed",
+      "priority": "high",
+      "project": "Atlas Migration",
+      "phaseId": "32536558-1be2-48cc-95f8-47d41686285c",
+      "updated": "2026-08-16T10:09:26.900Z"
+    },
+    {
+      "id": "3f78da2c-045d-43b2-8cff-e77a49acc939",
+      "title": "Migrate the mail relay",
+      "status": "stuck",
+      "priority": "high",
+      "project": "Atlas Migration",
+      "phaseId": "68656943-cdcb-416f-a0be-5c37e378a463",
+      "updated": "2026-08-16T10:09:27.426Z"
+    },
+    {
+      "id": "74467ae1-3b26-4540-8a7a-87bddd3825a7",
+      "title": "Decommission the old rack",
+      "status": "ideas",
+      "priority": "someday",
+      "project": "Atlas Migration",
+      "phaseId": "b49877aa-fef6-4c6c-acde-14149a87a8cd",
+      "updated": "2026-08-16T10:09:27.512Z"
+    },
+    {
+      "id": "2e66d59f-c291-43e9-878e-b62738aa1bc7",
+      "title": "Tune alert thresholds",
+      "status": "review",
+      "priority": "normal",
+      "project": "Beacon Observability",
+      "phaseId": null,
+      "updated": "2026-08-16T10:09:27.732Z"
+    },
+    {
+      "id": "d444f8c1-ab5e-48a5-844a-8a3c7c91f5d7",
+      "title": "Retire the legacy pager webhook",
+      "status": "todo",
+      "priority": "low",
+      "project": "Beacon Observability",
+      "phaseId": null,
+      "updated": "2026-08-16T10:09:27.804Z"
+    },
+    {
+      "id": "3202e22f-b485-49cb-8c55-751dbbff1b36",
+      "title": "On-call handbook chapter",
+      "status": "todo",
+      "priority": "normal",
+      "project": "Coral Docs",
+      "phaseId": null,
+      "updated": "2026-08-16T10:09:27.866Z"
+    },
+    {
+      "id": "380fd9e7-2d13-42dd-8141-4389228dee3e",
+      "title": "Glossary of estate vocabulary",
+      "status": "in-progress",
+      "priority": "normal",
+      "project": "Coral Docs",
+      "phaseId": null,
+      "updated": "2026-08-16T10:09:27.973Z"
+    },
+    {
+      "id": "702d14b6-1cb9-4629-b591-b17d4c801ff2",
+      "title": "Ship the estate dashboard",
+      "status": "in-progress",
+      "priority": "high",
+      "project": "Coral Docs",
+      "phaseId": null,
+      "updated": "2026-08-16T18:12:58.930Z"
+    },
+    {
+      "id": "fc008d21-5880-459f-92c2-c25d93ec4010",
+      "title": "Architecture decision records index",
+      "status": "archived",
+      "priority": "low",
+      "project": "Coral Docs",
+      "phaseId": null,
+      "updated": "2026-08-16T19:13:10.807Z"
+    },
+    {
+      "id": "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+      "title": "Cut over the reverse proxy",
+      "status": "in-progress",
+      "priority": "urgent",
+      "project": "Atlas Migration",
+      "phaseId": "68656943-cdcb-416f-a0be-5c37e378a463",
+      "updated": "2026-08-16T19:26:11.068Z"
+    },
+    {
+      "id": "32252cfe-ef6a-4604-b752-7fce1f20dff4",
+      "title": "A1 QA chain probe task",
+      "status": "ideas",
+      "priority": "normal",
+      "project": null,
+      "phaseId": null,
+      "updated": "2026-08-15T14:34:27.901Z"
+    },
+    {
+      "id": "c9e559a3-1e78-4835-90b3-8a47231ec51e",
+      "title": "Risk-rank the migration order",
+      "status": "review",
+      "priority": "normal",
+      "project": "Atlas Migration",
+      "phaseId": "32536558-1be2-48cc-95f8-47d41686285c",
+      "updated": "2026-08-16T10:09:27.146Z"
+    },
+    {
+      "id": "a8fb5d70-820f-4474-bd1c-7d1e13cb2622",
+      "title": "fewfewfg",
+      "status": "review",
+      "priority": "normal",
+      "project": null,
+      "phaseId": null,
+      "updated": "2026-08-16T03:57:59.090Z"
+    },
+    {
+      "id": "00915858-41dd-46ac-a08d-885a13c066b8",
+      "title": "Repoint internal DNS",
+      "status": "todo",
+      "priority": "high",
+      "project": "Atlas Migration",
+      "phaseId": "68656943-cdcb-416f-a0be-5c37e378a463",
+      "updated": "2026-08-16T10:09:27.346Z"
+    },
+    {
+      "id": "89a6ca13-b575-4de8-b1b2-3e4fbffe259a",
+      "title": "Quick capture: evaluate the new tracing agent",
+      "status": "ideas",
+      "priority": "someday",
+      "project": null,
+      "phaseId": null,
+      "updated": "2026-08-16T10:09:28.032Z"
+    }
+  ],
+  "edges": [
+    {
+      "from": "00915858-41dd-46ac-a08d-885a13c066b8",
+      "to": "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+      "kind": "dependency"
+    },
+    {
+      "from": "3f78da2c-045d-43b2-8cff-e77a49acc939",
+      "to": "8466bafe-12bd-4ee2-bcc4-c9609b528c8f",
+      "kind": "dependency"
+    },
+    {
+      "from": "74467ae1-3b26-4540-8a7a-87bddd3825a7",
+      "to": "00915858-41dd-46ac-a08d-885a13c066b8",
+      "kind": "dependency"
+    },
+    {
+      "from": "74467ae1-3b26-4540-8a7a-87bddd3825a7",
+      "to": "3f78da2c-045d-43b2-8cff-e77a49acc939",
+      "kind": "dependency"
+    },
+    {
+      "from": "2e66d59f-c291-43e9-878e-b62738aa1bc7",
+      "to": "702d14b6-1cb9-4629-b591-b17d4c801ff2",
+      "kind": "dependency"
+    },
+    {
+      "from": "d444f8c1-ab5e-48a5-844a-8a3c7c91f5d7",
+      "to": "2e66d59f-c291-43e9-878e-b62738aa1bc7",
+      "kind": "dependency"
+    }
+  ],
+  "phases": [
+    {
+      "id": "32536558-1be2-48cc-95f8-47d41686285c",
+      "name": "Discovery",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    },
+    {
+      "id": "68656943-cdcb-416f-a0be-5c37e378a463",
+      "name": "Cutover",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    },
+    {
+      "id": "b49877aa-fef6-4c6c-acde-14149a87a8cd",
+      "name": "Decommission",
+      "goal": null,
+      "projectId": "12a372b8-7ce2-4a8b-bcbd-323041ea5d8b",
+      "position": 0
+    }
+  ],
+  "generatedAt": "2026-08-16T21:05:54.318Z",
+  "fullCount": 15
+}

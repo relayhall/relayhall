@@ -1,0 +1,518 @@
+/* ========================================
+   SIDEBAR - Collapsible Layout
+   Visual Hierarchy: Avatar → Status → Nav
+   ======================================== */
+
+.sidebar {
+  width: var(--sidebar-width);
+  height: 100dvh;
+  background: linear-gradient(180deg, var(--bg-app) 0%, var(--bg-surface) 100%);
+  border-right: 1px solid var(--border-subtle, var(--border-default));
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-4) var(--space-4) var(--space-6);
+  overflow-x: hidden;
+  overflow-y: auto;
+  color: var(--text-primary);
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 200;
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), padding 0.3s ease;
+}
+
+/* ========================================
+   AVATAR SECTION - Top Priority
+   ======================================== */
+
+.sidebar-avatar-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0;
+  overflow: visible;
+  position: relative;
+  z-index: 10;
+  flex-shrink: 0;
+}
+
+.avatar-container {
+  position: relative;
+  width: 180px;
+  height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  z-index: 1000;
+  transition: width 0.3s ease, height 0.3s ease;
+  border-radius: 50%;
+}
+
+.avatar-placeholder {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--bg-surface-hover) 0%, var(--bg-elevated) 50%, var(--status-info) 100%);
+  color: var(--text-on-fill);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 16px var(--shadow-color);
+}
+
+.sidebar-avatar-section .nim-orb-webgl {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  pointer-events: auto;
+}
+
+.sidebar-avatar-section .nim-orb-webgl__canvas {
+  border-radius: 50%;
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  pointer-events: none;
+}
+
+.sidebar-orb-frame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 50%;
+  overflow: hidden;
+  background: transparent;
+  display: block;
+  flex-shrink: 0;
+}
+
+.sidebar-nav-section {
+  margin-bottom: var(--space-3);
+}
+
+.agent-item-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.agent-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--overlay-weak);
+  border: 1px solid var(--border-subtle);
+}
+
+.agent-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.agent-status.running {
+  background: var(--status-success);
+  color: var(--text-on-fill);
+  box-shadow: 0 0 0 4px var(--status-success-soft);
+}
+
+.agent-status.idle {
+  background: var(--text-quaternary);
+}
+
+.agent-status.completed {
+  background: var(--status-info);
+  color: var(--text-on-fill);
+}
+
+.agent-label {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.status-message {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.status-message-inline {
+  margin-top: 10px;
+  cursor: pointer;
+}
+
+.logout-section {
+  margin-top: var(--space-3);
+}
+
+/* The product line at the foot of the shell (RH-UI.3, §6). Quiet by
+   construction — the monochrome binding at the recessive ink — and quiet
+   through a TOKEN rather than an opacity, so the high-contrast Theme is not
+   dimmed by a multiplier that ignores it. See .wordmark--quiet. */
+.sidebar-product-line {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 4px;
+}
+
+.sidebar-product-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.sidebar-product-link:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+
+/* Entry point to the user config page (RH-UI.2). Quiet by design: it sits
+   with the account action rather than in the navigation groups. */
+.sidebar-preferences-link {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-glass);
+  color: var(--text-secondary);
+  padding: 11px 14px;
+  margin-bottom: var(--space-2);
+  text-decoration: none;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.sidebar-preferences-link:hover {
+  background: var(--bg-glass-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.sidebar-preferences-text {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+/* Walkthrough item R18. This was the only status fill in the chrome, so the
+   eye landed on "leave" before it landed on anything a person came to do.
+   The design system reserves the danger token for DESTRUCTIVE affordances and
+   signing out is not one: nothing is lost and the session can be started
+   again. It is an ordinary quiet control now, and it still darkens on hover
+   so it does not read as disabled. */
+.sidebar-logout-button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 11px 14px;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.sidebar-logout-button:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.logout-text {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.nav-group {
+  margin-bottom: var(--space-2);
+}
+
+.nav-group--flat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nav-group-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.nav-group-header:hover {
+  background: var(--overlay-weak);
+}
+
+.nav-group-icon,
+.nav-group-label,
+.nav-group-chevron {
+  display: inline-flex;
+  align-items: center;
+}
+
+.nav-group-label {
+  flex: 1;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.nav-group-chevron {
+  transition: transform 0.2s ease;
+}
+
+.chevron-collapsed {
+  transform: rotate(-90deg);
+}
+
+.nav-group-content {
+  display: grid;
+  transition: grid-template-rows var(--transition-base) var(--ease-out), opacity var(--transition-fast) var(--ease-out);
+}
+
+.nav-group-content--expanded {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.nav-group-content--collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.nav-group-items {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar-nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--text-tertiary);
+  text-decoration: none;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.sidebar-nav-link:hover {
+  background: var(--overlay-weak);
+}
+
+.sidebar-nav-link--active:is(.sidebar-nav-link) {
+  background: var(--status-info-soft);
+  color: var(--text-primary);
+}
+
+.nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-label {
+  font-size: var(--text-sm);
+  flex: 1;
+  min-width: 0;
+}
+
+.plugin-health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-danger);
+}
+
+.sidebar-section {
+  width: 100%;
+  margin-bottom: var(--space-3);
+}
+
+.sidebar-hamburger {
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  z-index: 260;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: 1px solid var(--border-default);
+  background: var(--scrim);
+  color: var(--text-primary);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim-weak);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 190;
+}
+
+.sidebar-backdrop-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@keyframes gentle-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+
+@keyframes thinking-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.04); }
+}
+
+@keyframes typing-glow {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+
+@keyframes working-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+
+@keyframes waiting-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.02); }
+}
+
+
+.sidebar.sidebar-compact {
+  width: 96px;
+  padding: var(--space-4) var(--space-2) var(--space-5);
+  align-items: center;
+}
+
+.sidebar.sidebar-compact > * {
+  width: 100%;
+}
+
+.sidebar.sidebar-compact .sidebar-avatar-section {
+  margin-bottom: var(--space-1);
+}
+
+.sidebar.sidebar-compact .avatar-container {
+  width: 64px;
+  height: 64px;
+}
+
+.sidebar.sidebar-compact .sidebar-status-meta-row,
+.sidebar.sidebar-compact .status-message-inline,
+.sidebar.sidebar-compact .activity-detail,
+.sidebar.sidebar-compact .activity-tools {
+  display: none !important;
+}
+
+.sidebar.sidebar-compact .sidebar-status-card,
+.sidebar.sidebar-compact .logout-section {
+  margin-bottom: 10px;
+}
+
+.sidebar.sidebar-compact .nav-group-label,
+.sidebar.sidebar-compact .nav-group-chevron,
+.sidebar.sidebar-compact .nav-label,
+.sidebar.sidebar-compact .sidebar-preferences-text,
+.sidebar.sidebar-compact .logout-text {
+  display: none !important;
+}
+
+.sidebar.sidebar-compact .plugin-health-dot {
+  display: none !important;
+}
+
+.sidebar.sidebar-compact .sidebar-runtime-monogram {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+}
+
+.sidebar.sidebar-compact .sidebar-status-card {
+  padding: 10px 8px;
+}
+
+.sidebar.sidebar-compact .status-card-content,
+.sidebar.sidebar-compact .status-card-stop,
+.sidebar.sidebar-compact .nav-group-header,
+.sidebar.sidebar-compact .sidebar-nav-link,
+.sidebar.sidebar-compact .agent-item,
+.sidebar.sidebar-compact .sidebar-logout-button {
+  justify-content: center;
+}
+
+.sidebar.sidebar-compact .status-card-stop {
+  margin-top: var(--space-2);
+}
+
+.sidebar.sidebar-compact .sidebar-nav-link,
+.sidebar.sidebar-compact .sidebar-logout-button,
+.sidebar.sidebar-compact .agent-item,
+.sidebar.sidebar-compact .nav-group-header {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+@media (max-width: 1279px) {
+  .sidebar-hamburger {
+    display: inline-flex;
+  }
+
+  .sidebar {
+    transform: translateX(-100%);
+    transition: transform var(--transition-base) var(--ease-out);
+    width: min(var(--sidebar-width), calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    padding: var(--space-4) var(--space-4) var(--space-6);
+    align-items: stretch;
+    box-shadow: 0 12px 36px var(--shadow-color);
+  }
+
+  .sidebar > * {
+    width: 100%;
+  }
+
+  .sidebar-open:is(.sidebar) {
+    transform: translateX(0);
+  }
+
+  .avatar-container {
+    width: 128px;
+    height: 128px;
+  }
+
+  .sidebar-orb-frame {
+    transform: scale(0.84);
+    transform-origin: center;
+  }
+}

@@ -1,0 +1,5 @@
+import {projectService} from '../services/ProjectService';
+import {phaseService} from '../services/PhaseService';
+import {taskManagerDB} from '../services/TaskManagerDB';
+import {reportManager} from '../services/ReportManager';
+let sql='SELECT id FROM tasks';sql='DELETE FROM tasks';client.query(sql);

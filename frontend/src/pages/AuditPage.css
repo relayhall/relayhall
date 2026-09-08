@@ -1,0 +1,453 @@
+/* AuditPage — the board's action ledger (card 96aeacb7).
+ *
+ * OWNERSHIP. `.audit-header` is owned by styles/shared-components.css and
+ * `.audit-page` picks up its phone padding from styles/responsive-phase3.css;
+ * neither is re-declared here (the RH-UI.1b collision rule: a component sheet
+ * may not own a class the global domain owns). The `.audit-btn`,
+ * `.audit-filters`, `.audit-search-form`, `.audit-header-actions`,
+ * `.audit-pagination` and `.audit-event-header` names already carry
+ * 44px-touch-target rules in that responsive sheet's @media block but are
+ * owned by nobody, so they are declared HERE — which is what makes those
+ * rules apply to this page and what keeps the rendered-class gate satisfied.
+ */
+
+.audit-page {
+  padding: var(--space-5);
+  max-inline-size: 1400px;
+  margin-inline: auto;
+}
+
+.audit-page-audit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-block-end: var(--space-5);
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.audit-page-audit-header h1 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-0);
+  font-size: var(--text-2xl);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+}
+
+.audit-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.audit-ledger-count {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-full);
+  color: var(--text-accent);
+  background: var(--accent-soft);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  white-space: nowrap;
+}
+
+.audit-btn {
+  min-height: var(--control-compact);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.audit-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-surface-hover);
+}
+
+.audit-btn:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.audit-btn:focus-visible,
+.audit-event-header:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.audit-btn-primary {
+  border-color: var(--border-accent);
+  color: var(--text-accent);
+  background: var(--accent-soft);
+}
+
+.audit-ledger-intro {
+  max-width: 78ch;
+  margin: var(--space-2) 0 var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* ── Filters ─────────────────────────────────────────────────────────── */
+
+.audit-filters {
+  margin-block-end: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+.audit-search-form {
+  display: block;
+}
+
+.audit-ledger-filters-heading {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-xl);
+  color: var(--text-primary);
+}
+
+.audit-ledger-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-4);
+}
+
+.audit-ledger-hint {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: var(--font-normal);
+}
+
+.audit-ledger-filter-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-block-start: var(--space-4);
+}
+
+/* ── States ──────────────────────────────────────────────────────────── */
+
+.audit-ledger-error {
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--status-danger);
+  border-radius: var(--radius-md);
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+  font-size: var(--text-sm);
+}
+
+.audit-ledger-refused {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  max-width: 78ch;
+  padding: var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.audit-ledger-refused svg {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+.audit-ledger-refused code {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.audit-ledger-state,
+.audit-ledger-empty {
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.audit-ledger-spin {
+  animation: audit-ledger-spin var(--transition-slower) linear infinite;
+}
+
+@keyframes audit-ledger-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── The record ──────────────────────────────────────────────────────── */
+
+.audit-ledger-list {
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+.audit-ledger-list-heading {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-xl);
+  color: var(--text-primary);
+}
+
+.audit-ledger-table {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+/* The same grid the rows use, so a heading sits over its own column. */
+.audit-ledger-columns {
+  display: grid;
+  grid-template-columns: minmax(130px, .8fr) minmax(160px, 1.2fr) minmax(90px, .5fr) minmax(140px, 1fr) minmax(140px, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  background: var(--bg-elevated);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.audit-ledger-clock-note {
+  max-width: 78ch;
+  margin: var(--space-3) 0 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.audit-ledger-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.audit-ledger-row + .audit-ledger-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.audit-event-header {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(130px, .8fr) minmax(160px, 1.2fr) minmax(90px, .5fr) minmax(140px, 1fr) minmax(140px, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 0;
+  color: var(--text-primary);
+  background: transparent;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.audit-event-header:hover {
+  background: var(--bg-surface-hover);
+}
+
+.audit-event-header > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-ledger-when {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.audit-ledger-action {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.audit-ledger-outcome {
+  width: max-content;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--status-success);
+  border-radius: var(--radius-full);
+  color: var(--text-success);
+  background: var(--status-success-soft);
+  font-size: var(--text-xs);
+}
+
+.audit-ledger-outcome-denied {
+  border-color: var(--status-danger);
+  color: var(--text-error);
+  background: var(--status-danger-soft);
+}
+
+.audit-ledger-actor,
+.audit-ledger-target {
+  color: var(--text-secondary);
+}
+
+.audit-ledger-chevron {
+  color: var(--text-tertiary);
+}
+
+.audit-pagination {
+  display: flex;
+  justify-content: center;
+  margin-block-start: var(--space-4);
+}
+
+/* ── Detail ──────────────────────────────────────────────────────────── */
+
+.audit-ledger-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.audit-ledger-drawer {
+  width: min(520px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-5);
+  border-left: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-3);
+}
+
+.audit-ledger-drawer:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.audit-ledger-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-block-end: var(--space-4);
+}
+
+.audit-ledger-drawer-head h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xl);
+  overflow-wrap: anywhere;
+}
+
+.audit-ledger-detail {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.audit-ledger-detail dt {
+  color: var(--text-tertiary);
+}
+
+.audit-ledger-detail dd {
+  margin: 0;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.audit-ledger-metadata-heading {
+  margin: var(--space-5) 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.audit-ledger-metadata {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── Narrow viewports ────────────────────────────────────────────────── */
+
+@media (max-width: 1024px) {
+  /* Below this width the rows stop being columns, so column headings would
+     label nothing. */
+  .audit-ledger-columns {
+    display: none;
+  }
+  .audit-event-header {
+    grid-template-columns: 1fr auto;
+    gap: var(--space-2);
+  }
+  .audit-event-header > * {
+    white-space: normal;
+  }
+  .audit-ledger-action {
+    grid-column: 1 / -1;
+  }
+  .audit-ledger-actor,
+  .audit-ledger-target {
+    grid-column: 1 / -1;
+  }
+  .audit-ledger-chevron {
+    grid-row: 1;
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 640px) {
+  .audit-ledger-list,
+  .audit-filters {
+    padding: var(--space-3);
+  }
+  .audit-ledger-filter-grid {
+    grid-template-columns: 1fr;
+  }
+  .audit-ledger-filter-actions .audit-btn {
+    flex: 1 1 0;
+    justify-content: center;
+  }
+  .audit-ledger-drawer {
+    width: 100%;
+    border-left: 0;
+  }
+  .audit-ledger-detail {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+  .audit-ledger-detail dd {
+    margin-block-end: var(--space-2);
+  }
+}

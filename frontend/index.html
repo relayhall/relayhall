@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <base href="/dashboard/" />
+    <!--
+      Icons (RH-UI.3). All of them are monogram Tile B — the accent ground, mark
+      knocked out — because Tile A's slate ground disappears into dark browser
+      chrome at 16px. The SVG carries `data-theme-variant`: the theme engine
+      repoints it at the active Theme's cut (THEME_FAVICONS). The rasters below
+      cannot follow a Theme — a bookmark bar never learns which one is active —
+      so they bake the default Theme and are referenced by exact size.
+    -->
+    <link rel="icon" type="image/svg+xml" href="/dashboard/favicon.svg" data-theme-variant />
+    <link rel="icon" type="image/png" sizes="64x64" href="/dashboard/favicon-64.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/dashboard/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/dashboard/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/dashboard/apple-touch-icon.png" />
+    <link rel="shortcut icon" href="/dashboard/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f1216" />
+    <meta name="description" content="RelayHall — a self-hosted, governed board for a mixed human and AI workforce." />
+    <!--
+      Social metadata is deliberately text-only. `og:image` needs an absolute URL
+      on a public origin, and nothing of ours is public: RH-PUB.B1 owns the
+      public package and adds the image reference at that gate. A relative
+      og:image here would be a tag that never resolves.
+    -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="RelayHall" />
+    <meta property="og:description" content="A self-hosted, governed board for a mixed human and AI workforce." />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="RelayHall" />
+    <meta name="twitter:description" content="A self-hosted, governed board for a mixed human and AI workforce." />
+    <title>RelayHall</title>
+    <!--
+      Theme boot snippet (RH-DESIGN.6 §5.5 FOUC guard). Runs before the first
+      paint and resolves the same chain the engine does, from the cache the
+      engine writes: principal preference -> deployment default -> relay-dark,
+      with `system` following prefers-color-scheme.
+
+      It is INLINE on purpose: an external script costs a round trip on the
+      paint path, which is the flash this exists to prevent. That makes it the
+      one script the §5.6 CSP admits by hash. Its sha256 is recorded in
+      docs/design-system.md and proved against BOTH this file and the built
+      dist/index.html by scripts/check-theme-boot-hash.py, so the CSP hash can
+      never silently drift from the bytes actually served.
+
+      Written pre-minified, on one line, for that reason: the build must not
+      be able to change these bytes. Keep it that way.
+    -->
+    <script data-theme-boot>!function(){try{var e=document.documentElement,t=JSON.parse(localStorage.getItem("relayhall_prefs:"+location.origin)||"{}"),a=["relay-dark","relay-light","high-contrast"],n=t.theme;"system"===n&&(n=window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches?"relay-light":"relay-dark"),a.indexOf(n)<0&&(n=a.indexOf(t.deploymentTheme)<0?"relay-dark":t.deploymentTheme),e.setAttribute("data-theme",n);var r=t.reducedMotion;"reduce"!==r&&"no-preference"!==r||e.setAttribute("data-reduced-motion",r)}catch(o){document.documentElement.setAttribute("data-theme","relay-dark")}}();</script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

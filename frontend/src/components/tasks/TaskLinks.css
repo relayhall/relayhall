@@ -1,0 +1,78 @@
+/* TaskLinks - Phase 4 Step 6 */
+@import '../../styles/variables.css';
+
+.task-links {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.task-links-header {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-3);
+}
+
+.task-links-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.task-link-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--overlay-weak);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  transition: all var(--transition-base) ease;
+}
+
+.task-link-item:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-primary);
+}
+
+.task-link-icon {
+  display: flex;
+  align-items: center;
+  color: var(--text-accent);
+  flex-shrink: 0;
+}
+
+.task-link-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-link-type {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  background: var(--overlay-weak);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+
+.task-links-more {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  padding-left: var(--space-3);
+}
+
+/* Compact mode */
+.task-links-compact .task-link-item {
+  padding: var(--space-1) var(--space-2);
+}
+
+.task-links-compact .task-links-header {
+  margin-bottom: var(--space-2);
+}

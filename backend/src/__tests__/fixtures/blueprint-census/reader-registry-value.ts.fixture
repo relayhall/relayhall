@@ -1,0 +1,1 @@
+import {BlueprintRegistryService} from '../services/BlueprintRegistryService'; const registry=new BlueprintRegistryService({limit:102400}); async function provenance(){const result=await registry.get(id,caller); const body=result['doc'+'ument'];return body}

@@ -1,0 +1,1 @@
+import {blueprintRequest as read} from '../blueprints/api'; async function Provenance(){const result=await read('/blueprints/'+blueprintId);return <span>{result.blueprint.document.tasks[0].title}</span>}

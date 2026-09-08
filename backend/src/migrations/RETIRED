@@ -1,0 +1,9 @@
+# Immutable post-baseline migrations for features extracted from core.
+# These files remain available for audit/history but migrate.ts stamps them
+# without executing them on fresh or upgraded RelayHall databases.
+045_journal_run_publications.sql
+046_journal_run_notifications.sql
+047_journal_publication_hardening.sql
+048_journal_mindscape_exactly_once.sql
+050_journal_new_entry_publication.sql
+063_ownership_attribution.sql

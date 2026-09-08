@@ -1,0 +1,40 @@
+{
+  "name": "claw-hello",
+  "version": "1.0.0",
+  "description": "A minimal example RelayHall plugin",
+
+  "docker": {
+    "image": "claw-hello",
+    "build": ".",
+    "ports": {
+      "3020": "3020"
+    },
+    "environment": {
+      "NODE_ENV": "production",
+      "PORT": "3020"
+    },
+    "networks": ["relayhall_network"]
+  },
+
+  "api": {
+    "base_path": "/api/plugins/hello",
+    "internal_port": 3020,
+    "health": "/health",
+    "endpoints": [
+      {
+        "method": "GET",
+        "path": "/",
+        "description": "Returns a greeting"
+      }
+    ]
+  },
+
+  "ui": {
+    "sidebar": {
+      "label": "Hello",
+      "icon": "👋",
+      "order": 100
+    },
+    "iframe_path": "/plugins/hello/"
+  }
+}

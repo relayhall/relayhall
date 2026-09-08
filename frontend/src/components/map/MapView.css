@@ -1,0 +1,1298 @@
+/* RH-UI.17i LOD — rendered Task card width in CSS pixels:
+ * full >=160: full Task; compact >=96: compact Task;
+ * aggregate >=40: simplified Task; silhouette <40: status shape.
+ * Every Project/Phase uses the same inside-top caption and done/active/next/
+ * blocked fields. Captions cross-fade at a fixed origin; layout never reads
+ * this band. Geometry stays size-truthful. Reduced motion removes transitions.
+ */
+/* The Map (design 77950a97 §§2-8).
+ *
+ * OWNERSHIP CONTRACT: the geometry of this surface comes from the layout
+ * engine (mapGraphModel.layoutHorizontal) and is applied INLINE by MapView.
+ * This sheet therefore never declares transform, left, top, width or height
+ * on .map-plane, .map-band, .map-lane-header or .map-tile.
+ *
+ * THE CELLS ARE THE EXCEPTION, and round 2 made them one rule rather than
+ * four accidents. The continuous plane reserves DECLARED ground for each
+ * element (PLANE_METRICS: tileCellW/H, chipCellW/H, laneHeaderW/H,
+ * pillReserveW/H) because a reservation taken from a MEASURED box is a
+ * reservation the filter can move — the size map holds what has been
+ * mounted, not what exists. The bounds below are what make those
+ * reservations true rather than hopeful: each element is held inside its
+ * cell here, so the layout is never surprised by a box it did not reserve.
+ *
+ * Heights stay CONTENT-DRIVEN inside their cell, so the measurement pass
+ * still reads a real box (diagnosis 7fa7e605 P3) — the cell is a ceiling,
+ * not a fixed size, and nothing is stretched to fill it.
+ */
+
+/* ============================================================
+   Shell
+   ============================================================ */
+
+.map-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-app);
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   Toolbar
+   ============================================================ */
+
+.map-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.map-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-segmented);
+}
+
+.map-scope-count {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/* ============================================================
+   Canvas and plane — the pan/zoom surface
+   ============================================================ */
+
+.map-canvas {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-app);
+  touch-action: none;
+  cursor: grab;
+  overscroll-behavior: contain;
+}
+
+.map-canvas:active {
+  cursor: grabbing;
+}
+
+.map-canvas[data-panning="true"] {
+  cursor: grabbing;
+}
+
+/* transform / width / height are set inline by MapView — never here. */
+.map-plane {
+  /* The plane's inverse scale, written here so the property is DECLARED
+     where it is owned (the same discipline --map-lane-progress follows) and
+     so a card still renders at its designed size if the inline value is ever
+     missing. MapView overwrites it inline on every zoom. */
+  --map-plane-inverse-scale: 1;
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+/* ============================================================
+   Edges (§4) — an SVG underlay beneath every tile
+   ============================================================ */
+
+.map-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 1;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.map-edge {
+  fill: none;
+  stroke: var(--border-default);
+  stroke-width: 2;
+  stroke-linecap: round;
+  transition: stroke var(--transition-base) var(--ease-out);
+}
+
+/* Kind: a dependency is a solid run. */
+.map-edge--dependency {
+  stroke-dasharray: none;
+}
+
+/* Chain state (§4): dammed, in flight, satisfied, or merely present. */
+.map-edge--dammed {
+  stroke: var(--status-danger);
+}
+
+.map-edge--active {
+  stroke: var(--status-info);
+}
+
+.map-edge--satisfied {
+  stroke: var(--status-success);
+}
+
+.map-edge--neutral {
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+/* Kind wins for knowledge links: always dashed accent, whatever the state. */
+.map-edge--knowledge {
+  stroke: var(--accent-color);
+  stroke-width: 2;
+  stroke-dasharray: 6 5;
+}
+
+.map-edge--knowledge.map-edge--neutral {
+  stroke-width: 1.5;
+}
+
+/* ============================================================
+   Bands — the phase/goal regions behind the tiles
+   ============================================================ */
+
+.map-band {
+  position: absolute;
+  box-sizing: border-box;
+  padding: var(--space-2);
+  z-index: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+
+/* The chip is PLACED by the layout engine (it is named in the §2 overlap
+   invariant), so it is positioned absolutely from inline left/top like the
+   tiles — not nested inside the band's box. z-index sits above the band
+   surface but below the tiles. */
+.map-band-chip {
+  position: absolute;
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+  z-index: 1;
+  pointer-events: none;
+  /* THE CHIP'S CELL. Its WIDTH is the band's inner width and arrives
+     inline from the layout; its height is PLANE_METRICS.chipCellH. The
+     phase name ellipsizes inside it (`.map-band-name` below) rather than
+     pushing the segment beside it along, and the container card carries the
+     name and the goal in full at the altitude where the chip has faded out.
+     Measured live at 68..107 contracted and 265 expanded — which is the
+     span that used to move the plane. */
+  max-block-size: 32px;
+  overflow: hidden;
+}
+
+.map-band-name {
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  line-height: var(--leading-tight);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-band-goal {
+  font-size: var(--text-xs);
+  font-weight: var(--font-normal);
+  line-height: var(--leading-tight);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   Lane headers
+   ============================================================ */
+
+.map-lane-header {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  z-index: 2;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  pointer-events: none;
+  /* THE HEADER IS A COLUMN, not a measurement (PLANE_METRICS.laneHeaderW).
+     Its §1 counters are computed from the tasks in scope, so left free it
+     changes width with the data — and every element in the lane is
+     positioned from it. Inside the column it wraps; the layout does not
+     move. ROUND 2: the height is a coordinate too — it sets the lane's
+     painted bottom, and the lane below stands under it — so it is bounded
+     by the cell as well (PLANE_METRICS.laneHeaderH). Measured live at 66
+     for every lane at every band; inside the cell it still wraps. */
+  inline-size: 220px;
+  max-block-size: 88px;
+}
+
+.map-lane-name {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-lane-count {
+  flex: none;
+  margin-left: auto;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  line-height: var(--leading-none);
+  color: var(--text-tertiary);
+  background: var(--bg-surface);
+  border-radius: var(--radius-full);
+}
+
+/* ============================================================
+   Tiles — width is a design constant; height stays content-driven
+   ============================================================ */
+
+.map-tile {
+  position: absolute;
+  /* THE TILE'S CELL — PLANE_METRICS.tileCellW / tileCellH. The width was
+     always this constant; the height is bounded rather than fixed, so a
+     tile still paints exactly as tall as its content and the plane still
+     knows the most it can ever be. Measured live at 81..108 across all four
+     detail bands on the 5,023-task portal. */
+  width: 170px;
+  max-block-size: 128px;
+  box-sizing: border-box;
+  z-index: 3;
+  border-radius: var(--radius-md);
+  /* §2/§6: a status change GLIDES the tile to its new position rather than
+     teleporting it. Pan and zoom are untouched by this — they transform the
+     PLANE, and a tile's left/top only move when the layout itself changes,
+     which is precisely when the glide is wanted. */
+  transition: left var(--transition-base) var(--ease-out),
+              top var(--transition-base) var(--ease-out);
+}
+
+/* Level of detail (§5): a tile NEVER vanishes. Only the ink inside it
+   fades, so the status-tinted shape and its edges survive every zoom. */
+.map-tile .task-card > *:not(.task-card-map-open):not(.task-card-map-agent) {
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+/* Contraction is marked PER ELEMENT from the detail table, not painted by band
+   rules. Two reasons, one from each review: round 2 rejected a stylesheet
+   racing the table for authority, and round 4 rejected unmounting, because the
+   tile box is measured and feeding the layout — so the element must stay in
+   place and merely stop being ink.
+   The opener never contracts (it must keep a visible focus ring and still open
+   the Task at far zoom, §6) and neither does the agent dot (§5: never dots). */
+/* Declared as a LEADING selector so this sheet OWNS the class: the ownership
+   gate reads the first compound, and `.map-plane .map-contracted` would have
+   owned `.map-plane` instead — leaving the band goal to render unstyled and
+   never actually fade. The gate caught exactly that. The `map-` prefix is what
+   scopes it; it is applied only inside the plane. */
+.map-contracted {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.map-tile--mid {
+  box-shadow: var(--shadow-1);
+}
+
+.map-tile--close {
+  box-shadow: var(--shadow-2);
+}
+
+/* A live change landed on this Task: a single brief ring, then silence. */
+.map-tile--pulsed {
+  z-index: 4;
+  animation: map-tile-pulse 1400ms var(--ease-out) 1;
+}
+
+@keyframes map-tile-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+  40% {
+    box-shadow: 0 0 0 8px var(--accent-soft);
+  }
+  100% {
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+}
+
+/* ============================================================
+   Overlays — status never unmounts the canvas
+   ============================================================ */
+
+.map-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-6);
+  text-align: center;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: var(--scrim);
+}
+
+.map-overlay--error {
+  color: var(--status-danger);
+}
+
+/* ============================================================
+   Tree — the accessible alternative (§6), a plain readable list
+   ============================================================ */
+
+.map-tree {
+  flex: none;
+  max-height: 40%;
+  overflow-y: auto;
+  padding: var(--space-4);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.map-tree h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+}
+
+.map-tree ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.map-tree li {
+  margin: 0;
+}
+
+.map-tree button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: var(--control-compact);
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background var(--transition-fast) var(--ease-out);
+}
+
+.map-tree button:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-subtle);
+}
+
+.map-tree button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.map-tree-band {
+  margin: 0 0 var(--space-4);
+  padding: 0 0 var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.map-tree-band h4 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  line-height: var(--leading-tight);
+  color: var(--text-secondary);
+}
+
+.map-tree-goal {
+  font-weight: var(--font-normal);
+  color: var(--text-tertiary);
+}
+
+/* ============================================================
+   Reduced motion — every transition and the pulse stand down
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  .map-edge,
+  .map-tile .task-card > *,
+  .map-tree button {
+    transition: none;
+  }
+
+  .map-tile--pulsed {
+    animation: none;
+  }
+}
+
+/* ============================================================
+   CHAIN SELECTION (§4)
+   Focusing or clicking a Task lights its full upstream and downstream
+   chain and dims everything else, so the eye follows the flow rather
+   than hunting it. Clicking the empty canvas clears the selection.
+   ============================================================ */
+
+.map-tile--lit {
+  z-index: 5;
+}
+
+.map-tile--dimmed {
+  opacity: 0.13;
+}
+
+/* §4's lit presentation, made AUTHORITATIVE by specificity - the exact dual
+   of the dimmed rule below, learned one round later (round 12, the FIFTH
+   collision in this file): `.map-edge--knowledge.map-edge--neutral` at
+   specificity 0,0,2 kept a SELECTED Knowledge relationship at its ordinary
+   1.5 width, and the late `.map-edge--unrouted` kept its 0.45 marker opacity
+   on lit edges - so an edge could carry map-edge--lit and paint as if nothing
+   were selected. Lit and dimmed are the two halves of one statement about the
+   whole surface; both now out-rank every per-kind, per-state and per-marker
+   rule. The semantic DASHES survive - knowledge stays dashed, unrouted stays
+   its distinct dash - only width and opacity yield. The single-class rule
+   stays alongside for the rendered-class ownership gate. */
+.map-edge--lit {
+  stroke-width: 3;
+}
+
+.map-edge.map-edge--lit {
+  stroke-width: 3;
+  opacity: 1;
+}
+
+/* §4's dimmed-edge opacity, made AUTHORITATIVE by specificity rather than by
+   source order. Round 11 found the FOURTH cascade collision in this file:
+   `.map-edge--unrouted` sets opacity 0.45 later in the file at equal
+   specificity, so a dimmed unroutable relationship painted nine times
+   brighter than §4 allows. Every single-class opacity rule loses to the
+   compound — which is the point: dimming is a statement about the whole
+   surface, and no per-kind or per-marker rule may quietly out-rank it. The
+   unrouted DASH marker survives; only its opacity yields. The single-class
+   rule stays alongside because the rendered-class ownership gate reads
+   ownership from single-class selectors; the compound is the one that wins
+   the cascade. */
+.map-edge--dimmed {
+  opacity: 0.05;
+}
+
+.map-edge.map-edge--dimmed {
+  opacity: 0.05;
+}
+
+.map-tile--lit,
+.map-tile--dimmed {
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+/* The canvas is a focusable region: it must show where focus is. */
+.map-canvas:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-tile--lit,
+  .map-tile--dimmed {
+    transition: none;
+  }
+}
+
+/* ============================================================
+   §3 TAXONOMY — lane counters and report pills
+   §1: the lane header answers what is DONE, who works NOW, what is
+   STUCK and what is NEXT without the reader zooming in.
+   ============================================================ */
+
+.map-lane-ring {
+  /* COMPONENT token (design-system §4.1 allows these scoped to the
+     component's own sheet — StatusOrb.css is the model). The inline style
+     overrides it per lane; this declaration is the default and the
+     definition the token gate looks for. */
+  --map-lane-progress: 0%;
+  flex: none;
+  inline-size: 20px;
+  block-size: 20px;
+  border-radius: var(--radius-full);
+  /* The ring is the completion share; the track is the remainder. */
+  background:
+    conic-gradient(var(--status-success) var(--map-lane-progress, 0%),
+                   var(--border-subtle) 0);
+}
+
+.map-lane-progress-text {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.map-lane-counters {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.map-lane-counter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.map-lane-counter--live {
+  color: var(--status-info);
+}
+
+.map-lane-counter--stuck {
+  color: var(--status-danger);
+}
+
+/* The pill is placed by the LAYOUT, in plane coordinates, like every other
+   element. It used to be an absolutely-positioned CHILD of the tile offset by
+   inset-inline-start:100% — which is exactly why it sat outside the tile's
+   measured box and could overlap the next column unseen (review 51a17ab2 B2).
+   Nothing here may reintroduce a tile-relative offset. */
+/* The plane is a CANVAS, not prose. Dragging across it must move the map, not
+   select tile titles: a stray selection also lets the browser start a native
+   text drag on the next press, which fires pointercancel and silently kills the
+   pan (owner walkthrough, 2026-08-17). touch-action lives here too, because the
+   finger lands on a CHILD of the canvas, not the canvas itself. */
+.map-plane,
+.map-plane * {
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.map-report-pill {
+  position: absolute;
+  /* THE PILL'S CELL — PLANE_METRICS.pillReserveW / pillReserveH. The strip
+     beside a tile is reserved at the widest and tallest this control paints
+     (measured live at 36x36, with the 44px mobile touch floor above it), and
+     the wrapper is held inside it so a pill can never reach past the column
+     its task stands in. */
+  max-inline-size: 96px;
+  max-block-size: 48px;
+  /* The pill CONTAINS an opener now (A2: Reports are openable from the Map),
+     so it must receive pointer events. Clicking it still does not clear the
+     chain selection — the canvas handler excludes .map-report-pill from its
+     empty-canvas test, which is why that exclusion was written. */
+  /* The tile's LAYER, not the band's. The plane stack is band 0, chip 1, lane
+     header 2, tile 3. Without this the pill sits at the auto level and the
+     band paints straight over it — present in the DOM, invisible on screen. */
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* NO FIXED SIZE. This wrapper is what the layout MEASURES, and the control
+     it contains is a kit IconButton: 36px on desktop and at least 44px under
+     the mobile touch-target floor. Pinning the wrapper at 24px made the
+     measured box smaller than the painted one, so the model reported zero
+     overlap while two adjacent Report controls overlapped by 8px on desktop
+     and 16px on mobile (round 1, B1). The box the checker sees is now the box
+     the browser paints, at every viewport, without this file having to know
+     which. The dashed-accent treatment lives on the control itself. */
+}
+
+/* The agent NAME is no longer hidden here: DETAIL_MATRIX.agentName decides
+   whether it is rendered at all, so one source of truth governs it instead of
+   a CSS rule racing the table. Only the far-band padding trim remains — the
+   badge itself survives every zoom (§3). */
+.map-tile--far .task-card-map-agent {
+  padding: 2px;
+}
+
+/* §3: the Report-to-Task link. Dashed and accent-toned, so a citation reads
+   as a reference rather than a dependency in the chain. */
+.map-edge--report {
+  stroke: var(--accent-color);
+  stroke-dasharray: 4 4;
+  opacity: 0.75;
+}
+
+/* §4 dimming for the Report surfaces (rounds 10 and 11, B2 both times). The
+   EDGES need no rule here: `.map-edge.map-edge--dimmed` above outranks the
+   0.75 report opacity and the 0.45 unrouted opacity alike. The NODES dim to
+   the node opacity, not the edge opacity, because a Report node and a Report
+   pill are furniture of the same family as the aggregates and tiles they sit
+   beside. */
+.map-aggregate-report--dimmed {
+  opacity: 0.13;
+}
+
+.map-report-pill--dimmed {
+  opacity: 0.13;
+}
+
+/* ======================================================================
+   AGGREGATE NODES — design 77950a97 amendment §2/§5-A2.
+
+   A Phase node or a Project node: what a cluster of Tasks looks like from
+   further away. It is furniture of the same family as the lane header, and
+   uses the same tokens, because it answers the same four §1 questions about
+   the same estate — a reader crossing an altitude should recognise the
+   vocabulary, not learn a second one.
+
+   NOTE ON SIZING: fixed width, content-driven height — the same shape §3
+   gives the task tile ("Width fixed (~170px), height content-driven
+   (measured, never assumed)"). The HEIGHT is what varies with the counters a
+   cluster happens to carry, and the layout reads it from the MEASURED box
+   rather than from a constant (mapGraphModel Rule 1). FALLBACK_AGGREGATE.w
+   mirrors the width below, so the pre-measurement pass and the measured pass
+   agree on that axis instead of reflowing across it.
+   ====================================================================== */
+
+.map-aggregate {
+  position: absolute;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-3);
+  inline-size: 220px;
+  z-index: 2;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+}
+
+/* A Project contains Phases, so it reads one step heavier than they do. */
+.map-aggregate--project {
+  border-color: var(--border-strong);
+}
+
+/* §3's alarm treatment, at aggregate scale: a cluster containing stuck work
+   must be findable without opening it. */
+.map-aggregate--stuck {
+  border-color: var(--status-danger);
+}
+
+/* The Project kicker on a Phase node: secondary to the phase name, but
+   present, because the phase name alone is ambiguous across the estate. */
+.map-aggregate-lane {
+  grid-column: 1 / -1;
+  font-size: var(--text-xs);
+  line-height: var(--leading-tight);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-aggregate-name {
+  grid-column: 1 / -1;
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-aggregate-ring {
+  --map-lane-progress: 0%;
+  flex: none;
+  inline-size: 20px;
+  block-size: 20px;
+  border-radius: var(--radius-full);
+  /* The ring is the completion share; the track is the remainder — same two
+     stops as .map-lane-ring, so the two altitudes read identically. */
+  background:
+    conic-gradient(var(--status-success) var(--map-lane-progress, 0%),
+                   var(--border-subtle) 0);
+}
+
+.map-aggregate-counters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-inline-size: 0;
+  /* Round 15 B1: this row was nowrap inside the FIXED 220px measured box, so
+     with all six facts present (done, live, stuck, next, and the two
+     internal-kind marks) the chips painted OUTSIDE the rectangle the layout
+     had measured - the exact painted-vs-measured class the measured-box
+     invariant (design §2) exists to prevent. Wrapping turns extra content
+     into extra HEIGHT, and height is measured: the aggregate's ref reads the
+     real offset box, the layout reruns, and the zero-overlap invariant holds
+     against what is actually painted. */
+  flex-wrap: wrap;
+}
+
+/* The rolled-up task count is the aggregate's headline number. */
+.map-aggregate-count {
+  position: absolute;
+  inset-block-start: var(--space-2);
+  inset-inline-end: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* A rolled-up edge carries multiplicity in its stroke width, set inline from
+   the roll-up.
+
+   IT MUST NOT SET A COLOUR UNCONDITIONALLY. This rule used to declare
+   `stroke: var(--border-strong)` and, sitting later in the file at equal
+   specificity, it silently overrode every one of §4's four chain-state
+   colours - so the aggregate altitudes computed dammed/active/satisfied
+   correctly and then painted all three the same grey. The state classes are
+   the ones that carry meaning; this only supplies the NEUTRAL case, and only
+   when no state has been asserted.
+
+   AND IT IS SCOPED TO THE DEPENDENCY KIND. Round 8: this selector at
+   specificity 0,0,2 outranked `.map-edge--knowledge` at 0,0,1, so a neutral
+   rolled-up KNOWLEDGE edge kept its dash and lost its teal - and §4 requires
+   Report links dashed teal at every zoom. Fixing one cascade collision in
+   round 7 created another in the same file; naming the kind is what keeps this
+   rule out of the way of the one above it. */
+.map-edge--aggregate.map-edge--dependency.map-edge--neutral {
+  stroke: var(--border-strong);
+}
+
+/* A Report drawn once at an aggregate altitude (amendment §2/§5-A2.1).
+
+   This rule positions ONLY. The control inside is the kit's compact Button,
+   which owns its own height, border, focus ring and disabled treatment — so
+   none of that is restated here, and the §7 two-size rule is satisfied by
+   using the kit rather than by claiming the §7-A1 chip exemption. */
+
+.map-aggregate-report {
+  position: absolute;
+  /* Above the aggregate nodes it converges on, like the task-altitude pill
+     sits above its band. */
+  z-index: 3;
+  max-inline-size: 160px;
+}
+
+.map-aggregate-report-title {
+  display: inline-block;
+  max-inline-size: 104px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* §3's dashed-accent Report treatment, applied to the control the wrapper
+   contains rather than to the wrapper, so the painted box and the measured
+   box are the same box. */
+.map-report-pill .icon-btn {
+  border: 1px dashed var(--accent-color);
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  color: var(--text-accent);
+}
+
+/* List mode REPLACES the canvas (§6). The canvas keeps its DOM node — §8
+   requires it to stay mounted, and unmounting is how the abandoned attempt
+   lost its listeners — but it leaves the visual flow entirely, so it cannot
+   be seen, focused, or reached by a pointer while the list is selected.
+   `aria-hidden` and the removed tab stop on the element itself do the same
+   for assistive technology; this rule is the visual half. */
+.map-view--list .map-canvas {
+  display: none;
+}
+
+/* With the canvas gone the list is the surface, not a 40% drawer under it. */
+.map-view--list .map-tree {
+  max-block-size: none;
+  flex: 1 1 auto;
+}
+
+/* A relationship the router could not clear. A2 forbids dropping it silently,
+   so it is still drawn - but marked, so a reader is not told a clean
+   connection exists where one could not be found. */
+.map-edge--unrouted {
+  stroke-dasharray: 2 6;
+  opacity: 0.45;
+}
+
+/* The aggregate's own control: it carries the node's name and toggles the §4
+   reveal. Styled to read as the node's title rather than as a button sitting
+   on top of one - the kit supplies the height, focus ring and semantics. */
+.map-aggregate-select {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+  inline-size: 100%;
+  min-inline-size: 0;
+  padding-inline: var(--space-1);
+  background: transparent;
+  border-color: transparent;
+}
+
+.map-aggregate--selected {
+  border-color: var(--accent-color);
+}
+
+/* §4's chain presentation, at the aggregate altitudes: the selected chain
+   stays lit and everything else recedes, matching what a Task selection does
+   one altitude down. */
+.map-aggregate--dimmed {
+  opacity: 0.13;
+}
+
+.map-aggregate--lit {
+  opacity: 1;
+}
+
+/* ============================================================
+   A7b: organization morphs (§2) and the radial hull (§3)
+   ============================================================ */
+
+/* Switching organizations: elements TWEEN to their recomputed targets.
+   0.5s cubic-bezier(.4,0,.2,1) on left/top (and the container boxes' size);
+   the plane transform rides the same curve so the fitted frame and the
+   travelling tiles arrive together. The class lives for the 500ms of the
+   morph and is then removed, so the ordinary 200ms status-glide transition
+   owns left/top again. */
+.map-plane--morphing {
+  transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.map-plane--morphing .map-tile,
+.map-plane--morphing .map-report-pill,
+.map-plane--morphing .map-band-chip,
+.map-plane--morphing .map-lane-header,
+.map-plane--morphing .map-aggregate {
+  transition: left 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+              top 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.map-plane--morphing .map-band {
+  transition: left 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+              top 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+              width 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+              height 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Edge routes cannot tween — they are recomputed geometry, not moved boxes.
+   They step aside while the tiles travel and return at the destination. */
+.map-plane--morphing .map-edges {
+  opacity: 0;
+  transition: opacity 0.2s var(--ease-out);
+}
+
+/* §3: the radial band container. Mirrors .map-band's surface so the two
+   container forms read as one family. */
+.map-hull {
+  fill: var(--bg-surface);
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+}
+
+/* §2: reduced motion = INSTANT swap. The whole morph stands down; the swap
+   is the committed re-render itself. */
+@media (prefers-reduced-motion: reduce) {
+  .map-plane--morphing,
+  .map-plane--morphing .map-tile,
+  .map-plane--morphing .map-report-pill,
+  .map-plane--morphing .map-band,
+  .map-plane--morphing .map-band-chip,
+  .map-plane--morphing .map-lane-header,
+  .map-plane--morphing .map-aggregate,
+  .map-plane--morphing .map-edges {
+    transition: none;
+  }
+}
+
+/* B2: while the container-morph overlay travels, the static containers stand
+   aside — the overlay IS the band for those 500ms, and it arrives at the
+   exact target geometry before unmounting, so nothing pops. The overlay
+   itself must stay visible through the edge fade, so it re-asserts opacity
+   inside the faded .map-edges svg. */
+.map-plane--container-morph .map-hull:not(.map-hull--morph),
+.map-plane--container-morph .map-band {
+  opacity: 0;
+  transition: none;
+}
+
+.map-plane--morphing .map-edges .map-hull--morph {
+  opacity: 1;
+}
+
+.map-plane--container-morph .map-edges {
+  opacity: 1;
+}
+
+.map-plane--container-morph .map-edges path:not(.map-hull) {
+  opacity: 0;
+}
+
+/* Ownership rule for the travelling container (rendered-class gate): the
+   overlay carries .map-hull for the shared surface, and this leading
+   declaration owns the modifier and keeps it styled on its own terms. */
+.map-hull--morph {
+  fill: var(--bg-surface);
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+}
+
+/* ============================================================
+   §2/§5-A3 — THE CONTINUOUS PLANE
+   A container is the REGION a phase or a project occupies, never a node on
+   some other plane. Its ink fades IN as the tiles inside fade out, in place:
+   no landing, no jump, positions retained (clause 1). Its size is the
+   honest picture of how much work is inside it (clause 2).
+
+   GEOMETRY OWNERSHIP is unchanged: left/top/width/height and the cross-fade
+   opacity are applied INLINE by MapView from the layout engine; this sheet
+   declares appearance only.
+   ============================================================ */
+
+.map-container {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  overflow: hidden;
+  z-index: 4;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-elevated);
+  /* The fade follows the ZOOM, which is a direct manipulation and needs no
+     easing of its own; this only smooths the STEPPED zoom controls, and it
+     stands down under reduced motion with everything else. */
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+/* A Project contains Phases, so it reads one step heavier — the same
+   relationship the aggregate nodes carry, because it is the same one. */
+.map-container--project {
+  z-index: 5;
+  border-color: var(--border-strong);
+}
+
+/* Clause 2 (R3): "State stays legible at every altitude by tint:
+   essentially-complete reads green, blocked reads red, archived reads
+   faded." All three arms, because at the zoom where containers carry the
+   plane the tint is the ONLY thing carrying state — the card is close-zoom
+   ink and a small region does not get one at all.
+
+   The tint is a BACKGROUND and a BORDER, never an opacity: opacity on this
+   element is the cross-fade, applied inline, and a stylesheet that also
+   wrote it would be overwritten without saying so. */
+.map-container--stuck {
+  border-color: var(--status-danger);
+  background: var(--status-danger-soft);
+}
+
+.map-container--complete {
+  border-color: var(--status-success);
+  background: var(--status-success-soft);
+}
+
+/* Faded, in the only way a cross-faded element can be: the quietest surface
+   and the quietest border the estate has, so archived ground reads as
+   history beside work that is still live. */
+.map-container--archived {
+  border-color: var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.map-container--selected {
+  border-color: var(--accent-color);
+}
+
+/* §4's chain presentation at the container tiers. The DIM ITSELF is a
+   number, composed with the cross-fade in MapView (see CHAIN_DIM) — an
+   opacity rule here would be beaten by the inline value and would quietly
+   do nothing. What the class carries is everything else. */
+.map-container--lit {
+  z-index: 6;
+  border-color: var(--accent-color);
+}
+
+/* The other half of the same statement. The DIM ITSELF is the number
+   MapView composes with the cross-fade; what the class carries is depth —
+   a region outside the chain sits UNDER the ones inside it, so a lit chain
+   is never crossed by ground that is not part of it. */
+.map-container--dimmed {
+  z-index: 3;
+}
+
+/* What a container shows while some OTHER tier is the one in charge: §5's
+   "status-tinted shapes ... NEVER unmounted, never dots". No ink, no
+   controls, nothing to reach — the tier that owns the region owns the tab
+   order too. */
+.map-container--shape {
+  pointer-events: none;
+}
+
+/* The card is the container's ink; the container is its ground. The two are
+   separate boxes because the ground is the region — which can be very large
+   — and the ink is a card, which is exactly as big as what it says. */
+.map-container-card {
+  /* SCREEN-SPACE INK. The plane hands down its inverse scale, so the card
+     keeps the CSS size §7 designed it at however far out the world is
+     zoomed. It is drawn only where the region can hold it at that size —
+     the layout decides that, not this sheet. */
+  transform: scale(var(--map-plane-inverse-scale, 1));
+  transform-origin: top left;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-3);
+  inline-size: 220px;
+  max-inline-size: 100%;
+}
+
+/* A tile while its container carries the picture: the same shape in the
+   same place, tinted by status and holding nothing a pointer or a screen
+   reader can reach. §5 forbids unmounting it and forbids reducing it to a
+   dot; this is neither. */
+.map-tile--shape {
+  position: absolute;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  pointer-events: none;
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+/* §3's live agent badge in its FAR form — the pulsing dot. §3 is untouched
+   by A3 and requires the badge to survive every zoom level, so it survives
+   the tile becoming a shape too: it is the "who works now" signal, and it is
+   the one thing LOD may never take away. */
+.map-tile-shape-agent {
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-end: 4px;
+  inline-size: 8px;
+  block-size: 8px;
+  border-radius: var(--radius-full);
+  background: var(--status-info);
+  animation: map-agent-pulse 2s ease-in-out infinite;
+}
+
+@keyframes map-agent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-tile-shape-agent {
+    animation: none;
+  }
+}
+
+/* Status reaches the shape through a DATA ATTRIBUTE, not through a class
+   assembled from a wire string: a class built from data is a class no gate
+   can see and no stylesheet can be held to. */
+.map-tile--shape[data-status="completed"] {
+  border-color: var(--status-success);
+  background: var(--status-success-soft);
+}
+
+.map-tile--shape[data-status="in-progress"] {
+  border-color: var(--status-info);
+  background: var(--status-info-soft);
+}
+
+.map-tile--shape[data-status="review"] {
+  border-color: var(--status-warning);
+  background: var(--status-warning-soft);
+}
+
+.map-tile--shape[data-status="stuck"] {
+  border-color: var(--status-danger);
+  background: var(--status-danger-soft);
+}
+
+.map-tile--shape[data-status="ideas"] {
+  border-color: var(--status-idea);
+  background: var(--status-idea-soft);
+}
+
+/* The tile's own opacity is the cross-fade weight, applied inline. It needs
+   the same easing the container has, or the two halves of one cross-fade
+   would travel at different speeds. */
+.map-tile {
+  transition: left var(--transition-base) var(--ease-out),
+              top var(--transition-base) var(--ease-out),
+              opacity var(--transition-base) var(--ease-out);
+}
+
+/* REDUCED MOTION. The cross-fade itself is not motion — it is the picture at
+   the zoom the reader chose, and removing it would leave a blank plane. What
+   stands down is the EASING: the fade commits instantly instead of gliding,
+   exactly as §2's morph does. */
+@media (prefers-reduced-motion: reduce) {
+  .map-container,
+  .map-tile--shape,
+  .map-tile {
+    transition: none;
+  }
+}
+
+
+/* Close and aggregate captions are the same ink at the same inside-top origin.
+   The surrounding reserved ground is independent of the current LOD. */
+.map-plane[data-plane-lod] .map-band-chip,
+.map-plane[data-plane-lod] .map-lane-header {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-3);
+  inline-size: 220px;
+  max-block-size: 96px;
+  overflow: hidden;
+  transform: scale(var(--map-plane-inverse-scale, 1));
+  transform-origin: top left;
+  transition: opacity var(--transition-base) var(--ease-out);
+}
+
+.map-plane[data-plane-lod] .map-aggregate-name {
+  font-size: var(--text-sm);
+}
+
+.map-plane[data-plane-lod] .map-aggregate-select {
+  grid-column: 1 / -1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-plane[data-plane-lod] .map-band-chip,
+  .map-plane[data-plane-lod] .map-lane-header {
+    transition: none;
+  }
+}
+
+/* Every plane caption uses the same bounded, top-edge frame. Narrow frames
+   keep all four numeric facts, using the same status symbols as their titles.
+   Container queries change wrapping, never the world-space footprint. */
+.map-plane[data-plane-lod] :is(.map-band-chip, .map-lane-header, .map-container-card) {
+  container-type: inline-size;
+  border-radius: var(--radius-md);
+  padding: var(--space-1);
+  gap: var(--space-1);
+  max-block-size: 120px;
+}
+.map-counter-symbol { display: none; }
+@container (max-width: 160px) {
+  .map-counter-symbol { display: inline-block; flex: none; }
+  .map-counter-word { position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip-path: inset(50%); }
+  /* Give the ratified 16px symbols the whole caption width. The progress
+     ring shares the metadata row instead of consuming a counter column. */
+  .map-aggregate-ring { inline-size: 16px; block-size: 16px; grid-column: 1; grid-row: 1; }
+  .map-aggregate-lane { grid-column: 2; }
+  .map-aggregate-counters { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; }
+}
+[data-plane-lod="silhouette"] :is(.map-container-card, .map-band-chip, .map-lane-header) {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Organic's region is the branch network and its phase clusters. The project
+   wrapper owns caption placement and hit testing, while the underlay owns the
+   truthful geography. Archived work is the quiet central circle. */
+.map-organic-region { fill: var(--bg-surface); stroke: var(--border-strong); }
+.map-organic-region--core { fill: var(--bg-surface); stroke: var(--border-subtle); }
+.map-organic-branch { fill: none; stroke: var(--border-strong); stroke-width: 16px; }
+.map-plane--branched .map-container--project { background: transparent; border-color: transparent; }
+
+.map-organic-region.map-container--stuck { fill: var(--status-danger-soft); stroke: var(--status-danger); }
+.map-organic-region.map-container--complete { fill: var(--status-success-soft); stroke: var(--status-success); }
+.map-container--core .map-container-card {
+  position: absolute;
+  left: calc(50% - 110px * var(--map-plane-inverse-scale));
+  top: 64px;
+}
+
+.map-organic-region .map-hull { fill: inherit; stroke: inherit; }
+
+.map-project-territory { fill: inherit; stroke: inherit; stroke-width: 1px; }
+.map-organic-region .map-hull { fill: var(--bg-elevated); stroke: var(--border-default); }
+.map-organic-region .map-hull.map-container--stuck { fill: var(--status-danger-soft); stroke: var(--status-danger); }
+.map-organic-region .map-hull.map-container--complete { fill: var(--status-success-soft); stroke: var(--status-success); }
+.map-plane--branched .map-tile { transition: left 500ms var(--ease-out), top 500ms var(--ease-out), opacity var(--transition-base) var(--ease-out); }
+
+/* Secondary metadata must remain legible on every status-tinted region. */
+.map-plane[data-plane-lod] :is(.map-aggregate-lane, .map-aggregate-count, .map-lane-counter:not(.map-lane-counter--live):not(.map-lane-counter--stuck)) {
+  color: var(--text-primary);
+}
+
+/* Persistent ground is painted in the SVG below connections. Caption and
+   hit-target overlays never obscure tasks, nested phase ground or routes. */
+.map-plane[data-plane-lod] .map-container {
+  background: transparent;
+  border-color: transparent;
+}
+.map-project-ground {
+  fill: var(--bg-surface);
+  stroke: var(--border-strong);
+  stroke-width: 2px;
+}
+.map-phase-ground {
+  fill: var(--bg-elevated);
+  stroke: var(--border-default);
+  stroke-width: 1px;
+}
+.map-project-ground.map-container--stuck,
+.map-phase-ground.map-container--stuck { fill: var(--status-danger-soft); stroke: var(--status-danger); }
+.map-project-ground.map-container--complete,
+.map-phase-ground.map-container--complete { fill: var(--status-success-soft); stroke: var(--status-success); }
+.map-project-ground.map-container--archived,
+.map-phase-ground.map-container--archived { fill: var(--bg-surface); stroke: var(--border-subtle); }
+.map-project-territory { stroke-width: 2px; }
+.map-organic-region .map-hull { stroke-width: 1px; }
+
+/* The outer HTML transform scales SVG strokes too. Compensate explicitly so
+   ownership borders remain readable at Fit, as well as at task zoom. */
+.map-plane[data-plane-lod] :is(.map-project-ground, .map-project-territory) {
+  stroke-width: calc(2px * var(--map-plane-inverse-scale));
+}
+.map-plane[data-plane-lod] :is(.map-phase-ground, .map-organic-region .map-hull, .map-organic-region--core ellipse) {
+  stroke-width: calc(1px * var(--map-plane-inverse-scale));
+}

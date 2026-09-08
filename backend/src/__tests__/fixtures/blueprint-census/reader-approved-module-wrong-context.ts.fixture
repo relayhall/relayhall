@@ -1,0 +1,1 @@
+class BlueprintInstantiationService {afterCommitRenderer(){return pool.query('SELECT document FROM blueprint_versions WHERE id=$1')}}

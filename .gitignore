@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables — real env files must never be tracked; only the
+# .example templates belong in git (.env.dev leaked a real DB password into
+# history once — see convergence-20260723).
+.env
+.env.dev
+.env.local
+.env.*.local
+.env.backup*
+.env.bak*
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sql.gz
+postgres_data_*/
+backups/
+data/
+
+# Temporary files
+tmp/
+temp/
+
+# Config files (use .example as template)
+relayhall.config.json
+# relayhall.plugins.json is deliberately TRACKED (convergence-20260723): the
+# prod compose reads it from /deployed-repo, which under the exact-main wrapper
+# only contains git-tracked files. No secrets; per-env tweaks go in
+# config_override.
+backend/data/device/
+
+# Deployment-specific residue patterns (never published; see scripts/check-public-residue.py)
+.residue-patterns.local.json
+
+# Local code relationship index
+/graphify-out/
+# Generated code graph
+# Generated code relationship graph
+graphify-out/
+# Dependency directories may be linked by isolated local checkouts.
+**/node_modules

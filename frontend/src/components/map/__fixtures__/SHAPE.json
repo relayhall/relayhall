@@ -1,0 +1,88 @@
+{
+  "recordedAt": "2026-08-16T21:05:54.358Z",
+  "source": "DEV :18082, showcase fixture",
+  "graph": {
+    "keys": [
+      "success",
+      "lod",
+      "nodes",
+      "edges",
+      "phases",
+      "generatedAt",
+      "fullCount"
+    ],
+    "nodeCount": 14,
+    "nodeKeys": [
+      "id",
+      "phaseId",
+      "priority",
+      "project",
+      "status",
+      "title",
+      "updated"
+    ],
+    "edgeCount": 6,
+    "edgeKinds": [
+      "dependency"
+    ],
+    "phaseCount": 3,
+    "phaseKeys": [
+      "goal",
+      "id",
+      "name",
+      "position",
+      "projectId"
+    ],
+    "phasesWithGoal": 0,
+    "statuses": [
+      "completed",
+      "ideas",
+      "in-progress",
+      "review",
+      "stuck",
+      "todo"
+    ],
+    "projects": [
+      "Atlas Migration",
+      "Beacon Observability",
+      "Coral Docs",
+      null
+    ],
+    "nodesWithPhase": 6,
+    "nodesWithoutPhase": 8,
+    "fullCount": 14
+  },
+  "aggregate": {
+    "keys": [
+      "success",
+      "lod",
+      "nodes",
+      "edges",
+      "generatedAt",
+      "fullCount"
+    ],
+    "nodeKeys": [
+      "byStatus",
+      "kind",
+      "progress",
+      "project",
+      "total"
+    ],
+    "hasPhases": false
+  },
+  "delta": {
+    "status": 200,
+    "nodeCount": 0,
+    "keys": [
+      "success",
+      "lod",
+      "nodes",
+      "edges",
+      "phases",
+      "generatedAt",
+      "fullCount",
+      "deltaOf"
+    ]
+  },
+  "provenanceNote": "graph.task.json / graph.delta.json were recorded from the live DEV serializer BEFORE the section 3 taxonomy fields existed, so their nodes carry no agent or progress and the responses carry no reports key. That absence reflects the serializer at recording time, NOT the current wire. Tests needing taxonomy vary one field on top of these bodies and say so in place; report rows follow the serializer shape {id, taskId, title} returned by backend queryLinkedReports."
+}

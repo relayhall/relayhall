@@ -1,0 +1,137 @@
+/* CoreSurfacePlaceholder — the explanatory shell for the always-on core
+   surfaces (Sessions, Tools, Stats).
+   Every value here is a semantic token: this sheet is read on these three surfaces,
+   so an off-scale size or a hand-rolled shadow shows up in each consumer. */
+
+.core-placeholder-container {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: var(--space-8);
+}
+
+.core-placeholder-card {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-10);
+  max-inline-size: 800px;
+  box-shadow: var(--shadow-1);
+}
+
+.core-placeholder-icon {
+  display: flex;
+  justify-content: center;
+  margin-block-end: var(--space-6);
+  color: var(--accent-color);
+}
+
+.core-placeholder-card h2 {
+  margin-block: var(--space-0) var(--space-4);
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+  line-height: var(--leading-tight);
+  text-align: center;
+}
+
+/* The description is the one paragraph that explains the surface. It was
+   centred, which turned three lines of running text into three ragged ones;
+   a bounded measure, left-aligned and centred as a BLOCK, is the same shape
+   without the ragged edges. */
+.core-placeholder-description {
+  margin-block: var(--space-0) var(--space-8);
+  margin-inline: var(--space-0) auto;
+  max-inline-size: 68ch;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.core-placeholder-section {
+  margin-block-end: var(--space-6);
+  padding: var(--space-5);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.core-placeholder-section h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-block: var(--space-0) var(--space-3);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+}
+
+.core-placeholder-section ul,
+.core-placeholder-section ol {
+  margin-block: var(--space-0);
+  margin-inline-start: var(--space-5);
+  color: var(--text-secondary);
+  line-height: var(--leading-relaxed);
+}
+
+.core-placeholder-section li + li {
+  margin-block-start: var(--space-2);
+}
+
+/* `--font-mono` is the shipped IBM Plex Mono. This sheet named 'Courier New'
+   and therefore rendered in whatever generic monospace the browser chose. */
+.core-placeholder-section code,
+.core-placeholder-footer code {
+  padding: var(--space-0) var(--space-1);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-accent);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* The one in-copy link the placeholders ship (Tools → Skills) carried no
+   colour rule at all, so it rendered in the browser's default blue — off
+   palette in every Theme and below AA in relay-dark and high-contrast. */
+.core-placeholder-description a,
+.core-placeholder-section a,
+.core-placeholder-footer a {
+  color: var(--text-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.core-placeholder-footer {
+  margin-block-start: var(--space-8);
+  padding-block-start: var(--space-6);
+  border-block-start: 1px solid var(--border-default);
+}
+
+.core-placeholder-footer p {
+  margin-block: var(--space-0);
+  margin-inline: var(--space-0) auto;
+  max-inline-size: 68ch;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.core-placeholder-footer strong {
+  color: var(--text-accent);
+}
+
+@media (max-width: 768px) {
+  .core-placeholder-container {
+    padding: var(--space-4) var(--space-2);
+  }
+
+  .core-placeholder-card {
+    padding: var(--space-6);
+  }
+
+  .core-placeholder-section {
+    padding: var(--space-4);
+  }
+}

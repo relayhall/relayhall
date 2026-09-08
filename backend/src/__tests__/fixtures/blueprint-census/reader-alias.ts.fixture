@@ -1,0 +1,1 @@
+function provenance(){const table='blueprint_'+'versions'; const {query:read}=pool; return read('SELECT * FROM '+table+' WHERE id=$1')}

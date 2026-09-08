@@ -1,0 +1,64 @@
+# RESERVED — migration numbers claimed by an in-flight lane branch
+#
+# Owner ruling PARALLEL-WRITERS `0464ad54` §2 (2026-09-03) replaced the
+# one-product-writer rule with parallel lane branches, and with it the
+# assumption that migration numbers on `main` are contiguous:
+#
+#   > "Migration numbers are RESERVED here, not read live. A lane uses ONLY
+#   >  its reserved numbers; an unreserved number is a packet violation. ...
+#   >  The migration runner orders by filename, so a reserved number that
+#   >  integrates LATER than a higher one is acceptable ONLY if the files are
+#   >  independent (a lane's migration must not depend on another lane's
+#   >  schema; if it does, say so in the handover and integrate after it)."
+#
+# Because lanes integrate serially in a preference order that is NOT the
+# numeric order, `main` legitimately holds a GAP wherever a lower reserved
+# number belongs to a lane that has not integrated yet. This file is the
+# authority on which gaps are legitimate: `projectResourceMigrationContract`
+# asserts that every absent number past the 067 tip appears HERE, so an
+# unreserved gap — a renumbering, a deleted migration, a typo'd filename —
+# still fails the gate exactly as it did before the ruling.
+#
+# A lane that needs a number not listed here asks the dispatcher and this file
+# gains a line FIRST.
+#
+# THIS LEDGER IS APPEND-ONLY HISTORY. A line is NEVER removed once written,
+# not even after its migration has integrated (review `bfac1dd5` finding F4).
+# Retiring lines was the defect: with the line gone, a DELETED migration looked
+# like an ordinary un-integrated reservation and the gate stayed green. Keeping
+# every line means the gate can tell "not written yet" from "was here and is
+# gone", because the second question is answered by git, not by this file.
+#
+# The gate that reads this file
+# (`backend/src/__tests__/projectResourceMigrationContract.test.ts`) enforces:
+#   1. every migration number PRESENT past the 067 tip is reserved HERE — an
+#      unreserved new migration is a packet violation, not a free choice;
+#   2. every number ABSENT in the range is reserved here — a renumbering fails;
+#   3. every migration file present at the MERGE BASE is still present at HEAD
+#      — deletion is caught by git, an anchor this file cannot forge;
+#   4. this file's grammar is complete and no number is reserved twice.
+#
+# Format: <number> <lane-branch-or-lane-name> [<card>]
+109 rh-bbec04de-setgov-a bbec04de
+110 rh-fb06c930-retry-contract fb06c930
+111 rh-beac9c79-tw1a beac9c79
+112 rh-beac9c79-tw1a beac9c79
+113 rh-beac9c79-tw1a beac9c79
+114 rh-0b4b779b-kw1 0b4b779b
+115 rh-0b4b779b-kw1 0b4b779b
+116 rh-0b4b779b-kw1 0b4b779b
+117 rh-b363a38c-az-proj-a b363a38c
+118 tw1b dac2ca71
+119 tw1b dac2ca71
+120 tw1c 50e74c1d
+121 blueprint-build 7e202fca
+122 blueprint-build 7e202fca
+123 rule-4-arm
+124 rh-feata-duedate 7d38a6e0
+125 rh-95572530-az-proj-b 95572530
+126 rh-3793117c-tw1d 3793117c
+127 rh-74e02a05-lenses-a 74e02a05
+128 rh-4287af8a-lenses-b 4287af8a
+129 rh-590e88cc-scale 590e88cc
+130 rh-50493968-personality-versions 50493968
+131 fresh-install-cleanup c0c93382

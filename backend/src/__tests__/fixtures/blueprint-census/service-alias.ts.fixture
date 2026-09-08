@@ -1,0 +1,1 @@
+import {grantService as grant} from '../services/GrantService'; const writer=grant; writer['cre'+'ate']({});

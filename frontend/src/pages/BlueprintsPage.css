@@ -1,0 +1,49 @@
+.blueprints-page { color: var(--text-primary); max-width: 100%; }
+.blueprint-page-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--space-4); margin-bottom: var(--space-6); }
+.blueprint-page-header h1 { display: flex; align-items: center; gap: var(--space-3); font-size: var(--text-2xl); margin: 0; }
+.blueprints-page h2 { font-size: var(--text-xl); }
+.blueprints-page h3 { font-size: var(--text-sm); }
+.blueprints-page h4 { font-size: var(--text-sm); }
+.blueprints-page p, .blueprints-page li, .blueprints-page label, .blueprints-page dd, .blueprints-page dt, .blueprints-page summary { font-size: var(--text-sm); }
+.blueprints-page p, .blueprints-page dd, .blueprints-page li { overflow-wrap: anywhere; }
+.blueprints-page small { font-size: var(--text-xs); color: var(--text-secondary); }
+.blueprint-actions { display: flex; flex-wrap: wrap; gap: var(--space-3); margin: var(--space-4) 0; }
+.blueprint-steps { display: flex; flex-wrap: wrap; gap: var(--space-3); list-style: none; padding: 0; color: var(--text-secondary); }
+.blueprint-steps li { padding: var(--space-2); border-bottom: 2px solid transparent; }
+.blueprint-steps [aria-current="step"] { color: var(--text-primary); font-weight: var(--font-bold); border-color: var(--focus-ring-color); }
+.blueprint-registry { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: var(--space-4); }
+.blueprint-registry article, .blueprint-lifecycle { padding: var(--space-5); background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.blueprint-status { color: var(--text-secondary); font-size: var(--text-sm); font-weight: var(--font-normal); }
+.blueprint-fields { display: grid; gap: var(--space-5); }
+.blueprint-field { display: flex; flex-direction: column; gap: var(--space-2); }
+.blueprints-page label { display: block; font-weight: var(--font-medium); margin-bottom: var(--space-2); }
+.blueprints-page input:not([type="file"]), .blueprints-page textarea, .blueprints-page select { width: 100%; box-sizing: border-box; min-height: var(--control-standard); padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text-primary); font: inherit; }
+.blueprints-page textarea { resize: vertical; }
+.blueprints-page input:focus-visible, .blueprints-page textarea:focus-visible, .blueprints-page select:focus-visible, .blueprints-page summary:focus-visible, .blueprints-page a:focus-visible { outline: 2px solid var(--focus-ring-color); outline-offset: 2px; }
+.blueprint-error { color: var(--text-error); border-left: 2px solid var(--text-error); padding: var(--space-3); margin: var(--space-3) 0; }
+.blueprint-data { margin: var(--space-3) 0; }
+.blueprint-data > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 3fr); gap: var(--space-3); padding: var(--space-2) 0; }
+.blueprint-data dt { color: var(--text-secondary); }
+.blueprint-data dd { margin: 0; min-width: 0; }
+.blueprint-literal { white-space: pre-wrap; overflow-wrap: anywhere; }
+.blueprints-page details { border-bottom: 1px solid var(--border-subtle); padding: var(--space-3) 0; }
+.blueprints-page summary { cursor: pointer; min-height: var(--control-compact); }
+.blueprint-document { font-family: var(--font-mono); }
+.blueprints-page a { color: var(--text-accent); }
+@media (max-width: 1279px) {
+  .blueprint-page-header { padding-inline-start: var(--space-16); }
+}
+@media (max-width: 640px) {
+  .blueprint-data > div { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
+  .blueprint-actions > .btn { flex: 1 1 auto; }
+}
+
+.blueprint-plan, .blueprint-wizard, .blueprint-setup { min-width: 0; }
+
+.blueprint-tile { min-width: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.blueprint-tile h2, .blueprint-tile p { margin: 0; }
+.blueprint-tile .map-aggregate-select { width: 100%; text-align: start; justify-content: flex-start; white-space: normal; }
+.blueprint-tile .map-aggregate-name { font-size: var(--text-xl); font-weight: var(--font-semibold); overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .blueprints-page *, .blueprints-page *::before, .blueprints-page *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}

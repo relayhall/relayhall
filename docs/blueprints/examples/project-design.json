@@ -1,0 +1,228 @@
+{
+  "schemaVersion": "rh.blueprint/1.0",
+  "blueprint": {
+    "key": "project-design",
+    "name": "Project design",
+    "version": 1,
+    "summary": "Project design",
+    "description": "A portable interview-driven plan. Tasks begin parked; human decisions and ordinary write authority govern subsequent work.",
+    "tags": [
+      "governed-work"
+    ],
+    "provenance": "human-authored"
+  },
+  "parameters": [
+    {
+      "key": "design_name",
+      "label": "Design name",
+      "promptText": "What is the design called?",
+      "type": "string",
+      "required": true,
+      "order": 0
+    },
+    {
+      "key": "owning_project",
+      "label": "Owning project",
+      "promptText": "Which existing Project contains this design?",
+      "type": "project-ref",
+      "required": false,
+      "order": 1
+    },
+    {
+      "key": "author_principal",
+      "label": "Author principal",
+      "promptText": "Who authors the design?",
+      "type": "principal-ref",
+      "required": true,
+      "order": 2
+    },
+    {
+      "key": "verifier_principal",
+      "label": "Verifier principal",
+      "promptText": "Who verifies it? Must not be the author.",
+      "type": "principal-ref",
+      "required": true,
+      "order": 3
+    },
+    {
+      "key": "ratifier_principal",
+      "label": "Ratifier principal",
+      "promptText": "Who decides whether to ratify? They steward both decision arms.",
+      "type": "principal-ref",
+      "required": true,
+      "order": 4
+    },
+    {
+      "key": "governing_documents",
+      "label": "Governing documents",
+      "promptText": "Which reports govern this design?",
+      "type": "text",
+      "required": false,
+      "order": 5
+    },
+    {
+      "key": "review_rounds_cap",
+      "label": "Review rounds cap",
+      "promptText": "What is the review rounds cap?",
+      "type": "integer",
+      "required": false,
+      "default": 4,
+      "constraints": {
+        "min": 1,
+        "max": 20
+      },
+      "order": 6
+    }
+  ],
+  "target": {
+    "mode": "existing-project",
+    "project": "{{owning_project}}"
+  },
+  "phases": [
+    {
+      "key": "phase-author",
+      "name": "Author",
+      "position": 0
+    },
+    {
+      "key": "phase-review",
+      "name": "Review",
+      "position": 1
+    },
+    {
+      "key": "phase-ratify",
+      "name": "Ratify",
+      "position": 2
+    }
+  ],
+  "tasks": [
+    {
+      "key": "author-v1",
+      "title": "Author v1",
+      "phase": "phase-author",
+      "roles": {
+        "shepherd": "{{author_principal}}"
+      },
+      "definitionOfDone": "State purpose, governing decisions, vocabulary, behavior, authority, failure modes, acceptance and limitations. Governing documents: {{governing_documents}}"
+    },
+    {
+      "key": "red-team",
+      "title": "Same-family red team",
+      "phase": "phase-review",
+      "defaults": {
+        "personality": "functional-alignment-reviewer"
+      },
+      "references": [
+        "design-review-brief"
+      ]
+    },
+    {
+      "key": "repair-v11",
+      "title": "Repair to v1.1",
+      "phase": "phase-review"
+    },
+    {
+      "key": "cross-family",
+      "title": "Cross-family review round",
+      "phase": "phase-review",
+      "roles": {
+        "verifier": "{{verifier_principal}}"
+      }
+    },
+    {
+      "key": "repair",
+      "title": "Repair",
+      "phase": "phase-review",
+      "description": "Stop at {{review_rounds_cap}} review rounds and seek disposition."
+    },
+    {
+      "key": "sitting",
+      "title": "Ratification sitting",
+      "phase": "phase-ratify"
+    },
+    {
+      "key": "fold-amendments",
+      "title": "Fold amendments",
+      "phase": "phase-ratify"
+    },
+    {
+      "key": "close-card",
+      "title": "Close the card",
+      "phase": "phase-ratify"
+    },
+    {
+      "key": "repair-review",
+      "title": "Repair and re-review",
+      "phase": "phase-review"
+    }
+  ],
+  "humanGates": [
+    {
+      "key": "ratification-decision",
+      "title": "Ratification decision",
+      "phase": "phase-ratify",
+      "decider": "{{ratifier_principal}}",
+      "decisionPrompt": "Ratify this design, or request another bounded review round?",
+      "arms": [
+        {
+          "key": "ratify",
+          "label": "Ratify",
+          "tasks": [
+            "fold-amendments",
+            "close-card"
+          ]
+        },
+        {
+          "key": "another-round",
+          "label": "Another round",
+          "tasks": [
+            "repair-review"
+          ]
+        }
+      ]
+    }
+  ],
+  "references": [
+    {
+      "kind": "personality",
+      "name": "functional-alignment-reviewer",
+      "requirement": "optional"
+    },
+    {
+      "kind": "skill",
+      "name": "design-review-brief",
+      "requirement": "optional"
+    }
+  ],
+  "dependencies": [
+    {
+      "task": "red-team",
+      "dependsOn": "author-v1"
+    },
+    {
+      "task": "repair-v11",
+      "dependsOn": "red-team"
+    },
+    {
+      "task": "cross-family",
+      "dependsOn": "repair-v11"
+    },
+    {
+      "task": "repair",
+      "dependsOn": "cross-family"
+    },
+    {
+      "task": "sitting",
+      "dependsOn": "repair"
+    },
+    {
+      "task": "ratification-decision",
+      "dependsOn": "sitting"
+    },
+    {
+      "task": "close-card",
+      "dependsOn": "fold-amendments"
+    }
+  ],
+  "reports": []
+}

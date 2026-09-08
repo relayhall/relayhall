@@ -1,0 +1,210 @@
+{
+  "compose": {
+    "frontend/src/components/ConfirmationModal.tsx": [
+      "btn-cancel"
+    ],
+    "frontend/src/components/PluginFrame.tsx": [
+      "loading-spinner"
+    ],
+    "frontend/src/components/dashboard/HeroCard.tsx": [
+      "hero-greeting",
+      "hero-tagline"
+    ],
+    "frontend/src/components/projects/ContextPreview.tsx": [
+      "retry-btn"
+    ],
+    "frontend/src/components/projects/CreateProjectModal.tsx": [
+      "form-group",
+      "modal-content",
+      "modal-overlay"
+    ],
+    "frontend/src/components/projects/ProjectDetailModal.tsx": [
+      "brief-modal",
+      "brief-modal-overlay",
+      "project-detail-header"
+    ],
+    "frontend/src/components/skills/SkillDetailModal.tsx": [
+      "form-row"
+    ],
+    "frontend/src/pages/AuditPage.tsx": [
+      "audit-header"
+    ],
+    "frontend/src/pages/DashboardPage.tsx": [
+      "dashboard-error",
+      "dashboard-stats-grid",
+      "retry-button"
+    ],
+    "frontend/src/pages/ProjectsPage.tsx": [
+      "filter-option",
+      "filter-toggle",
+      "loading-spinner",
+      "projects-grid",
+      "projects-search",
+      "projects-sort",
+      "retry-btn"
+    ],
+    "frontend/src/pages/StatsPage.tsx": [
+      "stats-header"
+    ],
+    "frontend/src/pages/TaskCreatePage.tsx": [
+      "task-detail-back",
+      "task-detail-content-section",
+      "task-detail-heading",
+      "task-detail-inline-error",
+      "task-detail-layout",
+      "task-detail-left-rail",
+      "task-detail-page",
+      "task-detail-page-header",
+      "task-detail-page-header-controls",
+      "task-detail-rail-group",
+      "task-detail-section",
+      "task-detail-section-heading",
+      "task-detail-title-editor",
+      "task-detail-work",
+      "sr-only"
+    ]
+  },
+  "global_selector_exclusions": {
+    "frontend/src/styles/responsive-phase3.css": {
+      "dashboard-stats-grid": [
+        "dashboard-page-dashboard-stats-grid"
+      ]
+    }
+  },
+  "contextual": {
+    "frontend/src/components/dashboard/HeroCard.css": {
+      "hero-action-btn": ".hero-card",
+      "hero-quick-actions": ".hero-card"
+    },
+    "frontend/src/components/projects/ProjectDetailModal.css": {
+      "context-preview": ".project-detail-modal",
+      "form-row": ".project-detail-modal"
+    },
+    "frontend/src/components/tasks/TaskCard.css": {
+      "priority-high": ".task-card",
+      "priority-low": ".task-card"
+    },
+    "frontend/src/pages/ProjectsPage.css": {
+      "sort-select": ".projects-page"
+    },
+    "frontend/src/pages/TasksPage.css": {
+      "task-column-expanded": ".tasks-page-container"
+    }
+  },
+  "renames": {
+    "frontend/src/components/ConfirmationModal.css": {
+      "btn-cancel": "confirmation-modal-btn-cancel"
+    },
+    "frontend/src/components/PluginFrame.css": {
+      "loading-spinner": "plugin-frame-loading-spinner"
+    },
+    "frontend/src/components/dashboard/HeroCard.css": {
+      "hero-greeting": "hero-card-hero-greeting",
+      "hero-tagline": "hero-card-hero-tagline"
+    },
+    "frontend/src/components/projects/ContextPreview.css": {
+      "retry-btn": "context-preview-retry-btn"
+    },
+    "frontend/src/components/projects/CreateProjectModal.css": {
+      "error-message": "create-project-modal-error-message",
+      "form-group": "create-project-modal-form-group",
+      "modal-content": "create-project-modal-modal-content",
+      "modal-overlay": "create-project-modal-modal-overlay"
+    },
+    "frontend/src/components/projects/ProjectCard.css": {
+      "stat-agents": "project-card-stat-agents",
+      "stat-progress": "project-card-stat-progress",
+      "stat-total": "project-card-stat-total"
+    },
+    "frontend/src/components/projects/ProjectDetailModal.css": {
+      "brief-modal": "project-detail-modal-brief-modal",
+      "brief-modal-overlay": "project-detail-modal-brief-modal-overlay",
+      "project-detail-header": "project-detail-modal-project-detail-header"
+    },
+    "frontend/src/components/projects/ProjectResources.css": {
+      "resources-hint": "project-resources-resources-hint"
+    },
+    "frontend/src/components/skills/SkillDetailModal.css": {
+      "form-row": "skill-detail-modal-form-row"
+    },
+    "frontend/src/pages/AuditPage.css": {
+      "audit-header": "audit-page-audit-header"
+    },
+    "frontend/src/pages/DashboardPage.css": {
+      "dashboard-error": "dashboard-page-dashboard-error",
+      "dashboard-stats-grid": "dashboard-page-dashboard-stats-grid",
+      "error-icon": "dashboard-page-error-icon",
+      "retry-button": "dashboard-page-retry-button"
+    },
+    "frontend/src/pages/ProjectsPage.css": {
+      "filter-option": "projects-page-filter-option",
+      "filter-toggle": "projects-page-filter-toggle",
+      "loading-spinner": "projects-page-loading-spinner",
+      "projects-grid": "projects-page-projects-grid",
+      "projects-search": "projects-page-projects-search",
+      "projects-sort": "projects-page-projects-sort",
+      "retry-btn": "projects-page-retry-btn"
+    },
+    "frontend/src/pages/StatsPage.css": {
+      "stats-header": "stats-page-stats-header"
+    }
+  },
+  "tsx": {
+    "frontend/src/components/ConfirmationModal.tsx": {
+      "btn-cancel": "confirmation-modal-btn-cancel"
+    },
+    "frontend/src/components/PluginFrame.tsx": {
+      "loading-spinner": "plugin-frame-loading-spinner"
+    },
+    "frontend/src/components/dashboard/HeroCard.tsx": {
+      "hero-greeting": "hero-card-hero-greeting",
+      "hero-tagline": "hero-card-hero-tagline"
+    },
+    "frontend/src/components/projects/ContextPreview.tsx": {
+      "retry-btn": "context-preview-retry-btn"
+    },
+    "frontend/src/components/projects/CreateProjectModal.tsx": {
+      "error-message": "create-project-modal-error-message",
+      "form-group": "create-project-modal-form-group",
+      "modal-content": "create-project-modal-modal-content",
+      "modal-overlay": "create-project-modal-modal-overlay"
+    },
+    "frontend/src/components/projects/ProjectCard.tsx": {
+      "stat-agents": "project-card-stat-agents",
+      "stat-progress": "project-card-stat-progress",
+      "stat-total": "project-card-stat-total"
+    },
+    "frontend/src/components/projects/ProjectDetailModal.tsx": {
+      "brief-modal": "project-detail-modal-brief-modal",
+      "brief-modal-overlay": "project-detail-modal-brief-modal-overlay",
+      "project-detail-header": "project-detail-modal-project-detail-header"
+    },
+    "frontend/src/components/projects/ProjectResources.tsx": {
+      "resources-hint": "project-resources-resources-hint"
+    },
+    "frontend/src/components/skills/SkillDetailModal.tsx": {
+      "form-row": "skill-detail-modal-form-row"
+    },
+    "frontend/src/pages/AuditPage.tsx": {
+      "audit-header": "audit-page-audit-header"
+    },
+    "frontend/src/pages/DashboardPage.tsx": {
+      "dashboard-error": "dashboard-page-dashboard-error",
+      "dashboard-stats-grid": "dashboard-page-dashboard-stats-grid",
+      "error-icon": "dashboard-page-error-icon",
+      "retry-button": "dashboard-page-retry-button"
+    },
+    "frontend/src/pages/ProjectsPage.tsx": {
+      "filter-option": "projects-page-filter-option",
+      "filter-toggle": "projects-page-filter-toggle",
+      "loading-spinner": "projects-page-loading-spinner",
+      "projects-grid": "projects-page-projects-grid",
+      "projects-search": "projects-page-projects-search",
+      "projects-sort": "projects-page-projects-sort",
+      "retry-btn": "projects-page-retry-btn"
+    },
+    "frontend/src/pages/StatsPage.tsx": {
+      "stats-header": "stats-page-stats-header"
+    }
+  }
+}

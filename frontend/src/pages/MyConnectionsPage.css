@@ -1,0 +1,52 @@
+/* My connections (card 653be44f). Tokens only; the status pairings mirror the
+   Access manager's, which the contrast matrix already proves in all three
+   Themes. */
+
+.conn-page { color: var(--text-primary); }
+.conn-page-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.conn-page-head > div { display: flex; align-items: center; gap: var(--space-2); }
+.conn-page-head h1 { margin: 0; font-size: var(--text-xl); }
+.conn-page-head svg { color: var(--text-accent); }
+.conn-page-intro { max-width: 82ch; margin: var(--space-2) 0 var(--space-4); color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+
+.conn-empty { margin-top: var(--space-4); padding: var(--space-5); border: 1px dashed var(--border-default); border-radius: var(--radius-lg); background: var(--bg-surface); text-align: center; }
+.conn-empty-title { margin: 0 0 var(--space-2); color: var(--text-primary); font-size: var(--text-xl); }
+.conn-empty-body { max-width: 62ch; margin: 0 auto var(--space-4); color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+
+.conn-list { list-style: none; margin: var(--space-4) 0 0; padding: 0; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden; }
+.conn-item { border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); }
+.conn-item:last-child { border-bottom: 0; }
+.conn-item-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); padding: var(--space-3); }
+.conn-item-title { flex: 1; min-width: 180px; }
+.conn-item-name { display: block; margin: 0; color: var(--text-primary); font-size: var(--text-sm); font-weight: var(--font-semibold); }
+.conn-item-title small { display: block; margin-top: var(--space-1); color: var(--text-secondary); font-size: var(--text-xs); }
+.conn-item-meta { color: var(--text-secondary); font-size: var(--text-xs); }
+.conn-item-tools { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.conn-item-detail { padding: 0 var(--space-3) var(--space-4); border-top: 1px solid var(--border-subtle); }
+
+.conn-status { width: max-content; padding: var(--space-1) var(--space-2); border-radius: var(--radius-full); font-family: var(--font-mono); font-size: var(--text-xs); }
+.conn-status--live { border: 1px solid var(--status-success); color: var(--text-success); background: var(--status-success-soft); }
+.conn-status--graced { border: 1px solid var(--status-warning); color: var(--status-warning); background: var(--status-warning-soft); }
+.conn-status--revoked { border: 1px solid var(--status-danger); color: var(--text-error); background: var(--status-danger-soft); }
+.conn-status--replaced { border: 1px solid var(--status-danger); color: var(--text-error); background: var(--status-danger-soft); }
+.conn-status--none, .conn-status--disabled { border: 1px solid var(--border-default); color: var(--text-secondary); background: var(--bg-elevated); }
+.conn-status--expired { border: 1px solid var(--border-default); color: var(--text-secondary); background: var(--bg-elevated); }
+
+.conn-advanced { margin-top: var(--space-3); }
+.conn-adv-section { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--border-subtle); }
+.conn-adv-section h3 { margin: 0 0 var(--space-2); font-size: var(--text-sm); color: var(--text-primary); }
+
+.conn-facts { display: grid; grid-template-columns: minmax(160px, max-content) 1fr; gap: var(--space-1) var(--space-3); margin: 0; font-size: var(--text-sm); }
+.conn-facts dt { color: var(--text-secondary); }
+.conn-facts dd { margin: 0; color: var(--text-primary); }
+
+.conn-agents, .conn-warrants, .conn-grants { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.conn-agent, .conn-warrant, .conn-grant { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); color: var(--text-primary); font-size: var(--text-sm); }
+.conn-agent-handle, .conn-warrant-name { font-weight: var(--font-medium); }
+.conn-agent-meta { color: var(--text-secondary); font-size: var(--text-xs); }
+
+@media (max-width: 640px) {
+  .conn-item-row { align-items: flex-start; }
+  .conn-item-tools { width: 100%; }
+  .conn-facts { grid-template-columns: 1fr; }
+}

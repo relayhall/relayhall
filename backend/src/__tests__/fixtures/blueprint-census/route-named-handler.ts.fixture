@@ -1,0 +1,1 @@
+async function apply(req,res){const {blueprintId,instanceId}=req.body;await update(blueprintId,instanceId)} router.post('/apply',apply);

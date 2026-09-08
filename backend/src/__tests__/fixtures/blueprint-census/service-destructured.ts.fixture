@@ -1,0 +1,1 @@
+import {grantService} from '../services/GrantService'; const {create:write}=grantService; write({});

@@ -1,0 +1,1 @@
+router.patch('/tasks/:taskId',async(req,res)=>res.json({id:req.params.taskId}));router.get('/blueprints/:blueprintId',async(req,res)=>res.json({id:req.params.blueprintId}));

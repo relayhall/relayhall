@@ -1,0 +1,99 @@
+# EVERY GATE STEP THIS REPOSITORY RUNS, one per line.
+#
+# Built from `main` at the commit that split CI into two tiers (ci.yml, fast,
+# every push; ci-full.yml, complete, on demand). `scripts/check-workflow-shape.py`
+# requires each name below to appear EXACTLY ONCE across the two workflows, so a
+# gate cannot be dropped, and cannot be quietly duplicated into both tiers
+# either. Adding a gate means adding its name here in the same commit.
+#
+# The shared bootstrap steps are deliberately absent: `Wait for PostgreSQL to
+# accept connections`, `Bring up the contract database (base schema +
+# migrations)` and `Install backend dependencies` run once per job by design,
+# so an exactly-once rule cannot be stated about them. They are job plumbing,
+# not gates.
+#
+# Blank lines and lines beginning with # are ignored.
+Keep GitHub and Gitea CI definitions identical
+Install the workflow-shape gate's YAML parser
+Enforce workflow shape (a malformed workflow runs NOTHING)
+Prove the workflow-shape gate itself
+Validate shell scripts
+Validate secret-scan preprocessor
+Check publication allowlist matches the tree
+Test setup and backup failure boundaries
+Test publication failure boundaries
+Test GitHub configuration contract
+Enforce public terminology
+Prove the terminology gate itself (A15.2)
+Keep semantic and API version truth centralized
+Prove the version-truth gate itself
+Enforce design tokens (existence + literal-colour ratchet)
+Prove the design-token gate itself
+Enforce the contrast pairing matrix (relay-dark)
+Enforce the contrast pairing matrix (relay-light)
+Enforce the contrast pairing matrix (high-contrast)
+Prove the design-contrast gate itself
+Keep one Theme value space across CSS, engine, plugins and schema
+Prove the theme-parity gate itself
+Pin the theme boot snippet to its recorded CSP hash
+Prove the theme boot-hash gate itself
+Keep exceptions out of logs (ratchet)
+Prove the error-log hygiene gate itself
+Prove the colour-sweep mapping semantics
+Reject cross-stylesheet class collisions
+Every rendered class must be owned by a stylesheet
+Prove the rendered-class gate itself
+Every class a guarded stylesheet OWNS must have a renderer
+Prove the dead-selector census itself
+Prove the sweep scripts themselves
+Enforce semantic/brand token separation
+Prove the semantic-token gate itself
+Reject emoji in chrome
+Prove the emoji-chrome gate itself
+Enforce the type scale and control metrics
+Prove the type-scale gate itself
+Check the brand asset set
+Prove the brand-asset gate itself
+Reject private deployment residue
+Prove the residue gate's pattern loader
+Validate Compose configuration
+List/point authorization parity (08f42f36)
+Project-bounded selector form, live (95572530)
+Task create/move target Project authorization (9c177e6a)
+Project to Task Grant inheritance
+Project to Task inheritance semantic controls
+Task point-route refusal shape (f9b7febe)
+Blueprint atomic creation, transport and retry contract (7e202fca)
+Blueprint gates and role authority contract (7e202fca)
+Session touch burst bound (8491557e)
+Mint target authorization (45e7110a)
+Report link authorization (aad1894b, 91af25a6)
+Telemetry projection authorization and replay (50e74c1d)
+Day-one connection acceptance (6e25ae48, 3f145fa3)
+The password act (bc5cd9f0)
+Knowledge fan-out set and board authorization (0b4b779b)
+Directory group carriage, live (74e02a05)
+Task write-field contract (9c3a1aa4, 7d38a6e0)
+FEAT-A backend red proofs (7d38a6e0)
+FEAT-A MCP receipt and schema red proofs
+Featured, home group and the creation default, live (4287af8a)
+Retry contract against a real PostgreSQL (fb06c930, owner ruling 94ecf329)
+Blueprint document policy and census real-red controls (7e202fca)
+Blueprint canonical runtime and gate real-red controls (7e202fca)
+Blueprint MCP real-red controls in isolated source (7e202fca)
+Three clean Blueprint installations and portability (7e202fca)
+Prove the SSO login-drill oracles (cba66ebb, 533db731)
+Prove the SETGOV drill oracles (bbec04de, annex 85a2218d)
+Immutable Personality versions and production API contract
+Boot check on the compiled build (the artefact the container runs)
+Prove the SETGOV contract census and its normaliser anchor (bbec04de)
+Prove the orchestration-configuration drill oracles (590c638a)
+Orchestration configuration reaches the compiled process (590c638a)
+Red-proof drill for the carriage controls (74e02a05, B-L10a)
+Task read paths under load at estate scale (590e88cc)
+Pin the BUILT theme boot snippet to the same CSP hash
+Accessibility smoke set (axe)
+Blueprint interview real-red controls in isolated source (7e202fca)
+The deadline control across a daylight-saving gap and fold (7d38a6e0)
+FEAT-A frontend red proofs (7d38a6e0)
+Blueprint CLI real-red controls in isolated source (7e202fca)

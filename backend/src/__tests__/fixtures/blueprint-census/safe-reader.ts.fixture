@@ -1,0 +1,1 @@
+function provenance(task){return {blueprint:task.blueprintKey,version:task.blueprintVersion}} function ledger(){return pool.query('SELECT v.version,i.instantiation_id FROM blueprint_versions v JOIN ledger i ON true')}

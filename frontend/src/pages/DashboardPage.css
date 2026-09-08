@@ -1,0 +1,153 @@
+/* DashboardPage - Main Dashboard Layout */
+@import '../styles/variables.css';
+
+.dashboard-page {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: var(--space-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+/* Seven lifecycle cards, including Review as distinct from Stuck. */
+.dashboard-page-dashboard-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+/* Keep all seven lifecycle states on one normal desktop row. These
+   page-owned compact dimensions also prevent legacy global dashboard styles
+   from making the cards too wide for the added Review state. */
+.dashboard-page-dashboard-stats-grid .stats-card {
+  min-width: 0;
+  padding: var(--space-4);
+  gap: var(--space-3);
+}
+
+.dashboard-page-dashboard-stats-grid .stats-card-icon {
+  font-size: 32px;
+}
+
+.dashboard-page-dashboard-stats-grid .stats-card-label {
+  font-size: var(--text-xs);
+}
+
+.dashboard-page-dashboard-stats-grid .stats-card-description {
+  font-size: var(--text-xs);
+}
+
+/* Two-column widget grid */
+.dashboard-widget-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-6);
+}
+
+/* Loading State */
+.dashboard-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 400px;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* Error State */
+.dashboard-page-dashboard-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  min-height: 300px;
+  color: var(--text-secondary);
+}
+
+.dashboard-page-error-icon {
+  font-size: 36px;
+}
+
+.dashboard-page-retry-button {
+  padding: var(--space-3) var(--space-6);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  font-family: var(--font-body);
+}
+
+.dashboard-page-retry-button:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-strong);
+}
+
+/* Responsive Design */
+/* Tablet: four cards on the first row, three on the second. */
+@media (max-width: 1279px) {
+  .dashboard-page-dashboard-stats-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--space-5);
+  }
+
+  .dashboard-widget-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .dashboard-page-dashboard-stats-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+}
+
+/* Mobile: two readable cards per row. */
+@media (max-width: 640px) {
+  .dashboard-page {
+    padding: var(--space-4);
+    gap: var(--space-6);
+  }
+
+  .dashboard-page-dashboard-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-2);
+  }
+
+  /* Compact mobile cards */
+  .dashboard-page-dashboard-stats-grid .stats-card {
+    padding: var(--space-2);
+    gap: var(--space-1);
+  }
+
+  .dashboard-page-dashboard-stats-grid .stats-card-icon {
+    font-size: var(--text-sm);
+  }
+
+  .dashboard-page-dashboard-stats-grid .stats-card-value {
+    font-size: var(--text-sm);
+  }
+
+  .dashboard-page-dashboard-stats-grid .stats-card-label {
+    font-size: var(--text-xs);
+    letter-spacing: 0.02em;
+  }
+
+  .dashboard-page-dashboard-stats-grid .stats-card-description {
+    display: none; /* Hide description on mobile for compactness */
+  }
+}
+
+/* Global dashboard card header consistency */
+.dashboard-page h3 {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  margin: 0;
+  color: var(--text-primary);
+}

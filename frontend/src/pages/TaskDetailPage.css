@@ -1,0 +1,1080 @@
+.task-detail-page {
+  --task-detail-left-width: 17.5rem;
+  --task-detail-left-compact-width: 14rem;
+  --task-detail-timeline-width: 22.5rem;
+  min-width: 0;
+  color: var(--text-primary);
+}
+
+.task-detail-skip {
+  position: fixed;
+  inset-block-start: var(--space-2);
+  inset-inline-start: var(--space-2);
+  z-index: var(--z-modal);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--accent-color);
+  color: var(--text-on-fill);
+  transform: translateY(calc(-100% - var(--space-4)));
+}
+
+.task-detail-skip:focus-visible {
+  transform: translateY(var(--space-0));
+}
+
+.task-detail-page-header {
+  position: sticky;
+  inset-block-start: var(--space-0);
+  z-index: 100;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-block-end: 1px solid var(--border-default);
+  background: var(--bg-app);
+}
+
+.task-detail-back,
+.task-detail-heading,
+.task-detail-page-header-controls,
+.task-detail-page-header-controls label,
+.task-detail-id,
+.task-detail-page-header button:not(.editable-frame-edit) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.task-detail-back {
+  min-block-size: var(--control-standard);
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.task-detail-heading {
+  min-width: 0;
+}
+
+.task-detail-title-editor {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.task-detail-title-editor input {
+  min-width: 0;
+  min-block-size: var(--control-standard);
+  padding-inline: var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.task-detail-heading h1 {
+  margin: var(--space-0);
+  overflow: hidden;
+  font-size: var(--text-2xl);
+  line-height: var(--leading-tight);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-id,
+.task-detail-liveness {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  /* Owner ruling 2026-08-16: the pill matches its sibling header controls
+     instead of floating shorter in the same row. */
+  min-block-size: var(--control-standard);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.task-detail-page-header-controls {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.task-detail-page-header-controls label {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-page-header select,
+.task-detail-page-header button:not(.editable-frame-edit),
+.task-detail-tabs a,
+.task-detail-state button,
+.task-detail-state a {
+  /* Standard 48px control size: page-header context (design 77950a97
+     s7). One type size across the row (census A12: the 12px select
+     beside 16px button text retires). */
+  min-block-size: var(--control-standard);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.task-detail-page-header button:not(.editable-frame-edit),
+.task-detail-state button,
+.task-detail-state a {
+  justify-content: center;
+  padding-inline: var(--space-3);
+  cursor: pointer;
+}
+
+.task-detail-state a {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.task-detail-page-header select {
+  padding-inline: var(--space-2);
+}
+
+.task-detail-page :focus-visible,
+.task-detail-state :focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-offset);
+}
+
+.task-detail-liveness--active { color: var(--text-success); }
+.task-detail-liveness--stale,
+.task-detail-liveness--orphan { color: var(--text-warning); }
+.task-detail-liveness--unknown { color: var(--text-tertiary); }
+
+.task-detail-actions {
+  position: relative;
+}
+
+.task-detail-actions-menu {
+  position: absolute;
+  inset-block-start: calc(100% + var(--space-1));
+  inset-inline-end: var(--space-0);
+  z-index: var(--z-modal);
+  display: grid;
+  min-inline-size: calc(var(--space-20) * 2);
+  padding: var(--space-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-2);
+}
+
+.task-detail-actions-menu button {
+  justify-content: flex-start;
+  border-color: transparent;
+}
+
+.task-detail-danger {
+  color: var(--text-error) !important;
+}
+
+.task-detail-inline-error,
+.task-detail-inline-warning {
+  grid-column: 2 / -1;
+  margin: var(--space-0);
+  font-size: var(--text-sm);
+}
+
+.task-detail-inline-error {
+  color: var(--text-error);
+}
+
+.task-detail-inline-warning {
+  color: var(--text-warning);
+}
+
+.task-detail-tabs {
+  display: none;
+}
+
+/* Body-scale base for the whole surface: bare paragraphs, hints and
+   inline links inherit 14 instead of the browser's 16 (computed-census
+   residue; the declared rules all set explicit tokens). The create page
+   carries the same base in its own sheet (class ownership gate). */
+.task-detail-page {
+  font-size: var(--text-sm);
+}
+
+.task-detail-layout {
+  display: grid;
+  grid-template-columns: minmax(var(--task-detail-left-compact-width), var(--task-detail-left-width)) minmax(0, 1fr) minmax(calc(var(--space-20) * 3), var(--task-detail-timeline-width));
+  min-width: 0;
+}
+
+@media (min-width: 1280px) and (min-height: 480px) {
+  .task-detail-page {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .task-detail-page-header { flex: none; }
+
+  .task-detail-layout {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .task-detail-left-rail,
+  .task-detail-work,
+  .task-detail-timeline {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-gutter: stable;
+  }
+}
+
+.task-detail-left-rail,
+.task-detail-work,
+.task-detail-timeline {
+  min-width: 0;
+  padding: var(--space-4);
+}
+
+.task-detail-left-rail {
+  border-inline-end: 1px solid var(--border-subtle);
+}
+
+.task-detail-work {
+  width: 100%;
+  max-width: 76ch;
+  margin-inline: auto;
+}
+
+.task-detail-timeline {
+  border-inline-start: 1px solid var(--border-subtle);
+}
+
+.task-detail-left-rail h2,
+.task-detail-work h2,
+.task-detail-timeline h2,
+.task-detail-rail-group h3,
+.task-detail-advanced h3 {
+  margin-block-start: var(--space-0);
+}
+
+/* Census A2: region headings are section scale (20), one step below the
+   24px page title; a 280px rail never carries page-title type. */
+.task-detail-left-rail h2,
+.task-detail-work h2,
+.task-detail-timeline h2 {
+  font-size: var(--text-xl);
+}
+
+.task-detail-rail-group,
+.task-detail-advanced {
+  padding-block: var(--space-3);
+  border-block-start: 1px solid var(--border-subtle);
+}
+
+.task-detail-rail-group h3,
+.task-detail-advanced h3 {
+  margin-block-end: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.task-detail-rail-group dl,
+.task-detail-advanced dl {
+  display: grid;
+  gap: var(--space-3);
+  margin: var(--space-0);
+}
+
+.task-detail-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.task-detail-field dt {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-field dd {
+  min-width: 0;
+  margin: var(--space-0);
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.task-detail-field select,
+.task-detail-field input {
+  max-width: 100%;
+  min-block-size: var(--control-compact);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.task-detail-field input {
+  width: 100%;
+  padding-inline: var(--space-2);
+}
+
+.task-detail-field-editor,
+.task-detail-field-value {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.task-detail-field-editor .task-detail-editor-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.task-detail-chip-list,
+.task-detail-relation-list,
+.task-detail-reference-list,
+.task-detail-field ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin: var(--space-0);
+  padding: var(--space-0);
+  list-style: none;
+}
+
+.task-detail-chip-list li,
+.task-detail-reference-list li {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.task-detail-reference-list li {
+  display: grid;
+  max-width: 100%;
+  gap: var(--space-1);
+}
+
+.task-detail-reference-list code,
+.task-detail-advanced code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.task-detail-relation-list {
+  display: grid;
+}
+
+.task-detail-status-dot {
+  display: inline-block;
+  inline-size: var(--space-2);
+  block-size: var(--space-2);
+  margin-inline-end: var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--text-tertiary);
+}
+
+.task-detail-status-dot--in-progress { background: var(--accent-color); }
+.task-detail-status-dot--review { background: var(--status-warning); }
+.task-detail-status-dot--stuck { background: var(--status-danger); }
+.task-detail-status-dot--completed { background: var(--status-success); }
+.task-detail-status-dot--archived { background: var(--text-tertiary); }
+.task-detail-status-dot--ideas,
+.task-detail-status-dot--todo,
+.task-detail-status-dot--unknown { background: var(--border-strong); }
+
+.task-detail-content-section {
+  min-width: 0;
+  padding-block: var(--space-5);
+  border-block-end: 1px solid var(--border-subtle);
+}
+
+.task-detail-section-heading,
+.task-detail-editor-actions,
+.task-detail-external-update,
+.task-timeline-event-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.task-detail-section-heading h2,
+.task-detail-content-section > h2 {
+  margin: var(--space-0);
+  font-size: var(--text-xl);
+}
+
+.task-detail-section-heading button,
+.task-detail-editor-actions button,
+.task-detail-content-section button:not(.editable-frame-edit),
+.task-timeline button,
+.task-detail-field-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-block-size: var(--control-compact);
+  inline-size: fit-content;
+  padding-inline: var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+/* Linked-report entries: the h3+anchor rendered browser defaults
+   (18.7px, #0000ee - an axe contrast failure on dark themes). On-scale
+   type and accent link ink. */
+.task-detail-report-list h3 {
+  margin: var(--space-0);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+}
+
+.task-detail-report-list h3 a {
+  color: var(--text-accent);
+}
+
+.task-detail-report-list > li > p {
+  margin: var(--space-1) 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.task-detail-section-editor,
+.task-detail-rail-editor,
+.task-detail-report-list,
+.task-timeline-day ol {
+  display: grid;
+  gap: var(--space-3);
+  margin-block-start: var(--space-3);
+}
+
+.task-detail-section-editor textarea,
+.execution-profile-editor input,
+.execution-profile-editor select {
+  width: 100%;
+  min-block-size: var(--control-compact);
+  padding: var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.task-detail-section-editor textarea {
+  resize: vertical;
+}
+
+.task-detail-section-error,
+.task-detail-partial-error {
+  color: var(--text-error);
+}
+
+.task-detail-external-update,
+.task-detail-advisory,
+.task-detail-callout {
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.task-detail-advisory {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.task-detail-markdown,
+.task-detail-markdown pre,
+.task-detail-markdown table {
+  max-width: 100%;
+}
+
+.task-detail-markdown pre,
+.task-detail-markdown .table-wrapper,
+.task-detail-markdown table {
+  overflow-x: auto;
+}
+
+.task-detail-markdown img {
+  max-width: 100%;
+}
+
+.task-detail-additional-section {
+  min-width: 0;
+}
+
+.task-detail-report-list,
+.task-timeline-day ol {
+  padding: var(--space-0);
+  list-style: none;
+}
+
+.task-detail-report-list > li,
+.task-timeline-event {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.task-detail-report-list h3 {
+  margin-block: var(--space-0);
+}
+
+.task-detail-report-list blockquote {
+  margin-inline: var(--space-0);
+  padding: var(--space-3);
+  border-inline-start: var(--space-1) solid var(--border-strong);
+  background: var(--bg-surface);
+}
+
+.task-detail-report-list blockquote > span {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.task-timeline {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Owner ruling 2026-08-16 + RH-UI.20: the timeline filter renders through
+   the kit SegmentedControl - literally the same recipe as the tasks view
+   switcher now. The rail is narrow, so options may wrap. */
+.task-timeline-filters {
+  flex-wrap: wrap;
+}
+
+.task-timeline-filters .segmented-option {
+  flex: 1 1 auto;
+}
+
+.task-timeline-audit-caption,
+.task-timeline-partial-error,
+.task-timeline-redaction-tombstone {
+  margin: var(--space-0);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.task-timeline-audit-caption {
+  color: var(--text-secondary);
+}
+
+.task-timeline-partial-error {
+  padding: var(--space-2);
+  border: 1px solid var(--status-danger);
+  border-radius: var(--radius-sm);
+  color: var(--text-error);
+}
+
+.task-timeline-partial-error button {
+  min-block-size: var(--control-compact);
+  padding-inline: var(--space-2);
+}
+
+.task-timeline-day h3 {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.task-timeline-event {
+  display: grid;
+  grid-template-columns: var(--space-6) minmax(0, 1fr);
+  gap: var(--space-2);
+  min-width: 0;
+  scroll-margin-block-start: calc(var(--space-20) * 2);
+  background: var(--bg-app);
+}
+
+.task-timeline-event-icon {
+  display: grid;
+  place-items: center;
+  inline-size: var(--space-6);
+  block-size: var(--space-6);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+}
+
+.task-timeline-event-body {
+  min-width: 0;
+}
+
+.task-timeline-event-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-timeline-event-summary button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Compact control size (design 77950a97 §7). It was a 32px square, which
+     the physical-only height scan could not see through the logical
+     spelling (hardening 8244fda8). */
+  inline-size: var(--control-compact);
+  block-size: var(--control-compact);
+  padding: var(--space-0);
+}
+
+.task-timeline-event-summary button[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
+.task-timeline-event-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  margin-block-start: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.task-timeline-event-detail {
+  min-width: 0;
+  margin-block-start: var(--space-2);
+}
+
+.task-timeline-quoted-content {
+  min-width: 0;
+  margin: var(--space-0);
+  padding: var(--space-2);
+  border-inline-start: var(--space-1) solid var(--border-strong);
+  background: var(--bg-surface);
+}
+
+.task-timeline-quoted-content > span {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.task-timeline-quoted-content pre {
+  max-block-size: calc(var(--space-20) * 4);
+  margin-block: var(--space-2) var(--space-0);
+  overflow: auto;
+  color: var(--text-primary);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.task-timeline-event--redacted {
+  border-style: dashed;
+  background: var(--bg-surface);
+}
+
+.task-timeline-redaction-tombstone {
+  margin-block-start: var(--space-2);
+  color: var(--text-secondary);
+}
+
+.task-timeline-event--highlighted {
+  border-color: var(--accent-color);
+  background: var(--accent-soft);
+  animation: task-timeline-highlight 1.2s ease-out 1;
+}
+
+.task-timeline-older {
+  width: 100%;
+}
+
+@keyframes task-timeline-highlight {
+  from { box-shadow: inset 0 0 0 2px var(--accent-color); }
+  to { box-shadow: inset 0 0 0 0 var(--accent-color); }
+}
+
+.task-detail-content-section .core-placeholder-container {
+  min-height: auto;
+  padding: var(--space-3) var(--space-0);
+  background: transparent;
+}
+
+.task-detail-content-section .core-placeholder-card {
+  padding: var(--space-4);
+}
+
+.task-detail-content-section .core-placeholder-card h2 {
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+}
+
+.task-detail-read-only {
+  color: var(--text-tertiary);
+}
+
+.task-detail-advanced summary {
+  min-block-size: var(--control-standard);
+  cursor: pointer;
+}
+
+.task-detail-advanced summary h3 {
+  display: inline;
+}
+
+.task-detail-state {
+  display: grid;
+  place-items: center;
+  gap: var(--space-3);
+  max-width: calc(var(--space-20) * 8);
+  margin: var(--space-20) auto;
+  padding: var(--space-8);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  text-align: center;
+}
+
+.task-detail-state--permission {
+  border-color: var(--status-warning);
+  background: var(--status-warning-soft);
+}
+
+.task-detail-state--not-found {
+  border-style: dashed;
+}
+
+.task-detail-state--error {
+  border-color: var(--status-danger);
+}
+
+.task-detail-state h1,
+.task-detail-state p {
+  margin: var(--space-0);
+}
+
+.task-detail-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.task-detail-skeleton {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  min-block-size: calc(var(--space-20) * 5);
+  padding: var(--space-4);
+}
+
+.task-detail-skeleton > div {
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+@media (max-width: 1279px) {
+  .task-detail-page-header {
+    grid-template-columns: auto minmax(var(--space-20), 1fr);
+  }
+
+  .task-detail-page-header-controls {
+    grid-column: 1 / -1;
+  }
+
+  .task-detail-layout {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .task-detail-timeline {
+    position: static;
+    display: block;
+    width: auto;
+    border-inline-start: 0;
+  }
+
+
+  .task-detail-work { order: -1; max-width: none; }
+  .task-detail-left-rail { border-inline-end: 0; }
+  .task-detail-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+  }
+}
+
+@media (min-width: 1280px) {
+  .task-detail-timeline-toggle {
+    display: none !important;
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  .task-detail-layout {
+    grid-template-columns: var(--task-detail-left-compact-width) minmax(0, 1fr);
+  }
+
+  .task-detail-left-rail,
+  .task-detail-work {
+    padding: var(--space-3);
+  }
+}
+
+@media (max-width: 767px) {
+  .task-detail-page-header {
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: var(--space-2);
+  }
+
+  .task-detail-heading h1 {
+    font-size: var(--text-xl);
+  }
+
+  .task-detail-page-header-controls {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .task-detail-id,
+  .task-detail-timeline-toggle {
+    display: none;
+  }
+
+  .task-detail-actions-menu {
+    position: fixed;
+    inset-block-start: calc(var(--space-20) + var(--space-12));
+    inset-inline-end: var(--space-2);
+  }
+
+  .task-detail-tabs {
+    position: static;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    border-block-end: 1px solid var(--border-default);
+    background: var(--bg-app);
+  }
+
+  .task-detail-tabs a {
+    border-color: transparent;
+    border-radius: var(--space-0);
+  }
+
+
+  .task-detail-layout {
+    display: flex;
+  }
+
+  .task-detail-left-rail,
+  .task-detail-work,
+  .task-detail-timeline {
+    position: static;
+    display: block;
+    width: auto;
+    padding: var(--space-3);
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .task-detail-page-header { position: static; }
+}
+
+/* A very short desktop viewport also uses natural scrolling, keeping the
+   wrapped header usable instead of leaving a zero-height reading region. */
+@media (max-height: 479px) {
+  .task-detail-page-header { position: static; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-detail-page *,
+  .task-detail-page *::before,
+  .task-detail-page *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
+
+  .task-timeline-event--highlighted {
+    animation: none;
+  }
+}
+
+/* Inline navigation links inside content sections: browser-default link blue
+   is 1.99:1 on the dark app background (live-axe finding at 2fbd271). */
+.task-detail-inline-link {
+  color: var(--text-accent);
+  text-decoration: underline;
+}
+.task-detail-inline-link:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* A5 (986be411 §7): canonical structured DoD/Constraints sections. */
+.task-detail-structured-list {
+  margin: 0;
+  padding-left: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.task-detail-legacy-note {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-2);
+}
+
+/* --- A6 (design 986be411 §8) --- */
+
+/* Empty states: one compact line per section — the icon-card repetition
+   retired; CoreSurfacePlaceholder remains for genuinely empty surfaces. */
+.task-detail-empty-line {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.principal-name {
+  overflow-wrap: anywhere;
+}
+
+.task-detail-inline-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-block-start: var(--space-2);
+}
+
+.task-detail-inline-add input {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.task-detail-links-editor-list {
+  margin: var(--space-0);
+  padding: var(--space-0);
+  list-style: none;
+  display: grid;
+  gap: var(--space-1);
+}
+
+.task-detail-links-editor-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* Native region links keep all stacked content reachable without pretending
+   that visible sibling regions are mutually exclusive tabs. */
+.task-detail-tabs a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-inline: var(--space-3);
+  text-decoration: none;
+}
+
+.task-detail-left-rail,
+.task-detail-work,
+.task-detail-timeline {
+  scroll-margin-block-start: var(--space-4);
+  overscroll-behavior-y: contain;
+}
+
+@media (max-width: 1279px) {
+  .task-detail-skeleton { grid-template-columns: minmax(0, 1fr); }
+  .task-detail-left-rail,
+  .task-detail-work,
+  .task-detail-timeline { overscroll-behavior-y: auto; }
+}
+
+@media (max-width: 1279px) {
+  .task-detail-page-header .task-detail-back {
+    margin-inline-start: var(--control-standard);
+  }
+}
+
+.task-detail-heading > .editable-frame {
+  flex: 1;
+}
+
+@media (max-width: 767px) {
+  .task-detail-heading { grid-column: 1 / -1; }
+  .task-detail-page-header button.task-detail-id { display: none; }
+}
+
+/* The deadline on a Task's own page (card 7d38a6e0).
+   The absolute instant leads — this is the surface with room for it — and the
+   relative distance follows as a quieter suffix. Tone reinforces words that
+   already say "Overdue by": no state here is carried by colour alone, and
+   every pairing is one the contrast matrix tests in all three Themes. */
+.task-detail-due {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.task-detail-due-relative {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-due--later {
+  color: var(--text-primary);
+}
+
+.task-detail-due--soon {
+  color: var(--text-warning);
+}
+
+.task-detail-due--overdue {
+  color: var(--text-error);
+  font-weight: 600;
+}
+
+/* Rendered only when a deadline exists, so this state is unreachable today;
+   it is declared so the modifier set is complete and a future caller cannot
+   produce an unstyled class. */
+.task-detail-due--none {
+  color: var(--text-primary);
+}
+
+/* The deadline CONTROL's two descriptions (card 7d38a6e0, round-2 review).
+   Both are shared by the Task page and the create page, which imports this
+   file. Tokens only, and both are matrix-tested pairings in all three Themes:
+   the refusal reuses --text-error, the same ink every other inline refusal on
+   these pages uses, and it never carries its meaning by colour - the sentence
+   says what is wrong, and aria-invalid + role=alert say it to a reader who
+   sees no colour at all. */
+.due-at-absolute {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.due-at-refusal {
+  display: block;
+  color: var(--text-error);
+  font-size: var(--text-sm);
+}

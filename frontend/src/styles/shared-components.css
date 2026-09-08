@@ -1,0 +1,609 @@
+/**
+ * Shared component vocabulary (RH-UI.1b regression fix).
+ *
+ * Every class here is rendered by MORE THAN ONE component, so it belongs to
+ * the global domain: one owner, referenced everywhere (docs/design-system.md
+ * §2 — "shared vocabulary lives only in styles/ sheets").
+ *
+ * RH-UI.1b's de-collision namespaced or ancestor-scoped these declarations
+ * inside whichever component sheet happened to own them, which left the OTHER
+ * renderers with no owning rule: modals lost `position: fixed` and rendered
+ * inline in document flow, cut off. Rules are restored verbatim from faa5845
+ * with @media context preserved; component sheets still layer their own
+ * namespaced overrides on top.
+ */
+
+/* components/dashboard/HeroCard.css */
+.hero-greeting {
+  font-size: var(--text-2xl);
+  font-weight: var(--font-bold);
+  color: var(--text-primary);
+  margin: 0 0 var(--space-3) 0;
+  line-height: var(--leading-tight);
+  background: linear-gradient(
+  135deg,
+  var(--status-info) 0%,
+  var(--accent-hover) 50%,
+  var(--accent-hover) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: gradient-text 8s ease infinite;
+  background-size: 200% 200%;
+}
+
+/* components/dashboard/HeroCard.css */
+.hero-tagline {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0 0 var(--space-8) 0;
+  line-height: var(--leading-normal);
+}
+
+/* components/projects/ContextPreview.css + pages/ProjectsPage.css — the two
+   historical .retry-btn definitions merged into one owner (last-wins visual,
+   compact control metrics). */
+.retry-btn {
+  padding: var(--space-2) var(--space-4);
+  min-height: var(--control-compact);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-control);
+  color: var(--text-accent);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.retry-btn:hover {
+  background: var(--accent-soft);
+}
+
+/* components/projects/CreateProjectModal.css */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--scrim);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: var(--space-4);
+}
+
+/* components/projects/CreateProjectModal.css */
+.modal-content {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  width: 100%;
+  max-width: 500px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px var(--shadow-color);
+}
+
+/* components/projects/ProjectDetailModal.css */
+.project-detail-header {
+  padding: var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  background: linear-gradient(135deg, var(--accent-soft), var(--accent-soft));
+}
+
+/* components/projects/ProjectDetailModal.css */
+.brief-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+/* components/projects/ProjectDetailModal.css */
+.brief-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  max-width: 800px;
+  width: 90%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px var(--shadow-color);
+}
+
+/* pages/AuditPage.css */
+.audit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+/* pages/AuditPage.css */
+.audit-header h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-2xl);
+  color: var(--text-primary, var(--text-secondary));
+}
+
+/* pages/DashboardPage.css */
+.dashboard-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: var(--space-6);
+}
+
+/* pages/ProjectsPage.css */
+.projects-search {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+  max-width: 639px;
+}
+
+/* pages/ProjectsPage.css */
+.projects-search .search-icon {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+/* pages/ProjectsPage.css */
+.projects-search .search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-3) var(--space-3) var(--space-3) 2.75rem;
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  transition: all 0.2s ease;
+}
+
+/* pages/ProjectsPage.css */
+.projects-search .search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* pages/ProjectsPage.css */
+.projects-search .search-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+/* pages/ProjectsPage.css */
+.projects-sort {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* pages/ProjectsPage.css */
+.projects-sort label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* pages/ProjectsPage.css */
+.sort-select {
+  padding: var(--space-3) var(--space-8) var(--space-3) var(--space-3);
+  min-height: var(--control-compact);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca3af' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+}
+
+/* pages/ProjectsPage.css */
+.sort-select:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* pages/ProjectsPage.css */
+.filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+/* pages/ProjectsPage.css */
+/* Review f187bea5 F1. Skills renders these unprefixed classes; Projects
+   overrides them with its own copies above. */
+.filter-toggle:hover {
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* pages/ProjectsPage.css */
+.filter-toggle--active:is(.filter-toggle) {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* pages/ProjectsPage.css */
+.filter-option {
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-transform: capitalize;
+}
+
+/* pages/ProjectsPage.css */
+.filter-option:hover {
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* pages/ProjectsPage.css */
+.filter-option--active:is(.filter-option) {
+  background: var(--accent-soft);
+  border-color: var(--accent-color);
+  color: var(--text-accent);
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-6) var(--space-8);
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--space-5);
+  align-content: start;
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid::-webkit-scrollbar {
+  width: 10px;
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid::-webkit-scrollbar-track {
+  background: var(--scrim-weak);
+  border-radius: var(--radius-md);
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid::-webkit-scrollbar-thumb {
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-color);
+}
+
+/* pages/ProjectsPage.css */
+.projects-grid {
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent-color) var(--border-default);
+}
+
+/* pages/StatsPage.css */
+.stats-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+/* pages/StatsPage.css */
+.stats-header h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-2xl);
+  color: var(--text-primary, var(--text-secondary));
+}
+
+@media (max-width: 640px) {
+  /* components/dashboard/HeroCard.css */
+  .hero-greeting {
+    font-size: var(--text-2xl);
+  }
+  /* components/dashboard/HeroCard.css */
+  .hero-tagline {
+    font-size: var(--text-sm);
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(6, 1fr);
+    gap: var(--space-2);
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid .stats-card {
+    padding: var(--space-2);
+    gap: var(--space-1);
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid .stats-card-icon {
+    font-size: var(--text-sm);
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid .stats-card-value {
+    font-size: var(--text-sm);
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid .stats-card-label {
+    font-size: var(--text-xs);
+    letter-spacing: 0.02em;
+  }
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid .stats-card-description {
+    display: none;
+  }
+}
+
+@media (max-width: 768px) {
+  /* components/projects/CreateProjectModal.css */
+  .modal-content {
+    max-width: 100%;
+    margin: var(--space-4);
+  }
+  /* components/projects/ProjectDetailModal.css */
+  .project-detail-header {
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4);
+  }
+  /* pages/ProjectsPage.css */
+  .projects-search {
+    max-width: 100%;
+  }
+  /* pages/ProjectsPage.css */
+  .projects-sort {
+    width: 100%;
+    justify-content: space-between;
+  }
+  /* pages/ProjectsPage.css */
+  .filter-toggle {
+    width: 100%;
+    justify-content: center;
+  }
+  /* pages/ProjectsPage.css */
+  .projects-grid {
+    grid-template-columns: 1fr;
+    padding: var(--space-4);
+  }
+}
+
+@media (max-width: 767px) {
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(6, 1fr);
+    gap: var(--space-1);
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid .stats-card {
+    padding: var(--space-1) var(--space-1);
+    min-width: 0;
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid .stats-card-icon {
+    font-size: var(--text-sm);
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid .stats-card-label {
+    font-size: var(--text-xs);
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid .stats-card-value {
+    font-size: var(--text-xs);
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid .stats-card-description {
+    display: none;
+  }
+  /* styles/responsive-phase3.css */
+  .hero-greeting {
+    font-size: var(--text-xl);
+  }
+  /* styles/responsive-phase3.css */
+  .hero-tagline {
+    font-size: var(--text-sm);
+    margin-bottom: var(--space-5);
+  }
+  /* styles/responsive-phase3.css */
+  .audit-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  /* styles/responsive-phase3.css */
+  .stats-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  /* styles/responsive-phase3.css */
+  .projects-grid {
+    grid-template-columns: 1fr;
+    padding: var(--space-4);
+  }
+  /* styles/responsive-phase3.css */
+  .projects-search {
+    max-width: 100%;
+  }
+  /* styles/responsive-phase3.css */
+  .projects-sort {
+    width: 100%;
+  }
+  /* styles/responsive-phase3.css */
+  .filter-toggle {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
+  }
+  /* styles/responsive-phase3.css */
+  .task-detail-overlay {
+    padding: 0;
+  }
+  /* styles/responsive-phase3.css */
+  .task-detail-header {
+    padding: var(--space-4) var(--space-5);
+  }
+  /* styles/responsive-phase3.css */
+  .task-detail-content {
+    padding: var(--space-4) var(--space-5);
+  }
+  /* styles/responsive-phase3.css */
+  .task-detail-close-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* styles/responsive-phase3.css */
+  .create-task-overlay {
+    padding: 0;
+  }
+  /* styles/responsive-phase3.css */
+  .modal-overlay {
+    padding: 0;
+  }
+  /* styles/responsive-phase3.css */
+  .modal-content {
+    max-width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+    margin: 0 !important;
+  }
+  /* styles/responsive-phase3.css */
+  .modal-overlay {
+    z-index: 10000 !important;
+  }
+  /* styles/responsive-phase3.css */
+  .project-detail-header {
+    padding-top: calc(var(--space-6) + 12px);
+  }
+  /* styles/responsive-phase3.css */
+  .brief-modal-overlay {
+    padding: 0;
+  }
+  /* styles/responsive-phase3.css */
+  .brief-modal {
+    width: 100% !important;
+    max-height: 100% !important;
+    height: 100%;
+    border-radius: 0;
+  }
+  /* styles/responsive-phase3.css */
+  button,
+  [role="button"],
+  .audit-btn,
+  .stats-btn,
+  .hero-action-btn,
+  .image-gen-button,
+  .filter-toggle,
+  .filter-option,
+  .retry-button,
+  .retry-btn {
+    min-height: 44px;
+  }
+  /* styles/responsive-phase3.css */
+  select,
+  .sort-select,
+  .audit-header-actions select,
+  .stats-header-actions select,
+  .audit-filters select {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 1279px) {
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-5);
+  }
+}
+
+@media (max-width: 639px) {
+  /* pages/DashboardPage.css */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-2);
+  }
+}
+
+@media (max-width: 1023px) {
+  /* pages/ProjectsPage.css */
+  .projects-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: var(--space-4);
+  }
+  /* styles/responsive-phase3.css */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 1023px) and (min-width: 768px) {
+  /* styles/responsive-phase3.css */
+  .projects-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6);
+  }
+}
+
+/* Owner rule for the shared empty-state hint class (rendered by Projects
+   and Skills empty states; their page sheets carry the scoped overrides
+   that outrank the sibling `p` rules). */
+.empty-hint {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}

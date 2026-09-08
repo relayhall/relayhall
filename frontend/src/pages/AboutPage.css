@@ -1,0 +1,178 @@
+.about-page {
+  width: min(100%, 960px);
+  margin: 0 auto;
+  padding: var(--space-8);
+}
+
+.about-page__header {
+  margin-bottom: var(--space-6);
+}
+
+.about-page__header h1,
+.about-page__card h2,
+.about-page__card h3 {
+  color: var(--text-primary);
+}
+
+.about-page__header p,
+.about-page__card p {
+  color: var(--text-secondary);
+}
+
+.about-page__card {
+  padding: var(--space-6);
+  margin-bottom: var(--space-5);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+}
+
+.about-page__identity {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.about-page__facts {
+  display: grid;
+  gap: var(--space-3);
+  margin: var(--space-5) 0;
+}
+
+.about-page__facts > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.35fr) 1fr;
+  gap: var(--space-4);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.about-page__facts dt {
+  color: var(--text-tertiary);
+  font-weight: var(--font-semibold);
+}
+
+.about-page__facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.about-page__facts code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.about-page__links,
+.about-page__deployment-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+}
+
+.about-page__links a,
+.about-page__deployment-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-accent);
+}
+
+.about-page__links span {
+  color: var(--text-tertiary);
+}
+
+.about-page__link-kind {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  text-transform: capitalize;
+}
+
+.about-page__deployment-links {
+  padding: 0;
+  list-style: none;
+}
+
+.about-page__markdown {
+  margin-top: var(--space-5);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.about-page__error,
+.about-page__loading {
+  padding: var(--space-5);
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.about-page__error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  color: var(--text-error);
+  border-color: var(--danger-color);
+}
+
+.about-page__error button {
+  min-width: 44px;
+  min-height: var(--control-standard);
+  padding: var(--space-2) var(--space-4);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+@media (max-width: 1279px) {
+  .about-page__header {
+    /* The off-canvas sidebar trigger occupies y=14..58. Reserve a full
+       content row above this route's title at every hamburger breakpoint so
+       cold loads cannot place the H1 beneath the fixed control. */
+    padding-top: 60px;
+  }
+}
+
+@media (max-width: 639px) {
+  .about-page {
+    padding: var(--space-4);
+  }
+
+  .about-page__card {
+    padding: var(--space-5);
+  }
+
+  .about-page__facts > div {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+}
+
+.about-page__footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-default);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.about-page__footer a,
+.about-page__footer span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.about-page__footer a {
+  color: var(--text-accent);
+}
