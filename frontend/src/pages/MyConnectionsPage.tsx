@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChevronDown, ChevronRight, Loader2, Plug, RefreshCw, ShieldOff, Sliders,
 } from 'lucide-react';
@@ -8,11 +8,11 @@ import { useMyPrincipal } from '../hooks/usePrincipals';
 import { useMyConnections } from '../hooks/useMyConnections';
 import { CreateIdentityWizard } from '../components/identity/CreateIdentityWizard';
 import { BootstrapPane } from '../components/connections/BootstrapPane';
-import { ScopeNarrowing } from '../components/connections/ScopeNarrowing';
+import { CredentialPermissionsEditor } from '../components/connections/CredentialPermissionsEditor';
 import {
   Connection, ConnectionCredential, ConnectionTransport,
   REGENERATE_ADMIN_ONLY, kindLabelForDescription, lostCredentialRecovery,
-  mayRegenerateCredential, templateForDescription,
+  installLineFor, installNoteFor, mayRegenerateCredential, templateForDescription,
 } from '../types/connections';
 import '../components/connections/connections.css';
 import './MyConnectionsPage.css';
@@ -59,6 +59,26 @@ function primaryCredential(connection: Connection): ConnectionCredential | null 
 }
 
 /**
+ * Which credential the "Credential to edit" picker starts on (E476 finding).
+ * The actions beneath it (revoke, regenerate) act on exactly ONE credential,
+ * so a connection that holds several starts on NO pick: a press must follow a
+ * choice, never a guess at which credential was meant. A connection with
+ * exactly one credential has nothing to choose between and stays preselected.
+ */
+function initialCredentialId(connection: Connection): string {
+  return connection.credentials.length === 1 ? connection.credentials[0].id : '';
+}
+
+/**
+ * The grace window the page asks for when it replaces a credential's secret.
+ * Sent explicitly (it equals the board's default) so the sentence on the
+ * button is true by construction, not by coincidence with a server default.
+ */
+const REPLACE_GRACE_HOURS = 24;
+
+const credentialName = (item: ConnectionCredential): string => item.label || item.keyId || 'Unlabelled credential';
+
+/**
  * What a row says about itself. An ENUMERATED set with its own label and its
  * own class — never a class name built by interpolation, which is how an
  * unstyled state slips through a stylesheet review unnoticed.
@@ -97,9 +117,19 @@ export function rowStateOf(connection: Connection): RowState {
   return credential ? credential.state : 'none';
 }
 
+/* Card ff410dc4 (SQ-4): a connection that can no longer act - its Connector
+   disabled, or its credential revoked, expired or replaced past its grace -
+   stays readable but folds into one collapsed section with a count, so the
+   live connections are not interleaved with dead ones. Nothing is deleted. */
+const FOLDED_ROW_STATES: ReadonlySet<RowState> = new Set<RowState>(['disabled', 'revoked', 'expired', 'replaced']);
+
+export function isFoldedConnection(connection: Connection): boolean {
+  return FOLDED_ROW_STATES.has(rowStateOf(connection));
+}
+
 export const MyConnectionsPage: React.FC = () => {
-  const { me, scopes, loading: principalLoading } = useMyPrincipal();
-  const { connections, instructions, loading, unavailable, failed, reload } = useMyConnections();
+  const { me, scopes, delegableScopes, loading: principalLoading } = useMyPrincipal();
+  const { connections, instructions, mayLoosenCredentialTransport, loading, unavailable, failed, reload } = useMyConnections();
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -165,25 +195,38 @@ export const MyConnectionsPage: React.FC = () => {
         </div>
       )}
 
-      {connections.length > 0 && (
-        <ul className="conn-list">
-          {connections.map((connection) => (
-            <ConnectionRow
-              key={connection.principalId}
-              connection={connection}
-              instructions={instructions}
-              isRoot={isRoot}
-              accountScopes={Array.isArray(scopes) ? scopes : []}
-              accountId={me?.id ?? null}
-              onChanged={reload}
-              surface={(kind, message) => {
-                if (kind === 'error') { setError(message); setNotice(null); }
-                else { setNotice(message); setError(null); }
-              }}
-            />
-          ))}
-        </ul>
-      )}
+      {connections.length > 0 && (() => {
+        const renderRow = (connection: Connection) => (
+          <ConnectionRow
+            key={connection.principalId}
+            connection={connection}
+            instructions={instructions}
+            isRoot={isRoot}
+            accountScopes={Array.isArray(scopes) ? scopes : []}
+            delegableScopes={delegableScopes}
+            mayLoosenCredentialTransport={mayLoosenCredentialTransport}
+            accountId={me?.id ?? null}
+            onChanged={reload}
+            surface={(kind, message) => {
+              if (kind === 'error') { setError(message); setNotice(null); }
+              else { setNotice(message); setError(null); }
+            }}
+          />
+        );
+        const live = connections.filter((connection) => !isFoldedConnection(connection));
+        const folded = connections.filter(isFoldedConnection);
+        return (
+          <>
+            {live.length > 0 && <ul className="conn-list">{live.map(renderRow)}</ul>}
+            {folded.length > 0 && (
+              <details className="conn-folded">
+                <summary className="conn-folded-summary">Non-active connections ({folded.length})</summary>
+                <ul className="conn-list">{folded.map(renderRow)}</ul>
+              </details>
+            )}
+          </>
+        );
+      })()}
     </div>
   );
 };
@@ -193,32 +236,64 @@ const ConnectionRow: React.FC<{
   instructions: ReturnType<typeof useMyConnections>['instructions'];
   isRoot: boolean;
   accountScopes: string[];
+  delegableScopes: string[] | null | undefined;
+  mayLoosenCredentialTransport: boolean;
   accountId: string | null;
   onChanged: () => void;
   surface: (kind: 'notice' | 'error', message: string) => void;
-}> = ({ connection, instructions, isRoot, accountScopes, accountId, onChanged, surface }) => {
+}> = ({ connection, instructions, isRoot, accountScopes, delegableScopes, mayLoosenCredentialTransport, accountId, onChanged, surface }) => {
   const [open, setOpen] = useState<'none' | 'setup' | 'advanced'>('none');
   const [busy, setBusy] = useState(false);
-  const credential = primaryCredential(connection);
+  // Keep the exact choice across refreshes. If that credential disappears, do
+  // not silently switch an open editor to another live credential.
+  const [selectedCredentialId, setSelectedCredentialId] = useState(() => initialCredentialId(connection));
+  const [editorLocked, setEditorLocked] = useState(false);
+  const credential = connection.credentials.find((item) => item.id === selectedCredentialId) ?? null;
+  // A pick that was made and has since vanished is a different situation from
+  // no pick yet: the first asks the person to choose again, the second asks
+  // them to choose at all.
+  const selectionVanished = selectedCredentialId !== '' && !credential;
+  const setupAvailable = !selectionVanished && connection.credentials.length > 0;
   const state = rowStateOf(connection);
   const template = templateForDescription(connection.service.description);
   const transport = (credential?.transport ?? template?.transport ?? 'any') as ConnectionTransport;
   const detailId = `conn-detail-${connection.principalId}`;
 
-  const disable = async () => {
-    if (!credential) return;
+  const toggleOwnerControl = async () => {
+    setBusy(true);
+    try {
+      const enabled = !connection.ownerControl;
+      const response = await authenticatedFetch(`${API_BASE}/principals/${connection.principalId}/owner-control`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled, reason: enabled
+          ? 'Appointed as Main by the account owner in My connections'
+          : 'Main appointment revoked by the account owner in My connections' }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) { surface('error', data.error || 'The Main appointment could not be changed.'); return; }
+      surface('notice', enabled ? 'Main appointed for your owned resources. Existing credential limits still apply.'
+        : 'Main appointment removed. Delegated worker permissions are unchanged.');
+      onChanged();
+    } catch { surface('error', 'Could not reach the board.'); }
+    finally { setBusy(false); }
+  };
+
+  // Both acts take the id the person confirmed and refuse if the picker has
+  // moved since: a press can only ever land on the credential it named.
+  const revoke = async (credentialId: string) => {
+    if (!credential || credential.id !== credentialId) return;
     setBusy(true);
     try {
       const response = await authenticatedFetch(`${API_BASE}/credentials/${credential.id}/revoke`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'disabled by its owner from My connections' }),
+        body: JSON.stringify({ reason: 'revoked by its owner from My connections' }),
       });
       if (!response.ok) {
-        surface('error', 'The board refused to disable that credential.');
+        surface('error', 'The board refused to revoke that credential.');
         return;
       }
-      surface('notice', `${connection.service.name} can no longer reach the board. Its credential is revoked, and the very next call it makes is refused.`);
+      surface('notice', `Credential ${credential.keyId ?? credential.id} (${credentialName(credential)}) for ${connection.service.name} is revoked. Calls using that credential are refused; other credentials on the connection are unchanged; the connector stays enabled.`);
       onChanged();
     } catch {
       surface('error', 'Could not reach the board.');
@@ -227,21 +302,26 @@ const ConnectionRow: React.FC<{
     }
   };
 
-  const regenerate = async () => {
-    if (!credential) return;
+  const regenerate = async (credentialId: string) => {
+    if (!credential || credential.id !== credentialId) return;
     setBusy(true);
     try {
       const response = await authenticatedFetch(`${API_BASE}/credentials/${credential.id}/rotate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ graceHours: REPLACE_GRACE_HOURS }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         surface('error', data?.message || 'The board refused the regeneration.');
         return;
       }
-      surface('notice', `New credential for ${connection.service.name}: ${data.secretOnce} — shown once, copy it now. The old one keeps working for ${data.graceHours} hours.`);
+      // Rotating MINTS a new credential: the route answers with the new
+      // credential's id and key id, and the key id it replaces. The secret
+      // shown belongs to the new key id, so that is the one the notice names.
+      const newKeyId = data.keyId ?? data.id ?? 'the new credential';
+      const previousKeyId = data.previousKeyId ?? credential.keyId ?? credential.id;
+      surface('notice', `Replacement secret for new key id ${newKeyId} on ${connection.service.name}: ${data.secretOnce} — shown once, copy it now. It replaces ${previousKeyId} (${credentialName(credential)}), which keeps working for ${data.graceHours ?? REPLACE_GRACE_HOURS} hours. Only that credential was replaced. This is not a revoke, and the connection's other credentials are unchanged.`);
       onChanged();
     } catch {
       surface('error', 'Could not reach the board.');
@@ -261,13 +341,18 @@ const ConnectionRow: React.FC<{
           <small>{kindLabelForDescription(connection.service.description)}</small>
         </div>
         <span className={ROW_STATE_CLASS[state]}>{ROW_STATE_LABEL[state]}</span>
-        <span className="conn-item-meta">Last used {relative(credential?.lastUsedAt ?? connection.lastSeenAt)}</span>
+        <span className="conn-item-meta">Connection last seen {relative(connection.lastSeenAt)}</span>
         <div className="conn-item-tools">
+          <Button variant="secondary" size="compact" disabled={busy || editorLocked || connection.status !== 'active'}
+            onClick={toggleOwnerControl}>
+            {connection.ownerControl ? 'Remove Main appointment' : 'Appoint as Main'}
+          </Button>
           <Button
             variant="secondary"
             size="compact"
             ariaExpanded={open === 'setup'}
             ariaControls={detailId}
+            disabled={editorLocked}
             onClick={() => setOpen(open === 'setup' ? 'none' : 'setup')}
           >
             {open === 'setup' ? <ChevronDown size={16} /> : <ChevronRight size={16} />} Setup
@@ -278,6 +363,7 @@ const ConnectionRow: React.FC<{
             icon={<Sliders size={16} />}
             ariaExpanded={open === 'advanced'}
             ariaControls={detailId}
+            disabled={editorLocked}
             onClick={() => setOpen(open === 'advanced' ? 'none' : 'advanced')}
           >
             Advanced
@@ -287,34 +373,60 @@ const ConnectionRow: React.FC<{
 
       {open !== 'none' && (
         <div className="conn-item-detail" id={detailId}>
-          {open === 'setup' && (
-            instructions ? (
+          {(connection.credentials.length > 1 || (connection.credentials.length > 0 && !credential)) && (
+            <div className="conn-credential-choice">
+              <label htmlFor={`conn-credential-${connection.principalId}`}>Credential to edit</label>
+              <select id={`conn-credential-${connection.principalId}`} value={credential?.id ?? ''}
+                disabled={busy || editorLocked}
+                onChange={(event) => setSelectedCredentialId(event.target.value)}>
+                {!credential && <option value="">Choose a credential…</option>}
+                {connection.credentials.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {credentialName(item)} · {item.transport} · {item.state} · {item.id}
+                  </option>
+                ))}
+              </select>
+              {open === 'advanced' && credential && <p className="conn-note">Changing credentials discards unsaved permission edits.</p>}
+              {selectionVanished && <p role="status" className="conn-note">The previously selected credential is no longer available. Choose another credential.</p>}
+            </div>
+          )}
+          {open === 'setup' && (<><Button variant="secondary" disabled={!credential || editorLocked} onClick={() => setOpen('advanced')}>Edit permissions</Button>{
+            setupAvailable && instructions ? (
               <BootstrapPane
                 mcpConfig={instructions.mcpConfig}
                 cliEnv={instructions.cliEnv}
                 bootstrapLine={instructions.bootstrapLine}
+                bootstrapPrompt={instructions.bootstrapPrompt}
+                configurationGuidance={instructions.configurationGuidance}
+                installLine={installLineFor(template, instructions.boardEndpoint)}
+                installNote={installNoteFor(template)}
                 boardEndpoint={instructions.boardEndpoint}
                 transport={transport}
                 initialTab={template?.defaultTab}
                 carriesSecret={false}
                 recovery={lostCredentialRecovery(accountScopes)}
               />
-            ) : (
+            ) : setupAvailable ? (
               <p className="conn-note">The board did not return the setup instructions for this session.</p>
-            )
-          )}
+            ) : <p className="conn-note">Choose an available credential to see its setup instructions.</p>
+          }</>)}
 
           {open === 'advanced' && (
             <AdvancedTab
+              key={`${accountId ?? 'unknown'}:${connection.principalId}:${isRoot ? 'root' : 'member'}`}
               connection={connection}
               credential={credential}
-              transport={transport}
+              selectionVanished={selectionVanished}
               accountScopes={accountScopes}
+              delegableScopes={delegableScopes}
+              mayLoosenCredentialTransport={mayLoosenCredentialTransport}
+              onChanged={onChanged}
               accountId={accountId}
               isRoot={isRoot}
-              busy={busy}
-              onDisable={disable}
+              busy={busy || editorLocked}
+              onRevoke={revoke}
               onRegenerate={regenerate}
+              onEditorLockedChange={setEditorLocked}
             />
           )}
         </div>
@@ -323,72 +435,169 @@ const ConnectionRow: React.FC<{
   );
 };
 
+type DetailRow = Record<string, unknown>;
+type DetailRead =
+  | { status: 'loading' }
+  | { status: 'ready'; items: DetailRow[] }
+  | { status: 'unavailable'; message: string };
+type GrantRead = DetailRead | { status: 'inaccessible' };
+
+const isDetailRow = (row: unknown): row is DetailRow =>
+  typeof row === 'object' && row !== null && !Array.isArray(row);
+const isWarrantRow = (row: unknown): row is DetailRow =>
+  isDetailRow(row) && typeof row.id === 'string' && typeof row.name === 'string'
+  && typeof row.status === 'string' && typeof row.holderPrincipalId === 'string';
+const isGrantRow = (row: unknown): row is DetailRow =>
+  isDetailRow(row) && typeof row.id === 'string' && typeof row.verb === 'string'
+  && typeof row.resourceType === 'string'
+  && (row.resourceId === null || (typeof row.resourceId === 'string' && row.resourceId.trim().length > 0));
+
+async function readDetailRows(
+  url: string, field: 'warrants' | 'grants', valid: (row: unknown) => row is DetailRow,
+  denied: string, failed: string, malformed: string,
+): Promise<DetailRead> {
+  try {
+    const response = await authenticatedFetch(url);
+    if (!response.ok) {
+      return { status: 'unavailable', message: [401, 403, 404].includes(response.status) ? denied : failed };
+    }
+    const data = await response.json();
+    const rows: unknown = data?.[field];
+    if (data?.success !== true || !Array.isArray(rows) || !rows.every(valid)) return { status: 'unavailable', message: malformed };
+    return { status: 'ready', items: rows };
+  } catch {
+    return { status: 'unavailable', message: failed };
+  }
+}
+
 const AdvancedTab: React.FC<{
   connection: Connection;
   credential: ConnectionCredential | null;
-  transport: ConnectionTransport;
+  selectionVanished: boolean;
   accountScopes: string[];
+  delegableScopes: string[] | null | undefined;
+  mayLoosenCredentialTransport: boolean;
   accountId: string | null;
   isRoot: boolean;
   busy: boolean;
-  onDisable: () => void;
-  onRegenerate: () => void;
-}> = ({ connection, credential, transport, accountScopes, accountId, isRoot, busy, onDisable, onRegenerate }) => {
-  // The SAME predicate the wizard's recovery sentence is built from, so the two
-  // surfaces cannot disagree about what this session may do (round-2 P3-R2).
-  // `isRoot` stays separate below: reading another principal's object grants is
-  // a different authority question from rotating a credential.
+  onChanged: () => void;
+  onRevoke: (credentialId: string) => Promise<void>;
+  onRegenerate: (credentialId: string) => Promise<void>;
+  onEditorLockedChange: (locked: boolean) => void;
+}> = ({ connection, credential, selectionVanished, accountScopes, delegableScopes, mayLoosenCredentialTransport, accountId, isRoot, busy, onChanged, onRevoke, onRegenerate, onEditorLockedChange }) => {
+  // This is an introspection panel, not a grant. It reads warrants through the
+  // caller's self-scoped route; another principal's direct object grants are
+  // requested only by a root session, exactly as the existing backend gate
+  // permits. A skipped or failed read must never look like an empty result.
   const mayRegenerate = mayRegenerateCredential(accountScopes);
-  const [warrants, setWarrants] = useState<Array<Record<string, unknown>>>([]);
-  const [grants, setGrants] = useState<Array<Record<string, unknown>>>([]);
-  const [chainNote, setChainNote] = useState<string | null>(null);
+  const [warrants, setWarrants] = useState<DetailRead>({ status: 'loading' });
+  const [grants, setGrants] = useState<GrantRead>(isRoot ? { status: 'loading' } : { status: 'inaccessible' });
+  const requestSeq = useRef(0);
+  const [agentBusy, setAgentBusy] = useState<string | null>(null);
+  const [agentError, setAgentError] = useState<string | null>(null);
 
-  // WHAT THIS TAB MAY READ, and what it deliberately does not ask for.
-  //
-  // Warrants: `GET /warrants` carries the ratified §6.1/§9.1 self-scope arm —
-  // a non-root session is shown only holders inside its own subtree, and every
-  // other one is 404-concealed by the server. So the call is safe to make from
-  // any session and the filter below is a display narrowing, not the guard.
-  //
-  // Object grants: `GET /principals/{id}/grants` splits OWN vs the manage
-  // gate; a Connector is not the caller, so an ordinary Account session is
-  // refused there. Widening that split to the own subtree would be a change to
-  // an authorization gate, which this lane has no mandate to make — so the tab
-  // ASKS ONLY when the session already holds the authority, and otherwise says
-  // plainly that this view is an administrator one in this release rather than
-  // firing a call it knows will be refused. (Handover bounded question Q2.)
-  const loadChain = useCallback(async () => {
+  // The in-page revoke confirmation. It holds the id the person asked about;
+  // it is shown only while the picker still points at that same credential, so
+  // a second press can never land on a different one than the panel names.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const confirmRef = useRef<HTMLElement | null>(null);
+  const revokeWrapRef = useRef<HTMLSpanElement | null>(null);
+  const scopesHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const focusAfterClose = useRef<'trigger' | 'heading' | null>(null);
+  const confirming = credential !== null && confirmingId === credential.id;
+  const closeConfirmation = (returnFocusTo: 'trigger' | 'heading' | null) => {
+    focusAfterClose.current = returnFocusTo;
+    setConfirmingId(null);
+  };
+  useEffect(() => {
+    // The picker moved away from the credential being confirmed: drop the
+    // confirmation without taking focus from the control the person is using.
+    if (confirmingId !== null && credential?.id !== confirmingId) setConfirmingId(null);
+  }, [confirmingId, credential?.id]);
+  useEffect(() => {
+    if (confirming) confirmRef.current?.focus();
+  }, [confirming]);
+  useEffect(() => {
+    if (confirmingId !== null || focusAfterClose.current === null) return;
+    const target = focusAfterClose.current;
+    focusAfterClose.current = null;
+    if (target === 'trigger') revokeWrapRef.current?.querySelector('button')?.focus();
+    else scopesHeadingRef.current?.focus();
+  }, [confirmingId]);
+  const confirmRevoke = () => {
+    if (!credential || confirmingId !== credential.id) return;
+    const id = credential.id;
+    closeConfirmation('heading');
+    void onRevoke(id);
+  };
+
+  const revokeAgent = async (agent: Connection['agents'][number]) => {
+    setAgentBusy(agent.id); setAgentError(null);
     try {
-      const warrantResponse = await authenticatedFetch(`${API_BASE}/warrants`);
-      if (warrantResponse.ok) {
-        const data = await warrantResponse.json();
-        const all = Array.isArray(data?.warrants) ? data.warrants : [];
-        setWarrants(all.filter((w: any) => String(w?.holderPrincipalId ?? '') === connection.principalId));
+      for (const live of agent.credentials.filter(c => c.state === 'live' || c.state === 'graced')) {
+        const response = await authenticatedFetch(`${API_BASE}/credentials/${live.id}/revoke`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason: 'Agent credential revoked by the owner in My connections' }),
+        });
+        if (!response.ok) throw new Error('The board refused an agent credential revocation. Refresh to see any credentials already revoked.');
       }
-      if (!isRoot) {
-        setChainNote('Standing object grants on a connection are an administrator view in this release.');
-        return;
-      }
-      const grantResponse = await authenticatedFetch(`${API_BASE}/principals/${connection.principalId}/grants`);
-      if (grantResponse.ok) {
-        const data = await grantResponse.json();
-        setGrants(Array.isArray(data?.grants) ? data.grants : []);
-      } else {
-        setChainNote('The board did not disclose the object grants under this connection to this session.');
-      }
-    } catch {
-      setChainNote('The chain detail could not be read.');
-    }
+    } catch (e) { setAgentError(e instanceof Error ? e.message : 'Could not revoke agent credentials.'); }
+    finally { setAgentBusy(null); onChanged(); }
+  };
+
+  const loadChain = useCallback(() => {
+    const seq = ++requestSeq.current;
+    setWarrants({ status: 'loading' });
+    setGrants(isRoot ? { status: 'loading' } : { status: 'inaccessible' });
+    void readDetailRows(
+      `${API_BASE}/warrants`, 'warrants', isWarrantRow,
+      'The board did not disclose warrants to this session.',
+      'Could not read warrants from the board.',
+      'The board returned an incomplete warrant response.',
+    ).then((result) => {
+      if (seq !== requestSeq.current) return;
+      setWarrants(result.status === 'ready'
+        ? { status: 'ready', items: result.items.filter((row) => row.holderPrincipalId === connection.principalId) }
+        : result);
+    });
+    if (!isRoot) return;
+    void readDetailRows(
+      `${API_BASE}/principals/${connection.principalId}/grants`, 'grants', isGrantRow,
+      'The board did not disclose direct object grants to this session.',
+      'Could not read direct object grants from the board.',
+      'The board returned an incomplete direct-grant response.',
+    ).then((result) => { if (seq === requestSeq.current) setGrants(result); });
   }, [connection.principalId, isRoot]);
 
-  useEffect(() => { loadChain(); }, [loadChain]);
+  useEffect(() => {
+    loadChain();
+    return () => { requestSeq.current += 1; };
+  }, [loadChain]);
 
-  const scopes = credential?.scopes ?? [];
-  // The credential's own scope set, shown against the ceiling it was cut from.
-  const ceiling = useMemo(
-    () => Array.from(new Set([...accountScopes, ...scopes])).sort(),
-    [accountScopes, scopes],
-  );
+  const pid = connection.principalId;
+  const replaceHelpId = `conn-replace-help-${pid}`;
+  const revokeHelpId = `conn-revoke-help-${pid}`;
+  const pickHintId = `conn-pick-hint-${pid}`;
+  const stateHintId = `conn-state-hint-${pid}`;
+  // The board refuses to rotate a credential that is already replaced or
+  // revoked (ROTATE_FROM_RETIRED), so the button waits for a live one.
+  const notLive = credential !== null && credential.state !== 'live';
+  const confirmTitleId = `conn-confirm-title-${pid}`;
+  const confirmTextId = `conn-confirm-text-${pid}`;
+
+  const transport = credential?.transport;
+  const transportDescription = !credential
+    ? 'No credential transport pin is available.'
+    : transport === 'any'
+      ? 'any — this credential works through the MCP endpoint and the REST API'
+      : transport === 'mcp'
+        ? 'mcp — accepted through the MCP endpoint, refused on every REST route'
+        : transport === 'api'
+          ? 'api — accepted on the REST API, refused through the MCP endpoint'
+          : 'The board did not report a recognized transport pin for this credential.';
+  // The keyed tab remounts if the Account/root authority changes. This extra
+  // guard prevents a transient stale grant display before an effect reload.
+  const visibleGrants: GrantRead = isRoot ? grants : { status: 'inaccessible' };
 
   return (
     <div className="conn-advanced">
@@ -398,42 +607,47 @@ const AdvancedTab: React.FC<{
       </p>
 
       <section className="conn-adv-section" aria-labelledby={`conn-adv-scopes-${connection.principalId}`}>
-        <h3 id={`conn-adv-scopes-${connection.principalId}`}>What it can do</h3>
-        <ScopeNarrowing
-          available={ceiling}
-          selected={scopes}
-          readOnly
-          idPrefix={`conn-adv-${connection.principalId}`}
-        />
-        <p className="conn-note">
-          A credential&rsquo;s authority is fixed when it is issued: regeneration copies the scope set
-          and the transport pin verbatim, and the board refuses a regeneration that tries to change
-          either. To narrow this connection, make a narrower one and disable this.
-        </p>
+        <h3 id={`conn-adv-scopes-${connection.principalId}`} ref={scopesHeadingRef} tabIndex={-1} className="conn-focus-target">Scopes on this credential</h3>
+        {credential ? (
+          <>
+            <p className="conn-note">
+              Showing credential <code className="conn-inline-code">{credential.keyId ?? credential.id}</code>
+              {credential.label ? ` (${credential.label})` : ''}, state {credential.state}.
+              {connection.credentials.length > 1 ? ` This is one of ${connection.credentials.length} credentials on this connection.` : ''}
+            </p>
+            <p className="conn-note">
+              These scopes belong to the credential shown, not the connection&rsquo;s effective authority.
+              Access can also depend on current Account authority, grants, warrants and route policy.
+            </p>
+            <CredentialPermissionsEditor
+              key={`${credential.id}:${credential.scopes.join(',')}:${credential.transport}:${credential.state}`}
+              credential={credential} delegableScopes={delegableScopes}
+              mayLoosenTransport={mayLoosenCredentialTransport}
+              onChanged={onChanged} onLockedChange={onEditorLockedChange} />
+          </>
+        ) : connection.credentials.length === 0 ? (
+          <p className="conn-note">No credential is available for this connection.</p>
+        ) : selectionVanished ? (
+          <p className="conn-note">The credential you picked is gone from this connection. Choose another credential in the picker above to see its scopes and to use the actions below.</p>
+        ) : (
+          <p className="conn-note">No credential is picked yet. Choose one in the picker above to see its scopes and to use the actions below.</p>
+        )}
       </section>
 
       <section className="conn-adv-section" aria-labelledby={`conn-adv-pin-${connection.principalId}`}>
-        <h3 id={`conn-adv-pin-${connection.principalId}`}>Transport and expiry</h3>
+        <h3 id={`conn-adv-pin-${connection.principalId}`}>Credential transport, expiry and use</h3>
         <dl className="conn-facts">
-          <dt>Transport pin</dt>
-          <dd>
-            {transport === 'any'
-              ? 'any — this credential works through the MCP endpoint and the REST API'
-              : transport === 'mcp'
-                ? 'mcp — accepted through the MCP endpoint, refused on every REST route'
-                : 'api — accepted on the REST API, refused through the MCP endpoint'}
-          </dd>
-          <dt>Expires</dt>
-          <dd>{credential?.expiresAt ? new Date(credential.expiresAt).toLocaleString() : 'no expiry set'}</dd>
-          <dt>Board address</dt>
-          <dd><code className="conn-inline-code">{connection.service.slug}</code></dd>
-          <dt>Times its secret has been re-revealed</dt>
-          <dd>{credential?.revealCount ?? 0}</dd>
+          <dt>Transport pin</dt><dd>{transportDescription}</dd>
+          <dt>Expires</dt><dd>{credential ? credential.expiresAt ? new Date(credential.expiresAt).toLocaleString() : 'no expiry set' : 'No credential to describe.'}</dd>
+          <dt>Credential last used</dt><dd>{credential ? relative(credential.lastUsedAt) : 'No credential to describe.'}</dd>
+          <dt>Board address</dt><dd><code className="conn-inline-code">{connection.service.slug}</code></dd>
+          <dt>Times its secret has been re-revealed</dt><dd>{credential?.revealCount ?? 'No credential to describe.'}</dd>
         </dl>
       </section>
 
       <section className="conn-adv-section" aria-labelledby={`conn-adv-agents-${connection.principalId}`}>
         <h3 id={`conn-adv-agents-${connection.principalId}`}>Agents minted beneath it</h3>
+        {agentError && <p role="alert" className="conn-error">{agentError}</p>}
         {connection.agents.length === 0 ? (
           <p className="conn-note">None. Agents appear here when this connection mints one for a task.</p>
         ) : (
@@ -446,6 +660,9 @@ const AdvancedTab: React.FC<{
                   {agent.boundTaskId ? ` · bound to task ${agent.boundTaskId.slice(0, 8)}` : ' · not task-bound'}
                   {agent.mintedUnderWarrantId ? ' · minted under a warrant' : ''}
                 </span>
+                {!agent.terminatedAt && agent.status === 'active' && <Button variant="danger" size="compact"
+                  disabled={agentBusy !== null || !agent.credentials.some(c => c.state === 'live' || c.state === 'graced')}
+                  onClick={() => void revokeAgent(agent)}>Revoke agent credentials</Button>}
               </li>
             ))}
           </ul>
@@ -453,58 +670,125 @@ const AdvancedTab: React.FC<{
       </section>
 
       <section className="conn-adv-section" aria-labelledby={`conn-adv-warrants-${connection.principalId}`}>
-        <h3 id={`conn-adv-warrants-${connection.principalId}`}>Warrants and grants</h3>
-        {warrants.length === 0
-          ? <p className="conn-note">This connection holds no warrant.</p>
-          : (
-            <ul className="conn-warrants">
-              {warrants.map((warrant) => (
-                <li key={String(warrant.id)} className="conn-warrant">
-                  <span className="conn-warrant-name">{String(warrant.name)}</span>
-                  <span className="conn-agent-meta">{String(warrant.status)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        {grants.length === 0
-          ? <p className="conn-note">No standing object grants sit on this connection; short-lived, task-bound grants are issued as work arrives and expire with it.</p>
-          : (
-            <ul className="conn-grants">
-              {grants.map((grant, index) => (
-                <li key={String(grant.id ?? index)} className="conn-grant">
-                  {String(grant.verb ?? '')} on {String(grant.resourceType ?? '')}
-                  {grant.resourceId ? ` ${String(grant.resourceId).slice(0, 8)}` : ' (all of that type)'}
-                </li>
-              ))}
-            </ul>
-          )}
-        {chainNote && <p className="conn-note" role="status">{chainNote}</p>}
+        <div className="conn-adv-heading">
+          <h3 id={`conn-adv-warrants-${connection.principalId}`}>Warrants and direct object grants</h3>
+          <button type="button" className="conn-linkbtn" onClick={loadChain}>Refresh details</button>
+        </div>
+        {warrants.status === 'loading'
+          ? <p className="conn-note" role="status">Loading warrants…</p>
+          : warrants.status === 'unavailable'
+            ? <p className="conn-note" role="status">{warrants.message}</p>
+            : warrants.items.length === 0
+              ? <p className="conn-note">This connection holds no warrant.</p>
+              : (
+                <ul className="conn-warrants">
+                  {warrants.items.map((warrant) => (
+                    <li key={String(warrant.id)} className="conn-warrant">
+                      <span className="conn-warrant-name">{String(warrant.name)}</span>
+                      <span className="conn-agent-meta">{String(warrant.status)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+        {visibleGrants.status === 'inaccessible'
+          ? <p className="conn-note">Direct object grants are an administrator view in this release.</p>
+          : visibleGrants.status === 'loading'
+            ? <p className="conn-note" role="status">Loading direct object grants…</p>
+            : visibleGrants.status === 'unavailable'
+              ? <p className="conn-note" role="status">{visibleGrants.message}</p>
+              : visibleGrants.items.length === 0
+                ? <p className="conn-note">No direct standing object grants were returned for this connection.</p>
+                : (
+                  <ul className="conn-grants">
+                    {visibleGrants.items.map((grant, index) => (
+                      <li key={String(grant.id ?? index)} className="conn-grant">
+                        {String(grant.verb)} on {String(grant.resourceType)}
+                        {grant.resourceId ? ` ${String(grant.resourceId).slice(0, 8)}` : ' (all of that type)'}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+        <p className="conn-note">These direct rows do not summarize inherited or effective access.</p>
         {accountId && connection.purpose && <p className="conn-note">{connection.purpose}</p>}
       </section>
+
+      <div className="conn-action-help">
+        <p id={replaceHelpId} className="conn-note">
+          Replacing the secret applies to the picked credential only. The old secret keeps working for {REPLACE_GRACE_HOURS} hours,
+          then stops. This is not a revoke, and the connection&rsquo;s other credentials are untouched.
+        </p>
+        <p id={revokeHelpId} className="conn-note">
+          Revoking stops calls that use the picked credential. It leaves the connection&rsquo;s other credentials, and the
+          connector itself, as they are.
+        </p>
+        {!credential && (
+          <p id={pickHintId} className="conn-note">
+            Choose a credential in the picker above first; these actions apply to one credential at a time.
+          </p>
+        )}
+        {credential && notLive && (
+          <p id={stateHintId} className="conn-note">
+            Only a live credential can be regenerated; the picked one is {credential.state}.
+          </p>
+        )}
+      </div>
 
       <div className="conn-actions">
         <Button
           variant="secondary"
           icon={<RefreshCw size={16} />}
-          disabled={!credential || busy || !mayRegenerate}
+          disabled={!credential || notLive || busy || !mayRegenerate || confirming}
           title={mayRegenerate ? undefined : REGENERATE_ADMIN_ONLY}
-          onClick={onRegenerate}
+          ariaDescribedBy={`${replaceHelpId}${credential ? '' : ` ${pickHintId}`}${notLive ? ` ${stateHintId}` : ''}`}
+          onClick={() => { if (credential) void onRegenerate(credential.id); }}
         >
           Regenerate credential
         </Button>
-        <Button
-          variant="danger"
-          icon={<ShieldOff size={16} />}
-          disabled={!credential || busy || credential.state === 'revoked'}
-          onClick={onDisable}
-        >
-          Disable
-        </Button>
+        <span ref={revokeWrapRef}>
+          <Button
+            variant="danger"
+            icon={<ShieldOff size={16} />}
+            disabled={!credential || busy || credential.state === 'revoked'}
+            ariaDescribedBy={`${revokeHelpId}${credential ? '' : ` ${pickHintId}`}`}
+            onClick={() => { if (credential) setConfirmingId(credential.id); }}
+          >
+            Revoke this credential
+          </Button>
+        </span>
       </div>
+
+      {confirming && credential && (
+        <section
+          ref={confirmRef}
+          tabIndex={-1}
+          role="alertdialog"
+          aria-labelledby={confirmTitleId}
+          aria-describedby={confirmTextId}
+          className="conn-confirm"
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') { event.stopPropagation(); closeConfirmation('trigger'); }
+          }}
+        >
+          <h4 id={confirmTitleId} className="conn-confirm-title">Revoke this credential?</h4>
+          <dl className="conn-facts">
+            <dt>Label</dt><dd>{credentialName(credential)}</dd>
+            <dt>Key id</dt><dd><code className="conn-inline-code">{credential.keyId ?? 'none'}</code></dd>
+            <dt>Transport</dt><dd>{credential.transport}</dd>
+            <dt>Credential id</dt><dd><code className="conn-inline-code">{credential.id}</code></dd>
+          </dl>
+          <p id={confirmTextId} className="conn-note">
+            Calls using this credential will be refused; the other credentials on this connection are unchanged; the connector stays enabled.
+          </p>
+          <div className="conn-actions">
+            <Button variant="secondary" onClick={() => closeConfirmation('trigger')}>Cancel</Button>
+            <Button variant="danger" icon={<ShieldOff size={16} />} disabled={busy} onClick={confirmRevoke}>Yes, revoke this credential</Button>
+          </div>
+        </section>
+      )}
       {!mayRegenerate && (
         <p className="conn-note">
           {REGENERATE_ADMIN_ONLY}. Until that changes, replace a lost credential by connecting a new
-          agent and disabling this one.
+          agent and revoking this credential.
         </p>
       )}
     </div>

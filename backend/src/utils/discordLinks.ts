@@ -38,20 +38,14 @@ export function extractDiscordThreadIdFromSessionKey(
 }
 
 /**
- * Resolve a task's thread id: persisted column first, then thread ids embedded
- * in session keys (spawn/bind races can leave discord_thread_id unpersisted).
+ * Resolve a Task's explicitly persisted thread id. Retired Task runtime
+ * fields are not evidence of a thread binding.
  */
 export function resolveTaskDiscordThreadId(refs: {
   discordThreadId?: string | null;
-  acpSessionKey?: string | null;
-  activeAgentSessionKey?: string | null;
-  completedBySessionKey?: string | null;
 }): string | null {
   return (
     refs.discordThreadId
-    || extractDiscordThreadIdFromSessionKey(refs.acpSessionKey)
-    || extractDiscordThreadIdFromSessionKey(refs.activeAgentSessionKey)
-    || extractDiscordThreadIdFromSessionKey(refs.completedBySessionKey)
     || null
   );
 }

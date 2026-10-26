@@ -7,7 +7,7 @@
 // revoking an intermediate's last live credential takes effect on the very
 // next request (T10).
 //
-// LIVENESS (AZ-9/AZ-25, sol B2): chainAlive(p) = p.status='active' AND, IF
+// LIVENESS (AZ-9/AZ-25, review B2): chainAlive(p) = p.status='active' AND, IF
 // p is DELEGATED (parent set), p holds ≥1 live credential AND
 // chainAlive(parent). Accounts are keyless by design — an Account link is
 // live purely by active status. Live credential = not revoked, not
@@ -44,14 +44,19 @@ export interface OwnExpression {
 
 export interface ChainLink {
   principalId: string;
-  kind: 'human' | 'agent' | 'service';
+  // AZ-A12 clause 1: the kind vocabulary includes 'group'. A Group principal
+  // is never on a chain (it is parentless and never a parent), so no link
+  // ever carries it; the type says what the column admits.
+  kind: 'human' | 'agent' | 'service' | 'group';
   role: string | null;
   status: string;
   parentPrincipalId: string | null;
   boundTaskId: string | null;
+  boundTaskRole?: 'implementer' | 'verifier' | 'shepherd' | null;
   legacyIdentity: boolean;
   ownExpression: OwnExpression | null;
   liveCredentialCount: number;
+  ownerControlAccountId?: string | null;
 }
 
 export interface DelegationChain {
@@ -68,6 +73,22 @@ export interface DelegationChain {
  * current chain head in SQL and imports this rather than writing a 3.
  */
 export const MAX_CHAIN_DEPTH = 3;
+
+/** §7.3/T6 live bound context, shared by credential acceptance and previews.
+ * The sweeper is persistence, never the authorization boundary. */
+export async function boundAgentContextIsLive(
+  acting: Pick<ChainLink, 'kind' | 'boundTaskId'>,
+  queryable: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> } = pool,
+): Promise<boolean> {
+  if (acting.kind !== 'agent' || !acting.boundTaskId) return true;
+  const taskState = await queryable.query(
+    `SELECT t.status,
+            EXISTS (SELECT 1 FROM task_execution_leases l
+                     WHERE l.task_id = t.id AND l.status = 'active' AND l.expires_at <= NOW()) AS lease_expired
+       FROM tasks t WHERE t.id = $1`, [acting.boundTaskId]);
+  const taskRow = taskState.rows[0];
+  return Boolean(taskRow && !['completed', 'archived'].includes(String(taskRow.status)) && taskRow.lease_expired !== true);
+}
 
 export function parseOwnExpression(raw: unknown): OwnExpression | null {
   if (raw === null || raw === undefined) return null;
@@ -110,8 +131,10 @@ function mapLink(row: any): ChainLink {
     status: String(row.status),
     parentPrincipalId: row.parent_principal_id ? String(row.parent_principal_id) : null,
     boundTaskId: row.bound_task_id ? String(row.bound_task_id) : null,
+    boundTaskRole: row.bound_task_role ?? null,
     legacyIdentity: Boolean(row.legacy_identity),
     ownExpression: parseOwnExpression(row.own_expression),
+    ownerControlAccountId: row.owner_control_account_id ?? null,
     liveCredentialCount: Number(row.live_credential_count ?? 0),
   };
 }
@@ -123,8 +146,11 @@ export class DelegationService {
    * DelegationEvaluatorError on any structural problem — the caller maps
    * that to a whole-request 503 (AZ-34, T29).
    */
-  async resolveChain(principalId: string): Promise<DelegationChain> {
-    const result = await pool.query(
+  async resolveChain(
+    principalId: string,
+    queryable: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> } = pool,
+  ): Promise<DelegationChain> {
+    const result = await queryable.query(
       `WITH RECURSIVE chain AS (
          SELECT p.*, 0 AS depth FROM principals p WHERE p.id = $1
          UNION ALL
@@ -137,8 +163,8 @@ export class DelegationService {
          SELECT COUNT(*) FROM principal_credentials c
           WHERE c.principal_id = chain.id
             AND c.revoked_at IS NULL
-            AND (c.expires_at IS NULL OR c.expires_at > NOW())
-            AND (c.grace_until IS NULL OR c.grace_until > NOW())
+            AND (c.expires_at IS NULL OR c.expires_at > clock_timestamp())
+            AND (c.grace_until IS NULL OR c.grace_until > clock_timestamp())
        ) AS live_credential_count
        FROM chain ORDER BY depth ASC`,
       [principalId],

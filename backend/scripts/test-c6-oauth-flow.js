@@ -45,10 +45,12 @@ const BOARD = (process.env.RH_BOARD || '').replace(/\/+$/, '');
 const CLIENT_ID = process.env.RH_CLIENT_ID || '';
 const REDIRECT_URI = process.env.RH_REDIRECT_URI || '';
 const SESSION_TOKEN = process.env.RH_SESSION_TOKEN || '';
-// `principals:read` is not decoration: the bootstrap call compiles the SESSION
-// brief, which is a principals-plane read, and without a bootstrap record every
-// work-plane tool is refused. A Tier-B client that omits it can read but can
-// never write. docs/oauth.md says so; this default proves it.
+// `principals:read` WAS required here: the bootstrap call compiles the SESSION
+// brief, and until card 1118fefa that route sat behind it, so a Tier-B client
+// that omitted it could read but never write. The session brief is now a
+// self-identity read and bootstraps without it (docs/oauth.md); the default
+// keeps it so earlier runs of this drill stay comparable. Set RH_SCOPES without
+// it to exercise the narrower bootstrap.
 const SCOPES = process.env.RH_SCOPES
   || 'principals:read tasks:read tasks:write reports:read';
 

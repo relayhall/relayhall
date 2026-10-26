@@ -1,5 +1,6 @@
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { stepUpService } from '../services/StepUpService';
+import { stepUpMethodsFor } from '../services/stepUpMethods';
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
@@ -19,7 +20,11 @@ import { isFlagOn, FLAG_SESSIONS } from '../utils/featureFlags';
 import { firstRunService, FirstRunError } from '../services/FirstRunService';
 import { validateNewHandle } from '../utils/credentialAuthority';
 import { readCookie } from '../utils/cookies';
-import { createSsoRouter } from './sso';
+import { resolveActiveLoginSession, SessionAuthenticationUnavailableError } from '../services/sessionAuthentication';
+import { ssoAuthenticationService } from '../services/identity/SsoAuthenticationService';
+import { ssoAuthenticationRequestService, type StepUpCollection } from '../services/identity/SsoAuthenticationRequestService';
+import { createSsoRouter, issueSsoStateCookie, providerIdForSession, sendSsoRefusal } from './sso';
+import { isFullUuid, refuseMalformedPathId } from '../middleware/validate';
 
 const router = Router();
 
@@ -127,13 +132,8 @@ async function resolveCallingAccount(req: Request): Promise<CallingAccount | nul
   if (isFlagOn(FLAG_SESSIONS)) {
     const sessionToken = readCookie(req.headers.cookie, SESSION_COOKIE_NAME);
     if (sessionToken) {
-      const session = await loginSessionService.resolve(sessionToken);
-      if (session) {
-        const principal = await principalService.getPrincipalById(session.principalId);
-        if (principal && principal.status === 'active') {
-          return { principal, sessionId: session.sessionId };
-        }
-      }
+      const resolved = await resolveActiveLoginSession(sessionToken);
+      if (resolved) return { principal: resolved.principal, sessionId: resolved.session.sessionId };
     }
   }
   const header = req.headers.authorization;
@@ -596,6 +596,11 @@ router.delete('/session', async (req: Request, res: Response): Promise<void> => 
     res.clearCookie(BROWSER_ACCESS_COOKIE, CLEAR_BROWSER_COOKIE_OPTIONS);
     res.status(204).send();
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[Auth API] logout failed:', error);
     res.status(500).json({ error: 'Internal Server Error', code: 'SESSION_LOGOUT_FAILED', message: 'Logout failed', errorId });
   }
@@ -625,6 +630,11 @@ router.get('/sessions', async (req: Request, res: Response): Promise<void> => {
       })),
     });
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[Auth API] session list failed:', error);
     res.status(500).json({ error: 'Internal Server Error', code: 'SESSION_LIST_FAILED', message: 'Could not list sessions', errorId });
   }
@@ -650,6 +660,11 @@ router.delete('/sessions', async (req: Request, res: Response): Promise<void> =>
     res.clearCookie(BROWSER_ACCESS_COOKIE, CLEAR_BROWSER_COOKIE_OPTIONS);
     res.json({ success: true, revoked });
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[Auth API] bulk session revoke failed:', error);
     res.status(500).json({ error: 'Internal Server Error', code: 'SESSION_REVOKE_FAILED', message: 'Could not revoke sessions', errorId });
   }
@@ -664,6 +679,12 @@ router.delete('/sessions/:id', async (req: Request, res: Response): Promise<void
     const caller = await resolveCallingAccount(req);
     if (!caller) {
       res.status(401).json({ error: 'Unauthorized', message: 'No login session' });
+      return;
+    }
+    // Card bc847bd0: auth_sessions.id is a uuid column; a malformed id reached
+    // the ownership read and answered 500.
+    if (!isFullUuid(req.params.id)) {
+      refuseMalformedPathId(res, 'INVALID_SESSION_ID', 'session');
       return;
     }
     const owns = await loginSessionService.ownsSession(caller.principal.id, req.params.id);
@@ -684,6 +705,11 @@ router.delete('/sessions/:id', async (req: Request, res: Response): Promise<void
     }
     res.status(204).send();
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[Auth API] session revoke failed:', error);
     res.status(500).json({ error: 'Internal Server Error', code: 'SESSION_REVOKE_FAILED', message: 'Could not revoke the session', errorId });
   }
@@ -719,7 +745,12 @@ router.post('/browser-session', async (req: Request, res: Response): Promise<voi
       return;
     }
     res.status(401).json({ error: 'Unauthorized', message: 'No token provided' });
-  } catch {
+  } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     res.status(401).json({ error: 'Unauthorized', message: 'Invalid token' });
   }
 });
@@ -734,11 +765,22 @@ router.post('/browser-session', async (req: Request, res: Response): Promise<voi
 // deployment-wide secret, so a second human's step-up proves that second
 // human. The named local administrator keeps the deployment hash as its
 // fallback until a per-Account password is issued to it.
+//
+// Card a3e76724: an Account whose only proof is its Identity provider holds no
+// password to re-enter. `{ method: 'sso', action, targetId }` takes the OTHER
+// arm: it starts a re-authentication at that Identity provider bound to this
+// Account, action and target, and answers with the authorize URL. Every other
+// body — including one with no `method` at all — takes the password arm,
+// unchanged. `GET /auth/step-up/methods` tells the dashboard which arm applies.
 router.post('/step-up', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { password, action, targetId } = (req.body ?? {}) as Record<string, unknown>;
+    const { password, action, targetId, method } = (req.body ?? {}) as Record<string, unknown>;
     if (typeof action !== 'string' || !action.trim() || typeof targetId !== 'string' || !targetId.trim()) {
       res.status(400).json({ error: 'Bad Request', message: 'action and targetId are required' });
+      return;
+    }
+    if (method === 'sso') {
+      await beginSsoStepUp(req, res, action.trim(), targetId.trim());
       return;
     }
     if (typeof password !== 'string' || !password) {
@@ -760,7 +802,188 @@ router.post('/step-up', async (req: Request, res: Response): Promise<void> => {
     const minted = await stepUpService.mint(caller.principal.id, action.trim(), targetId.trim(), 'password');
     res.json({ success: true, stepUpToken: minted.token, expiresAt: minted.expiresAt });
   } catch (err) {
+    if (err instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', err.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[Auth API] step-up failed:', err);
+    res.status(500).json({ error: 'Internal Server Error', code: 'STEP_UP_FAILED', message: 'Failed to mint the step-up token', errorId });
+  }
+});
+
+/** Bounds on the binding a step-up re-authentication stores (card a3e76724). */
+const STEP_UP_ACTION_MAX_LENGTH = 128;
+const STEP_UP_TARGET_MAX_LENGTH = 256;
+const STEP_UP_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The SSO arm of `POST /auth/step-up` (card a3e76724).
+ *
+ * The binding is the CALLING session's Account plus the named action and
+ * target; nothing a caller sends can name a different Account. The pending
+ * relying-party row is created through the same `issueAuthorizationRequest`
+ * a login uses, with `prompt=login` and `max_age=0`, and the browser is bound
+ * to it by the same short-lived state cookie (T-SS3).
+ */
+async function beginSsoStepUp(req: Request, res: Response, action: string, targetId: string): Promise<void> {
+  if (action.length > STEP_UP_ACTION_MAX_LENGTH || targetId.length > STEP_UP_TARGET_MAX_LENGTH) {
+    res.status(400).json({
+      error: 'Bad Request', code: 'STEP_UP_BINDING_INVALID',
+      message: `action must be at most ${STEP_UP_ACTION_MAX_LENGTH} and targetId at most ${STEP_UP_TARGET_MAX_LENGTH} characters`,
+    });
+    return;
+  }
+  const caller = await resolveCallingAccount(req);
+  if (!caller) {
+    res.status(401).json({ error: 'Unauthorized', message: 'Step-up is a login-session act (AZ-18): bearer credentials do not step up' });
+    return;
+  }
+  try {
+    const sessionIdentityProviderId = caller.sessionId ? await providerIdForSession(caller.sessionId) : null;
+    const started = await ssoAuthenticationService.startStepUp({
+      principalId: caller.principal.id,
+      action,
+      targetId,
+      sessionIdentityProviderId,
+    });
+    issueSsoStateCookie(res, started.stateCookieValue, started.expiresAt);
+    res.json({
+      success: true,
+      method: 'sso',
+      authorizeUrl: started.authorizeUrl,
+      requestId: started.pendingRequestId,
+      expiresAt: started.expiresAt.toISOString(),
+    });
+  } catch (error) {
+    if (sendSsoRefusal(res, error)) return;
+    throw error;
+  }
+}
+
+/**
+ * GET /api/auth/step-up/methods — which step-up proofs THIS Account can give
+ * (card a3e76724), so the dashboard asks for the right one instead of asking
+ * an Identity-provider-only Account for a password it does not have.
+ *
+ *   * `password` — the Account holds a password credential, or it is the named
+ *     local administrator and the deployment hash is configured (the
+ *     break-glass fallback `passwordMatchesAccount` honours);
+ *   * `sso` — the Account holds a proven Identity link at an enabled Identity
+ *     provider (`stepUpProviderFor`, the same decision `startStepUp` makes).
+ *
+ * `preferred` is `sso` when the session itself came from an Identity provider
+ * and the Account has no password credential, and otherwise the first method
+ * available. It answers about the caller only; it needs no scope beyond being
+ * a signed-in Account, like the session routes beside it.
+ */
+router.get('/step-up/methods', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const caller = await resolveCallingAccount(req);
+    if (!caller) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Step-up is a login-session act (AZ-18): bearer credentials do not step up' });
+      return;
+    }
+    const principalId = caller.principal.id;
+    const sessionIdentityProviderId = caller.sessionId ? await providerIdForSession(caller.sessionId) : null;
+    // Card 72b8fb97: the ONE decision the SU-14 challenge also reports.
+    const { methods, hasPassword, sso } = await stepUpMethodsFor({
+      principalId,
+      handle: caller.principal.handle,
+      sessionIdentityProviderId,
+      localAdministratorPasswordConfigured: Boolean(PASSWORD_HASH),
+    });
+    const preferred = sso && sessionIdentityProviderId && !hasPassword ? 'sso' : (methods[0] ?? null);
+    res.json({ success: true, methods, preferred });
+  } catch (err) {
+    if (err instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', err.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
+    const errorId = logCaughtFailure('[Auth API] step-up methods failed:', err);
+    res.status(500).json({ error: 'Internal Server Error', code: 'STEP_UP_METHODS_FAILED', message: 'Could not read the step-up methods', errorId });
+  }
+});
+
+/**
+ * Typed answers for a proof that cannot be collected (card a3e76724). None is
+ * a 401: the caller IS signed in, and the dashboard treats any 401 as a dead
+ * session and signs the person out.
+ */
+const STEP_UP_COLLECT_REFUSALS: Record<Exclude<StepUpCollection['status'], 'collected'>, { status: number; code: string; message: string }> = {
+  unknown: { status: 404, code: 'STEP_UP_REQUEST_UNKNOWN', message: 'No such step-up re-authentication for this Account' },
+  pending: { status: 409, code: 'STEP_UP_PENDING', message: 'The Identity provider has not completed this re-authentication yet' },
+  refused: { status: 400, code: 'STEP_UP_REFUSED', message: 'The Identity provider re-authentication was refused; start the step-up again' },
+  already_collected: { status: 409, code: 'STEP_UP_ALREADY_COLLECTED', message: 'This re-authentication was already exchanged for its step-up token' },
+  expired: { status: 400, code: 'STEP_UP_EXPIRED', message: 'This re-authentication expired before it was collected; start the step-up again' },
+};
+
+/**
+ * POST /api/auth/step-up/collect — exchange a PROVEN Identity provider
+ * re-authentication for the single-use step-up token (card a3e76724).
+ *
+ * The callback proved it (fresh `auth_time`, same Account); this mints the
+ * token for exactly the action and target the request was bound to, through
+ * the same `stepUpService.mint` the password arm calls, with method `oidc` —
+ * so the consuming endpoint burns it, and audits its method, exactly as it
+ * does a password step-up. One conditional UPDATE decides the single winner:
+ * a replayed or concurrent collection, another Account's request id, and a
+ * stale proof are each refused by name.
+ */
+router.post('/step-up/collect', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { requestId } = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof requestId !== 'string' || !STEP_UP_REQUEST_ID.test(requestId)) {
+      res.status(400).json({ error: 'Bad Request', code: 'STEP_UP_REQUEST_INVALID', message: 'requestId must be the id the step-up start returned' });
+      return;
+    }
+    const caller = await resolveCallingAccount(req);
+    if (!caller) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Step-up is a login-session act (AZ-18): bearer credentials do not step up' });
+      return;
+    }
+    const collection = await ssoAuthenticationRequestService.collectStepUp(requestId, caller.principal.id);
+    if (collection.status !== 'collected') {
+      const refusal = STEP_UP_COLLECT_REFUSALS[collection.status];
+      res.status(refusal.status).json({ error: 'Step-up refused', code: refusal.code, message: refusal.message });
+      return;
+    }
+    const { binding } = collection;
+    const minted = await stepUpService.mint(caller.principal.id, binding.action, binding.targetId, 'oidc');
+    await auditService.record({
+      action: 'auth.step_up.mint',
+      actor: {
+        principalId: caller.principal.id,
+        handle: caller.principal.handle,
+        authMethod: caller.sessionId ? 'session' : 'dashboard_jwt',
+      },
+      resourceType: 'principal',
+      resourceId: caller.principal.id,
+      metadata: {
+        method: 'oidc',
+        action: binding.action,
+        target_id: binding.targetId,
+        token_id: minted.tokenId,
+        request_id: collection.requestId,
+        identity_provider_id: collection.identityProviderId,
+      },
+    });
+    res.json({
+      success: true,
+      method: 'sso',
+      stepUpToken: minted.token,
+      expiresAt: minted.expiresAt,
+      action: binding.action,
+      targetId: binding.targetId,
+    });
+  } catch (err) {
+    if (err instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth API] session authentication lookup unavailable:', err.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
+    const errorId = logCaughtFailure('[Auth API] step-up collect failed:', err);
     res.status(500).json({ error: 'Internal Server Error', code: 'STEP_UP_FAILED', message: 'Failed to mint the step-up token', errorId });
   }
 });

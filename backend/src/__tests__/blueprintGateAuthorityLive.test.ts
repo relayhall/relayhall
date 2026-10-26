@@ -130,14 +130,26 @@ async function armed(ids:string[]) {
   return (await pool.query('SELECT t.id,t.auto_start,a.armed FROM tasks t JOIN task_assignments a ON a.task_id=t.id WHERE t.id=ANY($1::uuid[]) ORDER BY t.id',[ids])).rows;
 }
 async function completeGate(fixture:any) {
-  // This D7 fixture explicitly holds the canonical legacy Verifier identity
-  // plus an ordinary write grant on the GATE only. It grants no arm authority.
+  // Preserve the fixture's gate-only write grant and exact assigned Verifier.
+  // Approval still requires the parent to enter Review; no arm authority is added.
   const {decider,result}=fixture;await grant(decider,'task',result.tasks.decision,['write']);
   const subtasks=(await pool.query('SELECT id FROM subtasks WHERE task_id=$1 ORDER BY index',[result.tasks.decision])).rows;
   for(const row of subtasks){
     ok(await call(user,'PATCH',`/tasks/${result.tasks.decision}/subtasks/by-id/${row.id}/status`,{status:'review'}));
     ok(await call(decider,'POST',`/tasks/${result.tasks.decision}/subtasks/by-id/${row.id}/approve`,{}));
   }
+  const gate=()=>pool.query('SELECT status,owner_principal_id,verifier_principal_id,auto_start FROM tasks WHERE id=$1',[result.tasks.decision]).then((value:any)=>value.rows[0]);
+  const history=()=>pool.query('SELECT * FROM task_history WHERE task_id=$1 ORDER BY id',[result.tasks.decision]).then((value:any)=>value.rows);
+  const before=await gate(), historyBefore=await history();
+  expect(before).toMatchObject({status:'todo',verifier_principal_id:decider.id,auto_start:false});
+  expect(before.owner_principal_id).not.toBe(decider.id);
+  // Even with completed children and the exact Verifier, Todo cannot skip Review.
+  expect(await call(decider,'PATCH',`/tasks/${result.tasks.decision}`,{status:'completed'}))
+    .toMatchObject({status:403,body:{code:'TASK_COMPLETION_FORBIDDEN'}});
+  expect(await gate()).toEqual(before);expect(await history()).toEqual(historyBefore);
+  const reviewed=ok(await call(user,'PATCH',`/tasks/${result.tasks.decision}`,{status:'review'})).task;
+  expect(reviewed.status).toBe('review');
+  expect(await gate()).toEqual({...before,status:'review'});
   ok(await call(decider,'PATCH',`/tasks/${result.tasks.decision}`,{status:'completed'}));
 }
 async function publishedConnector() {
@@ -245,7 +257,7 @@ describe('Blueprint gate authority and concealment on disposable PostgreSQL',()=
   expect([403,404]).toContain((await call(outsider,method,route,body)).status);ok(await call(decider,method,route,body));
   if(act==='park')expect((await armed([task]))[0].armed).toBe(false);else expect((await pool.query('SELECT owner_principal_id FROM tasks WHERE id=$1',[task])).rows[0].owner_principal_id).toBeNull();
  });
- test('D24c role-bound Shepherd reassigns execution with actual Service invoke and Grant coupling; ordinary writer is a positive control',async()=>{
+ test('D24c role-bound Shepherd reassigns execution only inside its own write cap and Service invoke',async()=>{
   const {decider,result}=await gateFixture();const service=await publishedConnector();
   expect([403,404]).toContain((await call(decider,'PATCH',`/tasks/${result.tasks.chosen}`,{executionProfile:{serviceId:service.serviceId,options:{}}})).status);
   const writer=await narrow(['tasks:read','tasks:write','services:invoke']);const outsider=await narrow(['tasks:read','tasks:write','services:invoke']);
@@ -258,8 +270,19 @@ describe('Blueprint gate authority and concealment on disposable PostgreSQL',()=
   const body={executionProfile:{serviceId:service.serviceId,options:{}}};
   ok(await call(writer,'PATCH',`/tasks/${result.tasks.shared}`,body));
   expect((await pool.query('SELECT execution_service_id FROM tasks WHERE id=$1',[result.tasks.shared])).rows[0].execution_service_id).toBe(service.serviceId);
-  expect((await pool.query("SELECT count(*)::int AS n FROM grants WHERE grantee_id=$1 AND resource_type='task' AND resource_id=$2",[service.accountId,result.tasks.shared])).rows[0].n).toBeGreaterThan(0);
+  // AZ-A10 lands the execution role on its Connector principal, never on
+  // the registering Account that may also own unrelated sibling services.
+  const roleRows=await pool.query(`SELECT g.grantee_id,l.role FROM grants g
+    JOIN access_vehicle_links l ON l.target_id=g.id AND l.target_kind='grant'
+    WHERE l.task_id=$1 AND l.vehicle_kind='role' AND l.role='implementer'
+      AND g.resource_type='task' AND g.resource_id=$1 AND g.verb='write'`,[result.tasks.shared]);
+  expect(roleRows.rows).toEqual([{grantee_id:service.principalId,role:'implementer'}]);
+  expect((await pool.query("SELECT count(*)::int AS n FROM grants WHERE grantee_id=$1 AND resource_type='task' AND resource_id=$2",[service.accountId,result.tasks.shared])).rows[0].n).toBe(0);
   expect([403,404]).toContain((await call(outsider,'PATCH',`/tasks/${result.tasks.chosen}`,body)).status);
+  const beyondCap=await call(shepherd,'PATCH',`/tasks/${result.tasks.chosen}`,body);
+  expect([beyondCap.status,beyondCap.body.code]).toEqual([403,'ROLE_EXCEEDS_ASSIGNER']);
+  expect((await pool.query('SELECT execution_service_id FROM tasks WHERE id=$1',[result.tasks.chosen])).rows[0].execution_service_id).toBeNull();
+  await grant(shepherd,'task',result.tasks.chosen,['write']);
   ok(await call(shepherd,'PATCH',`/tasks/${result.tasks.chosen}`,body));
   expect((await pool.query('SELECT execution_service_id FROM tasks WHERE id=$1',[result.tasks.chosen])).rows[0].execution_service_id).toBe(service.serviceId);
  });

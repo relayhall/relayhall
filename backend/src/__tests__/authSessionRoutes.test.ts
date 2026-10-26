@@ -37,6 +37,7 @@ jest.mock('../services/PrincipalService', () => ({
   principalService: {
     getPrincipalByHandle: (...args: unknown[]) => getPrincipalByHandle(...args),
     getPrincipalById: (...args: unknown[]) => getPrincipalById(...args),
+    getPrincipalByIdStrict: (...args: unknown[]) => getPrincipalById(...args),
   },
 }));
 jest.mock('../services/AuditService', () => ({
@@ -119,6 +120,20 @@ function call(
     request.end();
   });
 }
+
+// The first ts-jest route compilation is fixture setup, not login latency.
+// Keep each test's fresh module/router state and its default request deadline.
+beforeAll(async () => {
+  const previousJwtSecret = process.env.JWT_SECRET;
+  try {
+    process.env.JWT_SECRET = 'w1-auth-routes-secret';
+    await import('../routes/auth');
+  } finally {
+    jest.resetModules();
+    if (previousJwtSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = previousJwtSecret;
+  }
+}, 15_000);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -373,7 +388,7 @@ describe('session listing and revocation are the caller own sessions only', () =
     signedIn();
     sessionOwns.mockResolvedValue(false);
     const base = await startApp();
-    const reply = await call(base, 'DELETE', '/auth/sessions/sess-other', undefined, liveCookie);
+    const reply = await call(base, 'DELETE', '/auth/sessions/0e1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a40', undefined, liveCookie);
     expect(reply.status).toBe(404);
     expect(sessionRevoke).not.toHaveBeenCalled();
   });
@@ -384,9 +399,9 @@ describe('session listing and revocation are the caller own sessions only', () =
     sessionOwns.mockResolvedValue(true);
     sessionRevoke.mockResolvedValue(true);
     const base = await startApp();
-    const reply = await call(base, 'DELETE', '/auth/sessions/sess-2', undefined, liveCookie);
+    const reply = await call(base, 'DELETE', '/auth/sessions/1f2a3b4c-5d6e-4f70-8b9c-0d1e2f3a4b50', undefined, liveCookie);
     expect(reply.status).toBe(204);
-    expect(sessionRevoke).toHaveBeenCalledWith('sess-2', 'admin');
+    expect(sessionRevoke).toHaveBeenCalledWith('1f2a3b4c-5d6e-4f70-8b9c-0d1e2f3a4b50', 'admin');
   });
 
   it('logs out the current session and clears both cookies', async () => {

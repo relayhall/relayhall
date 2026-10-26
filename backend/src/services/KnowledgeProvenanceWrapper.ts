@@ -67,12 +67,13 @@ export function renderResult(result: KnowledgeEmittedResult, provenance: string)
     handle: result.handle,
     compartment: result.compartment,
     contentKind: result.contentKind,
+    ...(result.category ? { category: result.category } : {}),
     score: result.score,
     ...(result.updatedAt ? { updatedAt: result.updatedAt } : {}),
     ...(result.parentHandle ? { parentHandle: result.parentHandle } : {}),
   });
   return [
-    `- result from ${provenance}, compartment ${result.compartment}`,
+    `- result from ${provenance}, compartment ${typeof result.compartment === 'string' ? result.compartment : result.compartment.id}`,
     metadata,
     untrusted(`${provenance} title`, result.title),
     untrusted(`${provenance} snippet`, result.snippet),
@@ -84,6 +85,30 @@ export function renderGroup(group: KnowledgeGroup): string {
   const provenance = sourceProvenance(group.sourceId, group.sourceSlug);
   const heading = `## ${provenance} — ${group.results.length} result(s)`;
   return [heading, ...group.results.map((result) => renderResult(result, provenance))].join('\n');
+}
+
+/**
+ * Card 40e0e542: the one sentence that says what the search covered. The
+ * archive is whatever categories the sources declare as archive, and
+ * `archive.declaredBy` names the CONSULTED sources that declare one, so the
+ * sentence is true in each situation the record describes (the L3 review's
+ * rider):
+ *
+ *   - no consulted source declares an archive: there was none to exclude or
+ *     include, whatever the opt-in said;
+ *   - the default scope: the declared archive was subtracted;
+ *   - the opt-in, and EVERY source that declares an archive refused it: the
+ *     archive was requested, not searched;
+ *   - the opt-in otherwise: the archive was searched.
+ */
+export function knowledgeScopeSentence(coverage: Pick<KnowledgeCoverage, 'archive' | 'refusedBySource'>): string {
+  const declaredBy = coverage.archive?.declaredBy ?? [];
+  if (declaredBy.length === 0) return 'Searched: current knowledge (no consulted source declares an archive).';
+  if (coverage.archive.included !== true) return 'Searched: current knowledge; archive excluded (pass includeArchive: true).';
+  if (declaredBy.every((id) => coverage.refusedBySource.includes(id))) {
+    return 'Scope requested: current knowledge and the archive; the archive sources refused.';
+  }
+  return 'Searched: current knowledge and the archive (includeArchive: true).';
 }
 
 /**
@@ -109,7 +134,8 @@ export function renderKnowledgeResponse(
     || coverage.unavailable.length > 0
     || coverage.refusedBySource.length > 0
     || coverage.refusedByPolicy.length > 0
-    || coverage.skipped.length > 0;
+    || coverage.skipped.length > 0
+    || (coverage.partialSources?.length ?? 0) > 0;
 
   return [
     '# Knowledge search coverage',
@@ -119,6 +145,9 @@ export function renderKnowledgeResponse(
     degraded
       ? 'Some identity-filtered sources were skipped or unreachable — see the coverage record below.'
       : 'Every source in your queryable set answered.',
+    // Card 40e0e542 (owner ruling E127 (5)): every answer states which scopes
+    // were searched, in core's words, before the record it summarises.
+    knowledgeScopeSentence(coverage),
     quotedJsonBlock(coverage),
     `audit reference: ${auditRef}`,
     '',

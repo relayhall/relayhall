@@ -39,6 +39,11 @@ export interface Skill {
   config: Record<string, unknown>;
   provenance: SkillProvenance | null;
   content_sha256: string | null;
+  /** Card d67e6990 (AZ-A12 M-c): the owner, a person Account or a Group; null = unowned.
+   * Optional so a response from an older board still type-checks. */
+  owner_principal_id?: string | null;
+  owner_kind?: 'human' | 'group' | null;
+  owner_display_name?: string | null;
 }
 
 export interface ProjectSkillLink {

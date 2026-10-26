@@ -44,3 +44,22 @@ describe('explicit canonical creation transaction', () => {
     expect(pool.connect).not.toHaveBeenCalled();
   });
 });
+
+describe('dependency graph transaction preparation', () => {
+  test('graph lock precedes the callback snapshot and persists through commit', async () => {
+    const { pool, events } = fixture();
+    await runCreationTransaction(pool, actor, async transaction => {
+      expect(transaction.dependencyGraphLocked).toBe(true);
+      await transaction.client.query('SELECT graph snapshot');
+    }, 'blueprint', { dependencyGraphWrite: true });
+    expect(events).toEqual(['BEGIN ISOLATION LEVEL REPEATABLE READ', "SET LOCAL statement_timeout = '15s'", "SET LOCAL lock_timeout = '5s'",
+      'LOCK TABLE task_dependencies IN SHARE ROW EXCLUSIVE MODE', 'SELECT graph snapshot', 'COMMIT', 'release']);
+  });
+  test('failed graph lock rolls back without entering the callback', async () => {
+    const { pool, client, events } = fixture();
+    client.query.mockImplementation(async sql => { events.push(sql); if (sql.startsWith('LOCK TABLE')) throw new Error('lock timeout'); return { rows: [] }; });
+    const operation = jest.fn();
+    await expect(runCreationTransaction(pool, actor, operation, 'blueprint', { dependencyGraphWrite: true })).rejects.toThrow('lock timeout');
+    expect(operation).not.toHaveBeenCalled(); expect(events.slice(-2)).toEqual(['ROLLBACK', 'release']);
+  });
+});

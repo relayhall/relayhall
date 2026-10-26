@@ -64,7 +64,7 @@ describe('report visibility plumbing (no enforcement)', () => {
         body: JSON.stringify({ title: 'T', content: 'C', visibility: 'private' }),
       });
       expect(post.status).toBe(201);
-      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ visibility: 'private' }));
+      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ visibility: 'private' }), expect.objectContaining({ principalId: null }));
 
       const patch = await fetch(`${base}/reports/${RID}`, {
         method: 'PATCH',
@@ -72,7 +72,8 @@ describe('report visibility plumbing (no enforcement)', () => {
         body: JSON.stringify({ visibility: 'team' }),
       });
       expect(patch.status).toBe(200);
-      expect(manager.update).toHaveBeenCalledWith(RID, expect.objectContaining({ visibility: 'team' }));
+      // Card 5854f0d6: the third argument is the acting principal for the feed row.
+      expect(manager.update).toHaveBeenCalledWith(RID, expect.objectContaining({ visibility: 'team' }), expect.objectContaining({ handle: 'service_account' }));
     });
   });
 
@@ -124,13 +125,13 @@ describe('ReportManager visibility persistence', () => {
   it('INSERT persists visibility with a default of default', async () => {
     const pool = fakePool();
     const mgr = new ReportManager(pool as never);
-    await mgr.create({ title: 'T', content: 'C', visibility: 'private' });
+    await mgr.create({ title: 'T', content: 'C', visibility: 'private' }, {});
     let insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.text).toContain('visibility');
     expect(insert.params).toContain('private');
 
     pool.queries.length = 0;
-    await mgr.create({ title: 'T', content: 'C' });
+    await mgr.create({ title: 'T', content: 'C' }, {});
     insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.params).toContain('default');
   });

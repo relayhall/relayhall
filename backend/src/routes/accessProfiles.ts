@@ -10,6 +10,7 @@ import { logCaughtFailure } from '../utils/secretSafeLog';
 import { Router, Request, Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { sendApiError } from '../utils/apiErrors';
+import { RequestFaultError } from '../utils/httpErrors';
 import { accessProfileService, AccessProfileError } from '../services/AccessProfileService';
 import { auditActorFromRequest } from '../utils/auditActor';
 
@@ -59,12 +60,23 @@ router.get('/what-if', async (req: Request, res: Response): Promise<void> => {
       sendApiError(res, 400, 'INVALID_QUERY_VALUE', 'principalId query parameter is required');
       return;
     }
-    const access = await accessProfileService.effectiveAccess(principalId);
+    const { authorityPreviewService, previewOptions } = await import('../services/AuthorityPreviewService');
+    const credentialId = req.query.credentialId;
+    if (credentialId !== undefined && typeof credentialId !== 'string') {
+      sendApiError(res, 400, 'INVALID_PREVIEW_QUERY', 'credentialId must be one UUID');
+      return;
+    }
+    const access = await authorityPreviewService.preview(principalId, credentialId, previewOptions(req.query));
     res.json({ success: true, access });
   } catch (e) {
+    // AuthorityPreviewError is a RequestFaultError: developer-authored refusals.
+    if (e instanceof RequestFaultError) {
+      sendApiError(res, e.status, e.code, e.message);
+      return;
+    }
     if (sendAccessProfileError(res, e)) return;
     const errorId = logAccessProfileRouteFailure('what-if preview', e);
-    sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to compute the preview', undefined, { errorId });
+    sendApiError(res, 503, 'EFFECTIVE_ACCESS_FAILED', 'Failed to compute the preview', undefined, { errorId });
   }
 });
 

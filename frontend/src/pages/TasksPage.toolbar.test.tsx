@@ -207,6 +207,62 @@ describe('distinct toolbar actions (§2.3–§2.5)', () => {
   });
 });
 
+describe('the header actions on a phone (E466)', () => {
+  test('New task is a direct child of the header actions, beside the scrolling line and never inside it, last in the tab order', async () => {
+    setViewportWidth(375);
+    await renderTasksPage();
+
+    const actions = document.querySelector('.tasks-page-header-actions') as HTMLElement;
+    const scroll = document.querySelector('.tasks-page-header-scroll') as HTMLElement;
+    expect(actions).not.toBeNull();
+    expect(scroll).not.toBeNull();
+    expect(scroll.parentElement).toBe(actions);
+    const create = screen.getByRole('button', { name: 'Create new task' });
+    expect(create.parentElement).toBe(actions);
+    expect(scroll.contains(create)).toBe(false);
+    // The view switch, Search and More ride the scrolling line, in this order, before New task.
+    const inLine = [...scroll.querySelectorAll<HTMLElement>('button, [role="radio"]')]
+      .map(control => control.getAttribute('aria-label') ?? control.textContent?.trim() ?? '');
+    expect(inLine).toEqual(['Board', 'Map', 'Search and filter', 'More actions']);
+    const order = [...actions.querySelectorAll<HTMLElement>('button, [role="radio"]')];
+    expect(order[order.length - 1]).toBe(create);
+  });
+
+  test('E469: every icon-only control of the header opts in to the long-press label, and a long press shows it on a phone only', async () => {
+    const longPress = async (control: HTMLElement) => {
+      const down = new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 5, clientY: 5 });
+      Object.defineProperty(down, 'pointerType', { value: 'touch' });
+      Object.defineProperty(down, 'pointerId', { value: 1 });
+      await act(async () => { control.dispatchEvent(down); await vi.advanceTimersByTimeAsync(600); });
+      return screen.queryByRole('tooltip');
+    };
+    setViewportWidth(375);
+    await renderTasksPage();
+    const actions = document.querySelector('.tasks-page-header-actions') as HTMLElement;
+    const labelled = [...actions.querySelectorAll<HTMLElement>('[data-label-tip]')]
+      .map(control => control.getAttribute('aria-label') ?? control.textContent?.trim() ?? '');
+    expect(labelled).toEqual(['Board', 'Map', 'Search and filter', 'More actions', 'Create new task']);
+    const tip = await longPress(screen.getByRole('button', { name: 'Search and filter' }));
+    expect(tip).toHaveTextContent('Search and filter');
+    expect(screen.queryByRole('tooltip')).not.toBeNull();
+    cleanup();
+
+    setViewportWidth(1280);
+    await renderTasksPage();
+    expect(await longPress(screen.getByRole('button', { name: 'Search and filter' }))).toBeNull();
+  });
+
+  test('the desktop header keeps Show archived and Archive completed on the same line, New task last', async () => {
+    setViewportWidth(1280);
+    await renderTasksPage();
+
+    const scroll = document.querySelector('.tasks-page-header-scroll') as HTMLElement;
+    expect(scroll.contains(screen.getByRole('button', { name: 'Show archived' }))).toBe(true);
+    expect(scroll.contains(screen.getByRole('button', { name: 'Archive completed' }))).toBe(true);
+    expect(scroll.contains(screen.getByRole('button', { name: 'Create new task' }))).toBe(false);
+  });
+});
+
 describe('one URL encoding for view and filters (§3)', () => {
   test('a deep link restores the full filter state, drives the board query server-side, and round-trips', async () => {
     const entry = '/tasks?view=board&q=linked&projects=RelayHall&statuses=review&tags=frontend,ux&assignee=alice&phases=phase-1&archived=true&priorities=high';

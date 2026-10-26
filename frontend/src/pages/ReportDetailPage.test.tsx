@@ -5,8 +5,8 @@
  * agent-writable data (reports:write), so it must render through the shared
  * sanitizer — benign Markdown intact, active HTML stripped.
  */
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import '@testing-library/jest-dom/vitest';
 
@@ -58,6 +58,7 @@ describe('ReportDetailPage sanitization', () => {
     const { container } = renderPage();
     await screen.findByRole('heading', { name: 'Safe Heading' });
     expect(screen.getByText('benign bold')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View context' }).closest('.report-detail-actions')).not.toBeNull();
     const html = container.innerHTML;
     expect(html).not.toContain('onerror');
     expect(html).not.toContain('<script');
@@ -117,4 +118,57 @@ describe('ReportDetailPage structured handover', () => {
       unresolved_questions: [],
     });
   });
+});
+
+
+test('task-bound report uses its canonical task editor, not generic PATCH', async () => {
+  const response = await reportResponse('Task evidence').json();
+  response.report.origin = 'task-report';
+  response.report.source_task_id = 'source-task';
+  response.report.task_ids = ['unrelated-association'];
+  mockFetch.mockResolvedValue(jsonResponse(response));
+  renderPage();
+  await screen.findByRole('heading', {name:'Fixture report'});
+  expect(screen.queryByRole('button', {name:'Edit'})).not.toBeInTheDocument();
+  expect(screen.getByRole('link', {name:'Open task report'}))
+    .toHaveAttribute('href','/tasks/source-task?report=r1#task-detail-reports-heading');
+  expect(mockFetch.mock.calls.some(([,init]) => init?.method === 'PATCH')).toBe(false);
+});
+
+test('association metadata alone does not turn a standalone report into a task report', async () => {
+  const response = await reportResponse('Standalone evidence').json();
+  response.report.origin = 'api';
+  response.report.task_ids = ['associated-task'];
+  mockFetch.mockResolvedValue(jsonResponse(response));
+  renderPage();
+  await screen.findByRole('heading', {name:'Fixture report'});
+  fireEvent.click(screen.getByRole('button',{name:'Edit'}));
+  expect(screen.getByRole('heading',{name:'Edit Report'})).toBeInTheDocument();
+  expect(screen.queryByRole('link',{name:'Open task report'})).not.toBeInTheDocument();
+});
+
+
+function ReportRouteSwitch(){const navigate=useNavigate();return <button onClick={()=>navigate("/reports/r2")}>Switch Report route</button>;}
+function renderSwitchingReports(){return render(<MemoryRouter initialEntries={["/reports/r1"]}><Routes><Route path="/reports/:id" element={<><ReportDetailPage/><ReportRouteSwitch/></>}/></Routes></MemoryRouter>);}
+test("late GET from a previous Report route cannot replace the canonical current Report",async()=>{
+  let finish!:(response:Response)=>void;
+  const second=await reportResponse("Second canonical evidence").json();second.report.id="r2";second.report.title="Second canonical report";second.report.origin="task-report";second.report.source_task_id="second-task";
+  mockFetch.mockImplementation(async input=>String(input).endsWith("/r1")?new Promise<Response>(resolve=>{finish=resolve;}):jsonResponse(second));
+  renderSwitchingReports();await waitFor(()=>expect(finish).toBeDefined());
+  fireEvent.click(screen.getByRole("button",{name:"Switch Report route"}));await screen.findByRole("heading",{name:"Second canonical report"});
+  await act(async()=>finish(reportResponse("Stale first evidence")));
+  expect(screen.getByRole("heading",{name:"Second canonical report"})).toBeInTheDocument();
+  expect(screen.getByRole("link",{name:"Open task report"})).toHaveAttribute("href","/tasks/second-task?report=r2#task-detail-reports-heading");
+  expect(screen.queryByRole("button",{name:"Edit"})).not.toBeInTheDocument();
+});
+test("late PATCH result cannot reopen standalone editing on a new task-bound Report route",async()=>{
+  let finish!:(response:Response)=>void;
+  const second=await reportResponse("Second canonical evidence").json();second.report.id="r2";second.report.title="Second canonical report";second.report.origin="task-report";second.report.source_task_id="second-task";
+  mockFetch.mockImplementation(async(input,init)=>init?.method==="PATCH"?new Promise<Response>(resolve=>{finish=resolve;}):String(input).endsWith("/r2")?jsonResponse(second):reportResponse("First evidence"));
+  renderSwitchingReports();await screen.findByRole("heading",{name:"Fixture report"});
+  fireEvent.click(screen.getByRole("button",{name:"Edit"}));fireEvent.click(screen.getByRole("button",{name:"Save Changes"}));await waitFor(()=>expect(finish).toBeDefined());
+  fireEvent.click(screen.getByRole("button",{name:"Switch Report route"}));await screen.findByRole("heading",{name:"Second canonical report"});
+  await act(async()=>finish(reportResponse("Stale patch evidence")));
+  expect(screen.getByRole("heading",{name:"Second canonical report"})).toBeInTheDocument();
+  expect(screen.queryByRole("button",{name:"Edit"})).not.toBeInTheDocument();expect(screen.queryByRole("heading",{name:"Edit Report"})).not.toBeInTheDocument();
 });

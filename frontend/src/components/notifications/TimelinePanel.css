@@ -1,0 +1,295 @@
+/* The Timeline tab (card 5854f0d6, Slice B): the filter bar, the day groups,
+   the "new since your last visit" divider and the lazy-paging foot. Theme
+   tokens only; the rows use the action list's grammar at page width.
+   Owner ruling E453: the filter bar is folded to one compact line (the
+   search, the applied filters as chips, the Filters toggle) and unfolds into
+   grouped fieldsets. */
+
+.timeline-panel-filters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+/* The folded line: search, chips, toggle, clear. */
+.timeline-panel-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.timeline-panel-search {
+  display: flex;
+  flex: 1 1 240px;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 420px;
+  color: var(--text-secondary);
+}
+
+.timeline-panel-search .form-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.timeline-panel-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline-panel-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-height: var(--control-compact);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.timeline-panel-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-panel-chip:hover {
+  border-color: var(--border-default);
+}
+
+.timeline-panel-chip:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+
+/* Unfolded: the groups, side by side where they fit. */
+.timeline-panel-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.timeline-panel-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.timeline-panel-group legend {
+  margin-bottom: var(--space-1);
+  padding: 0;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.timeline-panel-group--wide {
+  grid-column: 1 / -1;
+}
+
+.timeline-panel-type-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: var(--space-1) var(--space-3);
+}
+
+.timeline-panel-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.timeline-panel-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-compact);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.timeline-panel-new {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.timeline-panel-note {
+  margin: 0 0 var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.timeline-panel-day {
+  margin-top: var(--space-4);
+}
+
+.timeline-panel-day h3 {
+  margin: 0 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.timeline-panel-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.timeline-panel-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.timeline-panel-item:last-child {
+  border-bottom: 0;
+}
+
+.timeline-panel-item-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+.timeline-panel-item-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  /* A long unbroken word (an id, a URL in a title) wraps inside the row and
+     never widens the page (E461). */
+  overflow-wrap: anywhere;
+}
+
+.timeline-panel-item-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.timeline-panel-badge {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+
+.timeline-panel-item-subject {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+a.timeline-panel-item-subject {
+  color: var(--text-accent);
+}
+
+.timeline-panel-item-what {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.timeline-panel-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* "New since your last visit": a rule across the list with its words on it,
+   so the boundary is said, not only drawn. */
+.timeline-panel-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 2px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+
+.timeline-panel-more {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+/* The lazy-paging trigger: a zero-height line at the list's end. */
+.timeline-panel-sentinel {
+  flex-basis: 100%;
+  height: 1px;
+}
+
+.timeline-panel-end {
+  margin: var(--space-3) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .timeline-panel-search {
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .timeline-panel-field .form-select,
+  .timeline-panel-field .form-input {
+    width: 100%;
+  }
+}

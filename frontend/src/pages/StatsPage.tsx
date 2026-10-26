@@ -16,6 +16,13 @@
  * reconciliation receipt, and a cost total that did not say which it was would
  * be presenting an estimate as an invoice. So every cost row carries its basis
  * as visible text, not as a tooltip or a colour.
+ *
+ * SHORT SESSIONS ARE COUNTED, AND SAID TO BE (card `0ac41d40`). The Sessions
+ * page hides short sessions by default; these totals do NOT. Stats count every
+ * session and event received in the window, and the Sessions and Events
+ * figures say how many of them are short, with the rule in words from the
+ * server's own values — so the same activity is never counted on one page and
+ * silently missing from the other.
  */
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -26,9 +33,11 @@ import {
   PRESENCE_LABELS,
   SESSION_STATE_HINTS,
   TELEMETRY_POLL_MS,
+  describeShortSession,
   fetchStats,
   formatAmount,
   formatCount,
+  reporterName,
 } from '../utils/telemetryProjection';
 import '../styles/telemetry-projection.css';
 import './StatsPage.css';
@@ -37,10 +46,11 @@ const Instant: React.FC<{ value: string }> = ({ value }) => (
   <time dateTime={value}>{formatDateTime(value)}</time>
 );
 
-const Stat: React.FC<{ label: string; value: string }> = ({ label, value }) => (
+const Stat: React.FC<{ label: string; value: string; note?: string | null }> = ({ label, value, note }) => (
   <div className="telemetry-stat">
     <dt>{label}</dt>
     <dd>{value}</dd>
+    {note && <dd className="telemetry-stat-note">{note}</dd>}
   </div>
 );
 
@@ -67,6 +77,12 @@ const EMPTY_STATE = (
           <>
             The same reporters feed both this page and the Sessions page —
             one setup covers both surfaces.
+          </>,
+          <>
+            A connector that declares a telemetry tier and works through this
+            board&apos;s MCP server is counted from the tool calls the board
+            received, as an <code>mcp</code> source with no model or token
+            figures.
           </>,
         ],
       },
@@ -108,6 +124,19 @@ export const StatsPage: React.FC = () => {
   const stats = statsQuery.data;
   const error = statsQuery.error as Error | undefined;
   const hasData = Boolean(stats && stats.totals.events > 0);
+  // The short share, stated even when it is zero, whenever the board reports
+  // it: the figure above it INCLUDES short sessions, and a label shown only
+  // sometimes would leave the reader guessing which case they are in.
+  const shortSessions = stats?.totals.shortSessions;
+  const shortEvents = stats?.totals.shortSessionEvents;
+  const sessionsNote = typeof shortSessions === 'number'
+    ? `Includes ${formatCount(shortSessions)} short session${shortSessions === 1 ? '' : 's'}`
+      + (stats?.shortSession ? ` (${describeShortSession(stats.shortSession)})` : '')
+      + ', which the Sessions page hides by default.'
+    : null;
+  const eventsNote = typeof shortEvents === 'number'
+    ? `Includes ${formatCount(shortEvents)} event${shortEvents === 1 ? '' : 's'} from short sessions.`
+    : null;
 
   return (
     <div className="stats-page">
@@ -141,8 +170,8 @@ export const StatsPage: React.FC = () => {
           <section className="telemetry-section" aria-labelledby="telemetry-usage-heading">
             <h2 id="telemetry-usage-heading">Usage</h2>
             <dl className="telemetry-stat-grid">
-              <Stat label="Events" value={formatCount(stats.totals.events)} />
-              <Stat label="Sessions" value={formatCount(stats.totals.sessions)} />
+              <Stat label="Events" value={formatCount(stats.totals.events)} note={eventsNote} />
+              <Stat label="Sessions" value={formatCount(stats.totals.sessions)} note={sessionsNote} />
               <Stat label="Sources" value={formatCount(stats.totals.sources)} />
               <Stat label="Requests" value={formatCount(stats.totals.requests)} />
               <Stat label="Input tokens" value={formatCount(stats.totals.inputTokens)} />
@@ -252,7 +281,7 @@ export const StatsPage: React.FC = () => {
                   {stats.coverage.map((source) => (
                     <tr key={`${source.connectorId}:${source.sourceProduct}`}>
                       <td>{source.sourceProduct}</td>
-                      <td>{source.connectorHandle ?? source.connectorId}</td>
+                      <td>{reporterName(source)}</td>
                       <td>
                         {source.adapter ?? '—'}
                         {source.adapterVersion ? ` ${source.adapterVersion}` : ''}

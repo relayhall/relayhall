@@ -290,8 +290,8 @@ const EXCEPTIONS: Record<string, { count: number; why: string }> = {
     why: 'three role=menuitem entries and the Timeline toggle which needs a forwarded ref for focus return; stacked-region navigation uses native destination links',
   },
   'components/tasks/TaskCard.tsx': {
-    count: 6,
-    why: 'three structural controls (the opener and drag handle are ref-managed under the board roving-tabindex contract and carry the data-task-id/onFocus hooks the routed return depends on) plus THREE CHIPS — project badge, tag, session link — which OWNER RULING de70a6dd R7 exempts from the two-size rule by declared amendment 7-A1 on design 77950a97. That is a contract amendment, not the visual excuse review af33fd17 B1 rejected',
+    count: 5,
+    why: 'three structural controls (the opener and drag handle are ref-managed under the board roving-tabindex contract and carry the data-task-id/onFocus hooks the routed return depends on) plus TWO CHIPS — project badge and tag — exempted by OWNER RULING de70a6dd R7, amendment 7-A1 on design 77950a97. Retirement removes the unsupported session link; it adds no exemption',
   },
   'components/tasks/TaskCardMoveMenu.tsx': {
     count: 1,
@@ -317,18 +317,26 @@ const EXCEPTIONS: Record<string, { count: number; why: string }> = {
 
 describe('structural ratchet: the raw-control census (NOT the rendered proof)', () => {
   const RAW = /<(button|select)[\s>]/g;
+  const assertCount = (source: string, file: string, count: number) => {
+    const found = source.match(RAW) ?? [];
+    expect(
+      found.length,
+      `${file} has ${found.length} raw <button>/<select>, the register allows ${count}. ` +
+      `Route it through the kit, or add it to EXCEPTIONS with the behaviour or ARIA ` +
+      `pattern the kit cannot express — visual size is NOT such a reason (review af33fd17 B1).`
+    ).toBe(count);
+  };
 
   for (const [file, { count, why }] of Object.entries(EXCEPTIONS)) {
     test(`${file}: ${count} raw — ${count ? why : 'no exceptions'}`, () => {
-      const found = read(file).match(RAW) ?? [];
-      expect(
-        found.length,
-        `${file} has ${found.length} raw <button>/<select>, the register allows ${count}. ` +
-        `Route it through the kit, or add it to EXCEPTIONS with the behaviour or ARIA ` +
-        `pattern the kit cannot express — visual size is NOT such a reason (review af33fd17 B1).`
-      ).toBe(count);
+      assertCount(read(file),file,count);
     });
   }
+  test('TaskCard retirement count rejects an additional raw JSX control',()=>{
+    const file='components/tasks/TaskCard.tsx';
+    const mutant=read(file)+'\nexport const CensusMutation = () => <button type="button">Extra control</button>;\n';
+    expect(()=>assertCount(mutant,file,EXCEPTIONS[file].count)).toThrow('has 6 raw');
+  });
 });
 
 describe('the rendered-surface promise is kept', () => {

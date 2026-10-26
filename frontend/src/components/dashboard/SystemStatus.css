@@ -37,12 +37,15 @@
 
 .system-status-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, 1fr): a long label wraps inside its cell; at 320px it must not
+     widen the page (E461). */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
 }
 
 .system-status-item {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-3);
@@ -93,6 +96,8 @@
 }
 
 .system-status-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: var(--text-sm);
   font-weight: var(--font-medium);
   color: var(--text-secondary);

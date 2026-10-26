@@ -8,6 +8,7 @@ import {
   BUILT_IN_THEMES,
   DEFAULT_PREFERENCES,
   DEFAULT_THEME,
+  MAP_REPORTS_MODE_VALUES,
   REDUCED_MOTION_VALUES,
   THEME_FAVICONS,
   THEME_LABELS,
@@ -15,6 +16,7 @@ import {
   applyReducedMotion,
   applyTheme,
   isBuiltInTheme,
+  isMapReportsMode,
   isThemePreference,
   motionIsReduced,
   preferencesCacheKey,
@@ -51,7 +53,14 @@ describe('the value space', () => {
 
   test('treats reduced motion as a tri-state defaulting to the system', () => {
     expect([...REDUCED_MOTION_VALUES]).toEqual(['system', 'reduce', 'no-preference']);
-    expect(DEFAULT_PREFERENCES).toEqual({ theme: null, reducedMotion: 'system' });
+    expect(DEFAULT_PREFERENCES).toEqual({ theme: null, reducedMotion: 'system', mapReportsMode: 'collapsed' });
+  });
+
+  test('offers the Map Reports display as Collapsed (the default) or Expanded (card 742fae98)', () => {
+    expect([...MAP_REPORTS_MODE_VALUES]).toEqual(['collapsed', 'expanded']);
+    expect(isMapReportsMode('expanded')).toBe(true);
+    expect(isMapReportsMode('Expanded')).toBe(false);
+    expect(isMapReportsMode(null)).toBe(false);
   });
 });
 
@@ -121,19 +130,19 @@ describe('the boot cache', () => {
   test('round-trips and is scoped to the origin', () => {
     expect(preferencesCacheKey()).toBe(`relayhall_prefs:${window.location.origin}`);
     writeCachedPreferences({
-      theme: 'relay-light', reducedMotion: 'reduce', deploymentTheme: 'high-contrast',
+      theme: 'relay-light', reducedMotion: 'reduce', mapReportsMode: 'expanded', deploymentTheme: 'high-contrast',
     });
     expect(readCachedPreferences()).toEqual({
-      theme: 'relay-light', reducedMotion: 'reduce', deploymentTheme: 'high-contrast',
+      theme: 'relay-light', reducedMotion: 'reduce', mapReportsMode: 'expanded', deploymentTheme: 'high-contrast',
     });
   });
 
   test('reads hostile or stale content as defaults instead of throwing', () => {
     // This runs on the paint path: a corrupt cache must cost a flash, not the app.
-    for (const raw of ['', 'not json', '[]', '{"theme":"relay-sepia","reducedMotion":7}']) {
+    for (const raw of ['', 'not json', '[]', '{"theme":"relay-sepia","reducedMotion":7,"mapReportsMode":"grouped"}']) {
       localStorage.setItem(preferencesCacheKey(), raw);
       expect(readCachedPreferences())
-        .toEqual({ theme: null, reducedMotion: 'system', deploymentTheme: null });
+        .toEqual({ theme: null, reducedMotion: 'system', mapReportsMode: 'collapsed', deploymentTheme: null });
     }
   });
 });

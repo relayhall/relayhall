@@ -12,11 +12,56 @@ import { auditService, type AuditActor } from './AuditService';
 import { encryptCredentialSecret } from '../utils/credentialCrypto';
 import { evaluateCredentialAcceptance, isUsableBearerKeyMaterial } from '../utils/credentialAcceptance';
 import { auditChainFor } from '../utils/auditChain';
-import { invalidateApprovalsForCredentials } from '../utils/approvalInvalidation';
+import { invalidateApprovalsForCredentials, lapseApprovalsForDisabledGrantee } from '../utils/approvalInvalidation';
+
+/** A status change the account-status seam refuses (both doors). */
+export class AccountStatusError extends Error {
+  constructor(public readonly status: number, public readonly code: string, message: string) {
+    super(message);
+    this.name = 'AccountStatusError';
+  }
+}
+
+/**
+ * The two principals no status change may disable (the rules `PATCH
+ * /principals/:id` states in its own words): the request-less internal actor
+ * and the dashboard login identity. Null when the change is admissible.
+ */
+export function accountStatusRefusal(handle: string, status: 'active' | 'disabled'): { code: string; message: string } | null {
+  if (status !== 'disabled') return null;
+  if (handle === 'system') {
+    return { code: 'SYSTEM_PRINCIPAL_NOT_DISABLED', message: 'The system principal cannot be disabled — internal writes depend on it' };
+  }
+  if (handle === 'dashboard_user') {
+    return { code: 'DASHBOARD_IDENTITY_NOT_DISABLED', message: 'The owner principal cannot be disabled through the API — this is the dashboard login identity' };
+  }
+  return null;
+}
+
+/**
+ * The principal kinds. AZ-A12 clause 1 (card 20f40e40) adds `group`: the
+ * identity anchor of exactly one Group (same id), which may own objects and
+ * never acts, authenticates, delegates or holds a credential. It is not a
+ * layer of §3, and only the Group writers create one.
+ */
+export const PRINCIPAL_KINDS = ['human', 'agent', 'service', 'group'] as const;
+export type PrincipalKind = (typeof PRINCIPAL_KINDS)[number];
+
+/** The directory's default exclusion (AZ-A12 clause 3(h)). */
+const EXCLUDE_GROUP_PRINCIPALS = "kind <> 'group'";
+
+/** Raised when anything but a Group writer tries to create a Group principal. */
+export class GroupPrincipalWriterError extends Error {
+  readonly code = 'GROUP_PRINCIPAL_WRITER_ONLY';
+  constructor() {
+    super('A Group principal is created only with its Group, by the Group writers (AZ-A12 clause 2)');
+    this.name = 'GroupPrincipalWriterError';
+  }
+}
 
 export interface Principal {
   id: string;
-  kind: 'human' | 'agent' | 'service';
+  kind: PrincipalKind;
   handle: string;
   displayName: string | null;
   status: 'active' | 'disabled' | 'terminated';
@@ -213,28 +258,65 @@ class PrincipalService {
   }
 
   async getPrincipalById(id: string): Promise<Principal | undefined> {
-    const cached = this.byId.get(id);
-    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-      return cached.principal ?? undefined;
-    }
     try {
-      const result = await pool.query('SELECT * FROM principals WHERE id = $1', [id]);
-      const principal = result.rows[0] ? rowToPrincipal(result.rows[0]) : null;
-      this.byId.set(id, { principal, at: Date.now() });
-      if (principal) this.byHandle.set(principal.handle, { principal, at: Date.now() });
-      return principal ?? undefined;
+      return await this.getPrincipalByIdStrict(id);
     } catch (err) {
       this.warnSubstrateMissing(`id lookup '${id}'`, err);
       return undefined;
     }
   }
 
-  async listPrincipals(includeHidden = false): Promise<Principal[]> {
+  /** Session authentication must distinguish a confirmed miss from a failed
+   * lookup. Keep the tolerant method above for its existing callers. */
+  async getPrincipalByIdStrict(id: string): Promise<Principal | undefined> {
+    const cached = this.byId.get(id);
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      return cached.principal ?? undefined;
+    }
+    const result = await pool.query('SELECT * FROM principals WHERE id = $1', [id]);
+    const principal = result.rows[0] ? rowToPrincipal(result.rows[0]) : null;
+    this.byId.set(id, { principal, at: Date.now() });
+    if (principal) this.byHandle.set(principal.handle, { principal, at: Date.now() });
+    return principal ?? undefined;
+  }
+
+  /**
+   * The principal directory. AZ-A12 clause 3(h): Group principals are left
+   * out unless the caller asks for `kind = 'group'`, so no person picker fed
+   * by this list ever offers a Group; `includeHidden` never adds them.
+   */
+  async listPrincipals(
+    includeHidden = false, kind?: PrincipalKind,
+    // Card 1e56dbef: a NARROWING of the same list (one principal, or one
+    // parent's children), so the Access Explorer's directory projection is
+    // this list's own filter and never a second one.
+    within: { principalIds?: readonly string[]; parentPrincipalId?: string } = {},
+  ): Promise<Principal[]> {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+    if (!includeHidden) {
+      conditions.push(`COALESCE((metadata->>'internal')::boolean, false) = false`);
+      conditions.push(`COALESCE((metadata->>'hidden_until_configured')::boolean, false) = false`);
+    }
+    if (kind !== undefined) {
+      params.push(kind);
+      conditions.push(`kind = $${params.length}`);
+    } else {
+      conditions.push(EXCLUDE_GROUP_PRINCIPALS);
+    }
+    if (within.principalIds !== undefined) {
+      params.push([...within.principalIds]);
+      conditions.push(`id = ANY($${params.length}::uuid[])`);
+    }
+    if (within.parentPrincipalId !== undefined) {
+      params.push(within.parentPrincipalId);
+      conditions.push(`parent_principal_id = $${params.length}::uuid`);
+    }
     const result = await pool.query(
       `SELECT * FROM principals
-        ${includeHidden ? '' : `WHERE COALESCE((metadata->>'internal')::boolean, false) = false
-          AND COALESCE((metadata->>'hidden_until_configured')::boolean, false) = false`}
-        ORDER BY kind, handle`
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY kind, handle`,
+      params,
     );
     return result.rows.map(rowToPrincipal);
   }
@@ -332,29 +414,41 @@ class PrincipalService {
   }
 
   /**
-   * Issue an api_key credential and return the full key exactly once.
-   * Never logged; only the sha256 of the secret is stored.
+   * THE CREDENTIAL POLICY, stated once (AUTHZ amendment AZ-A13 clause 7, E73:
+   * "one implementation, two doors"; clause 8a). The checks every Connector or
+   * Agent credential's scope set and transport pin must pass, whoever writes
+   * it: issuance (`issueCredential` below - every issuance path, P1-B-2's
+   * collect included, ends there) and the in-place edit
+   * (`AuthorityEditExecutor`), which calls this on the state AFTER the edit.
+   *
+   *   - never `root` (§5.2 rule 2, AZ-18);
+   *   - the target is a delegated principal: Accounts are keyless (A17.1);
+   *   - legacy identities are frozen (§10, T37), terminated ones refused;
+   *   - `*:admin` never reaches an Agent (§5.2 rule 3);
+   *   - the transport pin is one of any, mcp, api.
+   *
+   * `act` names the audit action of the durable denied row each refusal writes
+   * on the pool (§5.2 rule 8), so a refusal survives the caller's rollback:
+   * `credential.mint` for an issue, `credential.edit` for an edit.
    */
-  async issueCredential(input: {
-    principalId: string;
-    scopes: string[];
-    label?: string | null;
-    expiresAt?: Date | null;
-    transport?: 'any' | 'mcp' | 'api';
-    rotatedFromId?: string | null;
-    metadata?: Record<string, unknown>;
-    createdByPrincipalId?: string | null;
-  }, actor: AuditActor = { handle: 'system', authMethod: 'system' }, transaction?: PoolClient): Promise<{ fullKey: string; credentialId: string; keyId: string }> {
+  async assertCredentialPolicy(
+    input: { principalId: string; scopes: string[]; transport?: string },
+    actor: AuditActor = { handle: 'system', authMethod: 'system' },
+    transaction?: PoolClient,
+    act: 'credential.mint' | 'credential.edit' = 'credential.mint',
+    resource: { type: string; id: string } | null = null,
+  ): Promise<void> {
     // §5.2 rule 8 (review 6c7d68d2 B3): every policy REFUSAL below writes
     // a durable denied audit row with the reason and the full
     // server-resolved chain of the target.
     const refuse = async (status: number, code: string, message: string): Promise<never> => {
       await auditService.record({
-        action: 'credential.mint', actor, outcome: 'denied',
-        resourceType: 'principal', resourceId: input.principalId,
+        action: act, actor, outcome: 'denied',
+        resourceType: resource?.type ?? 'principal', resourceId: resource?.id ?? input.principalId,
         metadata: {
           refusal: code,
           scopes: input.scopes,
+          ...(act === 'credential.edit' ? { clause: 'AZ-A13 clause 8' } : {}),
           chain: await auditChainFor(pool, input.principalId),
         },
       }).catch(() => undefined);
@@ -393,7 +487,7 @@ class PrincipalService {
       await auditService.record({
         action: 'legacy.refused', actor, outcome: 'denied',
         resourceType: 'principal', resourceId: input.principalId,
-        metadata: { act: 'credential.mint', reason: 'legacy_identity frozen out (§10, T37)',
+        metadata: { act, reason: 'legacy_identity frozen out (§10, T37)',
           chain: await auditChainFor(pool, input.principalId) },
       });
       throw new CredentialPolicyError(409, 'LEGACY_FROZEN',
@@ -412,6 +506,27 @@ class PrincipalService {
     if (!['any', 'mcp', 'api'].includes(transport)) {
       await refuse(422, 'INVALID_TRANSPORT', "transport must be 'any', 'mcp' or 'api'");
     }
+  }
+
+  /**
+   * Issue an api_key credential and return the full key exactly once.
+   * Never logged; only the sha256 of the secret is stored.
+   */
+  async issueCredential(input: {
+    principalId: string;
+    scopes: string[];
+    label?: string | null;
+    expiresAt?: Date | null;
+    transport?: 'any' | 'mcp' | 'api';
+    rotatedFromId?: string | null;
+    metadata?: Record<string, unknown>;
+    createdByPrincipalId?: string | null;
+  }, actor: AuditActor = { handle: 'system', authMethod: 'system' }, transaction?: PoolClient): Promise<{ fullKey: string; credentialId: string; keyId: string }> {
+    // The policy is the one copy above (AZ-A13 clause 7): every refusal is
+    // audited there, on the pool, before anything is written.
+    await this.assertCredentialPolicy(
+      { principalId: input.principalId, scopes: input.scopes, transport: input.transport }, actor, transaction);
+    const transport = input.transport ?? 'any';
     const client = transaction ?? await pool.connect();
     const ownsTransaction = transaction === undefined;
     const keyId = crypto.randomBytes(9).toString('base64').replace(/[^A-Za-z0-9]/g, '').slice(0, 12).padEnd(12, '0');
@@ -527,11 +642,16 @@ class PrincipalService {
    */
   async createPrincipal(input: {
     handle: string;
-    kind: 'human' | 'agent' | 'service';
+    kind: PrincipalKind;
     displayName?: string | null;
     role?: string | null;
     purpose?: string | null;
   }, client: PoolClient | typeof pool = pool): Promise<Principal | undefined> {
+    // AZ-A12 clause 2: a Group principal is born with its Group, in the Group
+    // writers' one statement, never here.
+    if (input.kind === 'group') {
+      throw new GroupPrincipalWriterError();
+    }
     const result = await client.query(
       `INSERT INTO principals (kind, handle, display_name, role, purpose)
        VALUES ($1, $2, $3, $4, $5)
@@ -562,6 +682,19 @@ class PrincipalService {
     updates: { displayName?: string; status?: 'active' | 'disabled'; role?: string },
     client: PoolClient | typeof pool = pool,
   ): Promise<Principal | undefined> {
+    if (updates.status === 'disabled' && client === pool) {
+      const owned = await pool.connect();
+      try {
+        await owned.query('BEGIN');
+        const updated = await this.updatePrincipal(principalId, updates, owned);
+        await owned.query('COMMIT');
+        if (updated) this.invalidatePrincipals([principalId]);
+        return updated;
+      } catch (error) {
+        await owned.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally { owned.release(); }
+    }
     const sets: string[] = [];
     const params: unknown[] = [principalId];
     if (updates.displayName !== undefined) {
@@ -584,6 +717,12 @@ class PrincipalService {
     );
     if (!result.rows[0]) return undefined;
     const principal = rowToPrincipal(result.rows[0]);
+    if (updates.status === 'disabled') {
+      const { accessVehicleService } = await import('./AccessVehicleService');
+      await accessVehicleService.detachRoleHolder(
+        client as PoolClient, principalId, { handle: 'system', authMethod: 'system' },
+        'AZ-A10: role holder disabled');
+    }
     // Refresh rather than invalidate. The rh_ auth path reads status live from
     // its own JOIN, so disabling takes effect on the next request regardless;
     // this keeps the read caches from serving a stale display name or status
@@ -605,6 +744,61 @@ class PrincipalService {
   cachePrincipal(principal: Principal): void {
     this.byId.set(principal.id, { principal, at: Date.now() });
     this.byHandle.set(principal.handle, { principal, at: Date.now() });
+  }
+
+  /**
+   * THE ACCOUNT-STATUS SEAM (universal change request, design ratified by
+   * owner ruling E325, section 3 `identity.status` and section 12 Q31 (a);
+   * card 9ce0b0b0, train T2 slice S4). ONE function used by BOTH doors: the
+   * direct `PATCH /principals/:id` and the decision of an approved
+   * `identity.status` change. Inside the caller's transaction it writes the
+   * status (and, on the direct door, the display name), its
+   * `principal.update` ledger row, and, when the status moves to disabled,
+   * the cascade the board disable lacked (a declared tightening of AZ-A4's
+   * reversible disable): every STORED login session of the principal revoked
+   * (`disabled_user`, on this client), and every pending request naming it
+   * as grantee lapsed `GRANTEE_DISABLED`. An enable writes the status and
+   * nothing else. The read caches are the caller's to publish after COMMIT.
+   */
+  async applyAccountStatus(client: PoolClient, input: {
+    principalId: string;
+    status?: 'active' | 'disabled';
+    displayName?: string;
+    actor: AuditActor;
+    /** Extra ledger fields (the change decision's approval id, standing and step-up). */
+    metadata?: Record<string, unknown>;
+  }): Promise<{ principal: Principal | undefined; previousStatus: string | null; sessionsRevoked: number; lapsedApprovalIds: string[] }> {
+    const refusal = input.status ? accountStatusRefusal(
+      String((await client.query('SELECT handle FROM principals WHERE id = $1', [input.principalId])).rows[0]?.handle ?? ''), input.status) : null;
+    if (refusal) throw new AccountStatusError(400, refusal.code, refusal.message);
+    const before = (await client.query('SELECT display_name, status FROM principals WHERE id = $1 FOR UPDATE', [input.principalId])).rows[0];
+    const updates = { displayName: input.displayName, status: input.status };
+    const principal = await this.updatePrincipal(input.principalId, updates, client);
+    let sessionsRevoked = 0;
+    let lapsedApprovalIds: string[] = [];
+    if (principal && before) {
+      const changedFields = [
+        ...(updates.displayName !== undefined && updates.displayName !== before.display_name ? ['displayName'] : []),
+        ...(updates.status !== undefined && updates.status !== before.status ? ['status'] : []),
+      ];
+      const disabledNow = changedFields.includes('status') && principal.status === 'disabled';
+      if (disabledNow) {
+        const { loginSessionService } = await import('./LoginSessionService');
+        sessionsRevoked = await loginSessionService.revokeAllForPrincipal(principal.id, 'disabled_user', null, client);
+        lapsedApprovalIds = await lapseApprovalsForDisabledGrantee(client, principal.id, input.actor);
+      }
+      await auditService.record({
+        action: 'principal.update', actor: input.actor,
+        resourceType: 'principal', resourceId: principal.id,
+        metadata: {
+          changedFields,
+          ...(changedFields.includes('status') ? { previousStatus: before.status, status: principal.status } : {}),
+          ...(disabledNow ? { sessionsRevoked, lapsedApprovalIds } : {}),
+          ...(input.metadata ?? {}),
+        },
+      }, client);
+    }
+    return { principal, previousStatus: before ? String(before.status) : null, sessionsRevoked, lapsedApprovalIds };
   }
 
   /**
@@ -770,7 +964,7 @@ class PrincipalService {
             AND revoked_at IS NULL`,
         [credentialId],
       );
-      // Rotation mints an EXACT COPY (§7.3, sol r2-F1): scope set and
+      // Rotation mints an EXACT COPY (§7.3, review r2-F1): scope set and
       // transport class inherited verbatim — narrowing happens ONLY through
       // the live principal-level own() expression, never here.
       const issued = await this.issueCredential({
@@ -829,15 +1023,26 @@ class PrincipalService {
 
   /**
    * Revoke one credential by id. Never throws.
+   *
+   * `transaction` (AZ-A9 clause 12a, card 785e1eed P1-B-2): the terminal
+   * reaper revokes a request-issued credential "in the same transaction as the
+   * existing AZ-S7 terminal detach", on the connection that already holds the
+   * approvals rows FOR UPDATE. Given a client, every statement below runs on it
+   * and the caller commits or rolls back; omitted, the behaviour is unchanged
+   * (its own pool transaction), exactly as `issueCredential` takes one.
    */
   async revokeCredentialById(
     credentialId: string,
     reason: string,
     actor: AuditActor = { handle: 'system', authMethod: 'system' },
+    transaction?: PoolClient,
+    /** Extra ledger fields on the credential.revoke row (the decision of an approved credential.revoke change, E325 section 7.1). */
+    auditMetadata?: Record<string, unknown>,
   ): Promise<boolean> {
-    const client = await pool.connect();
+    const client = transaction ?? await pool.connect();
+    const ownsTransaction = transaction === undefined;
     try {
-      await client.query('BEGIN');
+      if (ownsTransaction) await client.query('BEGIN');
       const result = await client.query(
         `UPDATE principal_credentials
             SET revoked_at = now(), metadata = jsonb_set(metadata, '{revoke_reason}', to_jsonb($2::text))
@@ -846,12 +1051,14 @@ class PrincipalService {
         [credentialId, reason]
       );
       if (!result.rowCount) {
-        await client.query('ROLLBACK');
+        if (ownsTransaction) await client.query('ROLLBACK');
         return false;
       }
       // AZ-31c (AZ-S4): revocation invalidates every outstanding Approval
       // bound to this credential, in the same transaction.
       await invalidateApprovalsForCredentials(client, [credentialId], 'revoked', actor);
+      const { accessVehicleService } = await import('./AccessVehicleService');
+      await accessVehicleService.syncAgentRoleExpiry(client, String(result.rows[0].principal_id), actor);
       await auditService.record({
         action: 'credential.revoke', actor,
         resourceType: 'credential', resourceId: credentialId,
@@ -861,15 +1068,16 @@ class PrincipalService {
           reason,
           // §5.2 rule 8: the FULL resolved chain rides every revocation.
           chain: await auditChainFor(client, String(result.rows[0].principal_id)),
+          ...(auditMetadata ?? {}),
         },
       }, client);
-      await client.query('COMMIT');
+      if (ownsTransaction) await client.query('COMMIT');
       return true;
     } catch (error) {
-      await client.query('ROLLBACK');
+      if (ownsTransaction) await client.query('ROLLBACK');
       throw error;
     } finally {
-      client.release();
+      if (ownsTransaction) client.release();
     }
   }
 

@@ -18,7 +18,6 @@
 import { Pool } from 'pg';
 import { pool as defaultPool } from '../db/connection';
 import { feedEventService } from './FeedEventService';
-import { notificationManager } from './NotificationManager';
 import { notificationEndpointService } from './NotificationEndpointService';
 import { logCaughtWarning } from '../utils/secretSafeLog';
 import {
@@ -55,6 +54,53 @@ export const TELEMETRY_STALE_MS = 9 * 60_000;
  * heartbeating-but-dead backstop) — board-clock minutes since the Task's own
  * last recorded change. */
 export const TASK_STUCK_STALE_MINUTES = 30;
+
+/**
+ * THE QUALIFYING-ACTIVITY CLOCK of the stuck sweep, as ONE SQL expression over
+ * the Task row aliased `task` (review 79261f77, B2): the latest of the Task's
+ * status-bearing feed events (with started_at/created_at as the pre-feed
+ * fallback) and linked-Report activity through the ratified two-arm linkage
+ * (task_ids containment OR a task_references 'report' row).
+ *
+ * Exported (card 5854f0d6, Notifications and Timeline design section 3.1 and
+ * R2-N4): the "Needs your action" Stuck kind reads THIS expression, so an
+ * episode is open there exactly when the sweep counts it open, and a Task
+ * re-armed by a new linked Report leaves the list. Never re-typed.
+ */
+export function stuckActivityAtSql(task: string): string {
+  return `GREATEST(
+                  COALESCE((SELECT max(fe.occurred_at)
+                     FROM feed_events fe
+                    WHERE fe.object_type = 'task' AND fe.object_id = ${task}.id
+                      AND fe.name IN ('task.created', 'task.updated')
+                      AND fe.payload ? 'status'), ${task}.started_at, ${task}.created_at),
+                  COALESCE((SELECT max(GREATEST(r.created_at, COALESCE(r.updated_at, r.created_at)))
+                     FROM reports r
+                    WHERE r.deleted_at IS NULL
+                      AND (
+                        EXISTS (SELECT 1 FROM unnest(r.task_ids) AS linked(task_id)
+                                 WHERE linked.task_id::uuid = ${task}.id)
+                        OR EXISTS (SELECT 1 FROM task_references tr
+                                    WHERE tr.task_id = ${task}.id AND tr.kind = 'report'
+                                      AND tr.target_id = r.id)
+                      )), '-infinity'::timestamptz)
+                )`;
+}
+
+/**
+ * Episode dedup against the SAME clock: a `task.stuck` row at or after
+ * `activityAt` means the episode of Task `taskId` is announced (and, for the
+ * action list, still open). Exported with the clock for the same reason.
+ */
+export function stuckEpisodeAnnouncedSql(taskId: string, activityAt: string): string {
+  return `EXISTS (
+          SELECT 1 FROM feed_events fe
+           WHERE fe.name = 'task.stuck'
+             AND fe.object_type = 'task'
+             AND fe.object_id = ${taskId}
+             AND fe.occurred_at >= ${activityAt}
+        )`;
+}
 
 export interface TelemetryFrameInput {
   kind: TelemetryFrameKind;
@@ -160,12 +206,33 @@ export class TelemetryService {
     // A refusal is therefore `rowCount === 0`: the CTE runs (a data-modifying
     // CTE always executes), its WHERE refuses, it returns no rows, and the
     // outer `INSERT ... SELECT ... FROM gate` writes nothing.
+    // Task attribution (card b595b3b0) is decided in the SAME statement as the
+    // interval gate. Every frame the gate admits is stored as before (the MCP
+    // Task-link frames of card 35b73092 included), but only a frame from the
+    // Task's current Assignee, while the Task is in progress, and - when the
+    // Task names an assigned connector Service - from that Service's principal,
+    // carries the server's assignment-epoch stamp. Task activity reads count
+    // only stamped frames of the current epoch, so a reassignment (even away
+    // and back) retires every earlier observation. The caller's own
+    // `_taskAssignmentEpoch` is always removed: it cannot choose the stamp.
+    // FOR SHARE makes a concurrent reassignment wait for this bounded write.
     let inserted;
     try {
       inserted = await this.pool.query(
-        `WITH ${TELEMETRY_GATE_CTE}
+        `WITH attributed_task AS MATERIALIZED (
+           SELECT e.epoch::text AS epoch
+             FROM tasks t JOIN task_native_assignment_epochs e ON e.task_id=t.id
+             LEFT JOIN services s ON s.id=t.execution_service_id
+            WHERE $5::uuid IS NOT NULL AND t.id=$5 AND t.owner_principal_id=$1
+              AND t.status='in-progress'
+              AND (t.execution_service_id IS NULL OR s.principal_id=$1)
+            FOR SHARE OF t, e
+         ), ${TELEMETRY_GATE_CTE}
          INSERT INTO telemetry_frames (principal_id, task_id, kind, status, payload)
-         SELECT $1, $5, $6, $7, $8 FROM gate
+         SELECT $1, $5, $6, $7,
+           ($8::jsonb - '_taskAssignmentEpoch')
+             || COALESCE((SELECT jsonb_build_object('_taskAssignmentEpoch', epoch) FROM attributed_task), '{}'::jsonb)
+           FROM gate
          RETURNING received_at`,
         [
           ...gateParams(principalId, 'frames', new Date(now)),
@@ -233,6 +300,39 @@ export class TelemetryService {
     return { state, kind: row.kind, receivedAt: new Date(row.received_at).toISOString() };
   }
 
+  /** Task activity for the board and Task details (card b595b3b0). The caller
+   * supplies only ids narrowed by Task read authorization. One query, no
+   * canonical-session fallback, no lifecycle inference and no per-card
+   * fan-out: no stamped frame of the current assignment means 'unknown'. */
+  async activityForTasks(taskIds: string[]): Promise<Array<{
+    taskId: string; state: 'active' | 'idle' | 'stale' | 'unknown';
+    receivedAt: string | null; kind: TelemetryFrameKind | null;
+  }>> {
+    if (taskIds.length === 0) return [];
+    if (taskIds.length > 100) throw new Error('Activity read exceeds bounded task set');
+    const result = await this.pool.query(
+      `SELECT DISTINCT ON (f.task_id) f.task_id, f.kind, f.status, f.received_at
+         FROM telemetry_frames f JOIN tasks t ON t.id=f.task_id
+         JOIN task_native_assignment_epochs e ON e.task_id=t.id
+         LEFT JOIN services s ON s.id=t.execution_service_id
+        WHERE f.task_id=ANY($1::uuid[]) AND t.status='in-progress'
+          AND f.principal_id=t.owner_principal_id
+          AND (t.execution_service_id IS NULL OR s.principal_id=f.principal_id)
+          AND f.payload->>'_taskAssignmentEpoch'=e.epoch::text
+        ORDER BY f.task_id, f.received_at DESC, f.id DESC`, [taskIds],
+    );
+    const rows = new Map(result.rows.map(row => [String(row.task_id), row]));
+    const now = Date.now();
+    return taskIds.map(taskId => {
+      const row = rows.get(taskId);
+      if (!row) return { taskId, state: 'unknown', receivedAt: null, kind: null };
+      const receivedAt = new Date(row.received_at).toISOString();
+      return { taskId, receivedAt, kind: row.kind,
+        state: now - Date.parse(receivedAt) >= TELEMETRY_STALE_MS ? 'stale'
+          : row.kind === 'status' && row.status === 'idle' ? 'idle' : 'active' };
+    });
+  }
+
   /**
    * The `task.stuck` sweep: derive stuckness for every in-progress Task from
    * lease expiry or status staleness (board clock only), and announce each
@@ -258,11 +358,7 @@ export class TelemetryService {
     const candidates = await this.pool.query(
       `WITH candidates AS (
          SELECT t.id, t.title, t.status, t.project_id, t.owner_principal_id,
-                COALESCE(t.shepherd_principal_id, t.creator_principal_id, t.owner_principal_id) AS exception_recipient_principal_id,
-                GREATEST(
-                  COALESCE(status_activity.at, t.started_at, t.created_at),
-                  COALESCE(report_activity.at, '-infinity'::timestamptz)
-                ) AS activity_at,
+                ${stuckActivityAtSql('t')} AS activity_at,
                 lease.status AS lease_status,
                 lease.expires_at AS lease_expires_at
            FROM tasks t
@@ -273,35 +369,10 @@ export class TelemetryService {
               ORDER BY l.acquired_at DESC, l.id DESC
               LIMIT 1
            ) lease ON TRUE
-           LEFT JOIN LATERAL (
-             SELECT max(fe.occurred_at) AS at
-               FROM feed_events fe
-              WHERE fe.object_type = 'task' AND fe.object_id = t.id
-                AND fe.name IN ('task.created', 'task.updated')
-                AND fe.payload ? 'status'
-           ) status_activity ON TRUE
-           LEFT JOIN LATERAL (
-             SELECT max(GREATEST(r.created_at, COALESCE(r.updated_at, r.created_at))) AS at
-               FROM reports r
-              WHERE r.deleted_at IS NULL
-                AND (
-                  EXISTS (SELECT 1 FROM unnest(r.task_ids) AS linked(task_id)
-                           WHERE linked.task_id::uuid = t.id)
-                  OR EXISTS (SELECT 1 FROM task_references tr
-                              WHERE tr.task_id = t.id AND tr.kind = 'report'
-                                AND tr.target_id = r.id)
-                )
-           ) report_activity ON TRUE
           WHERE t.status = 'in-progress'
        )
        SELECT * FROM candidates c
-        WHERE NOT EXISTS (
-          SELECT 1 FROM feed_events fe
-           WHERE fe.name = 'task.stuck'
-             AND fe.object_type = 'task'
-             AND fe.object_id = c.id
-             AND fe.occurred_at >= c.activity_at
-        )`,
+        WHERE NOT ${stuckEpisodeAnnouncedSql('c.id', 'c.activity_at')}`,
     );
 
     let emitted = 0;
@@ -329,21 +400,12 @@ export class TelemetryService {
         await client.query('COMMIT');
         emitted += 1;
         // RH-P3.C8 (§2.12): the announced exception also reaches the human
-        // path — the UI notification surface (mandatory baseline) and any
-        // enabled webhook endpoints (ID-only, best-effort, loop-guarded).
-        // Both are post-commit and non-authoritative: the feed row is the
-        // record, and a notification failure never un-announces it.
-        try {
-          // §2.6.4: the SHEPHERD receives the exception events (creator,
-          // then Assignee, as fallbacks) — the UI read model additionally
-          // grant-filters the referenced Task for every caller.
-          await notificationManager.notifyException(
-            String(row.id), String(row.title ?? ''), 'task.stuck', reason,
-            row.exception_recipient_principal_id ?? null,
-          );
-        } catch (err) {
-          logCaughtWarning('[TelemetryService] exception UI notification failed:', err);
-        }
+        // path. The UI reads the feed row itself (the notification history
+        // and the "Needs your action" Stuck kind, addressed to the shepherd,
+        // else the creator, else the Assignee); the legacy file writer is
+        // gone (card 5854f0d6, choice C10). Enabled webhook endpoints are
+        // post-commit, ID-only, best-effort and loop-guarded: the feed row is
+        // the record, and a dispatch failure never un-announces it.
         try {
           await notificationEndpointService.dispatchException({
             name: 'task.stuck',

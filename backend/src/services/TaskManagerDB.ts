@@ -1,19 +1,31 @@
+import { taskAccountControl, recordAccountTaskDisposition } from './AccountControlService';
+import { assertHumanTaskArchiveAuthority } from './TaskArchiveAuthority';
+// Unforgeable, server-only operation marker: never copied from a request body.
+const RESTORE_ARCHIVE = Symbol('restore-archive');
+const ARCHIVE_COMPLETED = Symbol('archive-completed');
+import { assignedClaimBindingSql, assignedClaimEligibleSql, assignedClaimPrincipalSql, assignedClaimCaps } from './AssignedClaimAuthority';
+import { taskAuthoritySnapshot } from './TaskAuthoritySnapshot';
+import { authorizationRepository } from './AuthorizationRepository';
+import { isValidSubtaskId, SUBTASK_ID_ERROR } from '../utils/taskIds';
+import { grantService } from './GrantService';
 import { blueprintProvenanceOf, type BlueprintProvenanceFields } from '../utils/blueprintProvenance';
 import type { CreationTransaction } from '../db/creationTransaction';
+import { lockDependencyGraph } from '../db/dependencyGraph';
+import { bulkArchiveFailure } from '../utils/bulkArchiveFailure';
 import { logCaughtFailure, logCaughtWarning } from '../utils/secretSafeLog';
-import { NotFoundFault, ForbiddenFault, ConflictFault, InvalidRequestFault, ProjectTargetNotFoundFault } from '../utils/httpErrors';
+import { NotFoundFault, ForbiddenFault, ConflictFault, InvalidRequestFault, ProjectTargetNotFoundFault, RequestFaultError } from '../utils/httpErrors';
 // TaskManagerDB.ts - PostgreSQL-backed task management (replacement for JSON file)
 import { EventEmitter } from 'events';
+import { isDeepStrictEqual } from 'util';
 import { Pool, PoolClient } from 'pg';
 import { pool as defaultPool } from '../db/connection';
 import { isLegacyExecutionProfile } from '../utils/executionProfile';
 import { buildDiscordThreadUrl, resolveTaskDiscordThreadId } from '../utils/discordLinks';
-import { notificationManager } from './NotificationManager';
 import { taskHistoryService, TaskActor } from './TaskHistoryService';
 import type { TaskAutomationRole } from '../utils/taskAutomationRole';
 import { auditService, type AuditActor } from './AuditService';
 import { lifecyclePolicyService } from './LifecyclePolicyService';
-import { feedEventService } from './FeedEventService';
+import { feedEventService, type FeedActorRef } from './FeedEventService';
 import { accessVehicleService, AssignmentAccessError, SYSTEM_AUTHORIZATION_ACTOR } from './AccessVehicleService';
 import type { AuthorizationActor } from './AuthorizationService';
 // Type-only: the board's authorization is a PARAMETER, so the query layer
@@ -23,6 +35,25 @@ import type { AuthorizationListScope } from './AuthorizationRepository';
 // (card 9c177e6a), so this layer never builds an authorization actor of its own.
 import type { AuthorizedProjectTarget } from '../middleware/sharedAuthorization';
 import { syncTaskReadiness, syncDependentsReadiness } from '../utils/taskReadiness';
+import { reapAccessRequestsAtTerminal } from '../utils/accessRequestTerminal';
+import { runTaskTerminalEffects } from './TaskTerminalEffects';
+import { verificationModeOf, verificationNoneSetterBasis, recordVerificationNone, recordVerificationNoneCleared, VerificationModeError, type DisplacedVerifier, type VerificationMode } from './VerificationModes';
+import { assigningActExpiry, ROLE_GRANT_EXPIRY_FIELD, type RoleGrantExpiryRequest } from '../utils/roleGrantExpiry';
+import { isPlanningTaskStatusPatch, isTaskCompletionPatch, isTaskArchivePatch } from '../utils/taskLifecycle';
+import { assertTaskPlanningAuthority } from './TaskPlanningAuthority';
+import { assertTaskCompletionAuthority, assertCompletedTaskWriteAuthority } from './TaskCompletionAuthority';
+import { readInboxPhase, resolveCreatePlacement, statusAbsent } from './ProjectInboxPhase';
+import { usableVerifierPrincipalIds, verifierUnusableSql, verifierUsabilityOf, VERIFIER_ARM_REASONS, type DefaultVerifierWarning } from './VerifierUsability';
+
+/** Card 41e24358 (migration 155): the vocabulary of tasks.verifier_source. */
+export type VerifierSource = 'explicit' | 'inherited-phase' | 'inherited-project' | 'assigned';
+
+/** Where the create's Verifier decision is reported back to the route. */
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface CreateTaskReceipt {
+  warnings: DefaultVerifierWarning[];
+}
 
 /**
  * The authority that caps an AZ-S7 vehicle recompute triggered by a link
@@ -42,6 +73,27 @@ function taskAuditActor(actor?: TaskActor): AuditActor {
     credentialId: actor.credentialId ?? null,
   } : { handle: 'system', authMethod: 'system' };
 }
+
+/** Every answer the claim decides (Phase 1, spec b48bb799 §3.3). */
+export type ClaimOutcome = 'authority_changed' | 'epoch_mismatch' | 'claimed' | 'already_assignee'
+  | 'conflict' | 'self_review' | 'unarmed' | 'dependency_blocked' | 'not_found' | 'unavailable';
+
+/**
+ * Card 3fc32dd1: each claim refusal in the vocabulary of the lifecycle
+ * projection (`lifecycleAccess.claim.reason`, TaskLifecycleAccess.ts), so the
+ * route's refusal, its `task.claim` audit row and the disabled dashboard
+ * control name one reason. The two refusals the projection cannot foresee —
+ * authority that changed under the Task lock and the epoch compare-and-set —
+ * keep their own codes as their reason.
+ */
+export const CLAIM_REFUSAL_REASONS: Readonly<Partial<Record<ClaimOutcome, string>>> = {
+  authority_changed: 'TASK_CLAIM_AUTHORITY_CHANGED',
+  epoch_mismatch: 'TASK_ASSIGNMENT_EPOCH_MISMATCH',
+  conflict: 'TASK_ALREADY_ASSIGNED',
+  self_review: 'INDEPENDENT_VERIFIER',
+  unarmed: 'TASK_NOT_ARMED',
+  dependency_blocked: 'TASK_BLOCKED',
+};
 
 // Re-export types from TaskManager for compatibility
 export type TaskStatus = 'ideas' | 'todo' | 'in-progress' | 'review' | 'stuck' | 'completed' | 'archived';
@@ -97,6 +149,10 @@ export interface MeltdownRecoveryInput {
   executionDescriptorVersion: string | null;
   /** AZ-S7 access vehicle; null takes the auto-grant fallback (R2(b)). */
   executionWarrantId?: string | null;
+  /** AZ-A10 clause 6: the date the recovering shepherd sets on the
+   * reassignment's grant rows; absent = the default. Recovery reassigns, so
+   * it is an assigning act (E62). */
+  roleGrantExpiry?: RoleGrantExpiryRequest;
   /** Free text recorded in the audit and the Task stream. */
   reason?: string;
 }
@@ -120,6 +176,31 @@ export interface MeltdownRecoveryResult {
 
 export function allSubtaskStatusesDone(statuses: readonly string[]): boolean {
   return statuses.every((status) => status === 'completed' || status === 'skipped');
+}
+
+/** Completed Tasks must be reopened explicitly before unfinished work is added. */
+function assertTerminalTaskChildren(parentStatus: string, statuses: readonly string[]): void {
+  if (parentStatus === 'completed' && !allSubtaskStatusesDone(statuses)) {
+    throw new ConflictFault('Reopen the task before adding or reopening unfinished subtasks', 'TASK_REOPEN_REQUIRED');
+  }
+}
+
+function assertSubtaskStatusTransition(role: TaskAutomationRole, currentStatus: SubtaskStatus, newStatus: SubtaskStatus): void {
+  if (newStatus === 'completed' && role !== 'qa' && role !== 'reviewer') {
+    throw new ForbiddenFault('Only an independent Verifier identity can complete a subtask');
+  }
+  if (newStatus === 'completed' && currentStatus !== 'review') {
+    throw new Error(`A subtask can only be completed from review (current status: ${currentStatus})`);
+  }
+  if (role === 'agent') {
+    if (!AGENT_ALLOWED_STATUSES.includes(newStatus)) {
+      throw new ForbiddenFault(`Agents cannot set subtask status to '${newStatus}'. Allowed: ${AGENT_ALLOWED_STATUSES.join(', ')}`);
+    }
+    if (DONE_STATUSES.includes(currentStatus)) throw new ForbiddenFault(`Cannot change status of ${currentStatus} subtasks`);
+    if (currentStatus === 'stuck' && newStatus !== 'stuck') {
+      throw new ForbiddenFault('Cannot resume a stuck subtask. An independent Verifier or orchestrator must resolve it.');
+    }
+  }
 }
 
 // Disposition recorded when a task transitions into 'archived':
@@ -264,6 +345,12 @@ export function archiveReasonNote(disposition: ArchiveDisposition, reason: strin
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** PostgreSQL UUID equality ignores case; graph comparisons must do so too.
+ * Only normalize complete UUIDs, preserving malformed values in typed errors. */
+function canonicalDependencyId(id: string): string {
+  return typeof id === 'string' && id.length === 36 && UUID_RE.test(id) ? id.toLowerCase() : id;
+}
+
 
 export interface Subtask extends BlueprintProvenanceFields {
   id: string;
@@ -362,6 +449,8 @@ export interface ReviewHistoryEntry {
 }
 
 export interface Task extends BlueprintProvenanceFields {
+  /** Caller-scoped GET projection, not persisted and never mutation authority. */
+  reportMaintenanceAccess?: { allowed: boolean; reason: string | null };
   // Core fields
   id: string;
   title: string;
@@ -378,12 +467,9 @@ export interface Task extends BlueprintProvenanceFields {
   links: TaskLink[];
   
   // Audit trail
-  sessionRefs: string[];
   
   // Work tracking
-  autoCreated: boolean;
   autoStart: boolean;
-  lastChecked?: string;
   startedAt?: string;
   completedAt?: string;
   archivedAt?: string;
@@ -418,28 +504,6 @@ export interface Task extends BlueprintProvenanceFields {
   executionServiceId?: string;
   executionDescriptorVersion?: number;
   legacyExecutionProfile?: LegacyTaskExecutionProfile;
-  activeAgent?: {
-    name: string;
-    sessionKey: string;
-    harness?: TaskExecutionHarness;
-    pid?: number;
-    sourceTag?: string;
-    logPath?: string;
-    /** Durable spawn principal (epic 60558599). Rides inside the JSON blob so
-     *  TEXT-backed prod and JSONB-backed dev behave identically. */
-    principalId?: string;
-    spawnedByPrincipalId?: string;
-  } | null;
-  completedBy?: {
-    name: string;
-    sessionKey: string;
-    harness?: TaskExecutionHarness;
-    pid?: number;
-    sourceTag?: string;
-    logPath?: string;
-    principalId?: string;
-    spawnedByPrincipalId?: string;
-  } | null;
   /** tasks.owner_principal_id (migration 063); null pre-migration or when no Assignee is set. */
   ownerPrincipalId?: string | null;
   /** tasks.creator_principal_id (migration 063); null on rows created before it. */
@@ -448,13 +512,24 @@ export interface Task extends BlueprintProvenanceFields {
   shepherdPrincipalId?: string | null;
   /** Server-written Verifier task role (migration 082); must differ from the Assignee. */
   verifierPrincipalId?: string | null;
+  /** Card 41e24358 (migration 155): where the Verifier came from - explicit,
+   *  inherited-phase, inherited-project or assigned; null when none is set or
+   *  the card predates the column. Server-written. */
+  verifierSource?: VerifierSource | null;
+  /** Section 6.8 (E462 S4b, migration 170): no verification; finish completes the Task. */
+  verificationNone?: boolean;
+  /** Section 6.8: `none` (stored), else `human`/`service` from the Verifier's kind, else `unassigned`. */
+  verificationMode?: VerificationMode;
+  verificationNoneSetByPrincipalId?: string | null;
+  verificationNoneBasis?: string | null;
+  verificationNoneSetAt?: string | null;
+  verificationNoneClearedAt?: string | null;
   needsReview?: boolean;
   successCriteria?: string | string[];
   reviewHistory?: ReviewHistoryEntry[];
   maxRetries?: number;
   definitionOfDone?: string | string[];
   constraints?: string | string[];
-  acpSessionKey?: string | null;  // ACP session key for interactive sessions
   discordThreadId?: string | null;  // Discord thread ID for interactive sessions (Phase 3)
   discordThreadUrl?: string | null;  // Guild-scoped link derived via utils/discordLinks (read-only)
   
@@ -510,6 +585,9 @@ export interface TaskFilters {
   ownerPrincipalId?: string;
   /** unassigned=true — tasks with no Assignee. */
   unassigned?: boolean;
+  /** Card 41e24358: verifierUnusable=true - cards without a usable Verifier
+   *  (services/VerifierUsability: no Verifier, or one failing an arm). */
+  verifierUnusable?: boolean;
 }
 
 export interface TaskFilterOptions {
@@ -609,6 +687,17 @@ export function readRowDueAt(row: { due_at?: unknown; due_at_iso?: unknown }): s
     );
   }
   return row.due_at_iso;
+}
+
+/**
+ * The field NAMES an update applied, sorted (card 5854f0d6, design section
+ * 4.2): the keys the caller set to a defined value. A feed payload carries
+ * these names and never a value.
+ */
+export function appliedFieldNames(updates: object): string[] {
+  return Object.keys(updates)
+    .filter((key) => (updates as Record<string, unknown>)[key] !== undefined)
+    .sort();
 }
 
 export class TaskManagerDB extends EventEmitter {
@@ -808,6 +897,14 @@ export class TaskManagerDB extends EventEmitter {
       );
       for (const project of projectsRes.rows) projectNameById.set(project.id, project.name);
     }
+    // Section 6.8 (E462 S4b): the derived verification mode reads the
+    // Verifier's principal kind, in one lookup for the whole set.
+    const verifierIds = [...new Set(rows.map((row: any) => row.verifier_principal_id).filter(Boolean).map(String))];
+    const verifierKindById = new Map<string, string>();
+    if (verifierIds.length > 0) {
+      const kinds = await executor.query('SELECT id::text AS id, kind FROM principals WHERE id = ANY($1::uuid[])', [verifierIds]);
+      for (const principal of kinds?.rows ?? []) verifierKindById.set(String(principal.id), String(principal.kind));
+    }
 
     return rows.map((row: any) => this.mapTaskRow(row, {
       subtaskRows: subtasksByTask.get(row.id) ?? [],
@@ -815,6 +912,7 @@ export class TaskManagerDB extends EventEmitter {
       dependencyRows: depsByTask.get(row.id) ?? [],
       linkRows: linksByTask.get(row.id) ?? [],
       projectName: row.project_id ? projectNameById.get(row.project_id) : undefined,
+      verifierKind: row.verifier_principal_id ? verifierKindById.get(String(row.verifier_principal_id)) ?? null : null,
     }));
   }
 
@@ -825,6 +923,7 @@ export class TaskManagerDB extends EventEmitter {
   private mapTaskRow(row: any, children: {
     subtaskRows: any[]; tagRows: any[]; dependencyRows: any[]; linkRows: any[];
     projectName: string | undefined;
+    verifierKind?: string | null;
   }): Task {
     const taskId = row.id;
 
@@ -849,7 +948,6 @@ export class TaskManagerDB extends EventEmitter {
     }));
 
     // Parse JSON fields
-    const sessionRefs = row.session_refs || [];
     // RH-P2.2: stored profiles split by shape — the connector-first shape
     // hydrates as executionProfile; retired legacy blobs are held and
     // surface separately (never rewritten, never dropped).
@@ -868,31 +966,7 @@ export class TaskManagerDB extends EventEmitter {
     const maxRetries = row.max_retries ?? undefined;
     const definitionOfDone = row.definition_of_done ?? undefined;
     const constraints = row.constraints ?? undefined;
-    // active_agent / completed_by may come back as JSON strings on older schemas
-    // or already-decoded objects on newer JSON/JSONB-backed schemas.
-    const parseAgentRef = (value: any) => {
-      if (!value) return null;
-      if (typeof value === 'object') return value;
-      if (typeof value === 'string') {
-        try {
-          return JSON.parse(value);
-        } catch {
-          return null;
-        }
-      }
-      return null;
-    };
-
-    const activeAgent = parseAgentRef(row.active_agent);
-    const completedBy = parseAgentRef(row.completed_by);
-    
     const taskResources = row.task_resources || undefined;
-
-    const derivedAcpSessionKey = row.acp_session_key || (
-      row.execution_mode === 'interactive' && activeAgent?.sessionKey && activeAgent.sessionKey !== 'pending'
-        ? activeAgent.sessionKey
-        : null
-    );
 
     // Map to Task interface
     const task: Task = {
@@ -904,10 +978,7 @@ export class TaskManagerDB extends EventEmitter {
       priority: row.priority,
       subtasks,
       links,
-      sessionRefs,
-      autoCreated: row.auto_created,
       autoStart: row.auto_start,
-      lastChecked: row.last_checked || undefined,
       startedAt: row.started_at || undefined,
       completedAt: row.completed_at || undefined,
       archivedAt: row.archived_at || undefined,
@@ -925,31 +996,31 @@ export class TaskManagerDB extends EventEmitter {
       executionServiceId: row.execution_service_id || undefined,
       executionDescriptorVersion: row.execution_descriptor_version || undefined,
       legacyExecutionProfile,
-      activeAgent,
-      completedBy,
       ownerPrincipalId: row.owner_principal_id ?? null,
       creatorPrincipalId: row.creator_principal_id ?? null,
       shepherdPrincipalId: row.shepherd_principal_id ?? null,
       verifierPrincipalId: row.verifier_principal_id ?? null,
+      verifierSource: row.verifier_source ?? null,
+      // Section 6.8 (E462 S4b): `none` is stored; `human`/`service` derive from the Verifier's kind.
+      verificationNone: row.verification_none === true,
+      verificationMode: verificationModeOf({ verificationNone: row.verification_none === true,
+        verifierPrincipalId: row.verifier_principal_id ?? null, verifierKind: children.verifierKind ?? null }),
+      verificationNoneSetByPrincipalId: row.verification_none_set_by ?? null,
+      verificationNoneBasis: row.verification_none_basis ?? null,
+      verificationNoneSetAt: row.verification_none_set_at ?? null,
+      verificationNoneClearedAt: row.verification_none_cleared_at ?? null,
       needsReview: row.needs_review || false,
       successCriteria,
       reviewHistory,
       maxRetries,
       definitionOfDone,
       constraints,
-      acpSessionKey: derivedAcpSessionKey,
       discordThreadId: resolveTaskDiscordThreadId({
         discordThreadId: row.discord_thread_id,
-        acpSessionKey: derivedAcpSessionKey,
-        activeAgentSessionKey: activeAgent?.sessionKey,
-        completedBySessionKey: completedBy?.sessionKey,
-      }),
+        }),
       discordThreadUrl: buildDiscordThreadUrl(resolveTaskDiscordThreadId({
         discordThreadId: row.discord_thread_id,
-        acpSessionKey: derivedAcpSessionKey,
-        activeAgentSessionKey: activeAgent?.sessionKey,
-        completedBySessionKey: completedBy?.sessionKey,
-      })),
+        })),
       thinking: row.thinking_budget || undefined,
       thinkingAutoEstimated: row.thinking_auto_estimated || false,
       attemptCount: row.attempt_count || 0,
@@ -1144,6 +1215,17 @@ export class TaskManagerDB extends EventEmitter {
       }
     }
 
+    // Card 41e24358: "without a usable Verifier". Arms 1-3 come from the ONE
+    // predicate (usableVerifierPrincipalIds evaluates principalVerifierUsability
+    // for every principal named as a Verifier); arm 4 is the comparison with the
+    // Assignee. The point check (verifierUsabilityOf) reads the same arms, and
+    // the live suite pins point/list parity.
+    if (filters.verifierUnusable) {
+      const usable = await usableVerifierPrincipalIds(this.pool);
+      conditions.push(verifierUnusableSql('t', `$${paramIndex++}`));
+      params.push(usable);
+    }
+
     let filterParamCount = params.length;
 
     const searchQuery = filters.q?.trim();
@@ -1237,10 +1319,30 @@ export class TaskManagerDB extends EventEmitter {
 
   /**
    * Claim a task for a principal (Phase 1, spec b48bb799 §3.3) — the caller
-   * becomes its Assignee. Idempotent for the current Assignee; a different
-   * Assignee → 'conflict'.
+   * becomes its Assignee. The current Assignee claiming again is accepted and
+   * answers 'already_assignee'; a different Assignee → 'conflict'.
+   *
+   * Card 3fc32dd1: every claim the board decides is on the ledger as one
+   * `task.claim` row — `success` when it made an Assignee (written with the
+   * claim, below), `denied` with the projected reason when it refused. An
+   * accepted retry assigns nothing and records nothing.
    */
-  async claimTask(taskId: string, principalId: string): Promise<'claimed' | 'conflict' | 'self_review' | 'unarmed' | 'dependency_blocked' | 'not_found' | 'unavailable'> {
+  async claimTask(taskId: string, principalId: string, actor?: TaskActor, expectedAssignmentEpoch?: string): Promise<ClaimOutcome> {
+    const outcome = await this.decideClaim(taskId, principalId, actor, expectedAssignmentEpoch);
+    const reason = CLAIM_REFUSAL_REASONS[outcome];
+    if (reason) {
+      // The refusal is answered either way: a ledger that is down must not turn
+      // it into a 500, and it must not be silent (the surface.refused rule).
+      // The reason only — never the identity that holds the Task.
+      await auditService.record({
+        action: 'task.claim', actor: taskAuditActor(actor), outcome: 'denied',
+        resourceType: 'task', resourceId: taskId, metadata: { reason },
+      }, this.pool).catch((error) => logCaughtFailure('[TaskManagerDB] claim refusal audit not written:', error));
+    }
+    return outcome;
+  }
+
+  private async decideClaim(taskId: string, principalId: string, actor?: TaskActor, expectedAssignmentEpoch?: string): Promise<ClaimOutcome> {
     if (!(await this.ownerPrincipalColumnExists())) return 'unavailable';
     try {
       const hasVerifier = await this.taskColumnExists('verifier_principal_id');
@@ -1249,8 +1351,50 @@ export class TaskManagerDB extends EventEmitter {
       // consumer can observe; the claim and its feed event commit together.
       const client = await this.pool.connect();
       let claimedRow: { project_id?: string | null } | undefined;
+      let previousOwner: string | null = null;
       try {
         await client.query('BEGIN');
+        const exists = (await client.query('SELECT id FROM tasks WHERE id=$1 FOR UPDATE', [taskId])).rows[0];
+        // Derived service/descriptor/epoch facts use a NEW statement snapshot
+        // after the lock wait, not the locking SELECT's pre-wait snapshot.
+        const locked = exists && (await client.query(`SELECT t.*, e.epoch::text AS assignment_epoch,
+          ${assignedClaimBindingSql('t')} AS assigned_binding,
+          ${assignedClaimEligibleSql('t')} AS assigned_eligible,
+          ${assignedClaimPrincipalSql('t')} AS assigned_principal
+          FROM tasks t LEFT JOIN task_native_assignment_epochs e ON e.task_id=t.id
+          WHERE t.id=$1`, [taskId])).rows[0];
+        const refuse = async (outcome: 'not_found' | 'authority_changed' | 'epoch_mismatch') => {
+          await client.query('ROLLBACK'); return outcome;
+        };
+        if (!locked) return await refuse('not_found');
+        previousOwner = locked.owner_principal_id ?? null;
+        if (actor) {
+          if (actor.principalId !== principalId) return await refuse('authority_changed');
+          const snapshots = await taskAuthoritySnapshot(client, actor, taskId);
+          if (!snapshots) return await refuse('authority_changed');
+          if (expectedAssignmentEpoch !== undefined) {
+            const resource = {type: 'task' as const, id: taskId, projectId: locked.project_id};
+            if (!actor.credentialId || !locked.assigned_binding || locked.assigned_principal !== principalId
+              || snapshots.some(a => !assignedClaimCaps(a, resource))) return await refuse('authority_changed');
+            const epoch = BigInt(locked.assignment_epoch ?? '0');
+            const expected = BigInt(expectedAssignmentEpoch);
+            const retry = locked.owner_principal_id === principalId;
+            if (!locked.auto_start) return await refuse('authority_changed');
+            if (epoch !== expected && !(retry && epoch === expected + 1n)) return await refuse('epoch_mismatch');
+            if (!retry && !locked.assigned_eligible) return await refuse('authority_changed');
+          } else {
+            // No request epoch: the original positive-WRITE/Task-role contract
+            // remains; the new assignment exception never supplies WRITE.
+            for (const snapshot of snapshots) {
+              if (!(await authorizationRepository.authorizedIds(snapshot, 'task', [taskId], 'write', client)).has(taskId))
+                return await refuse('authority_changed');
+            }
+          }
+        } else if (expectedAssignmentEpoch !== undefined) return await refuse('authority_changed');
+        // A genuine retry changes no epoch, feed, readiness or generation.
+        if (expectedAssignmentEpoch !== undefined && locked.owner_principal_id === principalId) {
+          await client.query('COMMIT'); return 'already_assignee';
+        }
         const updated = await client.query(
           `UPDATE tasks SET owner_principal_id = $2, updated_at = NOW()
           WHERE id = $1 AND (owner_principal_id IS NULL OR owner_principal_id = $2)
@@ -1260,10 +1404,10 @@ export class TaskManagerDB extends EventEmitter {
               FROM task_dependencies dependency
               JOIN tasks prerequisite ON prerequisite.id = dependency.depends_on_task_id
              WHERE dependency.task_id = tasks.id
-               AND NOT (
+               AND NOT COALESCE((
                  prerequisite.status = 'completed'
                  OR (prerequisite.status = 'archived' AND prerequisite.archive_disposition = 'completed')
-               )
+               ), FALSE)
           )
           ${verifierGuard}
           RETURNING id, project_id`,
@@ -1271,6 +1415,15 @@ export class TaskManagerDB extends EventEmitter {
         );
         claimedRow = updated.rows[0];
         if (claimedRow) {
+          // Protocol v2 intent burns BEFORE claim; this witness is written only
+          // by the supported claim transaction, never inferred from owner alone.
+          if (process.env.RELAYHALL_DEPLOYMENT_ID) {
+            await client.query(`UPDATE task_native_generations g SET claim_epoch=e.epoch,claimed_at=clock_timestamp()
+              FROM task_native_assignment_epochs e WHERE g.task_id=$1 AND e.task_id=g.task_id
+              AND g.deployment_id=$3::uuid AND g.actor_principal_id=$2 AND g.state='reserved' AND g.claimed_at IS NULL
+              AND g.expires_at>clock_timestamp() AND e.epoch=g.reserved_epoch+CASE WHEN g.reserved_owner IS NULL THEN 1 ELSE 0 END`,
+              [taskId,principalId,process.env.RELAYHALL_DEPLOYMENT_ID]);
+          }
           await feedEventService.emit(client, {
             name: 'task.updated', objectType: 'task', objectId: taskId,
             // RH-P3.C2 (pre-review F1): record WHO wrote. C2 suppresses
@@ -1278,11 +1431,28 @@ export class TaskManagerDB extends EventEmitter {
             // unattributed emission cannot be suppressed.
             actorPrincipalId: principalId,
             projectId: claimedRow.project_id ?? null,
-            ownerPrincipalId: principalId, payload: {},
+            // Card 5854f0d6: the field NAME the claim wrote, never its value.
+            ownerPrincipalId: principalId, payload: { fields: ['ownerPrincipalId'] },
           });
           // RH-P3.C2: a claimed task has left the ready state; retract the
           // announcement so a later release announces it again.
           await syncTaskReadiness(client, taskId, { principalId });
+          // Card 3fc32dd1: a claim that made an Assignee is a durable act the
+          // owner can find — one audit row, and the `task.claimed` system
+          // entry the Task timeline already labels "Task claimed" — committed
+          // with the claim or not at all. The current Assignee's accepted
+          // legacy retry still emits its task.updated and records neither.
+          if (previousOwner !== principalId) {
+            await auditService.record({
+              action: 'task.claim', actor: taskAuditActor(actor), resourceType: 'task', resourceId: taskId,
+              metadata: { assigneePrincipalId: principalId, epochBound: expectedAssignmentEpoch !== undefined },
+            }, client);
+            await client.query(
+              `INSERT INTO task_stream_entries (task_id, provenance, event_type, content, metadata)
+               VALUES ($1, 'system', 'task.claimed', 'unassigned -> claimed', $2)`,
+              [taskId, { assigneePrincipalId: principalId }],
+            );
+          }
         }
         await client.query('COMMIT');
       } catch (txnError) {
@@ -1291,17 +1461,17 @@ export class TaskManagerDB extends EventEmitter {
       } finally {
         client.release();
       }
-      if (claimedRow) return 'claimed';
+      if (claimedRow) return previousOwner === principalId ? 'already_assignee' : 'claimed';
       const existing = await this.pool.query(
         `SELECT owner_principal_id, auto_start${hasVerifier ? ', verifier_principal_id' : ''},
                 EXISTS (
                   SELECT 1 FROM task_dependencies dependency
                   JOIN tasks prerequisite ON prerequisite.id = dependency.depends_on_task_id
                   WHERE dependency.task_id = tasks.id
-                    AND NOT (
+                    AND NOT COALESCE((
                       prerequisite.status = 'completed'
                       OR (prerequisite.status = 'archived' AND prerequisite.archive_disposition = 'completed')
-                    )
+                    ), FALSE)
                 ) AS dependency_blocked
            FROM tasks WHERE id = $1`,
         [taskId]
@@ -1366,7 +1536,8 @@ export class TaskManagerDB extends EventEmitter {
           // RH-P3.C2 (pre-review F1): attribute the write (see claimTask).
           actorPrincipalId: principalId ?? null,
           projectId: updated.rows[0].project_id ?? null,
-          ownerPrincipalId: null, payload: {},
+          // Card 5854f0d6: the field NAME the release wrote, never its value.
+          ownerPrincipalId: null, payload: { fields: ['ownerPrincipalId'] },
         });
         // RH-P3.C2: a released task may be ready again.
         await syncTaskReadiness(client, taskId, null);
@@ -1437,7 +1608,7 @@ export class TaskManagerDB extends EventEmitter {
       await client.query('BEGIN');
       const current = await client.query(
         `SELECT id, status, project_id, owner_principal_id, auto_start,
-                execution_service_id, execution_warrant_id
+                execution_service_id, execution_warrant_id, execution_profile, execution_descriptor_version
            FROM tasks
           WHERE id = $1
           FOR UPDATE`,
@@ -1524,8 +1695,16 @@ export class TaskManagerDB extends EventEmitter {
         && previousClaimant === null
         && activeLeases.rows.length === 0
         && previousAssignee === nextAssignee
-        && previousWarrant === nextWarrant;
-      if (alreadyRecovered) {
+        && previousWarrant === nextWarrant
+        && task.execution_descriptor_version === (input.executionDescriptorVersion ?? null)
+        && isDeepStrictEqual(task.execution_profile ?? null, input.executionProfile ?? null);
+      // AZ-A10 clause 6: a retry that names a date is the same act only if
+      // the links ALREADY carry that date. Otherwise an exact retry with a
+      // different date would answer 'replayed' and drop the date silently.
+      const replayed = alreadyRecovered
+        && (input.roleGrantExpiry === undefined
+          || await this.assignmentCarriesExpiry(client, taskId, input.roleGrantExpiry));
+      if (replayed) {
         await client.query('ROLLBACK');
         return {
           outcome: 'replayed',
@@ -1597,6 +1776,13 @@ export class TaskManagerDB extends EventEmitter {
           attach: true,
           actor,
           reason: 'RH-P3.C3: one-click meltdown recovery reassigned this Task',
+          roleGrantExpiry: input.roleGrantExpiry,
+        });
+      } else if (input.roleGrantExpiry !== undefined) {
+        // Same Connector, same carriage, a new date (AZ-A10 clause 6, E62):
+        // the rows stay and take the date the recovering shepherd set.
+        await accessVehicleService.redate(client, {
+          taskId, serviceId: nextAssignee, roleGrantExpiry: input.roleGrantExpiry, actor: taskAuditActor(actor),
         });
       }
 
@@ -1657,7 +1843,7 @@ export class TaskManagerDB extends EventEmitter {
         actorHandle: actor?.handle ?? null,
         projectId: task.project_id ?? null,
         ownerPrincipalId: null,
-        payload: { status: 'todo', previousStatus },
+        payload: { status: 'todo', previousStatus, fields: ['ownerPrincipalId', 'status'] },
       });
 
       // The whole point of putting it back in todo: the incoming assignee
@@ -1692,14 +1878,142 @@ export class TaskManagerDB extends EventEmitter {
     }
   }
 
+  /** Section 6.8: the default Verifier a new card would inherit (Phase, then Project), for the audit of a `none` create. */
+  private async defaultVerifierFor(client: PoolClient, projectId: string | null, phaseId: string | null): Promise<DisplacedVerifier | null> {
+    if (!projectId || !(await this.taskColumnExists('verifier_source'))) return null;
+    if (phaseId) {
+      const phase = await client.query('SELECT default_verifier_principal_id FROM phases WHERE id = $1', [phaseId]);
+      const value = phase.rows[0]?.default_verifier_principal_id;
+      if (value) return { principalId: String(value), source: 'inherited-phase' };
+    }
+    const project = await client.query('SELECT default_verifier_principal_id FROM projects WHERE id = $1', [projectId]);
+    const value = project.rows[0]?.default_verifier_principal_id;
+    return value ? { principalId: String(value), source: 'inherited-project' } : null;
+  }
+
+  /**
+   * Card 41e24358: the Verifier a new card starts with.
+   *
+   * EXPLICIT (`verifierPrincipalId` on POST /tasks and MCP task_create, owner
+   * answer Q2 (b)) is admitted only when it equals the Project default or the
+   * default of a non-archived Phase of the same Project AND passes the usable
+   * predicate; anything else refuses 422 VERIFIER_NOT_ALLOWED and the create
+   * rolls back, so no card exists. Nothing is ever silently replaced.
+   *
+   * INHERITED (Phase, then Project) never refuses (E284): a default that
+   * fails the predicate is left unset and reported as DEFAULT_VERIFIER_UNUSABLE
+   * on the create answer. The write itself runs under a SAVEPOINT (check F3):
+   * an outcome other than `updated`, or a refusal by the role-row
+   * materialization, rolls back only the Verifier and is reported as
+   * DEFAULT_VERIFIER_UNUSABLE with failedArm `assignment` - never a 503.
+   */
+  private async resolveCreateVerifier(client: PoolClient, input: {
+    taskId: string; projectId: string | null; phaseId: string | null; explicit: unknown;
+    actor: TaskActor | undefined; transaction?: CreationTransaction; receipt?: CreateTaskReceipt;
+  }): Promise<{ verifierPrincipalId: string; source: VerifierSource } | null> {
+    const { taskId, projectId, phaseId, explicit, actor, receipt } = input;
+    const hasColumns = await this.taskColumnExists('verifier_source');
+    let chosen: string | null = null;
+    let source: VerifierSource | null = null;
+    let inheritedFrom: { phaseId?: string; projectId?: string } | undefined;
+    if (explicit !== undefined && explicit !== null) {
+      const notAllowed = (detail: string) => new RequestFaultError(422, 'VERIFIER_NOT_ALLOWED',
+        `verifierPrincipalId is accepted only when it equals the Project default Verifier or the default of a non-archived Phase of the same Project, and that principal can judge the card (${detail})`);
+      if (typeof explicit !== 'string' || !UUID_TEXT.test(explicit)) throw notAllowed('not a principal id');
+      if (!projectId || !hasColumns) throw notAllowed('the card has no Project');
+      const defaults = await client.query(
+        `SELECT p.default_verifier_principal_id AS id FROM projects p
+          WHERE p.id = $1 AND p.default_verifier_principal_id IS NOT NULL
+         UNION
+         SELECT ph.default_verifier_principal_id FROM phases ph
+          WHERE ph.project_id = $1 AND ph.status <> 'archived' AND ph.default_verifier_principal_id IS NOT NULL`,
+        [projectId],
+      );
+      const value = explicit.toLowerCase();
+      if (!defaults.rows.some((row) => String(row.id).toLowerCase() === value)) throw notAllowed('not a default of this Project');
+      const usability = await verifierUsabilityOf(client, { verifierPrincipalId: value, ownerPrincipalId: null });
+      if (!usability.usable) throw notAllowed(VERIFIER_ARM_REASONS[usability.failedArm ?? 'none']);
+      chosen = value;
+      source = 'explicit';
+    } else if (projectId && hasColumns) {
+      if (phaseId) {
+        const phase = await client.query('SELECT default_verifier_principal_id FROM phases WHERE id = $1', [phaseId]);
+        const value = phase.rows[0]?.default_verifier_principal_id;
+        if (value) { chosen = String(value); source = 'inherited-phase'; inheritedFrom = { phaseId }; }
+      }
+      if (!chosen) {
+        const project = await client.query('SELECT default_verifier_principal_id FROM projects WHERE id = $1', [projectId]);
+        const value = project.rows[0]?.default_verifier_principal_id;
+        if (value) { chosen = String(value); source = 'inherited-project'; inheritedFrom = { projectId }; }
+      }
+    }
+    if (!chosen || !source) return null;
+
+    const inherited = source !== 'explicit';
+    const warn = (failedArm: DefaultVerifierWarning['failedArm'], reason: string): void => {
+      receipt?.warnings.push({
+        code: 'DEFAULT_VERIFIER_UNUSABLE', source: source as DefaultVerifierWarning['source'],
+        principalId: chosen as string, failedArm,
+        message: `The ${source === 'inherited-phase' ? 'Phase' : 'Project'} default Verifier was not set on this card: ${reason}.`,
+      });
+    };
+    if (inherited) {
+      const usability = await verifierUsabilityOf(client, { verifierPrincipalId: chosen, ownerPrincipalId: null });
+      if (!usability.usable) {
+        warn(usability.failedArm ?? 'none', VERIFIER_ARM_REASONS[usability.failedArm ?? 'none']);
+        return null;
+      }
+    }
+    // The role rows are capped by the creator as assigner (AZ-A10 clauses
+    // 1(c), 5); an internal create has no assigning authority to cap them by.
+    if (!actor?.authorization || !actor.principalId) {
+      if (inherited) { warn('assignment', 'the creating identity carries no assigning authority'); return null; }
+      throw new RequestFaultError(422, 'VERIFIER_NOT_ALLOWED', 'verifierPrincipalId requires an authenticated creator');
+    }
+    const roleTransaction: CreationTransaction = input.transaction ?? {
+      client, source: 'ordinary', actor, afterCommit: () => undefined,
+    };
+    await client.query('SAVEPOINT create_default_verifier');
+    let outcome: string;
+    let refusal: unknown;
+    try {
+      outcome = await this.assignTaskRoles(taskId, { verifierPrincipalId: chosen }, taskAuditActor(actor),
+        roleTransaction, actor.authorization, { verifierSource: source, ...(inheritedFrom ? { inheritedFrom } : {}) });
+    } catch (error) {
+      outcome = 'refused';
+      refusal = error;
+    }
+    if (outcome === 'updated') {
+      await client.query('RELEASE SAVEPOINT create_default_verifier');
+      return { verifierPrincipalId: chosen, source };
+    }
+    await client.query('ROLLBACK TO SAVEPOINT create_default_verifier');
+    await client.query('RELEASE SAVEPOINT create_default_verifier');
+    if (inherited) {
+      const code = (refusal as { code?: unknown } | undefined)?.code;
+      warn('assignment', `the role assignment was refused (${typeof code === 'string' ? code : outcome})`);
+      return null;
+    }
+    if (refusal instanceof AssignmentAccessError) throw refusal;
+    throw new RequestFaultError(409, 'VERIFIER_ASSIGNMENT_UNAVAILABLE', 'The named Verifier could not be assigned to the new card');
+  }
+
   /** Dedicated server-owned Task-role assignment surface. Generic Task
    * PATCH never writes these columns; the route authorizes the Shepherd and
    * resolves active Principals before calling here. */
   async assignTaskRoles(
     taskId: string,
-    assignments: { shepherdPrincipalId?: string; verifierPrincipalId?: string | null },
+    assignments: { shepherdPrincipalId?: string; verifierPrincipalId?: string | null;
+      roleGrantExpiry?: RoleGrantExpiryRequest },
     actor: AuditActor = { handle: 'system', authMethod: 'system' },
     transaction?: CreationTransaction,
+    assigner?: AuthorizationActor,
+    // Card 41e24358: where a supplied Verifier came from. Absent = 'assigned'
+    // (the roles route, a Blueprint); clearing the Verifier clears the source.
+    provenance?: { verifierSource?: VerifierSource; inheritedFrom?: { phaseId?: string; projectId?: string } },
+    // T2 S5 (card 9ce0b0b0; change-request design section 7.1): an approved
+    // task.roles change's decision, carried on the act's own audit row.
+    ledger?: Record<string, unknown>,
   ): Promise<'updated' | 'self_review' | 'not_found' | 'unavailable'> {
     if (transaction && actor.principalId !== transaction.actor.principalId) throw new Error('Creation actor mismatch');
     // §8.2/T36 defensive layer (review 731415a7 B3): the transactional
@@ -1727,15 +2041,32 @@ export class TaskManagerDB extends EventEmitter {
     const client = transaction?.client ?? await this.pool.connect();
     try {
       if (!transaction) await client.query('BEGIN');
+      const before = (await client.query(
+        `SELECT shepherd_principal_id, verifier_principal_id, verification_none FROM tasks WHERE id = $1 FOR UPDATE`,
+        [taskId],
+      )).rows[0];
       const fields: string[] = [];
       const params: unknown[] = [taskId];
       if (assignments.shepherdPrincipalId !== undefined) {
         params.push(assignments.shepherdPrincipalId);
         fields.push(`shepherd_principal_id = $${params.length}`);
       }
+      let verifierSource: VerifierSource | null | undefined;
+      let verifierParam = 0;
       if (assignments.verifierPrincipalId !== undefined) {
         params.push(assignments.verifierPrincipalId);
-        fields.push(`verifier_principal_id = $${params.length}`);
+        verifierParam = params.length;
+        fields.push(`verifier_principal_id = $${verifierParam}`);
+        // Card 41e24358: the source rides the same UPDATE, after the holder.
+        verifierSource = assignments.verifierPrincipalId === null ? null : (provenance?.verifierSource ?? 'assigned');
+        params.push(verifierSource);
+        fields.push(`verifier_source = $${params.length}`);
+        // Section 6.8 (E462 S4b): adding a Verifier clears `none` in the SAME
+        // UPDATE; once cleared it can never be set again (migration 170).
+        if (assignments.verifierPrincipalId !== null) {
+          fields.push('verification_none_cleared_at = CASE WHEN verification_none THEN clock_timestamp() ELSE verification_none_cleared_at END');
+          fields.push('verification_none = FALSE');
+        }
       }
       if (fields.length === 0) {
         if (!transaction) await client.query('ROLLBACK');
@@ -1743,23 +2074,61 @@ export class TaskManagerDB extends EventEmitter {
       }
 
       const verifierGuard = assignments.verifierPrincipalId !== undefined
-        ? `AND (owner_principal_id IS NULL OR $${params.length}::uuid IS NULL OR owner_principal_id <> $${params.length}::uuid)`
+        ? `AND (owner_principal_id IS NULL OR $${verifierParam}::uuid IS NULL OR owner_principal_id <> $${verifierParam}::uuid)`
         : '';
       const updated = await client.query(
         `UPDATE tasks SET ${fields.join(', ')}, updated_at = NOW()
           WHERE id = $1
             ${verifierGuard}
-          RETURNING id, project_id, owner_principal_id, shepherd_principal_id, verifier_principal_id`,
+          RETURNING id, project_id, owner_principal_id, shepherd_principal_id, verifier_principal_id, status`,
         params,
       );
       if (updated.rows.length > 0) {
+        // AZ-A10 clause 7: rows are reaped at task-terminal and materialized
+        // only for a live task, so a role field changed on a completed or
+        // archived Task carries no rows until the Task is live again.
+        const terminal = ['completed', 'archived'].includes(String(updated.rows[0].status));
+        const roleChanges = [
+          { role: 'shepherd' as const, previous: before?.shepherd_principal_id,
+            next: updated.rows[0].shepherd_principal_id,
+            supplied: assignments.shepherdPrincipalId !== undefined },
+          { role: 'verifier' as const, previous: before?.verifier_principal_id,
+            next: updated.rows[0].verifier_principal_id,
+            supplied: assignments.verifierPrincipalId !== undefined },
+        ];
+        for (const change of roleChanges) {
+          if (!change.supplied) continue;
+          if (String(change.previous ?? '') === String(change.next ?? '')) {
+            if (change.next && assignments.roleGrantExpiry) {
+              await accessVehicleService.redateRole(client, taskId, change.role,
+                String(change.next), assignments.roleGrantExpiry, actor);
+            }
+            continue;
+          }
+          await accessVehicleService.detachRole(client, taskId, change.role, actor,
+            'AZ-A10: task role holder changed', change.previous ? String(change.previous) : undefined);
+          if (change.next && !terminal) {
+            if (!assigner) throw new AssignmentAccessError(403, 'ASSIGNER_UNKNOWN',
+              'role assignment requires the assigning identity for its authority cap');
+            await accessVehicleService.materializeRole(client, {
+              taskId, principalId: String(change.next), role: change.role,
+              actor, assigner, roleGrantExpiry: assignments.roleGrantExpiry,
+            });
+          }
+        }
+        if (before?.verification_none === true && assignments.verifierPrincipalId) {
+          await recordVerificationNoneCleared(client, taskId, actor, String(assignments.verifierPrincipalId));
+        }
         await auditService.record({
           action: 'task.lifecycle_override.roles', actor,
           resourceType: 'task', resourceId: taskId,
           metadata: {
+            ...(ledger ?? {}),
             changedFields: Object.keys(assignments),
             shepherdPrincipalId: updated.rows[0].shepherd_principal_id,
             verifierPrincipalId: updated.rows[0].verifier_principal_id,
+            ...(verifierSource !== undefined ? { verifierSource } : {}),
+            ...(provenance?.inheritedFrom ? { inheritedFrom: provenance.inheritedFrom } : {}),
           },
         }, client);
         await feedEventService.emit(client, {
@@ -1768,7 +2137,8 @@ export class TaskManagerDB extends EventEmitter {
           actorPrincipalId: actor?.principalId ?? null,
           actorHandle: actor?.handle ?? null,
           projectId: updated.rows[0].project_id ?? null,
-          ownerPrincipalId: updated.rows[0].owner_principal_id ?? null, payload: {},
+          // Card 5854f0d6: the role field NAMES this edit wrote, never a value.
+          ownerPrincipalId: updated.rows[0].owner_principal_id ?? null, payload: { fields: appliedFieldNames(assignments) },
         });
         if (!transaction) await client.query('COMMIT');
         return 'updated';
@@ -1777,12 +2147,59 @@ export class TaskManagerDB extends EventEmitter {
       if (!transaction) await client.query('ROLLBACK');
       if (existing.rows.length === 0) return 'not_found';
       return 'self_review';
-    } catch {
+    } catch (error) {
       if (!transaction) await client.query('ROLLBACK');
+      if (error instanceof AssignmentAccessError) throw error;
       console.error('[TaskManagerDB] assignTaskRoles failed');
       return 'unavailable';
     } finally {
       if (!transaction) client.release();
+    }
+  }
+
+  /**
+   * Section 6.8 (E462 S4b): set or clear `verification: none` on an existing
+   * Task (PATCH /tasks/:id/roles {"verificationNone": true|false}). Setting is
+   * allowed only to the Account-control path or the roles authority outside
+   * G(Task), never an Agent, while the Task is To Do and has never started; a
+   * current Verifier is cleared in the same transaction and audited as
+   * displaced. Clearing needs only the roles authority the route admitted.
+   */
+  async setTaskVerificationNone(taskId: string, value: boolean, actor: TaskActor): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = (await client.query(
+        'SELECT verifier_principal_id, verifier_source, verification_none FROM tasks WHERE id = $1 FOR UPDATE', [taskId])).rows[0];
+      if (!current) throw new NotFoundFault('Task not found', 'TASK_NOT_FOUND');
+      if (value) {
+        const basis = await verificationNoneSetterBasis(client, taskId, actor);
+        let displaced: DisplacedVerifier | null = null;
+        if (current.verifier_principal_id) {
+          displaced = { principalId: String(current.verifier_principal_id), source: current.verifier_source ?? null };
+          const roleTransaction: CreationTransaction = { client, source: 'ordinary', actor, afterCommit: () => undefined };
+          const outcome = await this.assignTaskRoles(taskId, { verifierPrincipalId: null }, taskAuditActor(actor),
+            roleTransaction, actor.authorization);
+          if (outcome !== 'updated') throw new VerificationModeError(409, 'VERIFICATION_NONE_UNAVAILABLE', 'The current Verifier could not be cleared');
+        }
+        await recordVerificationNone(client, taskId, actor, basis, displaced, false);
+      } else if (current.verification_none === true) {
+        await client.query(
+          `UPDATE tasks SET verification_none = FALSE, verification_none_cleared_at = clock_timestamp(), updated_at = NOW()
+            WHERE id = $1`, [taskId]);
+        await recordVerificationNoneCleared(client, taskId, taskAuditActor(actor), null);
+      }
+      await feedEventService.emit(client, {
+        name: 'task.updated', objectType: 'task', objectId: taskId,
+        actorPrincipalId: actor.principalId ?? null, actorHandle: actor.handle ?? null,
+        payload: { fields: ['verificationNone'] },
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
   }
 
@@ -1989,7 +2406,11 @@ export class TaskManagerDB extends EventEmitter {
    */
   private async attachExecutionVehicle(
     client: PoolClient,
-    input: { taskId: string; serviceId: string; warrantId: string | null; actor?: TaskActor },
+    input: {
+      taskId: string; serviceId: string; warrantId: string | null; actor?: TaskActor;
+      /** AZ-A10 clause 6: the assigning act's date; absent = the default. */
+      roleGrantExpiry?: RoleGrantExpiryRequest;
+    },
   ): Promise<{ warrantId: string | null }> {
     const assigner = input.actor?.authorization;
     if (!assigner) {
@@ -2006,8 +2427,21 @@ export class TaskManagerDB extends EventEmitter {
       warrantId: input.warrantId,
       actor: taskAuditActor(input.actor),
       assigner,
+      roleGrantExpiry: input.roleGrantExpiry,
     });
     return { warrantId: result.warrantId };
+  }
+
+  /** Recovery's replay test for a date (AZ-A10 clause 6): do this task's
+   * assignment links ALREADY carry exactly the requested date? */
+  private async assignmentCarriesExpiry(
+    client: PoolClient,
+    taskId: string,
+    requested: RoleGrantExpiryRequest,
+  ): Promise<boolean> {
+    const carried = await accessVehicleService.assignmentExpiry(taskId, client);
+    if (carried === undefined) return false;
+    return requested.kind === 'unlimited' ? carried === null : carried === requested.instant;
   }
 
   /**
@@ -2034,6 +2468,8 @@ export class TaskManagerDB extends EventEmitter {
       attach: boolean;
       actor?: TaskActor;
       reason: string;
+      /** AZ-A10 clause 6: the incoming assignment's date; absent = the default. */
+      roleGrantExpiry?: RoleGrantExpiryRequest;
     },
   ): Promise<void> {
     await accessVehicleService.detach(client, input.taskId, taskAuditActor(input.actor), input.reason);
@@ -2044,6 +2480,7 @@ export class TaskManagerDB extends EventEmitter {
         serviceId: input.serviceId,
         warrantId: input.warrantId,
         actor: input.actor,
+        roleGrantExpiry: input.roleGrantExpiry,
       });
       if (attached.warrantId) {
         await client.query(
@@ -2067,30 +2504,38 @@ export class TaskManagerDB extends EventEmitter {
     actor: TaskActor | undefined,
     projectTarget: AuthorizedProjectTarget,
     transaction?: CreationTransaction,
+    receipt?: CreateTaskReceipt,
   ): Promise<Task> {
     if (transaction && actor?.principalId !== transaction.actor.principalId) throw new Error('Creation actor mismatch');
     const requestedSubtaskStatuses = (data.subtasks || []).map((subtask) => subtask.status || 'empty');
-    for (const status of requestedSubtaskStatuses) {
-      if (status === 'completed' && actor?.role !== 'qa' && actor?.role !== 'reviewer') {
-        throw new ForbiddenFault('Only an independent Verifier identity can create a completed subtask');
+    const ownerLifecycleRequested = data.status === 'completed' || requestedSubtaskStatuses.some(status =>
+      status === 'completed' || (actor?.role === 'agent' && status !== 'empty'
+        && !AGENT_ALLOWED_STATUSES.includes(status as SubtaskStatus)));
+    const assertCreationLifecycle = (accountControl = false): void => {
+      for (const status of requestedSubtaskStatuses) {
+        if (status === 'completed' && actor?.role !== 'qa' && actor?.role !== 'reviewer' && !accountControl) {
+          throw new ForbiddenFault('Only an independent Verifier identity can create a completed subtask');
+        }
+        if (actor?.role === 'agent' && !accountControl && status !== 'empty' && !AGENT_ALLOWED_STATUSES.includes(status as SubtaskStatus)) {
+          throw new ForbiddenFault(`Implementation agents cannot create a subtask with status '${status}'`);
+        }
       }
-      if (actor?.role === 'agent' && status !== 'empty' && !AGENT_ALLOWED_STATUSES.includes(status as SubtaskStatus)) {
-        throw new ForbiddenFault(`Implementation agents cannot create a subtask with status '${status}'`);
+      if (data.status === 'completed') {
+        if (actor?.role !== 'qa' && actor?.role !== 'reviewer' && !accountControl) {
+          throw new ForbiddenFault('Only an independent Verifier identity can create a completed task');
+        }
+        if (!allSubtaskStatusesDone(requestedSubtaskStatuses)) {
+          throw new ConflictFault('A task can be completed only when every subtask is completed or skipped');
+        }
       }
-    }
-    if (data.status === 'completed') {
-      if (actor?.role !== 'qa' && actor?.role !== 'reviewer') {
-        throw new ForbiddenFault('Only an independent Verifier identity can create a completed task');
-      }
-      if (!allSubtaskStatusesDone(requestedSubtaskStatuses)) {
-        throw new ConflictFault('A task can be completed only when every subtask is completed or skipped');
-      }
-    }
+    };
+    if (!ownerLifecycleRequested || !actor?.authorization?.authenticated) assertCreationLifecycle();
 
     const client = transaction?.client ?? await this.pool.connect();
 
     try {
       if (!transaction) await client.query('BEGIN');
+      if (data.dependsOn && data.dependsOn.length > 0) await lockDependencyGraph(client, transaction);
 
       // Card 9c177e6a. The TARGET Project is decided FIRST - before the
       // dependency read, before the INSERT, before any statement of this
@@ -2109,6 +2554,25 @@ export class TaskManagerDB extends EventEmitter {
       const projectId = data.project ? await projectTarget(String(data.project), client) : null;
       if (data.project && projectId === null) throw new ProjectTargetNotFoundFault();
 
+      // Card b13e5ac9 (owner ruling D34(b), Charter v5 §6.1): a Task created
+      // WITHOUT an explicit phaseId in a Project that names an inbox phase
+      // lands in it, and a Task that lands in the inbox without an explicit
+      // status is created as Ideas. An explicit phaseId (including null, the
+      // backlog) or status wins for its own field (§6.2). Decided HERE,
+      // after the target Project and on this transaction, because every
+      // creation surface reaches this method: the dashboard form, REST, MCP
+      // and the CLI cannot disagree about where a new card lands. The inbox
+      // row is read FOR SHARE so it cannot be archived or deleted between
+      // this decision and the INSERT. A Project with no inbox phase, and an
+      // orphan Task, take exactly the path they took before migration 141.
+      if (projectId !== null && (data.phaseId === undefined || statusAbsent(data.status))) {
+        const placement = resolveCreatePlacement(
+          { phaseId: data.phaseId, status: data.status },
+          await readInboxPhase(client, projectId, { lock: true }),
+        );
+        data = { ...data, phaseId: placement.phaseId, status: placement.status as Task['status'] };
+      }
+
       const now = new Date().toISOString();
 
       // Validate dependencies before creating. The task has no id yet, so
@@ -2126,15 +2590,9 @@ export class TaskManagerDB extends EventEmitter {
       // Insert task
       const taskResult = await client.query(
         `INSERT INTO tasks (
-          title, description, status, priority, project_id,
-          thinking_budget, thinking_auto_estimated, model, execution_mode,
-          execution_profile, execution_service_id, execution_descriptor_version, success_criteria, review_history, max_retries, definition_of_done, constraints, auto_created, auto_start, blocked_reason, status_reason,
-          active_agent, completed_by, attempt_count, session_refs,
-          parent_id, personality_id, phase_id, created_at, updated_at, started_at, completed_at, archived_at, archive_disposition,
-          notes, due_at
+          title, description, status, priority, project_id, thinking_budget, thinking_auto_estimated, model, execution_mode, execution_profile, execution_service_id, execution_descriptor_version, success_criteria, review_history, max_retries, definition_of_done, constraints, auto_start, blocked_reason, status_reason, attempt_count, parent_id, personality_id, phase_id, created_at, updated_at, started_at, completed_at, archived_at, archive_disposition, notes, due_at
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34,
-          $35, $36
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
         ) RETURNING *${DUE_AT_ISO_RETURNING}`,
         [
           data.title || 'Untitled Task',
@@ -2156,17 +2614,13 @@ export class TaskManagerDB extends EventEmitter {
           data.maxRetries ?? 3,
           data.definitionOfDone !== undefined ? JSON.stringify(data.definitionOfDone) : null,
           data.constraints !== undefined ? JSON.stringify(data.constraints) : null,
-          data.autoCreated !== undefined ? data.autoCreated : false,
           // Lifecycle gate: autoStart defaults FALSE (explicit opt-in only).
           // Previously defaulted true for any non-ideas status, which made the
           // orchestration loop auto-pick freshly created tasks unattended.
           data.autoStart !== undefined ? data.autoStart : false,
           data.blockedReason || null,
           null, // status_reason
-          data.activeAgent ? JSON.stringify(data.activeAgent) : null,
-          data.completedBy ? JSON.stringify(data.completedBy) : null,
           data.attemptCount || 0,
-          data.sessionRefs ? JSON.stringify(data.sessionRefs) : '[]',
           data.parentId || null,
           (data as any).personalityId || null,
           // Phase membership (079). Bound to the task's own project by the
@@ -2205,6 +2659,87 @@ export class TaskManagerDB extends EventEmitter {
           autoStart: data.autoStart === true,
         },
       });
+
+      // Creation attribution (migration 063), stamped INSIDE the creating
+      // transaction so the stored Task never changes after its task.created
+      // event — a consumer that pulls on the event must see the same row
+      // authorization will read (round 4 review 91461e9b, F2). The
+      // column-existence checks keep pre-063 compatibility; a stamp failure
+      // now rolls the create back with the rest of the transaction, which is
+      // the honest outcome — a Task whose authorization-bearing attribution
+      // could not be recorded should not exist half-attributed.
+      if (actor?.principalId) {
+        const hasCreator = await this.taskColumnExists('creator_principal_id');
+        const hasShepherd = await this.taskColumnExists('shepherd_principal_id');
+        if (hasCreator || hasShepherd) {
+          const assignments = [
+            ...(hasCreator ? ['creator_principal_id = $2'] : []),
+            ...(hasShepherd ? ['shepherd_principal_id = $2'] : []),
+          ];
+          await client.query(
+            `UPDATE tasks SET ${assignments.join(', ')} WHERE id = $1`,
+            [taskResult.rows[0].id, actor.principalId]
+          );
+          if (hasCreator) taskResult.rows[0].creator_principal_id = actor.principalId;
+          if (hasShepherd) taskResult.rows[0].shepherd_principal_id = actor.principalId;
+        }
+      }
+
+      // Ordinary authenticated creation bootstraps only this creator's
+      // exact Task grants. Internal/system actors have no trusted authority;
+      // Blueprint creation deliberately keeps its separate access contract.
+      if (transaction?.source !== 'blueprint' && actor?.authorization) {
+        if (!actor.principalId || actor.principalId !== actor.authorization.principalId) {
+          throw new ForbiddenFault('Authenticated Task creation authority is required', 'TASK_CREATOR_REQUIRED');
+        }
+        await grantService.createForTaskCreator(client, taskId, actor.authorization, taskAuditActor(actor));
+      }
+      if (actor?.authorization && taskResult.rows[0].shepherd_principal_id
+        && !['completed', 'archived'].includes(String(taskResult.rows[0].status))) {
+        await accessVehicleService.materializeRole(client, {
+          taskId, principalId: String(taskResult.rows[0].shepherd_principal_id),
+          role: 'shepherd', actor: taskAuditActor(actor), assigner: actor.authorization,
+        });
+      }
+
+      // Card 41e24358 (design ba22fd01 Part 3): the Verifier at creation,
+      // decided AFTER the landing Phase (the inbox decision above) and the
+      // Shepherd stamp, on this transaction: explicit -> the landing Phase's
+      // default -> the Project default -> none.
+      // Section 6.8 (E462 S4b): `verification: none` at creation suppresses
+      // the inherited Phase/Project default Verifier; the displaced default is
+      // audited. The setter's authority is decided below, once the execution
+      // assignment (part of G(Task)) is in place.
+      const verificationNoneRequested = (data as { verificationNone?: unknown }).verificationNone === true;
+      let displacedDefault: DisplacedVerifier | null = null;
+      if (verificationNoneRequested) {
+        const explicitVerifier = (data as { verifierPrincipalId?: unknown }).verifierPrincipalId;
+        if (explicitVerifier !== undefined && explicitVerifier !== null) {
+          throw new VerificationModeError(422, 'VERIFICATION_NONE_WITH_VERIFIER', 'verificationNone and verifierPrincipalId cannot be given together');
+        }
+        if (!['todo', 'ideas'].includes(String(taskResult.rows[0].status))) {
+          throw new VerificationModeError(409, 'VERIFICATION_NONE_TASK_STARTED', 'Verification none can be set only on a Task created in To Do or Ideas');
+        }
+        displacedDefault = await this.defaultVerifierFor(client, projectId, data.phaseId ?? null);
+      }
+      const createdVerifier = verificationNoneRequested ? null : await this.resolveCreateVerifier(client, {
+        taskId, projectId, phaseId: data.phaseId ?? null,
+        explicit: (data as { verifierPrincipalId?: unknown }).verifierPrincipalId,
+        actor, transaction, receipt,
+      });
+      if (createdVerifier) {
+        taskResult.rows[0].verifier_principal_id = createdVerifier.verifierPrincipalId;
+        taskResult.rows[0].verifier_source = createdVerifier.source;
+      }
+
+      // Owner/Main creation uses the same fresh, scoped authority as lifecycle
+      // edits. The row and its creator grants exist only in this transaction;
+      // any refusal rolls them all back before a feed event can escape.
+      if (ownerLifecycleRequested && actor?.authorization?.authenticated) {
+        const account = await taskAccountControl(client, taskId, actor);
+        assertCreationLifecycle(Boolean(account));
+        if (account) await recordAccountTaskDisposition(client, taskId, actor, account, 'explicit-task-create');
+      }
 
       // Insert subtasks
       if (data.subtasks && data.subtasks.length > 0) {
@@ -2261,31 +2796,6 @@ export class TaskManagerDB extends EventEmitter {
         }, client);
       }
 
-      // Creation attribution (migration 063), stamped INSIDE the creating
-      // transaction so the stored Task never changes after its task.created
-      // event — a consumer that pulls on the event must see the same row
-      // authorization will read (round 4 review 91461e9b, F2). The
-      // column-existence checks keep pre-063 compatibility; a stamp failure
-      // now rolls the create back with the rest of the transaction, which is
-      // the honest outcome — a Task whose authorization-bearing attribution
-      // could not be recorded should not exist half-attributed.
-      if (actor?.principalId) {
-        const hasCreator = await this.taskColumnExists('creator_principal_id');
-        const hasShepherd = await this.taskColumnExists('shepherd_principal_id');
-        if (hasCreator || hasShepherd) {
-          const assignments = [
-            ...(hasCreator ? ['creator_principal_id = $2'] : []),
-            ...(hasShepherd ? ['shepherd_principal_id = $2'] : []),
-          ];
-          await client.query(
-            `UPDATE tasks SET ${assignments.join(', ')} WHERE id = $1`,
-            [taskResult.rows[0].id, actor.principalId]
-          );
-          if (hasCreator) taskResult.rows[0].creator_principal_id = actor.principalId;
-          if (hasShepherd) taskResult.rows[0].shepherd_principal_id = actor.principalId;
-        }
-      }
-
       // RH-P3.AZ-S7 (ruling 7440b579 R1): a task created ALREADY ASSIGNED
       // gets its access vehicle in this same transaction, or the create is
       // refused. Same rule, same choke point, same proof as an update.
@@ -2296,10 +2806,25 @@ export class TaskManagerDB extends EventEmitter {
           serviceId: String(createdAssignment),
           warrantId: (data as any).executionWarrantId ?? null,
           actor,
+          roleGrantExpiry: assigningActExpiry(data),
         });
         if (attached.warrantId) {
           await client.query('UPDATE tasks SET execution_warrant_id = $1 WHERE id = $2', [attached.warrantId, taskId]);
         }
+      }
+
+      // Section 6.8 (E462 S4b): who may set `none` (never an Agent, never a
+      // principal in G(Task) on any basis; then the Account-control path, or
+      // the Shepherd/administrator authority). The creator is the new Task's
+      // Shepherd. A Blueprint instantiation sets it through its own plan
+      // authority instead.
+      if (verificationNoneRequested && actor) {
+        const basis = await verificationNoneSetterBasis(client, taskId, actor);
+        await recordVerificationNone(client, taskId, actor, basis, displacedDefault, true);
+        Object.assign(taskResult.rows[0], { verification_none: true, verification_none_set_by: actor.principalId,
+          verification_none_basis: basis });
+      } else if (verificationNoneRequested) {
+        throw new VerificationModeError(403, 'VERIFICATION_NONE_FORBIDDEN', 'Setting verification none requires an authenticated identity');
       }
 
       // RH-P3.C1: the feed event rides the creating transaction — visible
@@ -2400,12 +2925,30 @@ export class TaskManagerDB extends EventEmitter {
     actor?: TaskActor,
     projectTarget?: AuthorizedProjectTarget,
     transaction?: CreationTransaction,
+    originalPatch?: unknown,
+    archiveOperation?: typeof RESTORE_ARCHIVE | typeof ARCHIVE_COMPLETED,
+    // Card 5854f0d6, round 2: who the feed row records when the write runs
+    // under another authority actor (the internal reviewer) or none (the
+    // breakdown analyzer). Attribution only: it never grants or checks authority.
+    feedActor?: FeedActorRef,
   ): Promise<Task> {
+    id = canonicalDependencyId(id);
+    const restoring = archiveOperation === RESTORE_ARCHIVE;
+    const completedOnlyArchive = archiveOperation === ARCHIVE_COMPLETED;
+    const humanArchive = actor?.role === 'agent' && isTaskArchivePatch(updates)
+      && (originalPatch === undefined || isTaskArchivePatch(originalPatch));
     const reviewerAuthorized = actor?.role === 'qa' || actor?.role === 'reviewer';
-    if (updates.status === 'completed' && !reviewerAuthorized) {
+    const internalReviewer = reviewerAuthorized && actor?.authMethod === 'system'
+      && actor.principalId === null && !actor.authorization;
+    const completionRequest = updates.status === 'completed' && !internalReviewer;
+    // The route passes the original body so discarded fields cannot turn a
+    // mixed write into verification. Raw shape never replaces actual updates.
+    const completionAttempt = completionRequest && isTaskCompletionPatch(updates)
+      && (originalPatch === undefined || isTaskCompletionPatch(originalPatch));
+    if (completionRequest && !actor) {
       throw new ForbiddenFault('Only an independent Verifier identity can mark a task completed');
     }
-    if (updates.subtasks?.some((subtask) => subtask.status === 'completed') && !reviewerAuthorized) {
+    if (updates.subtasks?.some((subtask) => subtask.status === 'completed') && !reviewerAuthorized && !actor) {
       throw new ForbiddenFault('Only an independent Verifier identity can submit completed subtasks');
     }
     if (transaction && actor?.principalId !== transaction.actor.principalId) throw new Error('Task update actor mismatch');
@@ -2413,14 +2956,62 @@ export class TaskManagerDB extends EventEmitter {
 
     try {
       if (!transaction) await client.query('BEGIN');
+      if (updates.dependsOn !== undefined) await lockDependencyGraph(client, transaction);
 
-      // Get current task
-      const currentRes = await client.query('SELECT * FROM tasks WHERE id = $1', [id]);
+      // The planning exception decides on the current source state and exact
+      // Shepherd while holding the same row lock as the subsequent write.
+      const planningAttempt = actor?.role === 'agent' && isPlanningTaskStatusPatch(updates)
+        && (originalPatch === undefined || isPlanningTaskStatusPatch(originalPatch));
+      const currentRes = await client.query(
+        'SELECT * FROM tasks WHERE id = $1' + (restoring || completedOnlyArchive || humanArchive || planningAttempt || updates.status === 'completed' || updates.subtasks !== undefined ? ' FOR UPDATE' : ''), [id]);
       if (currentRes.rows.length === 0) {
         throw new NotFoundFault(`Task not found: ${id}`, 'TASK_NOT_FOUND');
       }
 
       const current = currentRes.rows[0];
+      const accountControl = actor && !completionRequest && (updates.status !== undefined || updates.subtasks !== undefined)
+        ? await taskAccountControl(client, id, actor) : null;
+      if (humanArchive || restoring) await assertHumanTaskArchiveAuthority(client, id, actor);
+      if (completedOnlyArchive && current.status !== 'completed') {
+        throw new ConflictFault('Task is no longer Completed', 'NOT_COMPLETED');
+      }
+      if (restoring) {
+        if (current.status !== 'archived') throw new TaskNotArchivedError(id);
+        const prior = await taskHistoryService.priorStatusBeforeArchive(id, client);
+        if (!prior || !['ideas', 'todo', 'in-progress', 'review', 'stuck', 'completed'].includes(prior)) {
+          throw new ConflictFault('The prior Task state could not be established', 'TASK_RESTORE_PROVENANCE_REQUIRED');
+        }
+        // A disposition inferred from children is not a whole-Task verdict.
+        if (prior === 'completed' && (current.archive_disposition !== 'completed'
+          || !current.archived_at || current.completed_at && new Date(current.completed_at).getTime() > new Date(current.archived_at).getTime())) {
+          throw new ConflictFault('Prior completion evidence is inconsistent', 'TASK_RESTORE_PROVENANCE_REQUIRED');
+        }
+        updates = { status: prior as TaskStatus };
+      }
+      let lockedCompletionStatuses: string[] | undefined;
+      if (completionRequest && !completionAttempt) {
+        await assertCompletedTaskWriteAuthority(client, current, actor!);
+      }
+      if (completionAttempt || internalReviewer && updates.status === 'completed') {
+        // Other writers may hold a child before updating its parent. Never
+        // wait in the inverse order: NOWAIT rolls this whole attempt back
+        // with a retryable conflict. The immediate nondeferrable task FK
+        // makes concurrent child inserts wait for this parent FOR UPDATE.
+        try {
+          const children = await client.query(
+            'SELECT status FROM subtasks WHERE task_id = $1 ORDER BY id FOR UPDATE NOWAIT', [id]);
+          lockedCompletionStatuses = children.rows.map(row => row.status);
+        } catch (error) {
+          if ((error as { code?: unknown })?.code === '55P03') {
+            throw new ConflictFault('Task is being changed; retry completion', 'TASK_COMPLETION_BUSY');
+          }
+          throw error;
+        }
+        if (completionAttempt) await assertTaskCompletionAuthority(client, current, actor!);
+      }
+      if (accountControl && actor && updates.subtasks !== undefined) {
+        await recordAccountTaskDisposition(client, id, actor, accountControl, 'explicit-subtask-update');
+      }
       const oldStatus = current.status;
       const oldPriority = current.priority;
       const oldNotes = current.notes;
@@ -2428,6 +3019,9 @@ export class TaskManagerDB extends EventEmitter {
 
       // Whole-task edit payloads may replace the subtask array, so apply the
       // same Verifier-only transition policy used by the dedicated endpoints.
+      if (updates.subtasks !== undefined) {
+        assertTerminalTaskChildren(updates.status ?? current.status, updates.subtasks.map(subtask => subtask.status || 'empty'));
+      }
       if (updates.subtasks !== undefined && actor) {
         const previous = await client.query('SELECT index, status FROM subtasks WHERE task_id = $1', [id]);
         const previousByIndex = new Map(previous.rows.map((row) => [Number(row.index), String(row.status)]));
@@ -2435,30 +3029,36 @@ export class TaskManagerDB extends EventEmitter {
           const next = updates.subtasks[index].status || 'empty';
           const previousStatus = previousByIndex.get(index);
           if (previousStatus === next || (previousStatus === undefined && next === 'empty')) continue;
-          if (next === 'completed' && actor.role !== 'qa' && actor.role !== 'reviewer') {
+          if (next === 'completed' && actor.role !== 'qa' && actor.role !== 'reviewer' && !accountControl) {
             throw new ForbiddenFault('Only an independent Verifier identity can complete a subtask');
           }
-          if (actor.role === 'agent' && !AGENT_ALLOWED_STATUSES.includes(next as SubtaskStatus)) {
+          if (actor.role === 'agent' && !accountControl && !AGENT_ALLOWED_STATUSES.includes(next as SubtaskStatus)) {
             throw new ForbiddenFault(`Implementation agents cannot set subtask status to '${next}'`);
           }
         }
       }
 
       // Completion is an independent-review transition, not an implementer or
-      // dashboard convenience action. Internal Verifier services omit actor;
-      // every authenticated REST/CLI/MCP caller carries its resolved role.
-      if (updates.status && actor?.role === 'agent' && !AGENT_ALLOWED_TASK_STATUSES.includes(updates.status)) {
-        throw new ForbiddenFault(`Implementation agents cannot move tasks to '${updates.status}'`);
+      // dashboard convenience action. Internal structured review supplies an
+      // explicit system actor; authenticated callers carry request authority.
+      if (updates.status && actor?.role === 'agent' && !AGENT_ALLOWED_TASK_STATUSES.includes(updates.status) && !completionRequest && !humanArchive && !restoring && !accountControl) {
+        if (!planningAttempt) throw new ForbiddenFault(`Implementation agents cannot move tasks to '${updates.status}'`);
+        await assertTaskPlanningAuthority(client, current, actor);
       }
-      if (updates.status === 'completed') {
+      if (updates.status === 'completed' && !restoring) {
         const effectiveStatuses = updates.subtasks !== undefined
           ? updates.subtasks.map((subtask) => subtask.status || 'empty')
-          : (await client.query('SELECT status FROM subtasks WHERE task_id = $1', [id])).rows.map((row) => row.status);
+          : lockedCompletionStatuses ?? (await client.query('SELECT status FROM subtasks WHERE task_id = $1', [id])).rows.map((row) => row.status);
         if (!allSubtaskStatusesDone(effectiveStatuses)) {
           throw new ConflictFault('A task can be completed only when every subtask is completed or skipped');
         }
       }
 
+      // Section 6.8 (E462 S4b, VM-N4): agents may PATCH to `review`; a `none`
+      // Task has no one to judge it there, so the move is refused.
+      if (updates.status === 'review' && current.status !== 'review' && current.verification_none === true) {
+        throw new ConflictFault('A Task with verification none completes at finish and never enters Review', 'VERIFICATION_NONE_NO_REVIEW');
+      }
       if (updates.status && updates.status !== current.status) {
         await lifecyclePolicyService.evaluate(client, {
           action: 'task.transition',
@@ -2481,7 +3081,7 @@ export class TaskManagerDB extends EventEmitter {
         if (updates.status === 'in-progress' && !current.started_at) {
           statusUpdates.started_at = now;
         }
-        if (updates.status === 'completed' && !current.completed_at) {
+        if (updates.status === 'completed' && !current.completed_at && !restoring) {
           statusUpdates.completed_at = now;
         }
         if (updates.status === 'archived' && !current.archived_at) {
@@ -2512,6 +3112,7 @@ export class TaskManagerDB extends EventEmitter {
         }
  else if (oldStatus === 'archived' && updates.status !== 'archived') {
           statusUpdates.archive_disposition = null;
+          if (restoring) statusUpdates.archived_at = null;
         }
       }
 
@@ -2538,24 +3139,22 @@ export class TaskManagerDB extends EventEmitter {
       if (updates.executionMode !== undefined) addField('execution_mode', updates.executionMode);
       if ((updates as any).executionProfile !== undefined) addField('execution_profile', (updates as any).executionProfile ? JSON.stringify((updates as any).executionProfile) : null);
       if ((updates as any).executionServiceId !== undefined) addField('execution_service_id', (updates as any).executionServiceId);
+      // The Warrant pointer requires an assignee (migration 099). A full
+      // unassignment must clear both columns in this one statement; the
+      // vehicle swap below then revokes its links in the same transaction.
+      if ((updates as any).executionServiceId === null) addField('execution_warrant_id', null);
       if ((updates as any).executionDescriptorVersion !== undefined) addField('execution_descriptor_version', (updates as any).executionDescriptorVersion);
-      if (updates.successCriteria !== undefined) addField('success_criteria', updates.successCriteria !== null ? JSON.stringify(updates.successCriteria) : null);
       if (updates.reviewHistory !== undefined) addField('review_history', updates.reviewHistory !== null ? JSON.stringify(updates.reviewHistory) : null);
       if (updates.maxRetries !== undefined) addField('max_retries', updates.maxRetries);
       if (updates.needsReview !== undefined) addField('needs_review', updates.needsReview);
       if ((updates as any).definitionOfDone !== undefined) addField('definition_of_done', (updates as any).definitionOfDone !== null ? JSON.stringify((updates as any).definitionOfDone) : null);
       if ((updates as any).constraints !== undefined) addField('constraints', (updates as any).constraints !== null ? JSON.stringify((updates as any).constraints) : null);
-      if (updates.autoCreated !== undefined) addField('auto_created', updates.autoCreated);
       if (updates.autoStart !== undefined) addField('auto_start', updates.autoStart);
       if (updates.blockedReason !== undefined) addField('blocked_reason', updates.blockedReason);
       if (updates.notes !== undefined && statusUpdates.notes === undefined) addField('notes', updates.notes);
       if (updates.dueAt !== undefined) addField('due_at', updates.dueAt);
-      if (updates.activeAgent !== undefined) addField('active_agent', updates.activeAgent ? JSON.stringify(updates.activeAgent) : null);
-      if (updates.completedBy !== undefined) addField('completed_by', updates.completedBy ? JSON.stringify(updates.completedBy) : null);
-      if (updates.acpSessionKey !== undefined) addField('acp_session_key', updates.acpSessionKey || null);
       if (updates.discordThreadId !== undefined) addField('discord_thread_id', updates.discordThreadId || null);
       if (updates.attemptCount !== undefined) addField('attempt_count', updates.attemptCount);
-      if (updates.sessionRefs !== undefined) addField('session_refs', JSON.stringify(updates.sessionRefs));
       if (updates.parentId !== undefined) addField('parent_id', updates.parentId);
       // Phase membership (079). Consistency with the task's Project is a
       // DATABASE fact (composite FK + CHECK), so a caller cannot move a task
@@ -2563,10 +3162,9 @@ export class TaskManagerDB extends EventEmitter {
       // refused and translated to a typed 409, never silently repaired.
       if (updates.phaseId !== undefined) addField('phase_id', updates.phaseId || null);
       if ((updates as any).personalityId !== undefined) addField('personality_id', (updates as any).personalityId || null);
-      if (updates.lastChecked !== undefined) addField('last_checked', updates.lastChecked);
       if (statusUpdates.started_at) addField('started_at', statusUpdates.started_at);
       if (statusUpdates.completed_at) addField('completed_at', statusUpdates.completed_at);
-      if (statusUpdates.archived_at) addField('archived_at', statusUpdates.archived_at);
+      if (statusUpdates.archived_at !== undefined) addField('archived_at', statusUpdates.archived_at);
       if (statusUpdates.archive_disposition !== undefined) addField('archive_disposition', statusUpdates.archive_disposition);
       if (statusUpdates.notes !== undefined) addField('notes', statusUpdates.notes);
 
@@ -2729,7 +3327,9 @@ export class TaskManagerDB extends EventEmitter {
       // not — auto-grant → Warrant, Warrant A → Warrant B, Warrant →
       // auto-grant are all real transitions, and the route accepts every
       // one of them. Dropping them silently let a caller believe a vehicle
-      // change had happened when nothing had moved.
+      // change had happened when nothing had moved. At the route each needs
+      // services:invoke: the first two through the executionProfile they ride
+      // with, the third through the Warrant-drop gate (card 69943b61).
       const oldWarrant = current.execution_warrant_id ? String(current.execution_warrant_id) : null;
       const warrantInPayload = (updates as any).executionWarrantId !== undefined;
       const newWarrant = warrantInPayload
@@ -2742,6 +3342,22 @@ export class TaskManagerDB extends EventEmitter {
 
       const vehicleChanged = (assignmentInPayload && newAssignment !== oldAssignment)
         || (warrantInPayload && newWarrant !== oldWarrant);
+      let detachAtTerminal = false;
+
+      // AZ-A10 clause 6: the assigning act's date. It is read from the
+      // out-of-band key only `resolveExecutionProfileWrite` sets, after the
+      // act's services:invoke gate and beside a non-null executionProfile —
+      // never from a body field — so its presence here means this PATCH
+      // performs an execution assignment (E62: whoever performs it may set
+      // it). A task that is or becomes terminal holds no rows to date —
+      // clause 7 reaps them — so the date is refused rather than dropped.
+      const roleGrantExpiry = assigningActExpiry(updates);
+      if (roleGrantExpiry !== undefined && isTerminal) {
+        throw new AssignmentAccessError(409, 'ROLE_GRANT_EXPIRY_TASK_TERMINAL',
+          'a completed or archived task holds no assignment grant rows for roleGrantExpiresAt to date (AZ-A10 clause 7 '
+          + 'reaps them at the terminal state): reopen the task with the date, or omit the field',
+          ROLE_GRANT_EXPIRY_FIELD);
+      }
 
       if (vehicleChanged) {
         await this.swapExecutionVehicle(client, {
@@ -2751,12 +3367,20 @@ export class TaskManagerDB extends EventEmitter {
           attach: !isTerminal,
           actor,
           reason: 'AZ-S7: the execution assignment changed',
+          roleGrantExpiry,
+        });
+      } else if (roleGrantExpiry !== undefined && newAssignment && !wasTerminal) {
+        // The SAME assignee, re-asserted with a date (E62 "shortenable"
+        // reaches an existing assignment only this way): the rows stay and
+        // take the new date; nothing is detached or re-created.
+        await accessVehicleService.redate(client, {
+          taskId: id, serviceId: newAssignment, roleGrantExpiry, actor: vehicleAuditActor,
         });
       } else if (!wasTerminal && isTerminal) {
         // R2(b): reaped at task-terminal. The assignment itself stays — a
-        // completed task keeps its record of who executed it.
-        await accessVehicleService.detach(client, id, vehicleAuditActor,
-          'AZ-S7: the task reached a terminal status');
+        // completed task keeps its record of who executed it. The detach runs
+        // in the shared terminal helper below (E462 S4b, VM-B4).
+        detachAtTerminal = true;
       } else if (wasTerminal && !isTerminal && newAssignment) {
         // R4: "A reopened task whose vehicle is dead returns UNASSIGNED."
         const carriedWarrant = current.execution_warrant_id ? String(current.execution_warrant_id) : null;
@@ -2782,16 +3406,37 @@ export class TaskManagerDB extends EventEmitter {
             metadata: { automatic: true, reason: 'AZ-S7: reopened while its carrying warrant was dead (ruling 7440b579 R4)', warrantId: carriedWarrant },
           }, client);
         } else {
+          // AZ-A10 clause 7: "On reopen, NEW rows (new ids, new links) are
+          // materialized for the current holders". A reopen is not itself a
+          // dated act: the new rows take the default unless this same PATCH
+          // re-asserts the assignment with a date.
           const attached = await this.attachExecutionVehicle(client, {
             taskId: id,
             serviceId: newAssignment,
             warrantId: carriedWarrant,
             actor,
+            roleGrantExpiry,
           });
           if (attached.warrantId) {
             await client.query('UPDATE tasks SET execution_warrant_id = $1 WHERE id = $2', [attached.warrantId, id]);
           }
         }
+      }
+
+      // AZ-A9 clause 12a (ratified 2026-10-10 (E43), card 785e1eed; E15): the
+      // grant rows a grant-kind Approval wrote for THIS task are revoked, the
+      // credential a credential-kind Approval issued for it is revoked, and its
+      // pending or approved-uncollected requests lapse TASK_TERMINAL, in this
+      // transaction and after the vehicle detach above. Reopening restores nothing. PATCH, archive and
+      // auto-archive all arrive here; the verifier's verdict is the other
+      // terminal writer (TaskReviewAttemptService.recordVerdict).
+      // The terminal effects are ONE helper, shared with a `none` Task's
+      // finish (TaskTerminalEffects; E462 S4b, VM-B4).
+      if (!wasTerminal && isTerminal) {
+        await runTaskTerminalEffects(client, {
+          taskId: id, to: String(updates.status) as 'completed' | 'archived', via: 'updateTask',
+          actor: vehicleAuditActor, detachVehicle: detachAtTerminal,
+        });
       }
 
       // RH-P3.C1: one task.updated per successful update (status in the
@@ -2803,21 +3448,26 @@ export class TaskManagerDB extends EventEmitter {
         name: 'task.updated',
         objectType: 'task',
         objectId: id,
-        actorPrincipalId: actor?.principalId ?? null,
-        actorHandle: actor?.handle ?? null,
+        actorPrincipalId: (feedActor ?? actor)?.principalId ?? null, actorHandle: (feedActor ?? actor)?.handle ?? null,
         projectId: current.project_id ?? null,
         ownerPrincipalId: current.owner_principal_id ?? null,
-        payload: updates.status && updates.status !== oldStatus
-          ? { status: updates.status, previousStatus: oldStatus }
-          : {},
+        // Card 5854f0d6 (design section 4.2, choice C6): the field NAMES of
+        // the applied update, sorted, beside the status move (the
+        // TaskSuccessCriteriaService `fields` precedent). Names only, never a
+        // value: the Timeline says WHAT changed and the pull carries the rest.
+        payload: {
+          ...(updates.status && updates.status !== oldStatus
+            ? { status: updates.status, previousStatus: oldStatus }
+            : {}),
+          fields: appliedFieldNames(updates),
+        },
       });
       if (updates.status === 'archived' && oldStatus !== 'archived') {
         await feedEventService.emit(client, {
           name: 'task.archived',
           objectType: 'task',
           objectId: id,
-          actorPrincipalId: actor?.principalId ?? null,
-          actorHandle: actor?.handle ?? null,
+          actorPrincipalId: (feedActor ?? actor)?.principalId ?? null, actorHandle: (feedActor ?? actor)?.handle ?? null,
           projectId: current.project_id ?? null,
           ownerPrincipalId: current.owner_principal_id ?? null,
           payload: {},
@@ -2826,11 +3476,12 @@ export class TaskManagerDB extends EventEmitter {
 
       // RH-P3.C2: arming, status moves and dependency edits all cross the
       // readiness boundary for THIS task.
-      await syncTaskReadiness(client, id, actor ?? null);
       // A status move is the one change that can make OTHER tasks ready:
       // nothing about a dependent's own row changes when its parent
       // completes, so without this fan-out an unblocked task would never
       // be announced. Run on any status change so regressions retract too.
+      // A `none` Task's finish runs the same two (TaskElementService).
+      await syncTaskReadiness(client, id, actor ?? null);
       if (updates.status && updates.status !== oldStatus) {
         await syncDependentsReadiness(client, id, actor ?? null);
       }
@@ -2857,10 +3508,10 @@ export class TaskManagerDB extends EventEmitter {
       };
       await history(client);
       if (!transaction) await client.query('COMMIT');
+      // The status move's notification IS the feed row written above (card
+      // 5854f0d6, choice C10: the legacy file writer is removed).
       const notify = async () => {
         this.emit('task.updated', task);
-        if (updates.status && updates.status !== oldStatus) await notificationManager.notifyStatusChange(
-          task.id, task.title, oldStatus, task.status, 'user');
       };
       if (transaction) transaction.afterCommit(notify); else await notify();
       return task;
@@ -2888,6 +3539,7 @@ export class TaskManagerDB extends EventEmitter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await lockDependencyGraph(client);
       const current = await client.query(
         'SELECT id, status, updated_at, project_id, owner_principal_id FROM tasks WHERE id = $1 FOR UPDATE',
         [id],
@@ -2917,6 +3569,12 @@ export class TaskManagerDB extends EventEmitter {
       // link rows, or the grants those links owned survive as orphans.
       await accessVehicleService.detach(client, id, { handle: 'system', authMethod: 'system' },
         'AZ-S7: the assigned task was deleted');
+      // AZ-A9 clause 12a: a deleted task is terminal for its grant requests
+      // too, and this runs BEFORE the delete — approvals.related_task_id is
+      // ON DELETE SET NULL, which would otherwise detach the request from the
+      // rows it wrote.
+      await reapAccessRequestsAtTerminal(client, { type: 'task', id, to: 'deleted', via: 'deleteTask' },
+        { handle: 'system', authMethod: 'system' });
       // CASCADE in schema handles subtasks, tags, deps, links.
       await client.query('DELETE FROM tasks WHERE id = $1', [id]);
       await client.query('COMMIT');
@@ -2940,20 +3598,42 @@ export class TaskManagerDB extends EventEmitter {
     return this.updateTask(id, { status }, actor);
   }
 
+  /** Check current archive authority under the Task lock before a no-op receipt. */
+  private async authorizedArchivedTask(id: string, actor: TaskActor): Promise<Task | undefined> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = await client.query('SELECT status FROM tasks WHERE id = $1 FOR UPDATE', [id]);
+      if (!current.rows.length) throw new NotFoundFault(`Task not found: ${id}`, 'TASK_NOT_FOUND');
+      if (current.rows[0].status !== 'archived') {
+        await client.query('COMMIT');
+        return undefined;
+      }
+      // A no-op still discloses the Task and archive result. Repeat the same
+      // current authority decision as an archive write, without an act audit.
+      await assertHumanTaskArchiveAuthority(client, id, actor, false);
+      const task = await this.getTask(id, client);
+      await client.query('COMMIT');
+      return task;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Archive a task from ANY status (unified archive policy, task 7d2a60a6).
-   *
-   * Same semantics as PATCH status->archived: disposition computed by
-   * computeArchiveDisposition inside updateTask; optional reason appended to
-   * task notes as "Archived (<disposition>): <reason>"; a warning is returned
-   * when the task was not completed at archive time. Archiving an
-   * already-archived task is an idempotent no-op that preserves the existing
-   * disposition (the reason, if any, is ignored).
+   * Same semantics as PATCH status->archived: the optional reason is appended
+   * to notes, and unfinished work receives a warning. An authorized repeat
+   * preserves its disposition and ignores a new reason.
    */
   async archiveTask(
     id: string,
     options: { reason?: string; suppressBoardEmit?: boolean } = {},
-    actor?: TaskActor
+    actor?: TaskActor,
+    archiveOperation?: typeof ARCHIVE_COMPLETED
   ): Promise<{
     success: boolean;
     archived: boolean;
@@ -2961,20 +3641,27 @@ export class TaskManagerDB extends EventEmitter {
     warning?: string;
     task: Task;
   }> {
-    const task = await this.getTask(id);
+    let task = await this.getTask(id);
     if (!task) {
       throw new NotFoundFault(`Task not found: ${id}`, 'TASK_NOT_FOUND');
     }
 
-    const oldStatus = task.status;
-    if (oldStatus === 'archived') {
-      return { success: true, archived: true, disposition: task.archiveDisposition ?? null, task };
+    if (task.status === 'archived') {
+      const archived = actor ? await this.authorizedArchivedTask(id, actor) : task;
+      if (archived) {
+        return { success: true, archived: true, disposition: archived.archiveDisposition ?? null, task: archived };
+      }
+      // The Task changed while the no-op acquired its lock. Rejoin the normal
+      // archive path, which locks and checks authority again before mutation.
+      task = await this.getTask(id);
+      if (!task) throw new NotFoundFault(`Task not found: ${id}`, 'TASK_NOT_FOUND');
     }
+    const oldStatus = task.status;
 
     const updated = await this.updateTask(id, {
       status: 'archived' as TaskStatus,
       archiveReason: options.reason,
-    }, actor);
+    }, actor, undefined, undefined, undefined, archiveOperation);
     const disposition = (updated.archiveDisposition ?? 'abandoned') as ArchiveDisposition;
 
     this.emit('task.archived', id);
@@ -2983,15 +3670,6 @@ export class TaskManagerDB extends EventEmitter {
     if (!options.suppressBoardEmit) {
       this.emit('tasks.updated', await this.getAllTasks());
     }
-
-    // Notification
-    await notificationManager.notifyStatusChange(
-      task.id,
-      task.title,
-      oldStatus,
-      'archived',
-      'system'
-    );
 
     console.log('[TaskManagerDB] Archived task:', id, `(disposition: ${disposition})`);
     const warning = archiveWarningForStatus(oldStatus, disposition);
@@ -3040,6 +3718,10 @@ export class TaskManagerDB extends EventEmitter {
     id: string,
     actor?: TaskActor
   ): Promise<{ success: boolean; task: Task; restoredTo: TaskStatus; derivedFrom: 'history' | 'fallback' }> {
+    if (actor?.authorization) {
+      const task = await this.updateTask(id, {}, actor, undefined, undefined, undefined, RESTORE_ARCHIVE);
+      return { success: true, task, restoredTo: task.status, derivedFrom: 'history' };
+    }
     const task = await this.getTask(id);
     if (!task) {
       throw new TaskNotFoundError(id);
@@ -3065,33 +3747,42 @@ export class TaskManagerDB extends EventEmitter {
     options: { reason?: string } = {},
     actor?: TaskActor
   ): Promise<{
-    results: Array<{ id: string; archived: boolean; code: 'ARCHIVED' | 'ALREADY_ARCHIVED' | 'NOT_COMPLETED' | 'NOT_FOUND' | 'ERROR'; error?: string; warning?: string }>;
+    results: Array<{ id: string; archived: boolean; code: string; error?: string; warning?: string; errorId?: string }>;
     archivedCount: number;
     failedCount: number;
   }> {
-    const results: Array<{ id: string; archived: boolean; code: 'ARCHIVED' | 'ALREADY_ARCHIVED' | 'NOT_COMPLETED' | 'NOT_FOUND' | 'ERROR'; error?: string; warning?: string }> = [];
+    const results: Array<{ id: string; archived: boolean; code: string; error?: string; warning?: string; errorId?: string }> = [];
     for (const id of ids) {
       try {
-        const task = await this.getTask(id);
+        let task = await this.getTask(id);
         if (!task) {
           results.push({ id, archived: false, code: 'NOT_FOUND', error: 'Task not found' });
           continue;
         }
         if (task.status === 'archived') {
-          results.push({ id, archived: true, code: 'ALREADY_ARCHIVED' });
-          continue;
+          const archived = actor ? await this.authorizedArchivedTask(id, actor) : task;
+          if (archived) {
+            results.push({ id, archived: true, code: 'ALREADY_ARCHIVED' });
+            continue;
+          }
+          task = await this.getTask(id);
+          if (!task) {
+            results.push({ id, archived: false, code: 'NOT_FOUND', error: 'Task not found' });
+            continue;
+          }
         }
         if (task.status !== 'completed') {
           results.push({ id, archived: false, code: 'NOT_COMPLETED', error: `Task is ${task.status}, not completed` });
           continue;
         }
-        const outcome = await this.archiveTask(id, { reason: options.reason, suppressBoardEmit: true }, actor);
+        const outcome = await this.archiveTask(id, { reason: options.reason, suppressBoardEmit: true }, actor, ARCHIVE_COMPLETED);
         results.push({ id, archived: true, code: 'ARCHIVED', ...(outcome.warning ? { warning: outcome.warning } : {}) });
       } catch (err) {
         // Safety floor (review f98d127b B1): the exception is logged
         // secret-safe; the per-Task result carries a FIXED message only.
-        logCaughtFailure('[TaskManagerDB] bulk archive failed for a task:', err);
-        results.push({ id, archived: false, code: 'ERROR', error: 'The Task could not be archived' });
+        const errorId = logCaughtFailure('[TaskManagerDB] bulk archive failed for a task:', err);
+        const failure = bulkArchiveFailure(err);
+        results.push({ id, archived: false, ...failure, ...(failure.code === 'NOT_FOUND' ? {} : { errorId }) });
       }
     }
     this.emit('tasks.updated', await this.getAllTasks());
@@ -3151,15 +3842,11 @@ export class TaskManagerDB extends EventEmitter {
     const { conditions, params, filterParamCount } = await this.buildTaskWhere(filters);
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const result = await this.pool.query(
-      // active_agent is JSONB; only the agent's NAME is projected — the
-      // session key, pid and log path are session internals and never
-      // belong in a bulk map read.
+      // No canonical record assigns a display name to this Task. Keep the
+      // graph's optional badge empty rather than inventing an actor identity.
       `SELECT t.id, t.title, t.status, t.priority, p.name AS project,
               t.phase_id, t.updated_at,
-              NULLIF(btrim(COALESCE(
-                CASE WHEN jsonb_typeof(to_jsonb(t.active_agent)) = 'object'
-                     THEN to_jsonb(t.active_agent)->>'name'
-                     ELSE NULL END, '')), '') AS agent_name
+              NULL::text AS agent_name
        FROM tasks t
        LEFT JOIN projects p ON p.id = t.project_id
        ${whereClause}`,
@@ -3407,7 +4094,11 @@ export class TaskManagerDB extends EventEmitter {
     newStatus: SubtaskStatus,
     role: TaskAutomationRole = 'orchestrator',
     reviewNote?: string,
-    blockedReason?: string
+    blockedReason?: string,
+    actor?: TaskActor,
+    // Card 5854f0d6, round 2: the request principal of a route that keeps the
+    // legacy role semantics (no authority actor); the feed row records it.
+    feedActor?: FeedActorRef,
   ): Promise<Task> {
     const task = await this.getTask(taskId);
     if (!task) {
@@ -3419,6 +4110,9 @@ export class TaskManagerDB extends EventEmitter {
     }
 
     const subtask = task.subtasks[subtaskIndex];
+    if (actor) {
+      return this.updateSubtaskStatusById(taskId, String(subtask.id), newStatus, role, reviewNote, blockedReason, actor, false, feedActor);
+    }
     const currentStatus = subtask.status;
 
     // Completion authority is enforced here, not only by HTTP routes, so
@@ -3456,13 +4150,20 @@ export class TaskManagerDB extends EventEmitter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      const parent = await client.query('SELECT status FROM tasks WHERE id = $1 FOR UPDATE', [taskId]);
+      if (!parent.rows.length) throw new NotFoundFault(`Task not found: ${taskId}`, 'TASK_NOT_FOUND');
+      const fresh = await client.query(
+        'SELECT status, note FROM subtasks WHERE task_id = $1 AND index = $2 FOR UPDATE', [taskId, subtaskIndex]);
+      if (!fresh.rows.length) throw new NotFoundFault(`Subtask not found at index ${subtaskIndex}`, 'SUBTASK_NOT_FOUND');
+      assertTerminalTaskChildren(parent.rows[0].status, [newStatus]);
+      assertSubtaskStatusTransition(role, fresh.rows[0].status as SubtaskStatus, newStatus);
       await client.query(
         `UPDATE subtasks
          SET status = $1, note = $2, blocked_reason = $3, completed_at = $4, updated_at = $5
          WHERE task_id = $6 AND index = $7`,
         [
           newStatus,
-          reviewNote || subtask.reviewNote || null,
+          reviewNote || fresh.rows[0].note || null,
           newStatus === 'stuck' ? (blockedReason || null) : null,
           completedAt,
           now,
@@ -3476,8 +4177,12 @@ export class TaskManagerDB extends EventEmitter {
       );
       await feedEventService.emit(client, {
         name: 'task.updated', objectType: 'task', objectId: taskId,
+        // The legacy index path runs WITHOUT an authority actor (an actor goes
+        // by id above); a route passes its request principal as feedActor.
+        actorPrincipalId: feedActor?.principalId ?? null, actorHandle: feedActor?.handle ?? null,
         projectId: bumped.rows[0]?.project_id ?? null,
-        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+        // Card 5854f0d6: the field NAME this write changed, never its value.
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['subtasks'] },
       });
       await client.query('COMMIT');
     } catch (error) {
@@ -3509,12 +4214,20 @@ export class TaskManagerDB extends EventEmitter {
     role: TaskAutomationRole = 'orchestrator',
     reviewNote?: string,
     blockedReason?: string,
+    actor?: TaskActor,
+    requireAccountControl = false,
+    // Card 5854f0d6, round 2: the request principal of a route that keeps the
+    // role semantics (no authority actor); the feed row records it.
+    feedActor?: FeedActorRef,
   ): Promise<Task> {
+    if (!isValidSubtaskId(subtaskId)) throw new InvalidRequestFault(SUBTASK_ID_ERROR, 'INVALID_SUBTASK_ID');
     const client = await this.pool.connect();
     let displayIndex = -1;
     let currentStatus: SubtaskStatus = 'empty';
     try {
       await client.query('BEGIN');
+      const parent = await client.query('SELECT status FROM tasks WHERE id = $1 FOR UPDATE', [taskId]);
+      if (!parent.rows.length) throw new NotFoundFault(`Task not found: ${taskId}`, 'TASK_NOT_FOUND');
       const rowResult = await client.query(
         `SELECT s.id, s.index, s.status, s.note
            FROM subtasks s
@@ -3532,20 +4245,15 @@ export class TaskManagerDB extends EventEmitter {
       displayIndex = Number(subtask.index);
       currentStatus = subtask.status as SubtaskStatus;
 
-      if (newStatus === 'completed' && role !== 'qa' && role !== 'reviewer') {
-        throw new ForbiddenFault('Only an independent Verifier identity can complete a subtask');
+      assertTerminalTaskChildren(parent.rows[0].status, [newStatus]);
+      const account = actor ? await taskAccountControl(client, taskId, actor) : null;
+      if (requireAccountControl && !account) {
+        throw new ForbiddenFault('Owner completion requires actual account-owner or appointed Main authority', 'ACCOUNT_CONTROL_REQUIRED');
       }
-      if (newStatus === 'completed' && currentStatus !== 'review') {
-        throw new Error(`A subtask can only be completed from review (current status: ${currentStatus})`);
-      }
-      if (role === 'agent') {
-        if (!AGENT_ALLOWED_STATUSES.includes(newStatus)) {
-          throw new ForbiddenFault(`Agents cannot set subtask status to '${newStatus}'. Allowed: ${AGENT_ALLOWED_STATUSES.join(', ')}`);
-        }
-        if (DONE_STATUSES.includes(currentStatus)) throw new ForbiddenFault(`Cannot change status of ${currentStatus} subtasks`);
-        if (currentStatus === 'stuck' && newStatus !== 'stuck') {
-          throw new ForbiddenFault('Cannot resume a stuck subtask. An independent Verifier or orchestrator must resolve it.');
-        }
+      if (account && actor) {
+        await recordAccountTaskDisposition(client, taskId, actor, account, newStatus, subtaskId);
+      } else {
+        assertSubtaskStatusTransition(role, currentStatus, newStatus);
       }
 
       const now = new Date().toISOString();
@@ -3570,8 +4278,10 @@ export class TaskManagerDB extends EventEmitter {
       );
       await feedEventService.emit(client, {
         name: 'task.updated', objectType: 'task', objectId: taskId,
+        actorPrincipalId: (actor ?? feedActor)?.principalId ?? null, actorHandle: (actor ?? feedActor)?.handle ?? null,
         projectId: bumped.rows[0]?.project_id ?? null,
-        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+        // Card 5854f0d6: the field NAME this write changed, never its value.
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['subtasks'] },
       });
       await client.query('COMMIT');
     } catch (error) {
@@ -3588,6 +4298,180 @@ export class TaskManagerDB extends EventEmitter {
     return updatedTask;
   }
 
+  /*
+   * Card 2bc7b303 (owner ruling E374): the Subtask structure verbs. Create,
+   * reorder and text edit are the dedicated forms of what the dashboard does
+   * through the generic whole-Task Subtask replacement, under the SAME lock
+   * order as the stable-id status verb (the parent Task row, then its Subtask
+   * rows), the same account-control disposition record and the same
+   * task.updated emission. They never change an existing Subtask's id or
+   * state; a new Subtask's id comes from the subtasks id sequence, as every
+   * other Subtask's does. Authorization is the status verb's: the route's
+   * point stage asks Task `write`, and a state other than empty on create
+   * meets the same transition rule the status verb applies from empty.
+   */
+  private async lockSubtaskParent(client: PoolClient, taskId: string): Promise<{ status: string; rows: Array<{ id: string; index: number }> }> {
+    const parent = await client.query('SELECT status FROM tasks WHERE id = $1 FOR UPDATE', [taskId]);
+    if (!parent.rows.length) throw new NotFoundFault(`Task not found: ${taskId}`, 'TASK_NOT_FOUND');
+    const rows = await client.query(
+      'SELECT id, index FROM subtasks WHERE task_id = $1 ORDER BY index ASC FOR UPDATE', [taskId]);
+    return {
+      status: String(parent.rows[0].status),
+      rows: rows.rows.map((row) => ({ id: String(row.id), index: Number(row.index) })),
+    };
+  }
+
+  /** Give each listed Subtask its display index by stable id. The rows are
+   *  parked above every old and new index first (the 36071c86 offset rule of
+   *  the whole-Task replacement), so no intermediate state meets
+   *  UNIQUE(task_id, index); attempt links follow through the compatibility
+   *  triggers, with their FKs deferred to COMMIT exactly as there. */
+  private async placeSubtasks(client: PoolClient, taskId: string, finalOrder: string[], finalLength: number): Promise<void> {
+    await client.query(
+      'SET CONSTRAINTS task_attempt_links_task_id_subtask_index_fkey, task_attempt_ownership_task_id_subtask_index_fkey DEFERRED',
+    );
+    await client.query(
+      `UPDATE subtasks
+          SET index = index + GREATEST(
+            (
+              SELECT COALESCE(MAX(current_subtask.index), -1) + 1
+                FROM subtasks current_subtask
+               WHERE current_subtask.task_id = $1
+            ),
+            $2::int
+          )
+        WHERE task_id = $1`,
+      [taskId, finalLength],
+    );
+    for (let index = 0; index < finalOrder.length; index += 1) {
+      await client.query('UPDATE subtasks SET index = $3 WHERE task_id = $1 AND id = $2', [taskId, finalOrder[index], index]);
+    }
+  }
+
+  /** One Subtask structure write in its own transaction: the parent Task row
+   *  and its Subtask rows are locked first, account control is read under that
+   *  lock, the parent is bumped and task.updated is emitted with the write,
+   *  then the in-process listeners hear it. */
+  private async subtaskStructureWrite<T>(
+    taskId: string,
+    write: (client: PoolClient, parent: { status: string; rows: Array<{ id: string; index: number }> }, account: string | null) => Promise<T>,
+    actor?: TaskActor,
+  ): Promise<{ task: Task; result: T }> {
+    const client = await this.pool.connect();
+    let result: T;
+    try {
+      await client.query('BEGIN');
+      const parent = await this.lockSubtaskParent(client, taskId);
+      result = await write(client, parent, actor ? await taskAccountControl(client, taskId, actor) : null);
+      const bumped = await client.query(
+        'UPDATE tasks SET updated_at = $1 WHERE id = $2 RETURNING project_id, owner_principal_id',
+        [new Date().toISOString(), taskId],
+      );
+      await feedEventService.emit(client, {
+        name: 'task.updated', objectType: 'task', objectId: taskId,
+        actorPrincipalId: actor?.principalId ?? null,
+        actorHandle: actor?.handle ?? null,
+        projectId: bumped.rows[0]?.project_id ?? null,
+        // Card 5854f0d6: the field NAME this write changed, never its value.
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['subtasks'] },
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const task = await this.getTask(taskId);
+    if (!task) throw new NotFoundFault(`Task not found after subtask update: ${taskId}`, 'TASK_NOT_FOUND');
+    this.emit('task.updated', task);
+    return { task, result };
+  }
+
+  /** Add one Subtask at a 1-based position (default: append). Returns the new
+   *  stable id and the position it took. */
+  async createSubtask(
+    taskId: string,
+    input: { text: string; position?: number; status?: SubtaskStatus },
+    role: TaskAutomationRole = 'orchestrator',
+    actor?: TaskActor,
+  ): Promise<{ task: Task; subtaskId: string; position: number }> {
+    const status: SubtaskStatus = input.status ?? 'empty';
+    const { task, result } = await this.subtaskStructureWrite(taskId, async (client, parent, account) => {
+      const count = parent.rows.length;
+      const position = input.position ?? count + 1;
+      if (!Number.isInteger(position) || position < 1 || position > count + 1) {
+        throw new InvalidRequestFault(
+          `position must be an integer from 1 to ${count + 1} for this Task (it has ${count} Subtasks)`,
+          'INVALID_SUBTASK_POSITION');
+      }
+      assertTerminalTaskChildren(parent.status, [status]);
+      if (!account && status !== 'empty') {
+        // The status verb's rule, applied from the empty state a new Subtask
+        // starts in. Completion stays a Verifier act from review, so a
+        // Verifier creating a completed Subtask is refused as a conflict.
+        if (status === 'completed' && (role === 'qa' || role === 'reviewer')) {
+          throw new ConflictFault('A Subtask is completed from review: create it in review, then complete it with the status verb', 'SUBTASK_COMPLETE_FROM_REVIEW');
+        }
+        assertSubtaskStatusTransition(role, 'empty', status);
+      }
+      if (position <= count) {
+        const order = parent.rows.map((row) => row.id);
+        await this.placeSubtasks(client, taskId, order, count + 1);
+        // Free the requested position: rows at or after it move down by one,
+        // last first, so each move lands on an index the previous one freed.
+        for (let index = order.length - 1; index >= position - 1; index -= 1) {
+          await client.query('UPDATE subtasks SET index = $3 WHERE task_id = $1 AND id = $2', [taskId, order[index], index + 1]);
+        }
+      }
+      const now = new Date().toISOString();
+      const inserted = await client.query(
+        `INSERT INTO subtasks (task_id, index, title, status, note, completed_at, updated_at)
+         VALUES ($1, $2, $3, $4, NULL, $5, $6) RETURNING id`,
+        [taskId, position - 1, input.text, status, status === 'completed' ? now : null, now],
+      );
+      const subtaskId = String(inserted.rows[0].id);
+      if (account && actor) await recordAccountTaskDisposition(client, taskId, actor, account, 'explicit-subtask-update', subtaskId);
+      return { subtaskId, position };
+    }, actor);
+    return { task, ...result };
+  }
+
+  /** Put the Task's Subtasks in a new order. `order` must name every current
+   *  Subtask id exactly once; ids, states and text are unchanged. */
+  async reorderSubtasks(taskId: string, order: string[], actor?: TaskActor): Promise<Task> {
+    const { task } = await this.subtaskStructureWrite(taskId, async (client, parent, account) => {
+      const current = new Set(parent.rows.map((row) => row.id));
+      const permutation = order.length === parent.rows.length && new Set(order).size === order.length
+        && order.every((subtaskId) => current.has(subtaskId));
+      if (!permutation) {
+        throw new ConflictFault(
+          `order must name every Subtask id of this Task exactly once (it has ${parent.rows.length}); re-read the Task and send its current ids`,
+          'SUBTASK_ORDER_MISMATCH');
+      }
+      await this.placeSubtasks(client, taskId, order, order.length);
+      if (account && actor) await recordAccountTaskDisposition(client, taskId, actor, account, 'explicit-subtask-update');
+      return null;
+    }, actor);
+    return task;
+  }
+
+  /** Replace one Subtask's text by stable id; its id, position and state are unchanged. */
+  async updateSubtaskText(taskId: string, subtaskId: string, text: string, actor?: TaskActor): Promise<Task> {
+    if (!isValidSubtaskId(subtaskId)) throw new InvalidRequestFault(SUBTASK_ID_ERROR, 'INVALID_SUBTASK_ID');
+    const { task } = await this.subtaskStructureWrite(taskId, async (client, parent, account) => {
+      if (!parent.rows.some((row) => row.id === subtaskId)) {
+        throw new NotFoundFault(`Subtask not found: ${subtaskId}`, 'SUBTASK_NOT_FOUND');
+      }
+      await client.query(
+        'UPDATE subtasks SET title = $3, updated_at = $4 WHERE task_id = $1 AND id = $2',
+        [taskId, subtaskId, text, new Date().toISOString()]);
+      if (account && actor) await recordAccountTaskDisposition(client, taskId, actor, account, 'explicit-subtask-update', subtaskId);
+      return null;
+    }, actor);
+    return task;
+  }
+
   async markSubtaskInReview(taskId: string, subtaskIndex: number, reviewNote?: string): Promise<Task> {
     return this.updateSubtaskStatus(taskId, subtaskIndex, 'review', 'agent', reviewNote);
   }
@@ -3596,12 +4480,12 @@ export class TaskManagerDB extends EventEmitter {
     return this.updateSubtaskStatus(taskId, subtaskIndex, 'in-progress', 'agent');
   }
 
-  async approveSubtask(taskId: string, subtaskIndex: number): Promise<Task> {
-    return this.updateSubtaskStatus(taskId, subtaskIndex, 'completed', 'reviewer');
+  async approveSubtask(taskId: string, subtaskIndex: number, feedActor?: FeedActorRef): Promise<Task> {
+    return this.updateSubtaskStatus(taskId, subtaskIndex, 'completed', 'reviewer', undefined, undefined, undefined, feedActor);
   }
 
-  async rejectSubtask(taskId: string, subtaskIndex: number, note?: string): Promise<Task> {
-    const task = await this.updateSubtaskStatus(taskId, subtaskIndex, 'empty', 'orchestrator');
+  async rejectSubtask(taskId: string, subtaskIndex: number, note?: string, feedActor?: FeedActorRef): Promise<Task> {
+    const task = await this.updateSubtaskStatus(taskId, subtaskIndex, 'empty', 'orchestrator', undefined, undefined, undefined, feedActor);
     if (note && task.subtasks && task.subtasks[subtaskIndex]) {
       task.subtasks[subtaskIndex].reviewNote = `REJECTED: ${note}`;
       // RH-P3.C1 (round 1, F2): the rejection note is a second Task
@@ -3619,8 +4503,10 @@ export class TaskManagerDB extends EventEmitter {
         );
         await feedEventService.emit(client, {
           name: 'task.updated', objectType: 'task', objectId: taskId,
+          actorPrincipalId: feedActor?.principalId ?? null, actorHandle: feedActor?.handle ?? null,
           projectId: bumped.rows[0]?.project_id ?? null,
-          ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+          // Card 5854f0d6: the field NAME this write changed, never its value.
+          ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['subtasks'] },
         });
         await client.query('COMMIT');
       } catch (error) {
@@ -3637,8 +4523,8 @@ export class TaskManagerDB extends EventEmitter {
     return this.updateSubtaskStatus(taskId, subtaskIndex, 'stuck', 'orchestrator', undefined, reason);
   }
 
-  async skipSubtask(taskId: string, subtaskIndex: number): Promise<Task> {
-    return this.updateSubtaskStatus(taskId, subtaskIndex, 'skipped', 'orchestrator');
+  async skipSubtask(taskId: string, subtaskIndex: number, feedActor?: FeedActorRef): Promise<Task> {
+    return this.updateSubtaskStatus(taskId, subtaskIndex, 'skipped', 'orchestrator', undefined, undefined, undefined, feedActor);
   }
 
   /** Apply one independent Verifier verdict to every subtask awaiting review. */
@@ -3655,12 +4541,15 @@ export class TaskManagerDB extends EventEmitter {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // Same parent-before-child order as status/replacement writers. The
+      // structured verdict's review-only outcome and authority stay intact.
+      await client.query('SELECT status FROM tasks WHERE id = $1 FOR UPDATE', [taskId]);
       await client.query(
         `UPDATE subtasks
-            SET status = $1,
+            SET status = $1::varchar,
                 note = COALESCE($2, note),
-                blocked_reason = CASE WHEN $1 = 'stuck' THEN $2 ELSE NULL END,
-                completed_at = CASE WHEN $1 = 'completed' THEN $3::timestamptz ELSE NULL END,
+                blocked_reason = CASE WHEN $1::varchar = 'stuck' THEN $2 ELSE NULL END,
+                completed_at = CASE WHEN $1::varchar = 'completed' THEN $3::timestamptz ELSE NULL END,
                 updated_at = $3::timestamptz
           WHERE task_id = $4 AND status = 'review'`,
         [nextStatus, reviewNote, now, taskId],
@@ -3672,7 +4561,9 @@ export class TaskManagerDB extends EventEmitter {
       await feedEventService.emit(client, {
         name: 'task.updated', objectType: 'task', objectId: taskId,
         projectId: bumped.rows[0]?.project_id ?? null,
-        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+        // Card 5854f0d6: the field NAME this write changed, never its value.
+        // A board-applied verdict: no acting principal (TIMELINE_SYSTEM_EMITS).
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['subtasks'] },
       });
       await client.query('COMMIT');
     } catch (error) {
@@ -3762,24 +4653,25 @@ export class TaskManagerDB extends EventEmitter {
 
     const executor = client || this.pool;
 
-    const selfDeps = currentTaskId ? dependsOn.filter(depId => depId === currentTaskId) : [];
+    const canonicalCurrentId = currentTaskId && canonicalDependencyId(currentTaskId);
+    const selfDeps = currentTaskId ? dependsOn.filter(depId => canonicalDependencyId(depId) === canonicalCurrentId) : [];
     if (selfDeps.length > 0) {
       throw new DependencyValidationError('SELF_DEPENDENCY', 'Task cannot depend on itself', selfDeps);
     }
 
     // Malformed ids can never reference a task, and would make the uuid cast
     // below throw a 22P02 (→ opaque 500) — treat them as unknown up front.
-    const malformed = dependsOn.filter(depId => typeof depId !== 'string' || !UUID_RE.test(depId));
-    const candidates = dependsOn.filter(depId => typeof depId === 'string' && UUID_RE.test(depId));
+    const malformed = dependsOn.filter(depId => typeof depId !== 'string' || depId.length !== 36 || !UUID_RE.test(depId));
+    const candidates = dependsOn.filter(depId => typeof depId === 'string' && depId.length === 36 && UUID_RE.test(depId));
 
     let missing: string[] = [...malformed];
     if (candidates.length > 0) {
       const result = await executor.query(
         'SELECT id FROM tasks WHERE id = ANY($1::uuid[])',
-        [candidates]
+        [candidates.map(canonicalDependencyId)]
       );
       const found = new Set(result.rows.map((r: any) => r.id));
-      missing = missing.concat(candidates.filter(depId => !found.has(depId)));
+      missing = missing.concat(candidates.filter(depId => !found.has(canonicalDependencyId(depId))));
     }
 
     if (missing.length > 0) {
@@ -3792,6 +4684,8 @@ export class TaskManagerDB extends EventEmitter {
   }
 
   private async hasCircularDependency(taskId: string, depId: string, visited = new Set<string>(), client?: PoolClient): Promise<boolean> {
+    taskId = canonicalDependencyId(taskId);
+    depId = canonicalDependencyId(depId);
     // Walk the dependency chain from depId. If we ever reach taskId, adding
     // taskId→depId would create a cycle.  `visited` tracks depIds we've
     // already expanded so we don't loop on existing (non-taskId) cycles.
@@ -3969,33 +4863,36 @@ export class TaskManagerDB extends EventEmitter {
    * Add a single dependency (taskId depends on dependsOnId)
    */
   async addDependency(taskId: string, dependsOnId: string, actor?: TaskActor, transaction?: CreationTransaction): Promise<void> {
+    taskId = canonicalDependencyId(taskId);
+    dependsOnId = canonicalDependencyId(dependsOnId);
     if (transaction && actor?.principalId !== transaction.actor.principalId) throw new Error('Creation actor mismatch');
-    // Validate the parent task exists (missing parent → 404 at the route)
-    const task = await this.getTask(taskId, transaction?.client);
-    if (!task) throw new NotFoundFault(`Task not found: ${taskId}`, 'TASK_NOT_FOUND');
-
-    // Referential integrity + self-reference (typed → 400 at the route)
-    await this.validateDependencies([dependsOnId], taskId, transaction?.client);
-
-    // Check for circular dependency
-    if (await this.hasCircularDependency(taskId, dependsOnId, new Set(), transaction?.client)) {
-      throw new InvalidRequestFault(`Circular dependency detected: ${taskId} -> ${dependsOnId}`, 'CIRCULAR_DEPENDENCY');
-    }
-
-    // Check if already exists
-    const existing = await (transaction?.client ?? this.pool).query(
-      'SELECT 1 FROM task_dependencies WHERE task_id = $1 AND depends_on_task_id = $2',
-      [taskId, dependsOnId]
-    );
-    if (existing.rows.length > 0) {
-      throw new InvalidRequestFault(`Dependency already exists: ${taskId} -> ${dependsOnId}`, 'DEPENDENCY_EXISTS');
-    }
-
     // RH-P3.C1 (round 1, F2): a dependency edge changes the Task's
     // readiness; the write and its task.updated emission commit together.
     const client = transaction?.client ?? await this.pool.connect();
     try {
       if (!transaction) await client.query('BEGIN');
+      await lockDependencyGraph(client, transaction);
+      // Validate the parent task exists (missing parent → 404 at the route)
+      const task = await this.getTask(taskId, client);
+      if (!task) throw new NotFoundFault(`Task not found: ${taskId}`, 'TASK_NOT_FOUND');
+
+      // Referential integrity + self-reference (typed → 400 at the route)
+      await this.validateDependencies([dependsOnId], taskId, client);
+
+      // Check for circular dependency
+      if (await this.hasCircularDependency(taskId, dependsOnId, new Set(), client)) {
+        throw new InvalidRequestFault(`Circular dependency detected: ${taskId} -> ${dependsOnId}`, 'CIRCULAR_DEPENDENCY');
+      }
+
+      // Check if already exists
+      const existing = await client.query(
+        'SELECT 1 FROM task_dependencies WHERE task_id = $1 AND depends_on_task_id = $2',
+        [taskId, dependsOnId]
+      );
+      if (existing.rows.length > 0) {
+        throw new InvalidRequestFault(`Dependency already exists: ${taskId} -> ${dependsOnId}`, 'DEPENDENCY_EXISTS');
+      }
+
       await client.query(
         'INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)',
         [taskId, dependsOnId]
@@ -4013,7 +4910,7 @@ export class TaskManagerDB extends EventEmitter {
         actorPrincipalId: actor?.principalId ?? null,
         actorHandle: actor?.handle ?? null,
         projectId: bumped.rows[0]?.project_id ?? null,
-        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['dependsOn'] },
       });
       // RH-P3.C2 (pre-review F3): adding or removing a dependency edge is a
       // readiness transition for THIS task — gaining an unmet parent must
@@ -4037,9 +4934,12 @@ export class TaskManagerDB extends EventEmitter {
    * Remove a single dependency
    */
   async removeDependency(taskId: string, dependsOnId: string, actor?: TaskActor): Promise<void> {
+    taskId = canonicalDependencyId(taskId);
+    dependsOnId = canonicalDependencyId(dependsOnId);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await lockDependencyGraph(client);
       const result = await client.query(
         'DELETE FROM task_dependencies WHERE task_id = $1 AND depends_on_task_id = $2',
         [taskId, dependsOnId]
@@ -4060,8 +4960,11 @@ export class TaskManagerDB extends EventEmitter {
       );
       await feedEventService.emit(client, {
         name: 'task.updated', objectType: 'task', objectId: taskId,
+        actorPrincipalId: actor?.principalId ?? null,
+        actorHandle: actor?.handle ?? null,
         projectId: bumped.rows[0]?.project_id ?? null,
-        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: {},
+        // Card 5854f0d6: the field NAME this write changed, never its value.
+        ownerPrincipalId: bumped.rows[0]?.owner_principal_id ?? null, payload: { fields: ['dependsOn'] },
       });
       // RH-P3.C2 (pre-review F3): adding or removing a dependency edge is a
       // readiness transition for THIS task — gaining an unmet parent must
@@ -4081,7 +4984,7 @@ export class TaskManagerDB extends EventEmitter {
   }
 
   /**
-   * Get all tasks that are blocked by unmet dependencies (for clawbeat)
+   * Get all tasks that are blocked by unmet dependencies (for automation clients)
    */
   async getBlockedTasks(): Promise<Task[]> {
     // Find all tasks that have at least one semantically unsatisfied dependency.

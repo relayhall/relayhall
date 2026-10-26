@@ -8,6 +8,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 
 import { authenticatedFetch } from '../../utils/auth';
 import { TaskTimeline, type TimelineEvent } from './TaskTimeline';
+import { TIMELINE_RENDERER_REGISTRY } from './taskTimelineRendererRegistry';
 
 vi.mock('../../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
 
@@ -63,7 +64,19 @@ function renderTimeline(events: TimelineEvent[], initialEntry = `/tasks/${taskId
   );
 }
 
-test('uses purpose-built taxonomy renderers and an inert quoted fallback for hostile unknown events', async () => {
+test('completion shows the authenticated history actor without inventing a legacy session',async()=>{
+  renderTimeline([event({source:'history',eventType:'history.status',title:'Status changed',actor:'claude-reviewer',
+    actorDetail:{principalId:'reviewer-id',handle:'claude-reviewer',role:'verifier'},sessionKey:null,
+    metadata:{field:'status',newValue:'completed'}})]);
+  expect(await screen.findByText('Completed by claude-reviewer · Verifier')).toBeInTheDocument();
+  expect(screen.queryByText(/legacy session/i)).not.toBeInTheDocument();
+});
+
+// E387(2)/E388: the visual BEGIN/END fence retired; the untrusted-data
+// property it stood for is kept. Board text still renders through React text
+// escaping, so markup in it stays inert, and an unknown event type falls
+// through to the generic renderer as a compact key: value list.
+test('uses purpose-built taxonomy renderers and an inert plain-text fallback for hostile unknown events', async () => {
   const user = userEvent.setup();
   const hostile = '# heading\n<script>window.pwned = true</script>\n<img src=x onerror="window.pwned=true">\n' + 'x'.repeat(10_000);
   const { container } = renderTimeline([
@@ -72,7 +85,7 @@ test('uses purpose-built taxonomy renderers and an inert quoted fallback for hos
     event({ id: 'review', source: 'review', eventType: 'review.reject', title: 'Verifier decision: reject', actor: 'agent', actorDetail: null }),
     event({ id: 'telemetry', eventType: 'outpost.progress', provenance: 'reported', title: 'Outpost progress' }),
     event({ id: 'legacy', source: 'session', provenance: 'legacy', eventType: 'session.reference', title: 'Legacy session reference' }),
-    event({ id: 'unknown', eventType: 'plugin:future:hostile', provenance: 'reported', title: 'Future event', description: hostile, metadata: { payload: '<b>not markup</b>' } }),
+    event({ id: 'unknown', eventType: 'plugin:future:hostile', provenance: 'reported', title: 'Future event', description: hostile, metadata: { payload: '<b>not markup</b>', nested: { depth: 2, tags: ['a', 'b'] } } }),
   ]);
 
   expect(await screen.findByText('Task transitioned')).toBeInTheDocument();
@@ -84,13 +97,112 @@ test('uses purpose-built taxonomy renderers and an inert quoted fallback for hos
   const fallback = document.getElementById('event-unknown');
   expect(fallback).not.toBeNull();
   await user.click(within(fallback!).getByRole('button', { name: 'Show details for Future event' }));
-  expect(within(fallback!).getByText('reported provenance')).toBeInTheDocument();
-  expect(fallback?.querySelector('blockquote')).not.toBeNull();
-  expect(fallback).toHaveTextContent('BEGIN QUOTED CONTENT');
-  expect(fallback).toHaveTextContent('<script>window.pwned = true</script>');
-  expect(fallback).toHaveTextContent('<b>not markup</b>');
+  const detail = fallback!.querySelector('.task-timeline-event-detail') as HTMLElement;
+  expect(within(detail).getByText('Reported provenance')).toBeInTheDocument();
+  expect(detail).not.toHaveTextContent('BEGIN QUOTED CONTENT');
+  expect(detail.querySelector('pre')).toBeNull();
+  expect(detail).toHaveTextContent('<script>window.pwned = true</script>');
+  // Unknown metadata is a compact key: value list, never JSON.
+  const facts = detail.querySelector('dl.task-timeline-facts') as HTMLElement;
+  expect(facts).not.toBeNull();
+  expect(Array.from(facts.querySelectorAll('dt')).map(node => node.textContent)).toEqual(['Payload', 'Nested']);
+  expect(facts).toHaveTextContent('<b>not markup</b>');
+  expect(facts).toHaveTextContent('Depth: 2; Tags: a, b');
+  expect(facts.textContent).not.toMatch(/[{}"]/);
   expect(fallback?.querySelector('script, img, b')).toBeNull();
   expect(container.textContent).not.toContain('[object Object]');
+});
+
+const historyEvent = (id: string, field: string, oldValue: string | null, newValue: string | null, title: string): TimelineEvent => event({
+  id, source: 'history', provenance: 'system', description: null, title,
+  eventType: field === 'status' ? 'task.status_changed' : field === 'priority' ? 'task.priority_changed' : field === 'notes' ? 'task.notes_updated'
+    : field === 'autoStart' ? (newValue === 'true' ? 'task.arm' : 'task.park') : field === 'created' ? 'task.created' : 'task.field_changed',
+  metadata: { field, oldValue, newValue },
+});
+
+test('E387(2): an expanded system change reads as plain words, never as a fenced JSON block', async () => {
+  const user = userEvent.setup();
+  renderTimeline([
+    historyEvent('status', 'status', null, 'todo', 'Status changed: — → todo'),
+    historyEvent('priority', 'priority', 'normal', 'high', 'Priority changed: normal → high'),
+    historyEvent('notes-empty', 'notes', null, null, 'Notes updated'),
+    historyEvent('arm', 'autoStart', 'false', 'true', 'Task armed'),
+    historyEvent('field', 'trackerUrl', null, 'https://tracker.example/1', 'Field changed: trackerUrl'),
+  ]);
+  await screen.findByText('Status changed: — → todo');
+  for (const button of screen.getAllByRole('button', { name: /^Show details for / })) await user.click(button);
+
+  const detailOf = (id: string) => document.getElementById(`event-${id}`)!.querySelector('.task-timeline-event-detail') as HTMLElement;
+  expect(detailOf('status').querySelector('.task-timeline-change')).toHaveTextContent('Status: — → Todo');
+  expect(detailOf('priority').querySelector('.task-timeline-change')).toHaveTextContent('Priority: Normal → High');
+  expect(detailOf('notes-empty')).toHaveTextContent('Notes were updated.');
+  expect(detailOf('arm').querySelector('.task-timeline-change')).toHaveTextContent('Armed: No → Yes');
+  expect(detailOf('field').querySelector('.task-timeline-change')).toHaveTextContent('Tracker URL: — → https://tracker.example/1');
+  for (const id of ['status', 'priority', 'notes-empty', 'arm', 'field']) {
+    const detail = detailOf(id);
+    expect(detail).not.toHaveTextContent('BEGIN QUOTED CONTENT');
+    expect(detail.textContent).not.toMatch(/[{}"]/);
+    expect(detail.querySelector('pre, code, blockquote')).toBeNull();
+  }
+});
+
+test('E387(2): every registered event type and the generic fallback render detail without fences, JSON or monospace', async () => {
+  const user = userEvent.setup();
+  const types = [...Object.keys(TIMELINE_RENDERER_REGISTRY), 'plugin:unregistered'];
+  renderTimeline(types.map((eventType, index) => event({
+    id: `type-${index}`, eventType, title: `Event ${index}`,
+    provenance: index % 3 === 0 ? 'system' : index % 3 === 1 ? 'authored' : 'reported',
+    description: index % 2 ? `Body <i>${index}</i>` : null,
+    metadata: { decision: 'reject', findings: [{ code: 'F1', note: 'Missing proof' }], attemptCount: index, empty: null },
+  })));
+  await screen.findByText('Event 0');
+  for (const button of screen.getAllByRole('button', { name: /^Show details for / })) await user.click(button);
+  types.forEach((eventType, index) => {
+    const detail = document.getElementById(`event-type-${index}`)!.querySelector('.task-timeline-event-detail') as HTMLElement;
+    expect(detail, eventType).not.toBeNull();
+    expect(detail.textContent, eventType).not.toContain('BEGIN QUOTED CONTENT');
+    expect(detail.textContent, eventType).not.toMatch(/[{}"]/);
+    expect(detail.querySelector('pre, code, i'), eventType).toBeNull();
+    expect(detail, eventType).toHaveTextContent('Findings');
+    expect(detail, eventType).toHaveTextContent('Code: F1; Note: Missing proof');
+    if (index % 2) expect(detail, eventType).toHaveTextContent(`Body <i>${index}</i>`);
+  });
+});
+
+test('system events are compact rows; authored and reported events show an inert three-line preview of their own text', async () => {
+  const user = userEvent.setup();
+  renderTimeline([
+    historyEvent('status', 'status', 'todo', 'review', 'Status changed: todo → review'),
+    event({ id: 'note', eventType: 'handover.note', provenance: 'authored', title: 'Handover note', description: 'Line one <script>window.pwned = true</script>\nLine two' }),
+    event({ id: 'hidden', eventType: 'handover.note', provenance: 'authored', title: 'Redacted note', description: 'secret body',
+      redaction: { mode: 'tombstone', redactedAt: at } }),
+  ]);
+  const status = (await screen.findByText('Status changed: todo → review')).closest('li')!;
+  expect(status).toHaveClass('task-timeline-event--system');
+  expect(status.querySelector('.task-timeline-event-preview')).toBeNull();
+
+  const note = document.getElementById('event-note')!;
+  expect(note).not.toHaveClass('task-timeline-event--system');
+  const preview = note.querySelector('.task-timeline-event-preview') as HTMLElement;
+  expect(preview).toHaveTextContent('Line one <script>window.pwned = true</script> Line two');
+  expect(note.querySelector('script')).toBeNull();
+  await user.click(within(note).getByRole('button', { name: 'Show details for Handover note' }));
+  expect(note.querySelector('.task-timeline-event-preview')).toBeNull();
+  const quote = note.querySelector('.task-timeline-quoted-content') as HTMLElement;
+  expect(quote).toHaveTextContent('Authored note detail');
+  expect(quote).toHaveTextContent('Line one <script>window.pwned = true</script>');
+  expect(quote.querySelector('pre, script')).toBeNull();
+
+  expect(document.getElementById('event-hidden')).not.toHaveTextContent('secret body');
+});
+
+test('the audit caption is the last item of the Timeline, after the events', async () => {
+  const { container } = renderTimeline([event({ id: 'one', title: 'Only event' })]);
+  await screen.findByText('Only event');
+  const timeline = container.querySelector('.task-timeline')!;
+  const children = Array.from(timeline.children);
+  expect(children[children.length - 1]).toHaveClass('task-timeline-audit-caption');
+  expect(children.findIndex(node => node.classList.contains('task-timeline-day'))).toBeLessThan(children.length - 1);
 });
 
 test('uses purpose-built renderers for the default authored and reported event types produced by C1', async () => {
@@ -257,7 +369,7 @@ test('keeps attribution nullable, renders redaction tombstones, and tells the tr
       event({ id: 'system', actor: null, actorDetail: null, provenance: 'system', title: 'System event' }),
       event({
         id: 'redacted', title: 'Private authored note', description: 'secret body', provenance: 'authored',
-        actor: 'wadera', actorDetail: { principalId: 'p2', handle: 'wadera', role: 'verifier' },
+        actor: 'river', actorDetail: { principalId: 'p2', handle: 'river', role: 'verifier' },
         redaction: { mode: 'tombstone', redactedAt: '2026-08-14T13:00:00.000Z' },
       }),
     ],
@@ -274,7 +386,7 @@ test('keeps attribution nullable, renders redaction tombstones, and tells the tr
   expect(await screen.findByText('unattributed · agent')).toBeInTheDocument();
   expect(screen.getByText('system')).toBeInTheDocument();
   const tombstone = document.getElementById('event-redacted');
-  expect(tombstone).toHaveTextContent('wadera · Verifier');
+  expect(tombstone).toHaveTextContent('river · Verifier');
   expect(tombstone).toHaveTextContent('History entry redacted');
   expect(tombstone).toHaveTextContent('tombstone');
   expect(tombstone).not.toHaveTextContent('secret body');

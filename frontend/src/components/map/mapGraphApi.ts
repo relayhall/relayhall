@@ -72,10 +72,11 @@ const graphParams = (query: MapGraphQuery): URLSearchParams => {
 export async function fetchMapGraph(
   query: MapGraphQuery,
   updatedSince?: string,
+  signal?: AbortSignal,
 ): Promise<MapGraphResponse> {
   const params = graphParams(query);
   if (updatedSince) params.set('updatedSince', updatedSince);
-  const response = await authenticatedFetch(`${API_BASE_URL}/tasks/graph?${params.toString()}`);
+  const response = await authenticatedFetch(`${API_BASE_URL}/tasks/graph?${params.toString()}`, { signal });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.success) {
     throw new Error(data.error || 'The Task graph could not be read.');

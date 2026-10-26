@@ -41,6 +41,7 @@ import http from 'http';
 import path from 'path';
 import ts from 'typescript';
 import { AddressInfo } from 'net';
+import { BUILT_IN_WORKFLOW_GUIDANCE } from '../utils/workflowGuidance';
 
 // ── the bootstrap record store, implemented rather than stubbed ─────────────
 interface FakeRow { credential_id: string; bootstrapped_at: string; expires_at: string }
@@ -295,9 +296,12 @@ const EXEMPT_TOOLS = MCP_TOOLS.filter((tool) => BOOTSTRAP_EXEMPT_PLANES.includes
  * state and an un-bootstrapped caller may run it".
  */
 const EXPECTED_EXEMPT_TOOLS = [
+  'relayhall_task_account_owner_get', // Pure authorized ownership read; transfer stays bootstrap-gated.
   'relayhall_access_preview',
+  'relayhall_action_items_list', // E467: the read-only Action Center queue; no write tool exists.
   'relayhall_brief_compile',
   'relayhall_charter_get',
+  'relayhall_knowledge_shared_writers_list', // Card 549cc51f: introspection read of the writer list; no write tool exists.
   'relayhall_personality_list',
   'relayhall_phase_get',
   'relayhall_phase_list',
@@ -315,8 +319,15 @@ const EXPECTED_EXEMPT_TOOLS = [
   'relayhall_skill_get',
   'relayhall_skill_list',
   'relayhall_task_get',
+  'relayhall_task_graph', // reviewed introspection-only Map read; retains tasks:read authorization
   'relayhall_task_list',
+  'relayhall_task_stream_list', // Governed read; no board state change.
+  'relayhall_task_timeline_get', // Governed read; no board state change.
   'relayhall_task_reference_list',
+  // 50b5e9c4 round-1 B1: a pure GET /tasks/:id/reports/:reportId read.
+  'relayhall_task_report_get',
+  'relayhall_task_report_list',
+  'relayhall_task_report_reconcile',
   'relayhall_warrant_list',
 ];
 
@@ -445,6 +456,18 @@ describe('un-bootstrapped: EVERY work-plane tool refuses, EVERY exempt tool does
     }
     expect(wronglyRefused).toEqual([]);
   }, 60_000);
+
+  it('refuses the change-request preview un-bootstrapped: it is a work-plane action with no readOnly flag (E325 section 4.3, F10)', async () => {
+    // "What may I request here" writes nothing on the board, yet it rides the
+    // filing tool, which is tool-level work: the gate refuses it like the
+    // knowledge pair, and the tool carries no readOnly flag that would let a
+    // filing tool pass for a read.
+    const tool = toolByName('relayhall_access_request')!;
+    expect([tool.plane, (tool as { readOnly?: boolean }).readOnly]).toEqual(['work', undefined]);
+    const wire = await callTool('relayhall_access_request', { action: 'preview', objectType: 'project', targetId: '11111111-1111-4111-8111-111111111111' });
+    expect(textOf(wire)).toContain(BOOTSTRAP_REFUSAL_MARKER);
+    expect(wire.body.result.isError).toBe(true);
+  });
 
   it('refuses BEFORE the handler runs — an invalid work call still gets the gate', async () => {
     // `relayhall_report_create` requires title and content. Sent empty, a
@@ -629,6 +652,7 @@ describe('the session brief is what a harness bootstraps with (strategy §2.10)'
     expect(text).toContain('This identity');
     expect(text).toContain('Granted skill index');
     expect(text).toContain('Board workflow doctrine');
+    expect(text).toContain(BUILT_IN_WORKFLOW_GUIDANCE);
     // Board free text rides inside the §4.1 untrusted fence, as everywhere else.
     expect(text).toContain('untrusted data');
   }, 30_000);
@@ -693,6 +717,15 @@ describe('the Brief route hands the compiler the PRESENTING caller actor', () =>
       id, title: 'Linked report', status: 'published',
       summary: id === REPORT_FOR_DEFAULT ? 'DEFAULT-ONLY-REPORT' : 'OTHER-ONLY-REPORT',
       handover: null, content: 'body', content_hash: 'h',
+    })) as never);
+    // The bounded Report context (card 50b5e9c4) reads metadata through its
+    // own call; it carries the same caller-specific summary.
+    jest.spyOn(reportManager, 'getContextRows').mockImplementation(async (ids) => (ids as string[]).map((id) => ({
+      id, title: 'Linked report', status: 'active',
+      summary: id === REPORT_FOR_DEFAULT ? 'DEFAULT-ONLY-REPORT' : 'OTHER-ONLY-REPORT',
+      pinned: false, origin: 'api', auto_promoted: false, source_task_id: null,
+      source_outpost_visibility_tier: null, author_principal_id: null, has_handover: false,
+      created_key: '2026-08-27T00:00:00.000000Z', created_at: null, updated_at: null,
     })) as never);
     jest.spyOn(personalityService, 'getById').mockImplementation(async (id) => ({
       id, name: id === PERSONALITY_FOR_DEFAULT ? 'Default Personality' : 'Other Personality',

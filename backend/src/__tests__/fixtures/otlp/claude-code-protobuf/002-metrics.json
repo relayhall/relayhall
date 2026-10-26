@@ -1,0 +1,12 @@
+{
+  "producer": "claude-code",
+  "producerVersion": "2.1.246",
+  "note": "Claude Code OTLP export, http/protobuf, one print-mode session with one Read tool call",
+  "signal": "metrics",
+  "path": "/v1/metrics",
+  "contentType": "application/x-protobuf",
+  "userAgent": "OTel-OTLP-Exporter-JavaScript/0.208.0",
+  "bytes": 672,
+  "sha256": "ae2b7b3327bb4c51e159f3786df8c0ed0ed7df98916117cb8bcbdaa8a1313550",
+  "bodyBase64": "Cp0FCocBChQKCWhvc3QuYXJjaBIHCgVhbWQ2NAoUCgdvcy50eXBlEgkKB3dpbmRvd3MKGgoKb3MudmVyc2lvbhIMCgoxMC4wLjI2MzAwCh0KDHNlcnZpY2UubmFtZRINCgtjbGF1ZGUtY29kZQocCg9zZXJ2aWNlLnZlcnNpb24SCQoHMi4xLjI0NhAAEpAECiQKGWNvbS5hbnRocm9waWMuY2xhdWRlX2NvZGUSBzIuMS4yNDYS5wMKGWNsYXVkZV9jb2RlLnNlc3Npb24uY291bnQSHUNvdW50IG9mIENMSSBzZXNzaW9ucyBzdGFydGVkGgA6qAMKoQMRwOxpukbv3xgZgMdIE0fv3xghAAAAAAAA8D86TQoHdXNlci5pZBJCCkBhMGYyNmNiZmI5ZDU1ZjRkY2EzYzVmNjUzZmVhZDQ3MzllY2ExNzAwODVjODkxNTQ3OWI3ZTBiMzIwMjExNWU0OjQKCnNlc3Npb24uaWQSJgokZjY5ZTM3MmEtYWUwYy00MzAyLTg0YzItMDJmYzhjM2ZmODMzOjkKD29yZ2FuaXphdGlvbi5pZBImCiQ4OTQxOTdkOC00ODRjLTRhODYtOGU0Mi1jMDk2MWVkMmM0MGE6IAoKdXNlci5lbWFpbBISChBwQHNhbXBsZS5pbnZhbGlkOjsKEXVzZXIuYWNjb3VudF91dWlkEiYKJDAzYjhiMzc0LTZmYTctNGFlYi04ZWM0LWE4ZGQwYTMyZGQ2ZToyCg91c2VyLmFjY291bnRfaWQSHwoddXNlcl8wMVNBTVBMRUJFNzUxNkNGODBGM0U4MjQ6GgoNdGVybWluYWwudHlwZRIJCgdtaW5ndzY0OhUKCnN0YXJ0X3R5cGUSBwoFZnJlc2gQARgB"
+}

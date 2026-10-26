@@ -1,0 +1,661 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:relayhall:knowledge-selector-contract:2",
+  "title": "Knowledge selector and dynamic Compartment v2 contracts",
+  "$defs": {
+    "filter": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "code",
+              "docs",
+              "data"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "version",
+        "kinds"
+      ],
+      "additionalProperties": false
+    },
+    "retrieval": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "complete",
+            "partial"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "store-unavailable",
+              "deadline",
+              "acl-stale",
+              "ingest-stale"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 4,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "status",
+        "reasons"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "complete"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reasons": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "reasons": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "compartment": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "query": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "q": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "code",
+              "docs",
+              "data"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true
+        },
+        "limitPerSource": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 25
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 8000
+        },
+        "includeArchive": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "descriptor": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "compartment_mode": {
+          "const": "dynamic-opaque"
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "content": {
+                "enum": [
+                  "code",
+                  "docs",
+                  "data",
+                  "mixed"
+                ]
+              },
+              "label": {
+                "type": "string",
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "key",
+              "content"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+          },
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true
+        },
+        "archiveCategories": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+          },
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "protocol_version",
+        "compartment_mode",
+        "classes",
+        "categories"
+      ]
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[ -;=?-_a-~]+$"
+        },
+        "parentRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[ -;=?-_a-~]+$"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "snippet": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "contentKind": {
+          "enum": [
+            "code",
+            "docs",
+            "data"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+        },
+        "compartment": {
+          "$ref": "#/$defs/compartment"
+        },
+        "score": {
+          "type": "number"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ref",
+        "title",
+        "snippet",
+        "contentKind",
+        "category",
+        "compartment",
+        "score"
+      ]
+    },
+    "sourceSearchRequest": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "q": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 25
+        },
+        "filter": {
+          "$ref": "#/$defs/filter"
+        },
+        "assertion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "budget_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8000
+        }
+      },
+      "required": [
+        "protocol_version",
+        "q",
+        "limit",
+        "filter"
+      ]
+    },
+    "sourceSearchResponse": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/result"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "retrieval": {
+          "$ref": "#/$defs/retrieval"
+        },
+        "deadline_fired": {
+          "enum": [
+            "caller_deadline",
+            "source_deadline"
+          ]
+        }
+      },
+      "required": [
+        "protocol_version",
+        "results",
+        "retrieval"
+      ]
+    },
+    "getRequest": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "handle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "continuation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "ifNoneMatch": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "handle"
+      ],
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "continuation",
+          "ifNoneMatch"
+        ]
+      }
+    },
+    "sourceGetRequest": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "const": 2
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[ -;=?-_a-~]+$"
+        },
+        "compartment_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "filter": {
+          "$ref": "#/$defs/filter"
+        },
+        "limitBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 262144
+        },
+        "continueFrom": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "contentHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "ifNoneMatch": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "assertion": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocol_version",
+        "ref",
+        "compartment_id",
+        "filter",
+        "limitBytes"
+      ],
+      "dependentRequired": {
+        "continueFrom": [
+          "contentHash"
+        ],
+        "contentHash": [
+          "continueFrom"
+        ]
+      },
+      "not": {
+        "required": [
+          "continueFrom",
+          "ifNoneMatch"
+        ]
+      }
+    },
+    "sourceGetResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "protocol_version": {
+              "const": 2
+            },
+            "status": {
+              "const": "content"
+            },
+            "content_base64": {
+              "type": "string",
+              "maxLength": 349528,
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "compartment": {
+              "$ref": "#/$defs/compartment"
+            },
+            "contentKind": {
+              "enum": [
+                "code",
+                "docs",
+                "data"
+              ]
+            },
+            "category": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "byteLength": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 262144
+            },
+            "totalBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "retrieval": {
+              "$ref": "#/$defs/retrieval"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "status",
+            "content_base64",
+            "sha256",
+            "compartment",
+            "contentKind",
+            "category",
+            "offset",
+            "byteLength",
+            "totalBytes",
+            "truncated",
+            "retrieval"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "protocol_version": {
+              "const": 2
+            },
+            "status": {
+              "const": "notModified"
+            }
+          },
+          "required": [
+            "protocol_version",
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "protocol_version": {
+              "const": 2
+            },
+            "status": {
+              "const": "refused"
+            },
+            "code": {
+              "enum": [
+                "refused",
+                "content_changed"
+              ]
+            }
+          },
+          "required": [
+            "protocol_version",
+            "status",
+            "code"
+          ]
+        }
+      ]
+    },
+    "provisionRequest": {
+      "type": "object",
+      "properties": {
+        "deployment_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "kind": {
+          "enum": [
+            "personal",
+            "project"
+          ]
+        },
+        "stable_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "expected_binding_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "deployment_id",
+        "kind",
+        "stable_id",
+        "expected_binding_version",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "grant": {
+      "type": "object",
+      "properties": {
+        "subject_type": {
+          "enum": [
+            "user",
+            "group"
+          ]
+        },
+        "stable_subject_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "permission": {
+          "enum": [
+            "read",
+            "write"
+          ]
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "consent_ref": {
+          "type": "string",
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "subject_type",
+        "stable_subject_id",
+        "permission",
+        "active"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/query"
+    }
+  ]
+}

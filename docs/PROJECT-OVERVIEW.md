@@ -18,9 +18,8 @@ RelayHall is deliberately **pull-only**:
 
 Agents use the REST/OpenAPI surface or the `relayhall` CLI. Optional reporter
 outposts run next to a harness and push telemetry into the reporting seam — an
-outpost runs beside the harness, a plugin installs into the board (`b94dd86e`,
-D-14). Until a reporter is connected, Sessions and Stats show a documented
-empty state.
+outpost runs beside the harness, a plugin installs into the board. Until a
+reporter is connected, Sessions and Stats show a documented empty state.
 
 ## Runtime components
 

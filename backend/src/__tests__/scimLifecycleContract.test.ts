@@ -163,6 +163,7 @@ function armPool(): void {
     if (sql.includes('COUNT(*)::int AS total FROM directory_provisioned_accounts')) {
       return { rows: [{ total: rowsFor(sql, params).length }] };
     }
+    if (sql.startsWith('SELECT DISTINCT task_id, role FROM access_vehicle_links')) return { rows: [] };
     if (sql.includes('FROM directory_provisioned_accounts d JOIN principals p')) {
       return { rows: rowsFor(sql, params).map((row) => ({ ...row, status: principalStatus[String(row.id)] ?? 'active' })) };
     }
@@ -353,13 +354,13 @@ describe('auto-disable on active=false — AZ-A4 clause 2 as amended 2026-09-01'
     expect(spy).toHaveBeenCalledWith(NEW_ACCOUNT_ID, { status: 'disabled' });
     spy.mockRestore();
 
-    // The NEXT read — with no further SELECT — sees the disabled row. A bare
-    // UPDATE that skipped the helper would leave the warm row in place and
-    // answer 'active' here for up to CACHE_TTL_MS.
+    // The helper commits the disable transaction and invalidates the warm row.
+    // The NEXT read reloads the disabled row; a bare UPDATE would leave the
+    // cached active row in place for up to CACHE_TTL_MS.
     const next = await principalService.getPrincipalById(NEW_ACCOUNT_ID);
     expect(next?.status).toBe('disabled');
     const selectsAfter = statements.filter((s) => s.sql.startsWith('SELECT * FROM principals WHERE id')).length;
-    expect(selectsAfter).toBe(selectsBefore);
+    expect(selectsAfter).toBe(selectsBefore + 1);
     // ...and exactly one status statement was issued, in the helper's shape.
     expect(statusWrites().length).toBe(1);
     expect(statusWrites()[0].params).toEqual([NEW_ACCOUNT_ID, 'disabled']);

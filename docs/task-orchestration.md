@@ -30,16 +30,28 @@ Automated review depends on these task fields:
 - `successCriteria` — explicit acceptance checks for the automated Verifier
 - `definitionOfDone` — extra completion notes for humans/orchestrators
 - `constraints` — scope, safety, or execution boundaries
-- `maxRetries` — retry budget before escalating to a human
-- `attemptCount` — current number of Verifier attempts
-- `reviewHistory` — structured pass/reject/escalate audit trail
+- `maxRetries` — retry budget before escalating to a human (server-written:
+  a Blueprint's task defaults can set it, a create or edit body cannot)
+- `attemptCount` — current number of Verifier attempts (server-written)
+- `reviewHistory` — structured pass/reject/escalate audit trail (server-written)
 - `needsReview` — set when the task needs human attention after review
+  (server-written)
+
+A create or edit body that carries any of the four is refused with
+`400 SERVER_WRITTEN_FIELD` (see
+[Task create and edit fields](api.md#task-create-and-edit-fields)).
 
 ## Normal agent workflow
 
 1. A human or orchestrator creates a task.
 2. The task should include concise instructions plus any linked reports for deep context.
-3. If automated review is desired, set `successCriteria` and optionally `maxRetries`.
+3. If automated review is desired, the assigned Verifier or account owner/Main
+   sets `successCriteria` through the dedicated audited Verifier path
+   (`PATCH /tasks/{id}/success-criteria`, MCP `relayhall_task_success_criteria_set`).
+   Blueprint instantiation can seed it server-side. Generic create/edit refuse
+   criteria; implementers see it read-only. The retry budget
+   (`maxRetries`, default 3) comes from a Blueprint's task defaults, never from
+   a create or edit body.
 4. The implementation agent works the task and marks each subtask with `start-subtask` / `complete-subtask`.
 5. The implementation agent hands off with `relayhall review <task-id>` when the work is ready for checking.
 6. A separate Verifier/orchestrator run gathers independent evidence and records findings.
@@ -136,7 +148,10 @@ The dashboard should make these states legible:
 - `Review` and `Stuck` are separate workflow states, never a combined bucket
 - subtask labels are `Not started`, `In progress`, `To be reviewed`, `Completed`, `Stuck`, and `Skipped`
 
-- create/edit forms expose `successCriteria`, `definitionOfDone`, `constraints`, and `maxRetries`
+- create/edit forms expose `definitionOfDone` and `constraints`; success criteria
+  are read-only to implementers and editable through the dedicated Verifier
+  path by the assigned Verifier or account owner/Main. The retry budget and
+  attempt count are shown and never edited, because both are server-written.
 - task detail shows Verifier status, attempt count, review history, and the durable task/session timeline
 - board/task cards visually distinguish:
   - review in progress
@@ -149,7 +164,7 @@ The dashboard should make these states legible:
 Task detail treats reported session history as an audit trail, not as proof that
 the board can see a live runtime.
 
-`GET /tasks/{id}/timeline` merges four sources into one deterministic order
+`GET /tasks/{id}/timeline` merges three sources into one deterministic order
 (`at` DESC, then source, then id DESC), with `filter=all|handover|system`,
 keyset pagination (`before` cursor + `limit`, default 50, max 200), and
 per-source degradation (`sourcesUnavailable[]` — a failed source is
@@ -163,13 +178,15 @@ distinguishable from an empty one):
   (excluded where `legacy_source='task_history'` and `legacy_source_id`
   matches), i.e. post-086 field changes.
 - `reviewHistory` — synthesized Verifier events with stable `review-{id}` ids.
-- legacy `sessionRefs` — synthesized with stable timestamps
-  (`startedAt`/`created`, never `updated`).
+
+Session evidence is not a separate source: canonical session evidence is
+recorded in durable streams, and the retired Task session fields no longer
+synthesize timeline events.
 
 `task_timeline_events` is **not** an independent source: it is frozen (no
 writers since P1.3) and fully contained in the stream's legacy rows.
 
-Event-type → source → filter-view mapping (C1, design 3cdf6e65 §3.6):
+Event-type → source → filter-view mapping (C1, §3.6):
 
 | eventType (produced) | Source | View |
 |---|---|---|
@@ -182,7 +199,6 @@ Event-type → source → filter-view mapping (C1, design 3cdf6e65 §3.6):
 | `report.*` / `handover.*` from ANY stream provenance (created/linked/auto-promoted, atomic handback) | stream | Handovers & reports |
 | stream `provenance='legacy'` (086 backfill) known field-change vocabulary | stream | System & ownership |
 | `review.pass` / `review.reject` / `review.escalate` / `review.running` / `review.unknown` | review | Handovers & reports |
-| `session.reference` | session | System & ownership |
 | unknown / future / plugin types (every provenance, incl. reported/system) | any | `filter=all` only (fallback lane) |
 
 Envelope deviations from the design sketch, recorded per §4.3: `actor` stays a

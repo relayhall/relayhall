@@ -182,7 +182,7 @@ async function sessionFor(label: string, principalId: string): Promise<Caller> {
  * "must hold root" is a gate that silently reopens the moment root becomes
  * mintable, delegable or legacy-reachable again.
  */
-async function bearerReachingTheHandler(): Promise<Caller> {
+async function bearerReachingTheHandler(scopes: string[] = ['principals:read', 'principals:admin']): Promise<Caller> {
   const accountId = (await makeAccount('admin')).id;
   const handle = `pw-connector-${tag()}`;
   const principal = await pool.query(
@@ -193,7 +193,7 @@ async function bearerReachingTheHandler(): Promise<Caller> {
   );
   const principalId = String(principal.rows[0].id);
   const issued = await principalService.issueCredential(
-    { principalId, scopes: ['principals:read', 'principals:admin'], transport: 'any' },
+    { principalId, scopes, transport: 'any' },
     { handle: 'password-act-suite', authMethod: 'system' },
   );
   return { label: 'bearer credential', principalId, headers: { Authorization: `Bearer ${issued.fullKey}` } };
@@ -451,5 +451,94 @@ describe('WHAT IT DOES NOT DO — existing sessions', () => {
     expect(String(set.json.note)).toMatch(/stay signed in/);
 
     expect((await call(before, 'GET', '/principals/me')).status).toBe(200);
+  });
+});
+
+// Human project approval shares this mandatory live session-act gate. These
+// cases use the complete authentication/shared-authorization/router/service chain.
+describe('human project Charter approval', () => {
+  async function project(ownerId: string): Promise<string> {
+    const row = await pool.query(
+      `INSERT INTO projects(name, description, owner_principal_id, visibility)
+       VALUES ($1, 'disposable Charter approval fixture', $2, 'private') RETURNING id`,
+      [`charter-approval-${tag()}`, ownerId]);
+    return String(row.rows[0].id);
+  }
+  async function writeGrant(principalId: string, projectId: string) {
+    const granted = await call(ADMIN, 'POST', '/grants', {
+      granteeType: 'principal', granteeId: principalId, resourceType: 'project',
+      resourceId: projectId, verb: 'write',
+    });
+    expect(granted.status).toBe(201);
+  }
+  async function headCount(projectId: string): Promise<number> {
+    return Number((await pool.query('SELECT count(*) AS n FROM project_charters WHERE project_id=$1', [projectId])).rows[0].n);
+  }
+
+  it('ordinary project owner approves through a real session, version readback and revision conflict', async () => {
+    const owner = await sessionFor('charter owner', (await makeAccount('user')).id);
+    const id = await project(owner.principalId);
+    const first = await call(owner, 'POST', `/projects/${id}/charter/approve`, { content: '# Owner approved' });
+    expect(first.status).toBe(201);
+    expect(first.json.charter.updatedByPrincipalId).toBe(owner.principalId);
+    const current = await call(owner, 'GET', `/projects/${id}/charter`);
+    expect(current.json.charter.content).toBe('# Owner approved');
+    const stale = await call({ ...owner, headers: { ...owner.headers, 'If-Match': 'stale' } },
+      'POST', `/projects/${id}/charter/approve`, { content: '# Stale' });
+    expect(stale.status).toBe(412);
+    const revised = await call({ ...owner, headers: { ...owner.headers, 'If-Match': current.json.charter.revision } },
+      'POST', `/projects/${id}/charter/approve`, { content: '# Revised' });
+    expect(revised.status).toBe(200);
+    expect(revised.json.charter.version).toBe(2);
+    const ledger = await pool.query(
+      'SELECT actor_principal_id FROM project_charter_versions WHERE charter_id=$1 ORDER BY version',
+      [first.json.charter.id]);
+    expect(ledger.rows.map((r: any) => r.actor_principal_id)).toEqual([owner.principalId, owner.principalId]);
+  });
+
+  it('ordinary project writer cannot approve or use root PUT', async () => {
+    const writer = await sessionFor('charter writer', (await makeAccount('user')).id);
+    const id = await project(ADMIN.principalId);
+    await writeGrant(writer.principalId, id);
+    const refused = await call(writer, 'POST', `/projects/${id}/charter/approve`, { content: '# Writer' });
+    expect(refused.status).toBe(403);
+    expect(refused.json.code).toBe('CHARTER_APPROVAL_FORBIDDEN');
+    expect((await call(writer, 'PUT', `/projects/${id}/charter`, { content: '# Direct' })).status).toBe(403);
+    expect(await headCount(id)).toBe(0);
+  });
+
+  it('operator project administration approves; existing root PUT is still compatible', async () => {
+    const id = await project(MEMBER.principalId);
+    expect((await call(OPERATOR, 'POST', `/projects/${id}/charter/approve`, { content: '# Operator' })).status).toBe(201);
+    const second = await project(MEMBER.principalId);
+    expect((await call(ADMIN, 'PUT', `/projects/${second}/charter`, { content: '# Direct root' })).status).toBe(201);
+  });
+
+  it('a bearer reaching canonical project write is still refused human approval', async () => {
+    const bearer = await bearerReachingTheHandler(['projects:read', 'projects:write']);
+    const id = await project(ADMIN.principalId);
+    const refused = await call(bearer, 'POST', `/projects/${id}/charter/approve`, { content: '# Machine' });
+    expect(refused.status).toBe(403);
+    expect(refused.json.code).toBe('CHARTER_APPROVAL_FORBIDDEN');
+    expect(await headCount(id)).toBe(0);
+  });
+
+  it('current ownership, current role and archived status are enforced', async () => {
+    const owner = await sessionFor('changing charter owner', (await makeAccount('user')).id);
+    const id = await project(owner.principalId);
+    await writeGrant(owner.principalId, id);
+    await pool.query('UPDATE projects SET owner_principal_id=$2 WHERE id=$1', [id, ADMIN.principalId]);
+    expect((await call(owner, 'POST', `/projects/${id}/charter/approve`, { content: '# Old owner' })).status).toBe(403);
+    expect(await headCount(id)).toBe(0);
+    const own = await project(owner.principalId);
+    await pool.query("UPDATE principals SET role='viewer' WHERE id=$1", [owner.principalId]);
+    expect((await call(owner, 'POST', `/projects/${own}/charter/approve`, { content: '# Demoted' })).status).toBe(403);
+    expect(await headCount(own)).toBe(0);
+    const archived = await project(ADMIN.principalId);
+    await pool.query("UPDATE projects SET status='archived' WHERE id=$1", [archived]);
+    const refused = await call(ADMIN, 'POST', `/projects/${archived}/charter/approve`, { content: '# Archived' });
+    expect(refused.status).toBe(409);
+    expect(refused.json.code).toBe('PROJECT_ARCHIVED');
+    expect(await headCount(archived)).toBe(0);
   });
 });

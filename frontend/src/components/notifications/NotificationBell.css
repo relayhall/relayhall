@@ -1,0 +1,136 @@
+/* The bell and its popover (card b1e3b16d, lane L1; reworked for "Needs your
+   action", card 5854f0d6 Slice B). The bell is the control kit's icon button;
+   this sheet adds only its badge and the popover.
+   Theme tokens only: the badge is a filled affordance (accent ground,
+   `--text-on-fill` ink, the pairing design-system.md ratifies for fills), and
+   the panel is a raised surface like the Audit log's drawer. */
+
+.notification-bell {
+  position: relative;
+}
+
+.notification-bell-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-full);
+  background: var(--accent-color);
+  color: var(--text-on-fill);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+/* A count that could not be read: the same mark, on the neutral raised
+   ground, so it reads as "look here", not as a number. */
+.notification-bell-badge--unknown {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+}
+
+/* THE POPOVER PINS ITS HEADER AND FOOTER (design section 3.2, N6; the later
+   card 394131bd): the panel is a column that never scrolls itself; the head
+   and the foot keep their height, and only the body between them scrolls. */
+.notification-bell-panel {
+  position: fixed;
+  z-index: var(--z-modal);
+  display: flex;
+  flex-direction: column;
+  max-height: min(560px, calc(100dvh - 96px));
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-3);
+}
+
+.notification-bell-panel:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
+}
+
+.notification-bell-panel-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.notification-bell-panel-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.notification-bell-panel-count {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+/* E455: "Mark all seen" sits after the count, at the header's end. */
+.notification-bell-panel-mark {
+  margin-left: auto;
+}
+
+.notification-bell-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-3);
+}
+
+.notification-bell-group-title {
+  margin: var(--space-3) 0 var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+
+.notification-bell-quiet {
+  margin: var(--space-3) 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.notification-bell-failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+  color: var(--text-error);
+  font-size: var(--text-sm);
+}
+
+.notification-bell-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.notification-bell-panel-foot {
+  display: flex;
+  flex: none;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--text-sm);
+}
+
+.notification-bell-panel-foot a {
+  color: var(--text-accent);
+}

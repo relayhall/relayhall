@@ -1,0 +1,39 @@
+/* The visible label of an icon-only toolbar button on a phone (E469).
+   Behaviour: components/ui/LabelTip.tsx. */
+
+/* The bubble is a fixed-position portal child of <body>, so nothing clips it
+   and nothing around it moves. It carries no pointer events (a finger on the
+   control must never land on it) except while a mouse is resting on a control,
+   so the pointer can travel onto it (WCAG 1.4.13). */
+.label-tip {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  box-sizing: border-box;
+  max-width: min(20rem, calc(100vw - 16px));
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-2);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  text-align: center;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+.label-tip[data-source="hover"] {
+  pointer-events: auto;
+}
+
+/* A long press must not select the control's text, open the iOS callout or
+   (with the contextmenu handler) the Android menu. Phone width only: wider
+   than that the controls are exactly what they were. */
+@media (max-width: 768px) {
+  [data-label-tip] {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}

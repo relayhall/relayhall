@@ -1,37 +1,61 @@
+import { taskAccountOwnershipService } from '../services/TaskAccountOwnershipService';
+import { groupTransferStandingOf, sendGroupTransferRefusal } from '../services/GroupOwnershipTransfer';
+import { recordStewardTransferRefusal } from '../services/GroupOwnerStewardTransfer';
+import { ResourceContractError } from '../services/ProjectResourceService';
+import { taskAccountControl } from '../services/AccountControlService';
+import { GrantError } from '../services/GrantService';
+import { taskLifecycleAccess } from '../services/TaskLifecycleAccess';
 import { auditChainFor } from '../utils/auditChain';
 import { idempotent } from '../middleware/idempotency';
 import { auditService } from '../services/AuditService';
 import { logCaughtFailure, logCaughtWarning } from '../utils/secretSafeLog';
-import { RequestFaultError, NotFoundFault, ForbiddenFault, InvalidRequestFault, ProjectTargetNotFoundFault } from '../utils/httpErrors';
+import { RequestFaultError, NotFoundFault, ForbiddenFault, ConflictFault, InvalidRequestFault, ProjectTargetNotFoundFault } from '../utils/httpErrors';
 // tasks.ts - API endpoints for task management
 import { Router, Request, Response } from 'express';
-import { taskManagerDB as taskManager, SubtaskStatus, DependencyValidationError, TaskNotFoundError, TaskNotArchivedError, archiveWarningForStatus, ArchiveDisposition, dependencyBlocks } from '../services/TaskManagerDB';
+import { taskManagerDB as taskManager, SubtaskStatus, DependencyValidationError, TaskNotFoundError, TaskNotArchivedError, archiveWarningForStatus, ArchiveDisposition, dependencyBlocks, CLAIM_REFUSAL_REASONS } from '../services/TaskManagerDB';
 import { taskAnalyzer } from '../services/taskAnalyzer';
 import {
   generateTaskPromptWithSkills,
   renderAgentsMdShape,
   ReportReferenceLookupError,
+  DependencyContextLookupError,
   parseBriefInlineOptions,
 } from '../utils/promptTemplate';
 import { CharterLookupError } from '../services/CharterService';
-import { notificationManager } from '../services/NotificationManager';
+import {
+  notificationHistoryService, parseBefore, ITEM_KEY_PATTERN, NOTIFICATION_TYPES, NOTIFICATION_PAGE_DEFAULT,
+  NOTIFICATION_PAGE_MAX, NOTIFICATION_UNREAD_CEILING,
+  type NotificationQuery, type NotificationType, type NotificationViewer, type NotificationWho,
+} from '../services/NotificationHistoryService';
+import { administratorSessionOf, APPROVAL_DECIDE_ACT, isLoginSessionKind } from '../utils/administratorSession';
 import { taskReviewerService } from '../services/TaskReviewerService';
 import { taskOrchestrationService, OrchestrationConflictError } from '../services/TaskOrchestrationService';
 import { discordThreadService } from '../services/DiscordThreadService';
 import { unifiedTaskTimeline, decodeCursor, type TimelineFilter } from '../services/UnifiedTaskTimeline';
 import { taskHistoryService } from '../services/TaskHistoryService';
-import { telemetryService } from '../services/TelemetryService';
+import { telemetryService, TELEMETRY_STALE_MS } from '../services/TelemetryService';
+import { taskSessionEvidenceService } from '../services/TaskSessionEvidenceService';
 import { pool } from '../db/connection';
+import { verifierStanding, VerificationModeError } from '../services/VerificationModes';
 import { feedEventService } from '../services/FeedEventService';
-import { isValidTaskId, rejectInvalidTaskIdParam } from '../utils/taskIds';
+import { isValidTaskId, rejectInvalidTaskIdParam, isValidSubtaskId, SUBTASK_ID_ERROR, taskIdParam } from '../utils/taskIds';
+import { pathUuidParam } from '../middleware/validate';
 import { createHash } from 'crypto';
 import { resolveCreateAutoStart, dodWarningForStatusChange } from '../utils/taskLifecycle';
-import { resolveTaskLifecycleRole, type TaskAutomationRole } from '../utils/taskAutomationRole';
+import { resolveActorRole, resolveTaskLifecycleRole, type TaskAutomationRole } from '../utils/taskAutomationRole';
 import { isStringTooLongError, sendStringTooLongError, sendApiError } from '../utils/apiErrors';
 import { isPhaseBindingViolation, PhaseLookupError } from '../services/PhaseService';
 import { normalizeTaskDueAtWrite, normalizeTaskNotesWrite, sendTaskFieldRefusal, type DueAtResolution } from '../utils/taskWriteFields';
+import { publicTaskBody, SERVER_WRITTEN_TASK_COLUMN_KEYS } from '../utils/taskColumnContract';
+import { taskSuccessCriteriaService } from '../services/TaskSuccessCriteriaService';
 import { createPgDueAtResolver } from '../utils/dueAtResolver';
+import {
+  assigningActExpiry, carryAssigningActExpiry, normalizeRoleGrantExpiresAtWrite, ROLE_GRANT_EXPIRY_FIELD,
+  ROLE_GRANT_EXPIRY_UNLIMITED, type RoleGrantExpiryRequest,
+} from '../utils/roleGrantExpiry';
 import { buildBoardOwnershipFilters } from '../utils/boardFilters';
+import { verifierUsability, verifierUsabilityOf, verifierNotUsableWarning, type VerifierWarning, type VerifierUsability, type DefaultVerifierWarning } from '../services/VerifierUsability';
+import type { CreateTaskReceipt } from '../services/TaskManagerDB';
 import { scopesSatisfy } from '../utils/scopeMap';
 import {
   isLegacyExecutionProfile,
@@ -43,6 +67,7 @@ import type { TaskActor } from '../services/TaskHistoryService';
 import { taskNotificationService, type TaskNotificationKind } from '../services/TaskNotificationService';
 import { canonicalRuntimeSignalService } from '../services/CanonicalRuntimeSignalService';
 import { actorFromRequest, authorizedListScope, authorizedProjectTarget, filterAuthorizedResources } from '../middleware/sharedAuthorization';
+import { filterReadablePhases } from './phases';
 import { authorizationService } from '../services/AuthorizationService';
 import { authorizationRepository } from '../services/AuthorizationRepository';
 import { AssignmentAccessError, accessVehicleService } from '../services/AccessVehicleService';
@@ -51,12 +76,15 @@ import {
   taskElementService,
   TaskElementError,
   TASK_ELEMENT_INPUT_SCHEMA,
+  TASK_READ_LOCK_TIMEOUT_MS,
+  TASK_READ_BUSY_MESSAGE,
   compileTaskOperatingContract,
 } from '../services/TaskElementService';
 import { auditActorFromRequest } from '../utils/auditActor';
 import { agentLifecycleService } from '../services/AgentLifecycleService';
 import { taskAccessService } from '../services/TaskAccessService';
 import { lifecyclePolicyDenialEnvelope } from '../services/LifecyclePolicyService';
+import { compileTaskReportContext, parseReportContextRequest, readTaskProgressReport, ReportContextRequestError } from '../services/TaskReportContext';
 
 // Card 7d38a6e0. A Task deadline reaches this API either as an ISO-8601
 // instant or as `{ local, zone }` - a wall clock exactly as a person wrote
@@ -68,14 +96,105 @@ const dueAtResolver = createPgDueAtResolver(pool);
 
 const router = Router();
 
+// Card bc847bd0. Every `:id` on this router is a Task id, and so is
+// `:depTaskId`; the authorization stage resolves a Task id PREFIX, so a prefix
+// reached the handlers that read it as a uuid (500/503, and one request that
+// never answered). Both are refused by name before any handler runs, as are a
+// malformed `:leaseId` (task_execution_leases.id is a uuid). The route ceiling
+// and the point stage run first, so their refusals are unchanged. The one
+// parameter on this router that is NOT a Task id is the notification item key,
+// which is why that route names it `:itemKey`.
+router.param('id', taskIdParam);
+router.param('depTaskId', taskIdParam);
+router.param('leaseId', pathUuidParam('INVALID_LEASE_ID', 'lease'));
+
+router.get('/:id/account-owner', async (req: Request, res: Response): Promise<void> => {
+  try { res.json({ success: true, ownership: await taskAccountOwnershipService.read(req.params.id) }); }
+  catch (error) {
+    if (error instanceof ResourceContractError) { sendApiError(res, error.status, error.code, error.message); return; }
+    const errorId = logCaughtFailure('[Tasks API] Account owner read unavailable', error);
+    sendApiError(res, 503, 'ACCOUNT_OWNER_UNAVAILABLE', 'Task account owner unavailable', undefined, { errorId });
+  }
+});
+router.put('/:id/account-owner', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body = req.body;
+    const keys = ['accountOwnerPrincipalId', 'expectedAccountOwnerPrincipalId', 'expectedUpdatedAt', 'reason'];
+    // AZ-A12 clause 9(e) (R85): one optional key more, `stepUpToken`, read only
+    // when the source or the target is a Group. A declared route-contract change.
+    const stepUpToken = body && typeof body === 'object' && !Array.isArray(body) ? body.stepUpToken : undefined;
+    const counted = keys.length + (stepUpToken === undefined ? 0 : 1);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== counted
+      || keys.some(key => !Object.prototype.hasOwnProperty.call(body, key))
+      || (stepUpToken !== undefined && typeof stepUpToken !== 'string')) {
+      sendApiError(res, 422, 'INVALID_ACCOUNT_OWNER_CHANGE', 'Expected target account owner, previous owner, updatedAt and reason'); return;
+    }
+    const change = { accountOwnerPrincipalId: body.accountOwnerPrincipalId,
+      expectedAccountOwnerPrincipalId: body.expectedAccountOwnerPrincipalId,
+      expectedUpdatedAt: body.expectedUpdatedAt, reason: body.reason };
+    res.json({ success: true, ownership: await taskAccountOwnershipService.change(req.params.id, change, requestActor(req),
+      groupTransferStandingOf(req as AuthRequest, stepUpToken)) });
+  } catch (error) {
+    if (sendGroupTransferRefusal(res, error)) return;
+    if (error instanceof ResourceContractError) { sendApiError(res, error.status, error.code, error.message); return; }
+    const errorId = logCaughtFailure('[Tasks API] Account owner change unavailable', error);
+    sendApiError(res, 503, 'ACCOUNT_OWNER_CHANGE_UNAVAILABLE', 'Task account owner could not be changed', undefined, { errorId });
+  }
+});
+/**
+ * PUT /api/tasks/:id/account-owner/steward — LENSES-c gate (ii) and DD-5
+ * (c1-B, card b5c83682; design delta C.6). Body: the account-owner change
+ * fields plus `stepUpToken`. An owner-role holder of the owning Group moves a
+ * Group-owned Task to an active member (gate (ii)); the effective person owner
+ * moves their Task into a Group in which they hold the owner role (DD-5).
+ * Ceiling `tasks:write`, listed before the /tasks family rules (CC-8); the gate
+ * in the service is the decider, never `mayTransfer()` or the Main arm. No MCP
+ * tool reaches it. Every refusal is audited as a denied task.account_owner.change
+ * row (C.6): the body refusal here, through the one writer, and the act's own
+ * in the service.
+ */
+router.put('/:id/account-owner/steward', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body = req.body;
+    const keys = ['accountOwnerPrincipalId', 'expectedAccountOwnerPrincipalId', 'expectedUpdatedAt', 'reason', 'stepUpToken'];
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).some(key => !keys.includes(key))
+      || keys.slice(0, 4).some(key => !Object.prototype.hasOwnProperty.call(body, key))
+      || (body.stepUpToken !== undefined && typeof body.stepUpToken !== 'string')) {
+      const target = body && typeof body === 'object' ? (body as { accountOwnerPrincipalId?: unknown }).accountOwnerPrincipalId : undefined;
+      await recordStewardTransferRefusal({
+        objectType: 'task', objectId: String(req.params.id).toLowerCase(), currentOwnerId: null,
+        targetOwnerId: typeof target === 'string' ? target.toLowerCase() : null,
+        audit: { actor: auditActorFromRequest(req as AuthRequest), action: 'task.account_owner.change' },
+      }, 'INVALID_ACCOUNT_OWNER_CHANGE');
+      sendApiError(res, 422, 'INVALID_ACCOUNT_OWNER_CHANGE', 'Expected target account owner, previous owner, updatedAt, reason and stepUpToken'); return;
+    }
+    const authReq = req as AuthRequest;
+    const change = { accountOwnerPrincipalId: body.accountOwnerPrincipalId,
+      expectedAccountOwnerPrincipalId: body.expectedAccountOwnerPrincipalId,
+      expectedUpdatedAt: body.expectedUpdatedAt, reason: body.reason };
+    res.json({ success: true, ownership: await taskAccountOwnershipService.changeAsGroupOwner(req.params.id, change, requestActor(req), {
+      authMethod: authReq.authMethod, principalId: authReq.principal?.id ?? null,
+      chainLength: authReq.delegationLinks?.length ?? 0, scopes: authReq.scopes ?? null,
+    }, typeof body.stepUpToken === 'string' ? body.stepUpToken : '') });
+  } catch (error) {
+    if (sendGroupTransferRefusal(res, error)) return;
+    if (error instanceof ResourceContractError) { sendApiError(res, error.status, error.code, error.message); return; }
+    const errorId = logCaughtFailure('[Tasks API] Steward account owner change unavailable', error);
+    sendApiError(res, 503, 'ACCOUNT_OWNER_CHANGE_UNAVAILABLE', 'Task account owner could not be changed', undefined, { errorId });
+  }
+});
+
+
 // Valid subtask statuses for validation (6-state lifecycle)
 const VALID_SUBTASK_STATUSES: SubtaskStatus[] = ['empty', 'in-progress', 'review', 'stuck', 'skipped', 'completed'];
 // Statuses agents can set (subtask-level)
-const AGENT_ALLOWED_STATUSES: SubtaskStatus[] = ['in-progress', 'review', 'stuck'];
 // Task-level statuses agents can set (orchestrator controls completed/todo/ideas/archived)
-const AGENT_ALLOWED_TASK_STATUSES: string[] = ['in-progress', 'review', 'stuck'];
 
+// Sponsor provenance is creation-time server evidence, never caller authority.
 const SERVER_WRITTEN_TASK_ROLE_FIELDS = new Set([
+  'sponsorPrincipalId',
+  'sponsor_principal_id',
   'ownerPrincipalId',
   'claimantPrincipalId',
   'shepherdPrincipalId',
@@ -85,14 +204,42 @@ const SERVER_WRITTEN_TASK_ROLE_FIELDS = new Set([
   'shepherd_principal_id',
   'verifier_principal_id',
 ]);
+// Card 7c77fcf3: the INTERNAL keys of the execution assignment. The assignment
+// field of record and its descriptor pin are written on a request path by ONE
+// function, resolveExecutionProfileWrite, which derives both from an
+// executionProfile it validated against the Connector's pinned descriptor
+// after the services:invoke gate. A body carrying either key would reach the
+// Task write without that gate, without descriptor validation and without the
+// Warrant rules, so neither is ever a request field: a Task READ reports them,
+// and the executionProfile is how a caller sets them.
+const SERVER_WRITTEN_TASK_EXECUTION_FIELDS = new Set([
+  'executionServiceId',
+  'executionDescriptorVersion',
+]);
 const PRINCIPAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 /** RH-P3.AZ-S7: any UUID version — warrants.id is gen_random_uuid (v4),
  * but the id is opaque to this surface and the DB is the authority. */
 const WARRANT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function rejectCallerWrittenTaskRoles(req: Request, res: Response): boolean {
+// One refusal for every server-written Task field a generic create or edit
+// body may not carry: the role identifiers, the internal execution keys and,
+// since card c3880767, every key that names a server-written column of
+// `tasks` (utils/taskColumnContract.ts classifies every column).
+//
+// Card 41e24358 (owner answer Q2 (b), check F6): the CREATE alone may carry
+// `verifierPrincipalId`, and only that spelling of it; TaskManagerDB.createTask
+// admits it only when it equals a Project or Phase default of the target
+// Project and passes the usable predicate (422 VERIFIER_NOT_ALLOWED otherwise).
+// Every other role field stays refused on create, and the generic PATCH keeps
+// refusing `verifierPrincipalId` too.
+// Section 6.8 (E462 S4b): `verificationNone` is create-only too; an existing
+// Task sets or clears it on PATCH /tasks/:id/roles.
+const CREATE_ONLY_TASK_ROLE_FIELDS: ReadonlySet<string> = new Set(['verifierPrincipalId', 'verificationNone']);
+function rejectCallerWrittenTaskRoles(req: Request, res: Response, options: { create?: boolean } = {}): boolean {
   const supplied = Object.keys((req.body ?? {}) as Record<string, unknown>)
-    .find((field) => SERVER_WRITTEN_TASK_ROLE_FIELDS.has(field));
+    .filter((field) => !(options.create && CREATE_ONLY_TASK_ROLE_FIELDS.has(field)))
+    .find((field) => SERVER_WRITTEN_TASK_ROLE_FIELDS.has(field) || SERVER_WRITTEN_TASK_EXECUTION_FIELDS.has(field)
+      || SERVER_WRITTEN_TASK_COLUMN_KEYS.has(field));
   if (!supplied) return false;
   sendApiError(
     res,
@@ -103,6 +250,40 @@ function rejectCallerWrittenTaskRoles(req: Request, res: Response): boolean {
     { field: supplied },
   );
   return true;
+}
+
+/**
+ * Card 41e24358 (design ba22fd01 Part 5; E284): a card that reaches Review
+ * without a usable Verifier is WARNED about, never refused. Evaluated after
+ * the move committed; any failure of the evaluation itself yields no warning
+ * rather than an error, so the move's answer can never depend on it. Each
+ * warning is audited `task.review.verifier_warning` with the failed arm.
+ */
+async function reviewVerifierWarnings(req: Request, taskId: string): Promise<VerifierWarning[]> {
+  try {
+    const result = await verifierUsability(pool, taskId);
+    if (!result || result.usable) return [];
+    const warning = verifierNotUsableWarning(result);
+    await auditService.record({
+      action: 'task.review.verifier_warning', actor: auditActorFromRequest(req as AuthRequest),
+      resourceType: 'task', resourceId: taskId,
+      metadata: { code: warning.code, failedArm: warning.failedArm, verifierPrincipalId: warning.verifierPrincipalId },
+    }).catch(() => undefined);
+    return [warning];
+  } catch (error) {
+    logCaughtWarning('[Tasks API] Verifier usability could not be evaluated for a Review warning', error);
+    return [];
+  }
+}
+
+/** The predicate for the Task read (the dashboard's Review banner); null when it cannot be read. */
+async function readVerifierUsability(taskId: string): Promise<VerifierUsability | null> {
+  try {
+    return await verifierUsability(pool, taskId);
+  } catch (error) {
+    logCaughtWarning('[Tasks API] Verifier usability could not be evaluated for a Task read', error);
+    return null;
+  }
 }
 
 function getRequestAutomationRole(req: Request): TaskAutomationRole {
@@ -123,6 +304,7 @@ export function requestActor(req: Request): TaskActor {
     role: getRequestAutomationRole(req),
     authMethod: authReq.authMethod,
     credentialId: authReq.credentialId ?? null,
+    sessionId: authReq.sessionId ?? null,
     // RH-P3.AZ-S7: the ASSIGNER's authorization identity, so the coupling
     // at the TaskManagerDB choke point can cap every materialization ⊆ the
     // assigner's own effective authority (ruling 7440b579 R3).
@@ -136,7 +318,9 @@ function taskElementActor(req: Request) {
     throw new TaskElementError(400, 'PRINCIPAL_REQUIRED', 'This Task operation requires a resolved principal identity');
   }
   return {
+    credentialId: (req as AuthRequest).credentialId ?? null,
     principalId: authReq.principal.id,
+    sessionId: authReq.sessionId,
     handle: authReq.principal.handle,
     root: scopesSatisfy(authReq.scopes ?? null, 'root'),
     // RH-P3.AZ-S7 (review bedc25f3 B2): a link edit on an assigned Task
@@ -146,7 +330,23 @@ function taskElementActor(req: Request) {
   };
 }
 
+function sendReviewEvidenceBusy(res: Response, error: unknown): boolean {
+  if (error instanceof AssignmentAccessError && error.code === 'ASSIGNMENT_REFERENCE_BUSY') {
+    sendApiError(res, error.status, error.code, error.message); return true;
+  }
+  if (error && typeof error === 'object' && 'code' in error && error.code === 'PZ001') {
+    sendApiError(res, 409, 'TASK_REVIEW_EVIDENCE_BUSY', 'Task review evidence is busy; retry the write');
+    return true;
+  }
+  return false;
+}
+
 function sendTaskElementError(res: Response, error: unknown): void {
+  if (sendReviewEvidenceBusy(res, error)) return;
+  if (error && typeof error === 'object' && 'code' in error && error.code === 'PZ001') {
+    sendApiError(res, 409, 'FLAT_REVIEW_EVIDENCE_BUSY', 'A flat Task review is using this Report; retry the Task element write');
+    return;
+  }
   if (error instanceof TaskElementError) {
     sendApiError(res, error.status, error.code, error.message, undefined, error.field ? { field: error.field } : undefined);
     return;
@@ -171,8 +371,11 @@ async function rejectNonReviewerAction(req: Request, res: Response, action: stri
   const actor = actorFromRequest(req as AuthRequest);
   const task = await taskManager.getTask(req.params.id);
   const role = getRequestAutomationRole(req);
-  const assignedVerifier = task?.verifierPrincipalId === actor.principalId;
-  const legacyUnassignedVerifier = !task?.verifierPrincipalId && (role === 'qa' || role === 'reviewer');
+  // Section 6.8 (E462 S4b): the exact Verifier or a `verifier-agent` of it;
+  // the `verify` predicate below applies the chain guard to both. A `none`
+  // Task is never judged by the legacy unassigned arm (VM-N4).
+  const assignedVerifier = Boolean(task && await verifierStanding(pool, { id: task.id, verifier_principal_id: task.verifierPrincipalId ?? null }, actor.principalId));
+  const legacyUnassignedVerifier = !task?.verifierPrincipalId && task?.verificationNone !== true && (role === 'qa' || role === 'reviewer');
   // A generic admin/Grant verify allowance does not make its holder an
   // independent Verifier. Keep identity separation as well as the predicate.
   if (task && actor.principalId && task.ownerPrincipalId !== actor.principalId
@@ -288,6 +491,29 @@ export async function resolveExecutionProfileWrite(payload: any, req: Request): 
         'executionWarrantId');
     }
   }
+  // AZ-A10 clause 6 (RATIFIED 2026-10-10; E43 Q4; E62): the assigning act may
+  // date the grant rows it writes — any earlier or later date, or
+  // 'unlimited'. It is a property OF the assigning act, so it travels with
+  // the executionProfile that performs one, exactly as executionWarrantId
+  // does; on its own it would be a re-dating surface no ratified text names.
+  // The normalized value is attached below, after the act's own gate
+  // (services:invoke) has run, under a key no request body can carry
+  // (carryAssigningActExpiry): nothing downstream reads a body field as the
+  // date, whatever it is called.
+  const roleGrantExpiresAt = payload[ROLE_GRANT_EXPIRY_FIELD];
+  delete payload[ROLE_GRANT_EXPIRY_FIELD];
+  if (roleGrantExpiresAt !== undefined) {
+    if (payload.executionProfile === undefined || payload.executionProfile === null) {
+      throw new ProfileValidationError(422, 'ROLE_GRANT_EXPIRY_WITHOUT_ASSIGNMENT',
+        'roleGrantExpiresAt dates the grant rows an execution assignment writes (AZ-A10 clause 6) — send it with the executionProfile that makes the assignment',
+        ROLE_GRANT_EXPIRY_FIELD);
+    }
+    if (payload.executionWarrantId !== undefined && payload.executionWarrantId !== null) {
+      throw new ProfileValidationError(422, 'ROLE_GRANT_EXPIRY_WITH_WARRANT',
+        'roleGrantExpiresAt dates the grant rows an assignment writes (AZ-A10 clause 6); an assignment carried by a Warrant writes none and follows the Warrant\'s own expiry. Send one or the other',
+        ROLE_GRANT_EXPIRY_FIELD);
+    }
+  }
 
   const input = payload.executionProfile;
   if (input === undefined) return payload;
@@ -325,7 +551,95 @@ export async function resolveExecutionProfileWrite(payload: any, req: Request): 
   payload.executionProfile = profile;
   payload.executionServiceId = profile.serviceId;
   payload.executionDescriptorVersion = profile.descriptorVersion;
+  if (roleGrantExpiresAt !== undefined) {
+    // Shape only: the future-instant test needs the database clock and runs
+    // in the assignment's own transaction (AccessVehicleService).
+    carryAssigningActExpiry(payload, await normalizeRoleGrantExpiresAtWrite(roleGrantExpiresAt, dueAtResolver));
+  }
   return payload;
+}
+
+/**
+ * Card 69943b61 (owner ruling E100, option (a)): dropping a Warrant needs
+ * services:invoke.
+ *
+ * `executionWarrantId: null` with no executionProfile beside it passes the
+ * pipeline above untouched: its Warrant checks and its invoke gate run only
+ * for a non-null value or beside a profile. On a Task whose execution
+ * assignment a Warrant carries, TaskManagerDB.updateTask then swaps the
+ * vehicle. The Warrant is detached and the same assignee is re-carried on an
+ * auto-grant under the EDITOR's authority. Re-carrying an assignment is an
+ * execution reassignment, so it takes the gate every reassignment takes.
+ *
+ * Refused HERE, in the handler, before any write: 403
+ * WARRANT_DROP_INVOKE_REQUIRED naming executionWarrantId, with a denied audit
+ * row. A holder of services:invoke (or root) keeps the swap. On a Task no
+ * Warrant carries, the null changes nothing, as before; for a caller without
+ * services:invoke the key is also taken out of the write, so a Warrant
+ * attached between this read and the write is never dropped by a null that
+ * was checked against the state before it. `executionProfile: null`
+ * (unassign) is not this path and needs only tasks:write.
+ *
+ * It edits `updates` in place and never rebuilds it, because the pipeline
+ * attaches the assigning act's date under a Symbol key on that object.
+ */
+export async function refuseWarrantDropWithoutInvoke(updates: any, req: Request): Promise<void> {
+  if (!('executionWarrantId' in updates) || updates.executionWarrantId !== null) return;
+  if (updates.executionProfile !== undefined) return;
+  if (scopesSatisfy((req as AuthRequest).scopes, 'services:invoke')) return;
+  const taskId = req.params.id;
+  // A malformed or unknown id is left to the write, which answers it as before.
+  if (typeof taskId !== 'string' || !isValidTaskId(taskId)) return;
+  const stored = await pool.query('SELECT id, execution_warrant_id FROM tasks WHERE id = $1', [taskId]);
+  if (stored.rows.length === 0) return;
+  const carriedWarrant = stored.rows[0].execution_warrant_id;
+  if (!carriedWarrant) {
+    delete updates.executionWarrantId;
+    return;
+  }
+  await auditService.record({
+    action: 'task.execution_assign', actor: auditActorFromRequest(req as AuthRequest), outcome: 'denied',
+    resourceType: 'task', resourceId: String(stored.rows[0].id),
+    metadata: { refusal: 'WARRANT_DROP_INVOKE_REQUIRED', field: 'executionWarrantId', warrantId: String(carriedWarrant) },
+  }).catch(() => undefined);
+  throw new ProfileValidationError(
+    403,
+    'WARRANT_DROP_INVOKE_REQUIRED',
+    'a Warrant carries this Task\'s execution assignment: dropping it (executionWarrantId: null) re-carries the assignment on an auto-grant, which is an execution reassignment and requires services:invoke (or root), as setting a profile does (§2.1)',
+    'executionWarrantId',
+  );
+}
+
+/**
+ * AZ-A10 clauses 6 and 8: the date an assignment's grant rows now carry, for
+ * the response of the act that assigned. Read from the stored links after the
+ * write, in the request field's own name and domain (an instant, or
+ * 'unlimited'), with the timezone receipt when the caller sent
+ * `{ local, zone }`. Empty when the act made no grant-carried assignment.
+ *
+ * The write has already committed when this runs, so a failed read must not
+ * turn it into a 500 a caller would retry: the receipt is omitted instead,
+ * and GET /tasks/{id}/assignment-access remains the authoritative read.
+ */
+async function roleGrantExpiryReceipt(
+  taskId: string,
+  assigned: boolean,
+  requested: RoleGrantExpiryRequest | undefined,
+): Promise<Record<string, unknown>> {
+  if (!assigned) return {};
+  let carried: string | null | undefined;
+  try {
+    carried = await accessVehicleService.assignmentExpiry(taskId);
+  } catch (err) {
+    logCaughtWarning('[Tasks API] the assignment grant expiry receipt could not be read after the write', err);
+    return {};
+  }
+  if (carried === undefined) return {};
+  return {
+    [ROLE_GRANT_EXPIRY_FIELD]: carried === null ? ROLE_GRANT_EXPIRY_UNLIMITED : carried,
+    ...(requested?.kind === 'instant' && requested.resolution
+      ? { roleGrantExpiryResolution: requested.resolution } : {}),
+  };
 }
 
 async function getConfiguredDefaultModel(configPrimary: string): Promise<string> {
@@ -395,6 +709,7 @@ router.get('/:id/assignment-access', async (req: Request, res: Response): Promis
       links: await accessVehicleService.linksForTask(task.id),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] assignment-access read failed:', err);
     res.status(503).json({ success: false, code: 'ASSIGNMENT_ACCESS_UNAVAILABLE', error: 'The assignment access could not be read', errorId });
   }
@@ -455,6 +770,9 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
     // Assignee filters (Phase 1, spec b48bb799 §3.3)
     if (req.query.owner) filters.ownerHandle = String(req.query.owner);
     if (String(req.query.unassigned) === 'true') filters.unassigned = true;
+    // Card 41e24358: cards without a usable Verifier (the morning census is
+    // this filter over To-Do and Review).
+    if (String(req.query.verifierUnusable) === 'true') filters.verifierUnusable = true;
     if (String(req.query.mine) === 'true') {
       const callerPrincipal = (req as AuthRequest).principal;
       if (!callerPrincipal) {
@@ -521,9 +839,21 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
         dependentTasks: summarize(edges.dependents.get(task.id) ?? []),
       };
     });
+
+    // Card 41e24358: the census read says WHY each card is listed - the
+    // failed arm, from the same predicate - so the CLI and the dashboard can
+    // print it without a point read per card.
+    if (filters.verifierUnusable) {
+      for (const task of tasksWithDeps) {
+        task.verifierUsability = await verifierUsabilityOf(pool, {
+          verifierPrincipalId: task.verifierPrincipalId, ownerPrincipalId: task.ownerPrincipalId,
+        });
+      }
+    }
     
     res.json({ success: true, tasks: tasksWithDeps });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if ((err as { code?: string })?.code === 'OWNER_FILTER_UNAVAILABLE') {
       res.status(503).json({ success: false, error: 'Task Assignee filters are unavailable until the identity substrate is migrated' });
       return;
@@ -588,6 +918,7 @@ router.get('/filter-options', async (req: Request, res: Response): Promise<void>
     };
     res.json({ success: true, ...options });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error loading filter options:', err);
     res.status(500).json({ success: false, error: 'Task filter options could not be read', code: 'FILTER_OPTIONS_FAILED', errorId });
   }
@@ -687,6 +1018,7 @@ router.get('/board', async (req: Request, res: Response): Promise<void> => {
       meta: { statuses, perColumn, includeArchived },
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if ((err as { code?: string })?.code === 'OWNER_FILTER_UNAVAILABLE') {
       res.status(503).json({ success: false, error: 'Task Assignee filters are unavailable until the identity substrate is migrated' });
       return;
@@ -704,6 +1036,33 @@ router.get('/board', async (req: Request, res: Response): Promise<void> => {
  * confirm reads its EXPLICIT id set here — never the loaded column window.
  * NOTE: Must be BEFORE /:id route to avoid being caught by wildcard.
  */
+// Bounded coarse activity for visible board rows or one open detail. This
+// collection must precede /:id and use the shared batched read predicate.
+router.get('/activity', async (req: Request, res: Response): Promise<void> => {
+  const raw = req.query.ids;
+  if (typeof raw !== 'string' || Object.keys(req.query).some(key => key !== 'ids')) {
+    res.status(400).json({ success: false, code: 'INVALID_ACTIVITY_IDS', error: 'ids must be a comma-separated list of up to 100 Task UUIDs' });
+    return;
+  }
+  const values = raw.split(',').map(value => value.trim());
+  if (values.length > 100 || values.some(value => !isValidTaskId(value))) {
+    res.status(400).json({ success: false, code: 'INVALID_ACTIVITY_IDS', error: 'ids must be a comma-separated list of up to 100 Task UUIDs' });
+    return;
+  }
+  try {
+    const ids = [...new Set(values.map(value => value.toLowerCase()))];
+    const allowed = await filterAuthorizedResources(req as AuthRequest, 'read', ids,
+      id => ({ type: 'task', id }));
+    const activity = await telemetryService.activityForTasks(allowed);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ success: true, observedAt: new Date().toISOString(), staleAfterMs: TELEMETRY_STALE_MS, activity });
+  } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    const errorId = logCaughtFailure('[Tasks API] Task activity read failed:', err);
+    res.status(503).json({ success: false, code: 'TASK_ACTIVITY_UNAVAILABLE', error: 'Task activity could not be read', errorId });
+  }
+});
+
 router.get('/ids', async (req: Request, res: Response): Promise<void> => {
   try {
     const parseList = (value: unknown, fallback: string[] = []): string[] => {
@@ -755,6 +1114,7 @@ router.get('/ids', async (req: Request, res: Response): Promise<void> => {
     );
     res.json({ success: true, ids: authorizedIds, total: authorizedIds.length });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     // Safety floor (review f98d127b B1): an unexpected exception is logged
     // secret-safe and serialized as a FIXED envelope — a driver/adapter
     // message can carry row values or connection details.
@@ -843,6 +1203,7 @@ router.get('/aggregates', async (req: Request, res: Response): Promise<void> => 
     }
     res.json(payload);
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error reading task aggregates:', err);
     res.status(500).json({ success: false, error: 'The Task aggregates could not be read', code: 'AGGREGATES_FAILED', errorId });
   }
@@ -962,13 +1323,9 @@ router.get('/graph', async (req: Request, res: Response): Promise<void> => {
       );
       // Phases carry an explicit restricted-access policy (owner ruling
       // 44ee41f2), so each one goes through the SAME authorization
-      // predicate as the nodes — never inferred from a visible Task.
-      phases = await filterAuthorizedResources(
-        req as AuthRequest,
-        'read',
-        phaseRows,
-        (phase: { id: string }) => ({ type: 'phase', id: phase.id }),
-      );
+      // predicate as the nodes — never inferred from a visible Task. It is
+      // the one Phase read decision every Phase list asks (card bdf7b876).
+      phases = await filterReadablePhases(req as AuthRequest, phaseRows);
     }
     let newestUpdate = '';
     for (const row of authorizedRows) if (row.updated > newestUpdate) newestUpdate = row.updated;
@@ -1060,10 +1417,8 @@ router.get('/graph', async (req: Request, res: Response): Promise<void> => {
       fullCount,
       // PROGRESS is the one fact a delta keyed on tasks.updated_at cannot
       // carry: subtasks is a separate table with its own updated_at and no
-      // trigger writing back to tasks. Agent does NOT need this channel —
-      // active_agent is a column on tasks and `update_tasks_updated_at` fires
-      // unconditionally on every row update, so a pickup is already inside the
-      // delta window on its own node.
+      // trigger writing back to tasks. Optional actor badges remain empty
+      // until a lawful current identity source is available.
       //
       // Scoped to the tasks whose subtasks actually moved. Walking the whole
       // scope would make a delta nearly the size of a full read, on the one
@@ -1080,6 +1435,7 @@ router.get('/graph', async (req: Request, res: Response): Promise<void> => {
       ...(updatedSince ? { deltaOf: updatedSince.toISOString() } : {}),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error reading task graph:', err);
     res.status(500).json({ success: false, error: 'The Task graph could not be read', code: 'GRAPH_FAILED', errorId });
   }
@@ -1107,6 +1463,7 @@ router.get('/current', async (req: Request, res: Response): Promise<void> => {
       hasCurrentTask: Boolean(task),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error loading current task:', err);
     res.status(500).json({ success: false, error: 'The current task could not be read', code: 'CURRENT_TASK_READ_FAILED', errorId });
   }
@@ -1140,6 +1497,7 @@ router.post('/orchestration/:id/claim', async (req: Request, res: Response): Pro
     });
     res.status(claim.acquired ? 201 : 200).json({ success: true, ...claim });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof OrchestrationConflictError) {
       res.status(err.code === 'TASK_NOT_FOUND' ? 404 : 409).json({ success: false, code: err.code, error: err.message });
       return;
@@ -1170,6 +1528,7 @@ router.post('/orchestration/:id/lease/:leaseId/heartbeat', async (req: Request, 
     }
     res.json({ success: true, lease, ...(credentialExtension ? { credentialExtension } : {}) });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof OrchestrationConflictError) {
       res.status(409).json({ success: false, code: err.code, error: err.message });
       return;
@@ -1190,6 +1549,7 @@ router.post('/orchestration/:id/lease/:leaseId/release', async (req: Request, re
     );
     res.json({ success: true, lease });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof OrchestrationConflictError) {
       res.status(409).json({ success: false, code: err.code, error: err.message });
       return;
@@ -1213,7 +1573,8 @@ router.post('/reviewer/:id/run', async (req: Request, res: Response): Promise<vo
     });
     res.json({ success: true, dryRun: req.body?.dryRun === true, outcome });
   } catch (err) {
-    if (err instanceof NotFoundFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -1236,10 +1597,13 @@ router.post('/reviewer/:id/reject', async (req: Request, res: Response): Promise
     }
     const outcome = await taskReviewerService.rejectTask(req.params.id, reason, {
       triggeredBy: req.body?.triggeredBy || 'user',
+      // Card 5854f0d6, round 2: the Verifier's manual rejection is theirs in the feed.
+      feedActor: requestActor(req),
     });
     res.json({ success: true, outcome });
   } catch (err) {
-    if (err instanceof NotFoundFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -1287,6 +1651,7 @@ router.post('/:id/notifications/deliver', async (req: Request, res: Response): P
       ...result,
     });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     const errorId = logCaughtFailure('[Tasks API] Durable notification delivery failed:', error);
     res.status(500).json({ success: false, error: 'Durable notification delivery failed', code: 'NOTIFICATION_DELIVERY_FAILED', errorId });
   }
@@ -1318,6 +1683,7 @@ router.get('/next', async (req: Request, res: Response): Promise<void> => {
       queueLength: visibleQueue.length,
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting next task:', err);
     res.status(500).json({
       success: false,
@@ -1329,48 +1695,119 @@ router.get('/next', async (req: Request, res: Response): Promise<void> => {
 });
 
 /**
+ * The notification centre's viewer, built from the request the shared
+ * middleware already authenticated (card b1e3b16d, hub lane L2). null for an
+ * identity with no resolved principal: read state is per principal, so there
+ * is nothing to read it for.
+ */
+function notificationViewer(req: AuthRequest): NotificationViewer | null {
+  const principalId = req.principal?.id;
+  if (!principalId) return null;
+  const isSession = isLoginSessionKind(req.authMethod);
+  const administrator = isSession && administratorSessionOf({
+    authMethod: req.authMethod,
+    handle: req.userId,
+    principalRole: req.principal?.role ?? null,
+    sessionRole: req.sessionRole ?? null,
+  }, resolveActorRole, APPROVAL_DECIDE_ACT).ok;
+  const scopes = req.scopes ?? null;
+  return {
+    principalId,
+    isRoot: scopesSatisfy(scopes, 'root'),
+    isSession,
+    isAdministrator: administrator,
+    canReadSkills: scopesSatisfy(scopes, 'skills:read'),
+    // The same test GET /skills/:id/versions applies before it lists an
+    // unpublished version (routes/skills.ts canManage).
+    canManageSkills: Boolean(scopes?.includes('root') || scopes?.includes('skills:write') || scopes?.includes('skills:admin')),
+    taskScope: authorizedListScope(req, 'task', 'read'),
+  };
+}
+
+type NotificationFilters = Pick<NotificationQuery, 'types' | 'who'>;
+
+/** `?type=` (one type, or several comma-separated; `all` is every type) and
+ * `?who=` (`mine`, the default, or `all`). A value outside the grammar is a
+ * 400, never a silently wider list. */
+function parseNotificationFilters(source: Record<string, unknown>): NotificationFilters | { error: string } {
+  const rawType = source.type;
+  let types: NotificationType[] = [];
+  if (rawType !== undefined && rawType !== '' && rawType !== 'all') {
+    if (typeof rawType !== 'string') return { error: 'type must be one value or a comma-separated list' };
+    const parts = rawType.split(',').map((part) => part.trim()).filter(Boolean);
+    const unknown = parts.filter((part) => !(NOTIFICATION_TYPES as readonly string[]).includes(part));
+    if (unknown.length > 0) return { error: `Unknown notification type: ${unknown.join(', ')} (one of ${NOTIFICATION_TYPES.join(', ')})` };
+    types = [...new Set(parts)] as NotificationType[];
+  }
+  const rawWho = source.who;
+  if (rawWho !== undefined && rawWho !== '' && rawWho !== 'mine' && rawWho !== 'all') {
+    return { error: 'who must be mine or all' };
+  }
+  const who: NotificationWho = rawWho === 'all' ? 'all' : 'mine';
+  return { types, who };
+}
+
+function sendPrincipalRequired(res: Response): void {
+  sendApiError(res, 403, 'PRINCIPAL_REQUIRED', 'Notifications are read per principal, and this identity has no resolved principal');
+}
+
+/**
  * GET /tasks/notifications
- * Get all notifications (with optional filter for unread only).
+ * The notification history (card b1e3b16d, hub lane L2): every status move,
+ * stuck notice, review request, approval event and skill decision this
+ * caller may see, newest first, keyset-paged, with per-principal read state.
+ *
+ *   ?who=mine|all       "My work" (default, E44 Q4) or everything I can see
+ *   ?type=<t>[,<t>]     status | stuck | review | approval | skill
+ *   ?unread=true        only rows this principal has not read
+ *   ?before=<cursor>    the page after the row whose `cursor` this is
+ *   ?limit=<n>          1-100, default 50
+ *
+ * The task.stuck notice stays ADDRESSED (RH-P3.C8): only the task's shepherd,
+ * else creator, else owner — or root — sees it, under every filter. Every task
+ * row is narrowed by the shared task predicate IN the query, so no page is
+ * short and no unreadable task yields a row or a title.
  * NOTE: Registered here (before '/:id') — see route-order comment on /next.
- * Previously registered after '/:id' and therefore unreachable (400).
  */
 router.get('/notifications', async (req: Request, res: Response): Promise<void> => {
   try {
-    const unreadOnly = req.query.unread === 'true';
-
-    const stored = unreadOnly
-      ? await notificationManager.getUnreadNotifications()
-      : await notificationManager.getNotifications();
-
-    // RH-P3.C8 round 2 (review 4243b06e B1): this surface carries Task
-    // titles, so it is filtered TWICE for every caller —
-    //  1. addressing: an addressed notification reaches its recipient (and
-    //     root); NULL-recipient rows are broadcasts;
-    //  2. grants: every referenced Task goes through the SHARED
-    //     authorization adapter, so another principal's inaccessible Task
-    //     title is concealed here exactly as it is everywhere else.
     const authReq = req as AuthRequest;
-    const callerPrincipalId = authReq.principal?.id ?? null;
-    const callerIsRoot = scopesSatisfy(authReq.scopes ?? null, 'root');
-    const addressed = stored.filter((notification) => {
-      const recipient = (notification as { recipientPrincipalId?: string | null }).recipientPrincipalId ?? null;
-      if (recipient === null || callerIsRoot) return true;
-      return callerPrincipalId !== null && recipient === callerPrincipalId;
-    });
-    const notifications = await filterAuthorizedResources(
-      authReq,
-      'read',
-      addressed,
-      (notification) => ({ type: 'task', id: notification.taskId }),
-    );
+    const filters = parseNotificationFilters(req.query as Record<string, unknown>);
+    if ('error' in filters) { sendApiError(res, 400, 'INVALID_NOTIFICATION_FILTER', filters.error); return; }
+    const before = parseBefore(req.query.before);
+    if (before === 'invalid') {
+      sendApiError(res, 400, 'INVALID_NOTIFICATION_CURSOR', 'before must be a cursor this route returned');
+      return;
+    }
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined ? NOTIFICATION_PAGE_DEFAULT : Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > NOTIFICATION_PAGE_MAX) {
+      sendApiError(res, 400, 'INVALID_NOTIFICATION_LIMIT', `limit must be an integer from 1 to ${NOTIFICATION_PAGE_MAX}`);
+      return;
+    }
+    const viewer = notificationViewer(authReq);
+    if (!viewer) { sendPrincipalRequired(res); return; }
+    const unreadOnly = req.query.unread === 'true' || req.query.unread === '1';
+    const query: NotificationQuery = { ...filters, unreadOnly, before, limit };
+    const [page, unreadCount] = await Promise.all([
+      notificationHistoryService.list(viewer, query),
+      notificationHistoryService.unreadCount(viewer, filters),
+    ]);
 
     res.json({
       success: true,
-      notifications,
-      count: notifications.length,
-      unreadCount: notifications.filter(n => !n.read).length
+      notifications: page.notifications,
+      count: page.notifications.length,
+      // Bounded: past the ceiling the count is a floor and says so.
+      unreadCount: Math.min(unreadCount, NOTIFICATION_UNREAD_CEILING),
+      unreadCountCapped: unreadCount > NOTIFICATION_UNREAD_CEILING,
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore,
+      who: filters.who,
+      types: filters.types.length > 0 ? filters.types : [...NOTIFICATION_TYPES],
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting notifications:', err);
     res.status(500).json({
       success: false,
@@ -1399,6 +1836,7 @@ router.get('/:id/stream', async (req: Request, res: Response): Promise<void> => 
     const entries = await taskElementService.listStream(req.params.id, taskElementActor(req));
     res.json({ success: true, taskId: req.params.id, entries });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -1409,6 +1847,7 @@ router.get('/:id/references', async (req: Request, res: Response): Promise<void>
     const references = await taskElementService.listReferences(req.params.id);
     res.json({ success: true, taskId: req.params.id, references });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -1448,6 +1887,7 @@ router.get('/:id/timeline', async (req: Request, res: Response): Promise<void> =
     try {
       streamRows = await taskElementService.listStream(task.id, taskElementActor(req));
     } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
       streamSourceErrorId = logCaughtFailure('[Tasks API] timeline stream source failed:', err);
       streamRows = err instanceof Error ? err : new Error('stream source failed');
     }
@@ -1456,6 +1896,7 @@ router.get('/:id/timeline', async (req: Request, res: Response): Promise<void> =
     try {
       historyRows = await unifiedTaskTimeline.listHistoryNotInStream(task.id);
     } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
       historySourceErrorId = logCaughtFailure('[Tasks API] timeline history source failed:', err);
       historyRows = err instanceof Error ? err : new Error('history source failed');
     }
@@ -1480,6 +1921,7 @@ router.get('/:id/timeline', async (req: Request, res: Response): Promise<void> =
       } : {}),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting task timeline:', err);
     res.status(500).json({
       success: false,
@@ -1520,15 +1962,44 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
       await taskManager.getDependentTasks(task.id),
       (related) => ({ type: 'task', id: related.id }),
     );
+    const blocked = await taskManager.isTaskBlocked(task.id);
+    // Display hint only; each disposition repeats current authority under lock.
+    const accountClient = await pool.connect();
+    let ownerControl = false;
+    try { ownerControl = !!await taskAccountControl(accountClient, task.id, requestActor(req)); }
+    finally { accountClient.release(); }
     const taskWithDeps = {
+      ownerControl,
       ...task,
-      blocked: await taskManager.isTaskBlocked(task.id),
+      successCriteriaAccess: { allowed: await taskSuccessCriteriaService.access(task.id, requestActor(req)) },
+      lifecycleAccess: await taskLifecycleAccess(actorFromRequest(req as AuthRequest), task, blocked),
+      reportMaintenanceAccess: (req as AuthRequest).principal
+        ? await taskElementService.taskReportMaintenanceAccess(task.id, taskElementActor(req))
+        : {allowed:false,reason:'TASK_REPORT_AUTHORITY_REVOKED'},
+      // Card 50b5e9c4 slice 3: the Task carries its bounded Report context —
+      // the five newest authorized Report summaries, separate pinned
+      // evidence, the authorized total and the cursor for the rest. Never
+      // bodies, and never a Report this caller cannot read.
+      reportContext: await compileTaskReportContext(task.id, reportContextActor(req)),
+      // Card 41e24358: the usable-Verifier predicate, read live for the
+      // dashboard's Review banner (so it also shows on cards already there).
+      verifierUsability: await readVerifierUsability(task.id),
+      blocked,
       blockingTasks: blockingTasks.map(t => ({ id: t.id, title: t.title })),
       dependentTasks: dependentTasks.map(t => ({ id: t.id, title: t.title })),
     };
     
     res.json({ success: true, task: taskWithDeps });
   } catch (err) {
+    // Card e5240c73: the bounded Task-lock wait expired; nothing was changed.
+    // The answer is built from constants, never from the caught value.
+    if (err instanceof TaskElementError && err.code === 'TASK_READ_BUSY') {
+      res.setHeader('Retry-After', '1');
+      sendApiError(res, 409, 'TASK_READ_BUSY', TASK_READ_BUSY_MESSAGE, 'Retry the read in a moment; nothing was changed.',
+        { lockTimeoutMs: TASK_READ_LOCK_TIMEOUT_MS });
+      return;
+    }
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting task:', err);
     res.status(500).json({ 
       success: false, 
@@ -1545,16 +2016,18 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
  */
 router.post('/', idempotent('task.create'), async (req: Request, res: Response): Promise<void> => {
   try {
-    if (rejectCallerWrittenTaskRoles(req, res)) return;
+    if (rejectCallerWrittenTaskRoles(req, res, { create: true })) return;
     const { 
       title, description, status, priority, project, tags, 
-      // Phase 4 fields
-      subtasks, links, sessionRefs, autoCreated, autoStart, blockedBy, blockedReason,
+      // Phase 4 fields. Card c3880767: the server-written columns this list
+      // once forwarded (reviewHistory and maxRetries) are refused by name
+      // above. Retired fields have no read or write contract.
+      subtasks, links, autoStart, blockedBy, blockedReason,
       // Task dependencies
       dependsOn,
       // AI execution/Verifier fields
-      model, executionMode, executionProfile, activeAgent,
-      successCriteria, reviewHistory, maxRetries, definitionOfDone, constraints,
+      model, executionMode, executionProfile,
+      definitionOfDone, constraints,
       // Thinking level
       thinking,
       // Personality
@@ -1563,14 +2036,24 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       phaseId,
       // RH-P3.AZ-S7: the chosen access vehicle for this assignment.
       executionWarrantId,
+      // AZ-A10 clause 6: the assigning act's date for the rows it writes.
+      roleGrantExpiresAt,
       // When this Task is due (card 7d38a6e0). Absent is the ordinary state.
       dueAt,
+      // Card 41e24358 (Q2 (b)): a Project or Phase default, named explicitly.
+      verifierPrincipalId,
+      // Section 6.8 (E462 S4b): no verification; finish completes the Task.
+      verificationNone,
       // Legacy fields
       parentId, notes
     } = req.body;
 
     if (!title) {
       res.status(400).json({ success: false, error: 'Title is required' });
+      return;
+    }
+    if (verificationNone !== undefined && typeof verificationNone !== 'boolean') {
+      sendApiError(res, 422, 'INVALID_VERIFICATION_NONE', 'verificationNone must be a boolean', undefined, { field: 'verificationNone' });
       return;
     }
 
@@ -1598,8 +2081,6 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       // Phase 4 fields
       subtasks,
       links,
-      sessionRefs,
-      autoCreated,
       // Lifecycle gate: autoStart is opt-in. Missing/false-y -> FALSE so new
       // tasks are never silently eligible for orchestrator auto-pickup.
       autoStart: resolveCreateAutoStart(autoStart),
@@ -1612,18 +2093,18 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       executionMode,
       executionProfile,
       executionWarrantId,
-      activeAgent,
-      successCriteria,
-      reviewHistory,
-      maxRetries,
+      roleGrantExpiresAt,
       definitionOfDone,
       constraints,
       // Thinking level
       thinking,
       // Personality
       personalityId,
-      // Phase membership (RH-P2.4)
-      phaseId: normalizePhaseIdWrite(phaseId),
+      // Phase membership (RH-P2.4). ABSENT stays absent (card b13e5ac9): the
+      // create decides the Project's inbox-phase default from absence, so it
+      // must not be flattened into an explicit `null`, which is a choice - the
+      // unphased project backlog - and wins like any explicit phaseId.
+      phaseId: phaseId === undefined ? undefined : normalizePhaseIdWrite(phaseId),
       // Card 7d38a6e0: normalized by the same function the update route calls.
       dueAt: normalizedDueAt.value,
       // Legacy fields
@@ -1631,18 +2112,32 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       // Card 9c3a1aa4: `notes` was destructured, forwarded, and then dropped on
       // the floor by an INSERT that never named the column. It is now the same
       // field the update route accepts, normalized by the same function.
-      notes: normalizeTaskNotesWrite(notes)
+      notes: normalizeTaskNotesWrite(notes),
+      // Card 41e24358: validated inside the create's transaction, after the
+      // target Project is decided (TaskManagerDB.resolveCreateVerifier).
+      ...(verifierPrincipalId !== undefined ? { verifierPrincipalId } : {}),
+      // Section 6.8: decided inside the create's transaction (TaskManagerDB.createTask).
+      ...(verificationNone === true ? { verificationNone: true } : {}),
     }, req);
 
     // Card 9c177e6a: the TARGET Project decision travels INTO the create as a
     // required parameter, so it is made on the create's own transaction and
     // before its INSERT. The route is the only place that can build it,
     // because only the route holds the request the actor comes from.
+    const receipt: CreateTaskReceipt = { warnings: [] };
     const task = await taskManager.createTask(
       createPayload as any,
       requestActor(req),
       authorizedProjectTarget(req as AuthRequest),
+      undefined,
+      receipt,
     );
+    // Card 41e24358: an inherited default that could not be set, and a card
+    // created directly in Review without a usable Verifier, are WARNINGS.
+    const createWarnings: Array<VerifierWarning | DefaultVerifierWarning> = [
+      ...receipt.warnings,
+      ...(task.status === 'review' ? await reviewVerifierWarnings(req, task.id) : []),
+    ];
 
     // Add computed dependency fields
     const taskWithDeps = {
@@ -1656,9 +2151,16 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       success: true,
       task: taskWithDeps,
       ...(normalizedDueAt.resolution ? { dueAtResolution: normalizedDueAt.resolution } : {}),
+      ...(await roleGrantExpiryReceipt(task.id, Boolean(createPayload.executionServiceId), assigningActExpiry(createPayload))),
+      ...(createWarnings.length > 0 ? { warnings: createWarnings } : {}),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (sendLifecyclePolicyError(res, err)) return;
+    if (err instanceof GrantError) {
+      sendApiError(res, err.status, err.code, err.message);
+      return;
+    }
     if (err instanceof ProfileValidationError) {
       // Fixed-text diagnostics only — the profile pipeline's messages are
       // board-authored and the raw object never reaches the log sink.
@@ -1691,13 +2193,26 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
       res.status(400).json({ success: false, error: err.message, code: err.code, offendingIds: err.offendingIds });
       return;
     }
-    // Review 3db17273 r2 B1: POST /tasks keeps its base contract - domain
-    // preconditions surfaced during creation were 500 before the typed-fault
-    // refactor and stay 500; only the message is fixed (never the caught
-    // value). Typed fault statuses apply on the surfaces that always had
-    // them (update, delete, subtask and dependency verbs).
+    // Trusted service preconditions are actionable request outcomes, not
+    // server failures. Foreign errors still take the fixed, redacted 500.
+    if (err instanceof RequestFaultError) {
+      sendApiError(res, err.status, err.code, err.message);
+      return;
+    }
     const errorId = logCaughtFailure('[Tasks API] Error creating task:', err);
     res.status(500).json({ success: false, code: 'TASK_CREATE_FAILED', error: 'The task could not be created', errorId });
+  }
+});
+
+/** One audited Verifier criteria writer; generic POST/PATCH refuse its keys. */
+router.patch('/:id/success-criteria', async (req: Request, res: Response): Promise<void> => {
+  try {
+    await taskSuccessCriteriaService.change(req.params.id, req.body, requestActor(req));
+    res.json({ success: true, taskId: req.params.id });
+  } catch (error) {
+    if (error instanceof ResourceContractError) { sendApiError(res, error.status, error.code, error.message); return; }
+    const errorId = logCaughtFailure('[Tasks API] success criteria change unavailable', error);
+    sendApiError(res, 503, 'SUCCESS_CRITERIA_CHANGE_UNAVAILABLE', 'Success criteria could not be changed', undefined, { errorId });
   }
 });
 
@@ -1707,14 +2222,52 @@ router.post('/', idempotent('task.create'), async (req: Request, res: Response):
  * handler runs. */
 router.patch('/:id/roles', async (req: Request, res: Response): Promise<void> => {
   const body = (req.body ?? {}) as Record<string, unknown>;
-  const allowed = ['shepherdPrincipalId', 'verifierPrincipalId'];
+  const allowed = ['shepherdPrincipalId', 'verifierPrincipalId', 'roleGrantExpiresAt', 'verificationNone'];
   const unknown = Object.keys(body).find((field) => !allowed.includes(field));
   if (unknown) {
     sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown field '${unknown}'`, undefined, { field: unknown });
     return;
   }
+  // Section 6.8 (E462 S4b): `verificationNone` is its own act on this route.
+  // The shared predicate admitted the Shepherd or an administrator-class
+  // actor; the service adds the Account-control path, refuses an Agent and a
+  // principal in G(Task), and allows the set only before the Task started.
+  if (body.verificationNone !== undefined) {
+    if (typeof body.verificationNone !== 'boolean') {
+      sendApiError(res, 422, 'INVALID_VERIFICATION_NONE', 'verificationNone must be a boolean', undefined, { field: 'verificationNone' });
+      return;
+    }
+    if (Object.keys(body).length !== 1) {
+      sendApiError(res, 422, 'VERIFICATION_NONE_EXCLUSIVE', 'verificationNone is set or cleared on its own, without other role fields');
+      return;
+    }
+    try {
+      await taskManager.setTaskVerificationNone(req.params.id, body.verificationNone, requestActor(req));
+      res.json({ success: true, task: await taskManager.getTask(req.params.id) });
+    } catch (error) {
+      if (error instanceof RequestFaultError) {
+        if (error instanceof VerificationModeError && error.status === 403) {
+          await auditService.record({
+            action: 'task.verification_none.set', actor: auditActorFromRequest(req as AuthRequest), outcome: 'denied',
+            resourceType: 'task', resourceId: req.params.id, metadata: { refusal: error.code },
+          }).catch(() => undefined);
+        }
+        sendApiError(res, error.status, error.code, error.message);
+        return;
+      }
+      const errorId = logCaughtFailure('[Tasks API] verification none change unavailable', error);
+      sendApiError(res, 503, 'TASK_ROLE_ASSIGNMENT_UNAVAILABLE', 'Task role assignment is unavailable', undefined, { errorId });
+    }
+    return;
+  }
   if (Object.keys(body).length === 0) {
     sendApiError(res, 422, 'INVALID_TASK_ROLE', 'At least one Task role assignment is required');
+    return;
+  }
+  if (body.roleGrantExpiresAt !== undefined
+    && body.shepherdPrincipalId === undefined && body.verifierPrincipalId === undefined) {
+    sendApiError(res, 422, 'ROLE_GRANT_EXPIRY_WITHOUT_ASSIGNMENT',
+      'roleGrantExpiresAt belongs beside a Task role assigning act');
     return;
   }
   if (
@@ -1732,9 +2285,25 @@ router.patch('/:id/roles', async (req: Request, res: Response): Promise<void> =>
     return;
   }
   try {
+    const roleGrantExpiry = body.roleGrantExpiresAt === undefined ? undefined
+      : await normalizeRoleGrantExpiresAtWrite(body.roleGrantExpiresAt, dueAtResolver);
     const roleIds = [body.shepherdPrincipalId, body.verifierPrincipalId]
       .filter((value): value is string => typeof value === 'string');
     const principals = await Promise.all(roleIds.map((id) => principalService.getPrincipalById(id)));
+    // AZ-A12 clause 3(c): a Group principal never acts, so it is never a
+    // Shepherd or Verifier. Refused by name BEFORE the write; migration 146's
+    // backstop would otherwise surface as an opaque error.
+    const groupRole = principals.find((principal) => principal?.kind === 'group');
+    if (groupRole) {
+      await auditService.record({
+        action: 'task.role_assign', actor: auditActorFromRequest(req as AuthRequest), outcome: 'denied',
+        resourceType: 'task', resourceId: req.params.id,
+        metadata: { refusal: 'TASK_ROLE_GROUP_PRINCIPAL', groupPrincipalId: groupRole.id },
+      }).catch(() => undefined);
+      sendApiError(res, 422, 'TASK_ROLE_GROUP_PRINCIPAL',
+        'A Group principal never acts (AZ-A12 clause 3c): it cannot be a Task Shepherd or Verifier. Name a person or a Connector.');
+      return;
+    }
     if (principals.some((principal) => !principal || principal.status !== 'active')) {
       sendApiError(res, 422, 'TASK_ROLE_PRINCIPAL_UNAVAILABLE', 'Every assigned Task role must resolve to an active Principal');
       return;
@@ -1779,7 +2348,8 @@ router.patch('/:id/roles', async (req: Request, res: Response): Promise<void> =>
     const outcome = await taskManager.assignTaskRoles(req.params.id, {
       shepherdPrincipalId: body.shepherdPrincipalId as string | undefined,
       verifierPrincipalId: body.verifierPrincipalId as string | null | undefined,
-    }, auditActorFromRequest(req as AuthRequest));
+      roleGrantExpiry,
+    }, auditActorFromRequest(req as AuthRequest), undefined, actorFromRequest(req as AuthRequest));
     if (outcome === 'not_found') {
       sendApiError(res, 404, 'TASK_NOT_FOUND', 'Task not found');
       return;
@@ -1794,7 +2364,11 @@ router.patch('/:id/roles', async (req: Request, res: Response): Promise<void> =>
     }
     const task = await taskManager.getTask(req.params.id);
     res.json({ success: true, task });
-  } catch {
+  } catch (error) {
+    if (error instanceof RequestFaultError) {
+      sendApiError(res, error.status, error.code, error.message);
+      return;
+    }
     sendApiError(res, 503, 'TASK_ROLE_ASSIGNMENT_UNAVAILABLE', 'Task role assignment is unavailable');
   }
 });
@@ -1806,7 +2380,13 @@ router.patch('/:id/roles', async (req: Request, res: Response): Promise<void> =>
 router.patch('/:id', idempotent('task.patch'), async (req: Request, res: Response): Promise<void> => {
   try {
     if (rejectCallerWrittenTaskRoles(req, res)) return;
-    const updates = await resolveExecutionProfileWrite({ ...req.body }, req);
+    // Card c3880767: the write sees the caller's PUBLIC keys only. They are
+    // picked BEFORE the pipeline, because the pipeline attaches the assigning
+    // act's date to its payload under a Symbol key. Server-written keys were
+    // refused by name above; any other key is dropped, as it always was.
+    const updates = await resolveExecutionProfileWrite(publicTaskBody(req.body), req);
+    // Card 69943b61: a Warrant is dropped only by a caller holding services:invoke.
+    await refuseWarrantDropWithoutInvoke(updates, req);
     if (updates.phaseId !== undefined) updates.phaseId = normalizePhaseIdWrite(updates.phaseId);
     // The same function the create route calls, so the two surfaces cannot
     // drift about what `notes` means. `in` rather than `!== undefined`: an
@@ -1818,8 +2398,6 @@ router.patch('/:id', idempotent('task.patch'), async (req: Request, res: Respons
       updates.dueAt = normalized.value;
       dueAtResolution = normalized.resolution;
     }
-    delete updates.id; // Don't allow ID changes
-    delete updates.created; // Don't allow created timestamp changes
 
     // Validate thinking level if provided
     const validThinkingLevels = ['low', 'medium', 'high'];
@@ -1832,14 +2410,6 @@ router.patch('/:id', idempotent('task.patch'), async (req: Request, res: Respons
     let dodWarning: string | undefined;
     let priorStatus: string | undefined;
     if (updates.status) {
-      const role = getRequestAutomationRole(req);
-      if (role === 'agent' && !AGENT_ALLOWED_TASK_STATUSES.includes(updates.status)) {
-        res.status(403).json({
-          success: false,
-          error: `Agents cannot move tasks to '${updates.status}'. Allowed: ${AGENT_ALLOWED_TASK_STATUSES.join(', ')}. Only the orchestrator can mark tasks as completed.`
-        });
-        return;
-      }
 
       // Lifecycle gate (non-blocking): warn on ideas -> todo without a
       // definitionOfDone. The move still succeeds; the response carries a
@@ -1863,6 +2433,10 @@ router.patch('/:id', idempotent('task.patch'), async (req: Request, res: Respons
       // create does. The catch below already relays a RequestFaultError by
       // class, so the refusal arrives as 404 PROJECT_NOT_FOUND.
       authorizedProjectTarget(req as AuthRequest),
+      undefined,
+      // Shape evidence only: DB checks the original payload together with
+      // actual updates and the locked source state before choosing authority.
+      req.body,
     );
 
     // Unified archive policy (task 7d2a60a6): PATCH status->archived carries
@@ -1885,16 +2459,27 @@ router.patch('/:id', idempotent('task.patch'), async (req: Request, res: Respons
       dependentTasks: (await taskManager.getDependentTasks(task.id)).map(t => ({ id: t.id, title: t.title })),
     };
 
+    // Card 41e24358 (E284): a move INTO Review without a usable Verifier
+    // carries VERIFIER_NOT_USABLE. Never a refusal: the move has committed.
+    const verifierWarnings = updates.status === 'review' && priorStatus !== 'review'
+      ? await reviewVerifierWarnings(req, task.id) : [];
+
     // dodWarning (ideas->todo) and archiveWarning (->archived) are mutually
-    // exclusive transitions, but join defensively if both ever appear.
-    const warning = [dodWarning, archiveWarning].filter(Boolean).join('; ') || undefined;
+    // exclusive transitions, but join defensively if both ever appear. The
+    // Verifier warning is folded into the same string (check F1), because the
+    // MCP move and the CLI print only `warning`.
+    const warning = [dodWarning, archiveWarning, ...verifierWarnings.map((entry) => entry.message)]
+      .filter(Boolean).join('; ') || undefined;
     res.json({
       success: true,
       task: taskWithDeps,
       ...(warning ? { warning } : {}),
+      ...(verifierWarnings.length > 0 ? { warnings: verifierWarnings } : {}),
       ...(dueAtResolution ? { dueAtResolution } : {}),
+      ...(await roleGrantExpiryReceipt(task.id, Boolean(updates.executionServiceId), assigningActExpiry(updates))),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (sendLifecyclePolicyError(res, err)) return;
     if (err instanceof ProfileValidationError) {
       // Fixed-text diagnostics only — the profile pipeline's messages are
@@ -1965,6 +2550,7 @@ router.patch('/:id/access', async (req: Request, res: Response): Promise<void> =
     });
     res.json({ success: true, task: { id: policy.taskId, restrictedAccess: policy.restrictedAccess } });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof RequestFaultError) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
@@ -1986,6 +2572,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
     await taskManager.deleteTask(req.params.id);
     res.json({ success: true });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (sendLifecyclePolicyError(res, err)) return;
     if (err instanceof NotFoundFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
@@ -2084,6 +2671,7 @@ router.post('/:id/notes', idempotent('task.note.append'), async (req: Request, r
 
     res.json({ success: true, taskId: updated.rows[0].id, appended: entry.trim() });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (isStringTooLongError(err)) {
       sendStringTooLongError(res, 'task note', err);
       return;
@@ -2154,6 +2742,7 @@ router.post('/bulk-archive', async (req: Request, res: Response): Promise<void> 
     const archivedCount = results.filter(r => r.archived).length;
     res.json({ success: true, results, archivedCount, failedCount: results.length - archivedCount });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     // Safety floor (review f98d127b B1): fixed envelope, never the exception.
     const errorId = logCaughtFailure('[Tasks API] Error bulk-archiving tasks:', err);
     res.status(500).json({ success: false, error: 'The bulk archive could not be executed', code: 'BULK_ARCHIVE_FAILED', errorId });
@@ -2172,6 +2761,7 @@ router.post('/:id/unarchive', async (req: Request, res: Response): Promise<void>
     const result = await taskManager.unarchiveTask(req.params.id, requestActor(req));
     res.json(result);
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (sendLifecyclePolicyError(res, err)) return;
     // Known domain outcomes are identified by CLASS, never message substring,
     // and their response text is constructed from fixed wording + the
@@ -2182,6 +2772,10 @@ router.post('/:id/unarchive', async (req: Request, res: Response): Promise<void>
     } else if (err instanceof TaskNotArchivedError) {
       res.status(409).json({ success: false, error: `Task is not archived: ${req.params.id}`, code: 'NOT_ARCHIVED' });
     } else {
+      if (err instanceof RequestFaultError) {
+        res.status(err.status).json({ success: false, code: err.code, error: err.message });
+        return;
+      }
       const errorId = logCaughtFailure('[Tasks API] Error unarchiving task:', err);
       res.status(500).json({ success: false, error: 'The Task could not be unarchived', code: 'UNARCHIVE_FAILED', errorId });
     }
@@ -2198,6 +2792,98 @@ router.post('/:id/stream', idempotent('task.stream.append'), async (req: Request
     const result = await taskElementService.append(req.params.id, req.body || {}, taskElementActor(req));
     res.status(req.body?.dryRun ? 200 : 201).json({ success: true, ...result });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
+    sendTaskElementError(res, error);
+  }
+});
+
+/** The actor a Report context is evaluated for: the one the shared
+ * authorization middleware resolved, so a context counts exactly the Reports
+ * a point read by this caller would serve. */
+function reportContextActor(req: Request) {
+  return (req as AuthRequest).authorizationActor ?? actorFromRequest(req as AuthRequest);
+}
+
+/**
+ * GET /tasks/:id/reports — the bounded Report context of one Task (card
+ * 50b5e9c4 slice 3). Summaries only, never bodies: the five newest authorized
+ * Reports by default, separate bounded pinned evidence, the authorized total,
+ * hasMore and a keyset `nextCursor`. Query: scope (linked | progress; default
+ * linked), limit (1-50, default 5), cursor or offset, pinned=true. A Report
+ * the caller cannot read is neither listed nor counted. Bodies come from
+ * GET /reports/:id (reports:read), or, for this Task's own progress Reports,
+ * GET /tasks/:id/reports/:reportId below (tasks:read).
+ */
+router.get('/:id/reports', async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (rejectInvalidTaskIdParam(req.params.id, res)) return;
+    // A resolved principal is required, exactly as before (PRINCIPAL_REQUIRED).
+    taskElementActor(req);
+    const query = req.query as Record<string, unknown>;
+    const request = parseReportContextRequest({
+      scope: query.scope, limit: query.limit, cursor: query.cursor, offset: query.offset, pinned: query.pinned,
+    });
+    const context = await compileTaskReportContext(req.params.id, reportContextActor(req), request);
+    res.json({ success: true, ...context });
+  } catch (error) {
+    if (error instanceof RequestFaultError) {
+      sendApiError(res, error.status, error.code, error.message, undefined,
+        error instanceof ReportContextRequestError ? { field: error.field } : undefined);
+      return;
+    }
+    sendTaskElementError(res, error);
+  }
+});
+
+const TASK_REPORT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * GET /tasks/:id/reports/:reportId — one of this Task's progress Reports in
+ * full: body and content_hash, the row shape the save answers with (card
+ * 50b5e9c4 round-1 B1). The list above answers summaries only; this is the
+ * Task-authority read a claimant continues its own progress Report from (an
+ * edit needs the current content_hash as expectedContentHash), and like the
+ * full-row list it replaces it needs only tasks:read. It serves only the
+ * `progress` scope's Reports, through the same READ predicate and promotion
+ * narrowings the context lists and counts with; any other Report's body is
+ * GET /reports/:id (reports:read). Not one of them, or not readable: one 404.
+ */
+router.get('/:id/reports/:reportId', async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (rejectInvalidTaskIdParam(req.params.id, res)) return;
+    // A resolved principal is required, exactly as for the list.
+    taskElementActor(req);
+    if (!TASK_REPORT_ID.test(req.params.reportId)) {
+      sendApiError(res, 400, 'INVALID_REPORT_ID', 'reportId must be a full Report UUID', undefined, { field: 'reportId' });
+      return;
+    }
+    const report = await readTaskProgressReport(req.params.id, req.params.reportId.toLowerCase(), reportContextActor(req));
+    if (!report) {
+      sendApiError(res, 404, 'TASK_REPORT_NOT_FOUND',
+        'No progress Report of this Task with that id is readable to you; read other Reports with GET /reports/{id}');
+      return;
+    }
+    res.json({ success: true, taskId: req.params.id, report });
+  } catch (error) { sendTaskElementError(res, error); }
+});
+
+router.get('/:id/report-operations/:key', async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (rejectInvalidTaskIdParam(req.params.id,res)) return;
+    if (!/^[a-f0-9]{64}$/.test(String(req.query.requestHash||''))) {sendApiError(res,400,'INVALID_OPERATION_HASH','Provide the exact logical request hash');return;}
+    res.json(await taskElementService.readTaskReportOperation(req.params.id,req.params.key,taskElementActor(req),String(req.query.requestHash)));
+  } catch(error) { if (sendReviewEvidenceBusy(res,error)) return; sendTaskElementError(res,error); }
+});
+
+router.post('/:id/reports', idempotent('task.report.save'), async (req: Request, res: Response): Promise<void> => {
+  try {
+    if (rejectInvalidTaskIdParam(req.params.id, res)) return;
+    const key=req.get('Idempotency-Key');
+    if (!key) { sendApiError(res,400,'IDEMPOTENCY_KEY_REQUIRED','Task Report saves require a logical operation key'); return; }
+    const result = await taskElementService.saveTaskReport(req.params.id, req.body, taskElementActor(req),key);
+    res.status(req.body?.reportId ? 200 : 201).json(result);
+  } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -2206,8 +2892,15 @@ router.post('/:id/finish', async (req: Request, res: Response): Promise<void> =>
   try {
     if (rejectInvalidTaskIdParam(req.params.id, res)) return;
     const result = await taskElementService.finish(req.params.id, req.body || {}, taskElementActor(req));
-    res.json(result);
+    // Card 41e24358 (design Part 5): finish is the atomic handback into
+    // Review, so it carries the same warning. A dry run moved nothing.
+    const verifierWarnings = result?.status === 'review' && !result?.dryRun
+      ? await reviewVerifierWarnings(req, req.params.id) : [];
+    res.json(verifierWarnings.length > 0
+      ? { ...result, warning: verifierWarnings.map((entry) => entry.message).join('; '), warnings: verifierWarnings }
+      : result);
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -2218,6 +2911,7 @@ router.post('/:id/references', idempotent('task.reference.create'), async (req: 
     const reference = await taskElementService.createReference(req.params.id, req.body || {}, taskElementActor(req));
     res.status(req.body?.dryRun ? 200 : 201).json({ success: true, reference });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -2233,6 +2927,7 @@ router.post('/:id/stream/:entryId/redact', async (req: Request, res: Response): 
     );
     res.json({ success: true, entry });
   } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
     sendTaskElementError(res, error);
   }
 });
@@ -2246,8 +2941,9 @@ router.post('/:id/archive', async (req: Request, res: Response): Promise<void> =
     const result = await taskManager.archiveTask(req.params.id, { reason }, requestActor(req));
     res.json(result);
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (sendLifecyclePolicyError(res, err)) return;
-    if (err instanceof NotFoundFault) {
+    if (err instanceof RequestFaultError) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
     } else {
       const errorId = logCaughtFailure('[Tasks API] Error archiving task:', err);
@@ -2311,10 +3007,15 @@ async function handleCompiledBrief(req: Request, res: Response): Promise<void> {
       tokenBudget,
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     // Review 6fa91e28 F1: when Charter existence cannot be established the
     // Brief fails closed — a success response without the authority index
     // would hand an agent a seemingly complete Brief missing the project's
     // governing agreements.
+    if (err instanceof DependencyContextLookupError) {
+      res.status(503).json({ success: false, code: 'DEPENDENCY_CONTEXT_LOOKUP_FAILED', error: 'The Brief could not establish dependency context' });
+      return;
+    }
     if (err instanceof PhaseLookupError) {
       // Same fail-closed contract as the Charter (review 1a786ae4 F2): a
       // bound Phase whose lookup failed is not confirmed absence, and a Brief
@@ -2391,6 +3092,12 @@ router.post('/:id/brief', async (req: Request, res: Response): Promise<void> => 
 /**
  * POST /tasks/:id/claim — become the task's Assignee (Phase 1, spec §3.3).
  * Idempotent for the current Assignee; someone-else-is-Assignee → 409.
+ *
+ * Card 3fc32dd1: a 200 always means the caller IS the Assignee, and says
+ * which way (`claim.outcome`: `claimed`, or `already_assignee` for the
+ * accepted retry). A refusal is never a 200: it keeps its established status
+ * and code and names, in `details.reason`, the reason the lifecycle
+ * projection (`lifecycleAccess.claim.reason`) shows for it.
  */
 router.post('/:id/claim', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -2399,13 +3106,26 @@ router.post('/:id/claim', async (req: Request, res: Response): Promise<void> => 
       res.status(400).json({ success: false, error: 'Claiming requires a resolved principal identity' });
       return;
     }
-    const outcome = await taskManager.claimTask(req.params.id, callerPrincipal.id);
+    const body = req.body ?? {};
+    if (typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => key !== 'expectedAssignmentEpoch')
+      || (body.expectedAssignmentEpoch !== undefined && (typeof body.expectedAssignmentEpoch !== 'string'
+        || !/^[1-9][0-9]{0,18}$/.test(body.expectedAssignmentEpoch)))) {
+      sendApiError(res, 400, 'CLAIM_INPUT_INVALID', 'expectedAssignmentEpoch must be a positive decimal string'); return;
+    }
+    const outcome = await taskManager.claimTask(req.params.id, callerPrincipal.id, requestActor(req), body.expectedAssignmentEpoch);
+    const refusal = { reason: CLAIM_REFUSAL_REASONS[outcome] };
+    if (outcome === 'authority_changed') {
+      sendApiError(res, 403, 'TASK_CLAIM_AUTHORITY_CHANGED', 'Claim authority must still hold after the Task lock', undefined, refusal); return;
+    }
+    if (outcome === 'epoch_mismatch') {
+      sendApiError(res, 409, 'TASK_ASSIGNMENT_EPOCH_MISMATCH', 'Read the current assignment before claiming', undefined, refusal); return;
+    }
     if (outcome === 'not_found') {
       res.status(404).json({ success: false, error: 'Task not found' });
       return;
     }
     if (outcome === 'conflict') {
-      res.status(409).json({ success: false, error: 'Another principal is already the Assignee of this task' });
+      sendApiError(res, 409, 'TASK_ALREADY_ASSIGNED', 'Another principal is already the Assignee of this task', undefined, refusal);
       return;
     }
     if (outcome === 'self_review') {
@@ -2414,15 +3134,17 @@ router.post('/:id/claim', async (req: Request, res: Response): Promise<void> => 
         409,
         'CLAIMANT_VERIFIER_CONFLICT',
         'The assigned Verifier cannot become the Assignee of the same task',
+        undefined,
+        refusal,
       );
       return;
     }
     if (outcome === 'unarmed') {
-      sendApiError(res, 409, 'TASK_NOT_ARMED', 'This Task is parked. Arm it explicitly before claiming it.');
+      sendApiError(res, 409, 'TASK_NOT_ARMED', 'This Task is parked. Arm it explicitly before claiming it.', undefined, refusal);
       return;
     }
     if (outcome === 'dependency_blocked') {
-      sendApiError(res, 409, 'TASK_DEPENDENCY_BLOCKED', 'This Task cannot be claimed until every dependency is semantically completed.');
+      sendApiError(res, 409, 'TASK_DEPENDENCY_BLOCKED', 'This Task cannot be claimed until every dependency is semantically completed.', undefined, refusal);
       return;
     }
     if (outcome === 'unavailable') {
@@ -2430,8 +3152,9 @@ router.post('/:id/claim', async (req: Request, res: Response): Promise<void> => 
       return;
     }
     const task = await taskManager.getTask(req.params.id);
-    res.json({ success: true, task });
+    res.json({ success: true, task, claim: { outcome } });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error claiming task:', err);
     res.status(500).json({ success: false, error: 'The task could not be claimed', code: 'TASK_CLAIM_FAILED', errorId });
   }
@@ -2455,7 +3178,7 @@ router.post('/:id/claim', async (req: Request, res: Response): Promise<void> => 
  * around them.
  *
  * Body: { executionProfile: { serviceId, descriptorVersion, options },
- *         executionWarrantId?, reason? }
+ *         executionWarrantId?, roleGrantExpiresAt?, reason? }
  */
 router.post('/:id/recover', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -2483,7 +3206,13 @@ router.post('/:id/recover', async (req: Request, res: Response): Promise<void> =
       return;
     }
     const resolved = await resolveExecutionProfileWrite(
-      { executionProfile: body.executionProfile, executionWarrantId: body.executionWarrantId },
+      {
+        executionProfile: body.executionProfile,
+        executionWarrantId: body.executionWarrantId,
+        // AZ-A10 clause 6 / E62: recovery reassigns, so the recovering
+        // shepherd may date the reassignment's rows like any assigner.
+        [ROLE_GRANT_EXPIRY_FIELD]: body[ROLE_GRANT_EXPIRY_FIELD],
+      },
       req,
     );
     const outcome = await taskManager.recoverTask(
@@ -2493,6 +3222,7 @@ router.post('/:id/recover', async (req: Request, res: Response): Promise<void> =
         executionProfile: resolved.executionProfile,
         executionDescriptorVersion: resolved.executionDescriptorVersion ?? null,
         executionWarrantId: resolved.executionWarrantId ?? null,
+        roleGrantExpiry: assigningActExpiry(resolved),
         reason: typeof body.reason === 'string' ? body.reason : undefined,
       },
       requestActor(req),
@@ -2515,13 +3245,20 @@ router.post('/:id/recover', async (req: Request, res: Response): Promise<void> =
       return;
     }
     const task = await taskManager.getTask(req.params.id);
-    res.json({ success: true, recovery: outcome, task });
+    res.json({
+      success: true, recovery: outcome, task,
+      ...(await roleGrantExpiryReceipt(req.params.id, true, assigningActExpiry(resolved))),
+    });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof ProfileValidationError) {
       const errorId = logCaughtFailure('[Tasks API] meltdown-recovery reassignment refused', err);
       res.status(err.status).json({ success: false, error: err.message, code: err.code, errorId, ...(err.field ? { field: err.field } : {}) });
       return;
     }
+    // AZ-A10 clause 6: a malformed roleGrantExpiresAt is the same 400 shape
+    // the create and update routes answer.
+    if (sendTaskFieldRefusal(res, err)) return;
     // RH-P3.AZ-S7 (ruling 7440b579 R1): the coupling's refusal is a contract
     // answer. The recovery rolled back with it, so the Task keeps the
     // claimant and the assignment it had — a refused reassignment must never
@@ -2573,6 +3310,7 @@ router.post('/:id/release', async (req: Request, res: Response): Promise<void> =
     const task = await taskManager.getTask(req.params.id);
     res.json({ success: true, task });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error releasing task:', err);
     res.status(500).json({ success: false, error: 'The task could not be released', code: 'TASK_RELEASE_FAILED', errorId });
   }
@@ -2593,12 +3331,12 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
       return;
     }
 
-    const sessionKey = task.acpSessionKey || task.activeAgent?.sessionKey;
+    const sessions = await taskSessionEvidenceService.listForTasks([task.id]);
+    const sessionKey = sessions[0]?.attemptId;
     // Legacy-read path (RH-P2.2): harness/mode live only in held legacy
     // blobs now — the pickup contract itself is RH-P3.1 scope.
     const harness = task.legacyExecutionProfile?.harness
-      || task.activeAgent?.harness
-      || (typeof sessionKey === 'string' && sessionKey.startsWith('hermes:') ? 'hermes' : 'openclaw');
+      || sessions[0]?.harness || null;
     const interactive = (task.executionMode || task.legacyExecutionProfile?.mode) === 'interactive';
 
     let canonicalRuntimeSignals: Awaited<ReturnType<typeof canonicalRuntimeSignalService.listTaskSignals>> = [];
@@ -2606,6 +3344,7 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
     try {
       canonicalRuntimeSignals = await canonicalRuntimeSignalService.listTaskSignals(task.id);
     } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
       canonicalRuntimeError = 'canonical runtime lookup failed';
       logCaughtWarning('[Tasks API] Canonical runtime lookup failed', error);
     }
@@ -2620,6 +3359,7 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
     try {
       telemetryLiveness = await telemetryService.livenessForTask(task.id);
     } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
       logCaughtWarning('[Tasks API] Telemetry liveness lookup failed', error);
     }
 
@@ -2628,14 +3368,13 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
       data: {
         taskId: task.id,
         sessionKey: sessionKey || null,
-        acpSessionKey: task.acpSessionKey || null,
         executionMode: task.executionMode || task.legacyExecutionProfile?.mode || null,
         executionProfile: task.executionProfile || null,
         legacyExecutionProfile: task.legacyExecutionProfile || null,
         startedAt: task.startedAt || null,
         state: telemetryLiveness?.state || canonicalRuntimeSignals[0]?.state || 'none',
         telemetry: telemetryLiveness,
-        label: task.activeAgent ? `Task: ${task.title}` : null,
+        label: sessionKey ? `Task: ${task.title}` : null,
         model: task.model || null,
         interactive,
         discordThreadId: task.discordThreadId || null,
@@ -2650,6 +3389,7 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
       },
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting session status:', err);
     res.status(500).json({
       success: false,
@@ -2666,7 +3406,7 @@ router.get('/:id/session-status', async (req: Request, res: Response): Promise<v
  */
 router.post('/:id/breakdown', async (req: Request, res: Response): Promise<void> => {
   try {
-    const result = await taskAnalyzer.breakdownTask(req.params.id);
+    const result = await taskAnalyzer.breakdownTask(req.params.id, requestActor(req));
     if (!result) {
       res.status(404).json({ success: false, error: 'Task not found' });
       return;
@@ -2678,6 +3418,11 @@ router.post('/:id/breakdown', async (req: Request, res: Response): Promise<void>
       method: result.method
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof ConflictFault) {
+      res.status(err.status).json({ success: false, code: err.code, error: err.message });
+      return;
+    }
     const errorId = logCaughtFailure('[Tasks API] Error breaking down task:', err);
     res.status(500).json({ 
       success: false, 
@@ -2697,6 +3442,7 @@ router.post('/auto-archive', async (_req: Request, res: Response): Promise<void>
     const count = await taskManager.autoArchiveOldTasks();
     res.json({ success: true, archivedCount: count });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error auto-archiving:', err);
     res.status(500).json({ 
       success: false, 
@@ -2754,6 +3500,7 @@ router.get('/:id/dependencies', async (req: Request, res: Response): Promise<voi
       })),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof NotFoundFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
@@ -2815,6 +3562,7 @@ router.post('/:id/dependencies', async (req: Request, res: Response): Promise<vo
       })),
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof DependencyValidationError) {
       res.status(400).json({ success: false, error: err.message, code: err.code, offendingIds: err.offendingIds });
       return;
@@ -2840,6 +3588,7 @@ router.delete('/:id/dependencies/:depTaskId', async (req: Request, res: Response
 
     res.json({ success: true, taskId: id, removed: depTaskId });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     if (err instanceof NotFoundFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
@@ -2853,13 +3602,142 @@ router.delete('/:id/dependencies/:depTaskId', async (req: Request, res: Response
 // Phase 1 Hub Redesign: Subtask Status Management APIs
 // ============================================================
 
+// Card 2bc7b303 (owner ruling E374): the Subtask structure verbs. They join
+// the stable-id family with the status verb's authorization: tasks:write at
+// the route ceiling, Task `write` at the point stage (no route-level role gate
+// beyond it), and the manager's account-control and transition rules under
+// the parent Task lock. Each is keyed on the shared retry middleware.
+const SUBTASK_TEXT_MAX = 1000;
+
+function subtaskTextOf(value: unknown, res: Response): string | null {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text || text.length > SUBTASK_TEXT_MAX) {
+    sendApiError(res, 400, 'INVALID_SUBTASK_TEXT', `text must be a non-empty string of at most ${SUBTASK_TEXT_MAX} characters`, undefined, { field: 'text' });
+    return null;
+  }
+  return text;
+}
+
+/** POST /tasks/:id/subtasks — add one Subtask. Body { text, position?
+ *  (1-based; default append), status? (default empty) }. Answers 201 with the
+ *  Task and the new Subtask's stable id. */
+router.post('/:id/subtasks', idempotent('task.subtask.create'), async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body as Record<string, unknown> : {};
+    const unknownFields = Object.keys(body).filter((key) => !['text', 'position', 'status'].includes(key));
+    if (unknownFields.length > 0) {
+      sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown Subtask fields: ${unknownFields.sort().join(', ')}`, undefined, { fields: unknownFields.sort() });
+      return;
+    }
+    const text = subtaskTextOf(body.text, res);
+    if (text === null) return;
+    if (body.position !== undefined && (typeof body.position !== 'number' || !Number.isInteger(body.position) || body.position < 1)) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_POSITION', 'position must be a positive integer (1-based)', undefined, { field: 'position' });
+      return;
+    }
+    if (body.status !== undefined && !VALID_SUBTASK_STATUSES.includes(body.status as SubtaskStatus)) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_STATUS', `status must be one of: ${VALID_SUBTASK_STATUSES.join(', ')}`, undefined, { field: 'status' });
+      return;
+    }
+    const created = await taskManager.createSubtask(
+      id,
+      { text, position: body.position as number | undefined, status: body.status as SubtaskStatus | undefined },
+      getRequestAutomationRole(req),
+      requestActor(req),
+    );
+    res.status(201).json({
+      success: true,
+      task: created.task,
+      subtaskId: created.subtaskId,
+      position: created.position,
+      subtask: created.task.subtasks.find((subtask) => subtask.id === created.subtaskId) ?? null,
+    });
+  } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
+    if (error instanceof NotFoundFault || error instanceof ForbiddenFault || error instanceof ConflictFault || error instanceof InvalidRequestFault) {
+      res.status(error.status).json({ success: false, code: error.code, error: error.message });
+      return;
+    }
+    const errorId = logCaughtFailure('[Tasks API] Error creating subtask:', error);
+    res.status(500).json({ success: false, code: 'SUBTASK_CREATE_FAILED', error: 'The subtask could not be created', errorId });
+  }
+});
+
+/** POST /tasks/:id/subtasks/reorder — body { order: [every current Subtask id
+ *  exactly once] }. Ids, states and text are unchanged. */
+router.post('/:id/subtasks/reorder', idempotent('task.subtask.reorder'), async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const order = req.body?.order;
+    if (!Array.isArray(order) || order.length === 0
+      || order.some((subtaskId: unknown) => typeof subtaskId !== 'string' || !isValidSubtaskId(subtaskId))) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_ORDER', `order must be a non-empty array of Subtask ids (${SUBTASK_ID_ERROR})`, undefined, { field: 'order' });
+      return;
+    }
+    if (new Set(order).size !== order.length) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_ORDER', 'order names a Subtask id more than once', undefined, { field: 'order' });
+      return;
+    }
+    const unknownFields = Object.keys(req.body).filter((key) => key !== 'order');
+    if (unknownFields.length > 0) {
+      sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown fields: ${unknownFields.sort().join(', ')}`, undefined, { fields: unknownFields.sort() });
+      return;
+    }
+    const task = await taskManager.reorderSubtasks(id, order as string[], requestActor(req));
+    res.json({ success: true, task, order: task.subtasks.map((subtask) => subtask.id) });
+  } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
+    if (error instanceof NotFoundFault || error instanceof ForbiddenFault || error instanceof ConflictFault || error instanceof InvalidRequestFault) {
+      res.status(error.status).json({ success: false, code: error.code, error: error.message });
+      return;
+    }
+    const errorId = logCaughtFailure('[Tasks API] Error reordering subtasks:', error);
+    res.status(500).json({ success: false, code: 'SUBTASK_REORDER_FAILED', error: 'The subtasks could not be reordered', errorId });
+  }
+});
+
+/** PATCH /tasks/:id/subtasks/by-id/:subtaskId/text — body { text }. The
+ *  Subtask's id, position and state are unchanged. */
+router.patch('/:id/subtasks/by-id/:subtaskId/text', idempotent('task.subtask.text'), async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id, subtaskId } = req.params;
+    if (invalidSubtaskIdParam(subtaskId, res)) return;
+    const unknownFields = Object.keys(req.body ?? {}).filter((key) => key !== 'text');
+    if (unknownFields.length > 0) {
+      sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown fields: ${unknownFields.sort().join(', ')}`, undefined, { fields: unknownFields.sort() });
+      return;
+    }
+    const text = subtaskTextOf(req.body?.text, res);
+    if (text === null) return;
+    const task = await taskManager.updateSubtaskText(id, subtaskId, text, requestActor(req));
+    res.json({ success: true, task, subtaskId });
+  } catch (error) {
+    if (sendReviewEvidenceBusy(res, error)) return;
+    if (error instanceof NotFoundFault || error instanceof ForbiddenFault || error instanceof ConflictFault || error instanceof InvalidRequestFault) {
+      res.status(error.status).json({ success: false, code: error.code, error: error.message });
+      return;
+    }
+    const errorId = logCaughtFailure('[Tasks API] Error editing subtask text:', error);
+    res.status(500).json({ success: false, code: 'SUBTASK_TEXT_UPDATE_FAILED', error: 'The subtask text could not be changed', errorId });
+  }
+});
+
 /** PATCH /tasks/:id/subtasks/by-id/:subtaskId/status — preferred stable address. */
 router.patch('/:id/subtasks/by-id/:subtaskId/status', async (req: Request, res: Response): Promise<void> => {
   try {
     const { id, subtaskId } = req.params;
-    const { status, reviewNote, blockedReason } = req.body || {};
-    if (!/^\d+$/.test(subtaskId)) {
-      sendApiError(res, 400, 'INVALID_SUBTASK_ID', 'subtaskId must be the stable numeric Subtask id');
+    const { status, reviewNote, blockedReason, completionMode } = req.body || {};
+    if (completionMode !== undefined && (completionMode !== 'owner' || status !== 'completed')) {
+      sendApiError(res, 400, 'INVALID_COMPLETION_MODE', 'completionMode must be owner and status completed when supplied');
+      return;
+    }
+    if (completionMode === 'owner' && [reviewNote, blockedReason].some(value => value !== undefined && typeof value !== 'string')) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_EVIDENCE', 'reviewNote and blockedReason must be strings when supplied');
+      return;
+    }
+    if (!isValidSubtaskId(subtaskId)) {
+      sendApiError(res, 400, 'INVALID_SUBTASK_ID', SUBTASK_ID_ERROR);
       return;
     }
     if (!status || !VALID_SUBTASK_STATUSES.includes(status)) {
@@ -2868,7 +3746,7 @@ router.patch('/:id/subtasks/by-id/:subtaskId/status', async (req: Request, res: 
     }
     const actorRole = getRequestAutomationRole(req);
     const task = await taskManager.updateSubtaskStatusById(
-      id, subtaskId, status, actorRole, reviewNote, blockedReason,
+      id, subtaskId, status, actorRole, reviewNote, blockedReason, requestActor(req), completionMode === 'owner',
     );
     res.json({
       success: true,
@@ -2878,7 +3756,8 @@ router.patch('/:id/subtasks/by-id/:subtaskId/status', async (req: Request, res: 
       hasBlocked: await (taskManager as any).hasBlockedSubtasks(id),
     });
   } catch (error) {
-    if (error instanceof NotFoundFault || error instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, error)) return;
+    if (error instanceof NotFoundFault || error instanceof ForbiddenFault || error instanceof ConflictFault) {
       res.status(error.status).json({ success: false, code: error.code, error: error.message });
       return;
     }
@@ -2889,8 +3768,8 @@ router.patch('/:id/subtasks/by-id/:subtaskId/status', async (req: Request, res: 
 
 /** Shared validation for the stable-id Subtask verb family (task 228441cf). */
 function invalidSubtaskIdParam(subtaskId: string, res: Response): boolean {
-  if (!/^\d+$/.test(subtaskId)) {
-    sendApiError(res, 400, 'INVALID_SUBTASK_ID', 'subtaskId must be the stable numeric Subtask id');
+  if (!isValidSubtaskId(subtaskId)) {
+    sendApiError(res, 400, 'INVALID_SUBTASK_ID', SUBTASK_ID_ERROR);
     return true;
   }
   return false;
@@ -2899,13 +3778,26 @@ function invalidSubtaskIdParam(subtaskId: string, res: Response): boolean {
 /** POST /tasks/:id/subtasks/by-id/:subtaskId/approve — stable-id alias of the
  *  positional approve. Identical authorization (independent Verifier gate) and
  *  semantics: the id resolves inside the manager's row-locked transaction, so
- *  a concurrent reorder can never redirect the verb to a different Subtask. */
+ *  a concurrent reorder can never redirect the verb to a different Subtask.
+ *  Optional body { reviewNote?, blockedReason? } (strings) is written in that
+ *  same transaction; a malformed value is refused before any write. */
 router.post('/:id/subtasks/by-id/:subtaskId/approve', async (req: Request, res: Response): Promise<void> => {
   try {
     if (await rejectNonReviewerAction(req, res, 'approve subtasks')) return;
     const { id, subtaskId } = req.params;
     if (invalidSubtaskIdParam(subtaskId, res)) return;
-    const task = await taskManager.updateSubtaskStatusById(id, subtaskId, 'completed', 'reviewer');
+    const { reviewNote, blockedReason } = req.body || {};
+    for (const [field, value] of [['reviewNote', reviewNote], ['blockedReason', blockedReason]] as const) {
+      if (value !== undefined && typeof value !== 'string') {
+        sendApiError(res, 400, 'INVALID_SUBTASK_EVIDENCE', `${field} must be a string when supplied`, undefined, { field });
+        return;
+      }
+    }
+    const task = reviewNote === undefined && blockedReason === undefined
+      ? await taskManager.updateSubtaskStatusById(id, subtaskId, 'completed', 'reviewer',
+        undefined, undefined, undefined, false, requestActor(req))
+      : await taskManager.updateSubtaskStatusById(id, subtaskId, 'completed', 'reviewer', reviewNote, blockedReason,
+        undefined, false, requestActor(req));
     res.json({
       success: true,
       task,
@@ -2914,7 +3806,8 @@ router.post('/:id/subtasks/by-id/:subtaskId/approve', async (req: Request, res: 
       allCompleted: await (taskManager as any).allSubtasksCompletedAsync(id),
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -2932,6 +3825,7 @@ router.post('/:id/subtasks/by-id/:subtaskId/reject', async (req: Request, res: R
     const { note } = req.body || {};
     const task = await taskManager.updateSubtaskStatusById(
       id, subtaskId, 'empty', 'orchestrator', note ? `REJECTED: ${note}` : undefined,
+      undefined, undefined, false, requestActor(req),
     );
     res.json({
       success: true,
@@ -2940,7 +3834,8 @@ router.post('/:id/subtasks/by-id/:subtaskId/reject', async (req: Request, res: R
       subtaskSummary: await (taskManager as any).getSubtaskSummaryAsync(id),
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -2955,7 +3850,8 @@ router.post('/:id/subtasks/by-id/:subtaskId/skip', async (req: Request, res: Res
     if (rejectImplementationAgentOrchestratorAction(req, res, 'skip subtasks')) return;
     const { id, subtaskId } = req.params;
     if (invalidSubtaskIdParam(subtaskId, res)) return;
-    const task = await taskManager.updateSubtaskStatusById(id, subtaskId, 'skipped', 'orchestrator');
+    const task = await taskManager.updateSubtaskStatusById(id, subtaskId, 'skipped', 'orchestrator',
+      undefined, undefined, undefined, false, requestActor(req));
     res.json({
       success: true,
       task,
@@ -2964,7 +3860,8 @@ router.post('/:id/subtasks/by-id/:subtaskId/skip', async (req: Request, res: Res
       allCompleted: await (taskManager as any).allSubtasksCompletedAsync(id),
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -2994,19 +3891,7 @@ router.put('/:id/subtasks/by-id/:subtaskId', async (req: Request, res: Response)
     // Authority comes from the authenticated identity only (same rule as the
     // positional route): no body or header escape hatch.
     const actorRole = getRequestAutomationRole(req);
-    if (newStatus === 'completed' && actorRole !== 'qa' && actorRole !== 'reviewer') {
-      res.status(403).json({ success: false, error: 'Only an independent Verifier identity can complete a subtask' });
-      return;
-    }
-    if (!AGENT_ALLOWED_STATUSES.includes(newStatus) && actorRole === 'agent') {
-      res.status(403).json({
-        success: false,
-        error: `Agents cannot set status to '${newStatus}'. Use ${AGENT_ALLOWED_STATUSES.join(' or ')} instead.`
-      });
-      return;
-    }
-
-    const task = await taskManager.updateSubtaskStatusById(id, subtaskId, newStatus, actorRole, reviewNote, blockedReason);
+    const task = await taskManager.updateSubtaskStatusById(id, subtaskId, newStatus, actorRole, reviewNote, blockedReason, requestActor(req));
     const taskWithDeps = {
       ...task,
       blocked: await taskManager.isTaskBlocked(task.id),
@@ -3015,7 +3900,8 @@ router.put('/:id/subtasks/by-id/:subtaskId', async (req: Request, res: Response)
     };
     res.json({ success: true, task: taskWithDeps, subtaskId });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3063,11 +3949,7 @@ router.patch('/:id/subtasks/:index/status', async (req: Request, res: Response):
 
     // Validate role if provided
     const actorRole = getRequestAutomationRole(req);
-    if (status === 'completed' && actorRole !== 'qa' && actorRole !== 'reviewer') {
-      res.status(403).json({ success: false, error: 'Only an independent Verifier identity can complete a subtask' });
-      return;
-    }
-    const task = await taskManager.updateSubtaskStatus(id, index, status, actorRole, reviewNote, blockedReason);
+    const task = await taskManager.updateSubtaskStatus(id, index, status, actorRole, reviewNote, blockedReason, requestActor(req));
     
     // Get subtask summary (always use async version for DB)
     const subtaskSummary = await (taskManager as any).getSubtaskSummaryAsync(id);
@@ -3080,7 +3962,8 @@ router.patch('/:id/subtasks/:index/status', async (req: Request, res: Response):
       hasBlocked
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3125,22 +4008,7 @@ router.put('/:id/subtasks/:index', async (req: Request, res: Response): Promise<
     // Authority comes from the authenticated identity only. A request body flag
     // or a client-supplied header is not an authority source.
     const actorRole = getRequestAutomationRole(req);
-    if (newStatus === 'completed' && actorRole !== 'qa' && actorRole !== 'reviewer') {
-      res.status(403).json({ success: false, error: 'Only an independent Verifier identity can complete a subtask' });
-      return;
-    }
-    const role = actorRole;
-
-    // Block agents from using non-agent statuses
-    if (!AGENT_ALLOWED_STATUSES.includes(newStatus) && role === 'agent') {
-      res.status(403).json({
-        success: false,
-        error: `Agents cannot set status to '${newStatus}'. Use ${AGENT_ALLOWED_STATUSES.join(' or ')} instead.`
-      });
-      return;
-    }
-
-    const task = await taskManager.updateSubtaskStatus(id, index, newStatus, role, reviewNote, blockedReason);
+    const task = await taskManager.updateSubtaskStatus(id, index, newStatus, actorRole, reviewNote, blockedReason, requestActor(req));
     
     // Add computed dependency fields
     const taskWithDeps = {
@@ -3152,7 +4020,8 @@ router.put('/:id/subtasks/:index', async (req: Request, res: Response): Promise<
     
     res.json({ success: true, task: taskWithDeps });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3177,7 +4046,7 @@ router.post('/:id/subtasks/:index/approve', async (req: Request, res: Response):
       return;
     }
 
-    const task = await taskManager.approveSubtask(id, index);
+    const task = await taskManager.approveSubtask(id, index, requestActor(req));
     
     // Get subtask summary (always use async version for DB)
     const subtaskSummary = await (taskManager as any).getSubtaskSummaryAsync(id);
@@ -3190,7 +4059,8 @@ router.post('/:id/subtasks/:index/approve', async (req: Request, res: Response):
       allCompleted
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3216,7 +4086,7 @@ router.post('/:id/subtasks/:index/reject', async (req: Request, res: Response): 
       return;
     }
 
-    const task = await taskManager.rejectSubtask(id, index, note);
+    const task = await taskManager.rejectSubtask(id, index, note, requestActor(req));
     
     // Get subtask summary (always use async version for DB)
     const subtaskSummary = await (taskManager as any).getSubtaskSummaryAsync(id);
@@ -3227,7 +4097,8 @@ router.post('/:id/subtasks/:index/reject', async (req: Request, res: Response): 
       subtaskSummary
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3252,7 +4123,7 @@ router.post('/:id/subtasks/:index/skip', async (req: Request, res: Response): Pr
       return;
     }
 
-    const task = await taskManager.skipSubtask(id, index);
+    const task = await taskManager.skipSubtask(id, index, requestActor(req));
     
     const subtaskSummary = await (taskManager as any).getSubtaskSummaryAsync(id);
     const allCompleted = await (taskManager as any).allSubtasksCompletedAsync(id);
@@ -3264,7 +4135,8 @@ router.post('/:id/subtasks/:index/skip', async (req: Request, res: Response): Pr
       allCompleted
     });
   } catch (err) {
-    if (err instanceof NotFoundFault || err instanceof ForbiddenFault) {
+    if (sendReviewEvidenceBusy(res, err)) return;
+    if (err instanceof NotFoundFault || err instanceof ForbiddenFault || err instanceof ConflictFault) {
       res.status(err.status).json({ success: false, code: err.code, error: err.message });
       return;
     }
@@ -3301,6 +4173,7 @@ router.get('/:id/subtasks/summary', async (req: Request, res: Response): Promise
       hasBlocked
     });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error getting subtask summary:', err);
     res.status(500).json({ 
       success: false, 
@@ -3320,24 +4193,29 @@ router.get('/:id/subtasks/summary', async (req: Request, res: Response): Promise
 // route exists, so these literal POST paths cannot be shadowed.
 
 /**
- * POST /notifications/:id/read
- * Mark a notification as read
+ * POST /notifications/:itemKey/read
+ * Mark ONE notification read for THIS principal (card b1e3b16d, hub lane L2).
+ * `:itemKey` is the item key the history returned (it is not a Task id, so it
+ * is not named `:id`, which the Task id guard above covers). An item the
+ * caller cannot see is answered exactly as an absent one, and nobody else's
+ * read state moves.
  */
-router.post('/notifications/:id/read', async (req: Request, res: Response): Promise<void> => {
+router.post('/notifications/:itemKey/read', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { id } = req.params;
-    const success = await notificationManager.markAsRead(id);
-    
-    if (!success) {
-      res.status(404).json({ success: false, error: 'Notification not found' });
+    const { itemKey: id } = req.params;
+    const viewer = notificationViewer(req as AuthRequest);
+    if (!viewer) { sendPrincipalRequired(res); return; }
+    const marked = ITEM_KEY_PATTERN.test(id) && await notificationHistoryService.markRead(viewer, id);
+    if (!marked) {
+      sendApiError(res, 404, 'NOTIFICATION_NOT_FOUND', 'Notification not found');
       return;
     }
-    
     res.json({ success: true });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error marking notification as read:', err);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: 'The notification could not be marked read',
       code: 'NOTIFICATION_MARK_READ_FAILED',
       errorId
@@ -3347,16 +4225,26 @@ router.post('/notifications/:id/read', async (req: Request, res: Response): Prom
 
 /**
  * POST /notifications/read-all
- * Mark all notifications as read
+ * Mark everything read for THIS principal, within `?type=` and `?who=` (the
+ * same grammar and the same default as the history read). Filtered, it writes
+ * one read row per visible unread item under the filter; unfiltered (`who=all`,
+ * every type) it moves this principal's read mark to now. It never touches a
+ * row the caller cannot see under the filter, nor another principal's state.
  */
-router.post('/notifications/read-all', async (_req: Request, res: Response): Promise<void> => {
+router.post('/notifications/read-all', async (req: Request, res: Response): Promise<void> => {
   try {
-    const count = await notificationManager.markAllAsRead();
+    const source = { ...(req.body && typeof req.body === 'object' ? req.body : {}), ...(req.query as Record<string, unknown>) };
+    const filters = parseNotificationFilters(source);
+    if ('error' in filters) { sendApiError(res, 400, 'INVALID_NOTIFICATION_FILTER', filters.error); return; }
+    const viewer = notificationViewer(req as AuthRequest);
+    if (!viewer) { sendPrincipalRequired(res); return; }
+    const count = await notificationHistoryService.markAllRead(viewer, filters);
     res.json({ success: true, markedCount: count });
   } catch (err) {
+    if (sendReviewEvidenceBusy(res, err)) return;
     const errorId = logCaughtFailure('[Tasks API] Error marking all notifications as read:', err);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: 'Notifications could not be marked read',
       code: 'NOTIFICATIONS_MARK_READ_FAILED',
       errorId

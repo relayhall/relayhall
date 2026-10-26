@@ -18,6 +18,7 @@ import '@testing-library/jest-dom/vitest';
 import AccessVehiclePicker from './AccessVehiclePicker';
 import TaskAccessVehicle from './TaskAccessVehicle';
 import { authenticatedFetch } from '../../utils/auth';
+import { formatDateTime, formatInstantUtc } from '../../utils/dateFormat';
 
 vi.mock('../../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
 
@@ -160,5 +161,56 @@ describe('TaskAccessVehicle — the R5 task → its vehicle linkage', () => {
     render(<TaskAccessVehicle taskId="t1" />);
     await screen.findByText(/Runner/);
     expect(screen.queryByText(/pre-existing/i)).not.toBeInTheDocument();
+  });
+
+  // AZ-A10 clauses 6 and 8 (card 785e1eed P2-B): each grant row says when the
+  // access it carries ends, in the house format, with the instant in UTC as its
+  // title. Expired is the server's answer, never this browser's clock.
+  const AT = '2026-11-10T17:00:00.000000Z';
+  const LATER = '2027-01-10T17:00:00.000000Z';
+
+  it('shows when a grant row expires, in the house format, with the UTC instant as its title', async () => {
+    fetchMock.mockImplementation(() => ok({
+      assignment, links: [{ ...grantLink, roleGrantExpiresAt: AT, expiresAt: AT, expired: false }],
+    }));
+    render(<TaskAccessVehicle taskId="t1" />);
+    const expiry = await screen.findByText(`expires ${formatDateTime(AT)}`);
+    expect(expiry).toHaveAttribute('title', formatInstantUtc(AT));
+  });
+
+  it('says "until the Task ends" for an unlimited row this assignment created, and "expired" when the server says so', async () => {
+    fetchMock.mockImplementation(() => ok({
+      assignment,
+      links: [
+        { ...grantLink, id: 'l1', roleGrantExpiresAt: null, expiresAt: null, expired: false },
+        { ...grantLink, id: 'l2', resourceId: 'bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee', roleGrantExpiresAt: AT, expiresAt: AT, expired: true },
+      ],
+    }));
+    render(<TaskAccessVehicle taskId="t1" />);
+    expect(await screen.findByText('until the Task ends')).toBeInTheDocument();
+    expect(screen.getByText(`expired ${formatDateTime(AT)}`)).toBeInTheDocument();
+  });
+
+  it('names the date this assignment set when a shared row runs later, and an owner-plane row without a date as such', async () => {
+    fetchMock.mockImplementation(() => ok({
+      assignment,
+      links: [
+        { ...grantLink, id: 'l1', roleGrantExpiresAt: AT, expiresAt: LATER, expired: false },
+        { ...grantLink, id: 'l2', createdByAssignment: false, roleGrantExpiresAt: AT, expiresAt: null, expired: false },
+      ],
+    }));
+    render(<TaskAccessVehicle taskId="t1" />);
+    expect(await screen.findByText(`expires ${formatDateTime(LATER)} (this assignment set ${formatDateTime(AT)})`)).toBeInTheDocument();
+    expect(screen.getByText(`no expiry date (this assignment set ${formatDateTime(AT)})`)).toBeInTheDocument();
+  });
+
+  it('shows no expiry on a profile row, which a Warrant carries', async () => {
+    fetchMock.mockImplementation(() => ok({
+      assignment: { ...assignment, carriedBy: 'warrant', warrantName: 'Phase 3 delivery', warrantStatus: 'active' },
+      links: [{ ...grantLink, carriedBy: 'warrant', targetKind: 'profile_assignment', profileName: 'Delivery set', roleGrantExpiresAt: null, expiresAt: null }],
+    }));
+    const { container } = render(<TaskAccessVehicle taskId="t1" />);
+    await screen.findByText(/Phase 3 delivery/);
+    expect(container.querySelector('.access-vehicle-expiry')).toBeNull();
   });
 });

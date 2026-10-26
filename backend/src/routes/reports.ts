@@ -1,11 +1,18 @@
+import { ForbiddenFault } from '../utils/httpErrors';
 import { logCaughtFailure } from '../utils/secretSafeLog';
-import { idempotent } from '../middleware/idempotency';
+import { idempotent, lockReportCreateReceipt, prepareReportCreateResponse } from '../middleware/idempotency';
+import { actorFromRequest } from '../middleware/sharedAuthorization';
+import { auditActorFromRequest } from '../utils/auditActor';
+import { runCreationTransaction } from '../db/creationTransaction';
+import { pool } from '../db/connection';
+import { grantService, GrantError } from '../services/GrantService';
 // reports.ts - API endpoints for reports/notes management
 import { Router, Request, Response } from 'express';
 import { filterVisiblePromotions, filterVisibleReports } from '../services/ReportVisibility';
 import type { AuthRequest } from '../middleware/auth';
 import { reportManager, REPORT_TEXT_LIMITS } from '../services/ReportManager';
 import { rejectInvalidReportIdParam } from '../utils/reportIds';
+import type { FeedActorRef } from '../services/FeedEventService';
 import { validateBody, BodySchema } from '../middleware/validate';
 import { isStringTooLongError, sendStringTooLongError } from '../utils/apiErrors';
 import {
@@ -18,7 +25,20 @@ interface AuthedRequest extends AuthRequest {
   userId?: string;
 }
 
+/** The acting principal a report write's feed row records (card 5854f0d6). */
+function reportActor(req: Request): FeedActorRef {
+  const auth = req as AuthRequest;
+  return { principalId: auth.principal?.id ?? null, handle: auth.principal?.handle ?? auth.userId ?? null };
+}
+
 const router = Router();
+
+function sendFlatReviewContention(res: Response, error: unknown): boolean {
+  if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'PZ001') return false;
+  res.status(409).json({ success: false, code: 'FLAT_REVIEW_EVIDENCE_BUSY',
+    error: 'A flat Task review is using this Report; retry the Report write after the review transaction' });
+  return true;
+}
 
 // The three narrowings that decide which Reports a caller may see moved into
 // `services/ReportVisibility` (card 72258a60), because the dashboard's
@@ -194,17 +214,15 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
       include_deleted,
       status: status as 'active' | 'archived' | undefined,
       include_archived,
-    });
-    const reports = await filterVisibleReports(req as AuthRequest, result.reports);
+    }, (rows) => filterVisibleReports(req as AuthRequest, rows));
 
+    // Recheck fetched content: visibility may change after the count/page decision.
+    const reports = await filterVisibleReports(req as AuthRequest, result.reports);
     res.json({
       success: true,
       reports,
-      total: reports.length,
-      // Filtering after a bounded source page cannot honestly claim the
-      // caller has another visible page. A future SQL adapter may restore
-      // cursor pagination without leaking hidden-row counts.
-      hasMore: false,
+      total: result.total,
+      hasMore: result.hasMore,
     });
   } catch (err) {
     const errorId = logCaughtFailure('[Reports API] Error listing reports:', err);
@@ -272,7 +290,11 @@ router.post('/', idempotent('report.create'), validateReportBody, async (req: Re
       return;
     }
 
-    const report = await reportManager.create({
+    if (origin === 'task-report') {
+      res.status(400).json({ success: false, code: 'TASK_REPORT_ROUTE_REQUIRED', error: 'Create task-bound Reports through the Task workflow' });
+      return;
+    }
+    const data = {
       title,
       content,
       summary,
@@ -286,11 +308,36 @@ router.post('/', idempotent('report.create'), validateReportBody, async (req: Re
       visibility,
       handover: parsedHandover.present ? parsedHandover.value : undefined,
       pinned,
-    });
-
-    res.status(201).json({ success: true, report });
+    };
+    const auth = req as AuthRequest;
+    // Keep legacy identity compatibility; the canonical policy never guesses
+    // a principal from a display handle or a caller-supplied author field.
+    if (!auth.principal) {
+      const report = await reportManager.create(data, reportActor(req));
+      res.status(201).json({ success: true, report });
+      return;
+    }
+    if (['task-stream', 'native-execution', 'native-review'].includes(origin)) {
+      res.status(400).json({ success: false, code: 'REPORT_ORIGIN_ROUTE_REQUIRED', error: 'Create execution evidence through its dedicated workflow' });
+      return;
+    }
+    const authorization = auth.authorizationActor ?? actorFromRequest(auth);
+    const audit = auditActorFromRequest(auth);
+    const publish = await runCreationTransaction(pool, {
+      principalId: authorization.principalId ?? null,
+      handle: audit.handle, authorization,
+      authMethod: audit.authMethod, credentialId: audit.credentialId,
+    }, async transaction => {
+      await lockReportCreateReceipt(req, res, transaction.client);
+      const report = await reportManager.create(data, transaction);
+      await grantService.createForReportCreator(transaction.client, report.id, authorization, audit);
+      return prepareReportCreateResponse(res, transaction.client, { success: true, report });
+    }, 'ordinary', { isolation: 'read-committed' });
+    publish();
   } catch (err) {
+    if (err instanceof GrantError) { res.status(err.status).json({ success: false, code: err.code, error: err.message }); return; }
     if (isStringTooLongError(err)) { sendStringTooLongError(res, 'report', err); return; }
+    if (sendFlatReviewContention(res, err)) return;
     const errorId = logCaughtFailure('[Reports API] Error creating report:', err);
     res.status(500).json({
       success: false,
@@ -318,7 +365,7 @@ router.patch('/:id', validateReportBody, async (req: Request, res: Response): Pr
     delete updates.author_unverified; // response-only alias of author
     if (parsedHandover.present) updates.handover = parsedHandover.value;
 
-    const report = await reportManager.update(req.params.id, updates);
+    const report = await reportManager.update(req.params.id, updates, reportActor(req));
     if (!report) {
       res.status(404).json({ success: false, error: 'Report not found' });
       return;
@@ -326,6 +373,10 @@ router.patch('/:id', validateReportBody, async (req: Request, res: Response): Pr
 
     res.json({ success: true, report });
   } catch (err) {
+    if (err instanceof Error && err.message === 'TASK_REPORT_ROUTE_REQUIRED') {
+      res.status(409).json({ success: false, code: 'TASK_REPORT_ROUTE_REQUIRED', error: 'Maintain this Report through its Task; handed-over Reports are read-only' });
+      return;
+    }
     if (err instanceof Error && err.message === 'REPORT_ARCHIVED') {
       res.status(409).json({
         success: false,
@@ -335,6 +386,7 @@ router.patch('/:id', validateReportBody, async (req: Request, res: Response): Pr
       return;
     }
     if (isStringTooLongError(err)) { sendStringTooLongError(res, 'report', err); return; }
+    if (sendFlatReviewContention(res, err)) return;
     const errorId = logCaughtFailure('[Reports API] Error updating report:', err);
     res.status(500).json({
       success: false,
@@ -353,13 +405,14 @@ router.patch('/:id', validateReportBody, async (req: Request, res: Response): Pr
 router.post('/:id/archive', async (req: Request, res: Response): Promise<void> => {
   if (rejectInvalidReportIdParam(req.params.id, res)) return;
   try {
-    const report = await reportManager.archive(req.params.id);
+    const report = await reportManager.archive(req.params.id, reportActor(req));
     if (!report) {
       res.status(404).json({ success: false, error: 'Report not found or not active' });
       return;
     }
     res.json({ success: true, report });
   } catch (err) {
+    if (sendFlatReviewContention(res, err)) return;
     const errorId = logCaughtFailure('[Reports API] Error archiving report:', err);
     res.status(500).json({
       success: false,
@@ -377,13 +430,14 @@ router.post('/:id/archive', async (req: Request, res: Response): Promise<void> =
 router.post('/:id/unarchive', async (req: Request, res: Response): Promise<void> => {
   if (rejectInvalidReportIdParam(req.params.id, res)) return;
   try {
-    const report = await reportManager.unarchive(req.params.id);
+    const report = await reportManager.unarchive(req.params.id, reportActor(req));
     if (!report) {
       res.status(404).json({ success: false, error: 'Report not found or not archived' });
       return;
     }
     res.json({ success: true, report });
   } catch (err) {
+    if (sendFlatReviewContention(res, err)) return;
     const errorId = logCaughtFailure('[Reports API] Error unarchiving report:', err);
     res.status(500).json({
       success: false,
@@ -397,23 +451,23 @@ router.post('/:id/unarchive', async (req: Request, res: Response): Promise<void>
 /**
  * DELETE /reports/:id
  * Soft delete (tombstone) by default. ?hard=true destroys the row and is
- * restricted to the dashboard_user identity.
+ * restricted to verified account control or the legacy dashboard identity.
  */
 router.delete('/:id', async (req: Request, res: Response): Promise<void> => {
   if (rejectInvalidReportIdParam(req.params.id, res)) return;
   try {
     const hard = req.query.hard === 'true';
-    if (hard && (req as AuthedRequest).userId !== 'dashboard_user') {
-      res.status(403).json({
-        success: false,
-        error: 'hard delete is restricted to the dashboard user; omit ?hard=true for a soft delete',
-        code: 'HARD_DELETE_FORBIDDEN',
-      });
-      return;
+    const auth = req as AuthRequest;
+    if (hard && !auth.principal?.id && auth.userId !== 'dashboard_user') {
+      res.status(403).json({ success: false, code: 'HARD_DELETE_FORBIDDEN',
+        error: 'Hard delete requires account owner or authorized Main control' }); return;
     }
-
     const deleted = hard
-      ? await reportManager.hardDelete(req.params.id)
+      ? await reportManager.hardDelete(req.params.id, ...(auth.principal?.id ? [{
+          principalId: auth.principal.id, handle: auth.userId ?? '',
+          authMethod: auth.authMethod, credentialId: auth.credentialId, sessionId: auth.sessionId,
+          authorization: actorFromRequest(auth),
+        }] : []))
       : await reportManager.softDelete(req.params.id);
     if (!deleted) {
       res.status(404).json({ success: false, error: 'Report not found' });
@@ -421,6 +475,8 @@ router.delete('/:id', async (req: Request, res: Response): Promise<void> => {
     }
     res.json({ success: true, mode: hard ? 'hard' : 'soft' });
   } catch (err) {
+    if (err instanceof ForbiddenFault) { res.status(err.status).json({ success: false, code: err.code, error: err.message }); return; }
+    if (sendFlatReviewContention(res, err)) return;
     const errorId = logCaughtFailure('[Reports API] Error deleting report:', err);
     res.status(500).json({
       success: false,

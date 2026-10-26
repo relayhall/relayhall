@@ -5,13 +5,7 @@ import './connections.css';
  * The scopes editor (owner design record 99d6b0ad decision 1 and §3.1
  * "Advanced tab: scopes editor").
  *
- * ONE implementation, two callers: the *narrow it* disclosure in wizard step 1
- * and the Advanced tab of an existing connection. The wizard sends what this
- * returns as `issueCredential.scopes`; the Advanced tab shows it read-only,
- * because narrowing a LIVE credential is not something a credential rotation
- * may do (AUTHZ §7.3: rotation is an exact copy, and a rotation request
- * carrying a scope change is refused) — narrowing happens by making a narrower
- * connection, which is what the panel says.
+ * Used by connection creation and the in-place credential permissions editor.
  *
  * THE CEILING IS WHAT THE SESSION MAY DELEGATE. `POST /services` refuses
  * `ISSUE_EXCEEDS_SESSION` for anything outside the caller's current effective
@@ -27,7 +21,7 @@ export interface ScopeNarrowingProps {
   available: string[];
   selected: string[];
   onChange?: (next: string[]) => void;
-  /** True on the Advanced tab, where the set is what a credential already has. */
+  /** True when the caller only displays the set or an edit is pending. */
   readOnly?: boolean;
   idPrefix: string;
   /**

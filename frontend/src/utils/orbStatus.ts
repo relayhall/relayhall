@@ -77,7 +77,7 @@ export function attachOrbStatusForwarder(iframe: HTMLIFrameElement): () => void 
   };
 
   const onReady = (event: MessageEvent) => {
-    if (event.source !== iframe.contentWindow) return;
+    if (event.source !== iframe.contentWindow || event.origin !== window.location.origin) return;
     if (event.data && typeof event.data === 'object' && event.data.type === 'orb-ready') {
       post();
     }

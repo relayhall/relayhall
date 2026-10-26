@@ -5,7 +5,7 @@ import { authorizationService, type AuthorizationActor, type AuthorizationAction
 import { auditService, type AuditActor } from './AuditService';
 import { BlueprintError, blueprintDigests, validateBlueprintDocument, stableBlueprintJson,
   type BlueprintBodyConfiguration, type BlueprintDocument } from '../utils/blueprintDocument';
-import type { RequiredScope } from '../utils/scopeMap';
+import { scopesNamedByDenial, type RequiredScope } from '../utils/scopeMap';
 
 export interface BlueprintReader {
   actor: AuthorizationActor;
@@ -17,7 +17,13 @@ export function blueprintScope(caller: BlueprintReader, scope: RequiredScope): b
   return authorizationService.authorizeRoute(caller.actor, scope).allowed;
 }
 export function requireBlueprintScope(caller: BlueprintReader, scope: RequiredScope): void {
-  if (!blueprintScope(caller, scope)) throw new BlueprintError(403, 'SCOPE_REQUIRED', `Required scope: ${scope}`);
+  const decision = authorizationService.authorizeRoute(caller.actor, scope);
+  if (decision.allowed) return;
+  // The prose is unchanged. The scope also rides as data (details.requiredScopes)
+  // only when its absence is the whole reason: a role ceiling or an
+  // unauthenticated caller names nothing (scopesNamedByDenial).
+  throw new BlueprintError(403, 'SCOPE_REQUIRED', `Required scope: ${scope}`, undefined,
+    scopesNamedByDenial(scope, decision.denial));
 }
 export function blueprintNotFound(): never { throw new BlueprintError(404, 'BLUEPRINT_NOT_FOUND', 'Blueprint not found'); }
 export class BlueprintRegistryService {

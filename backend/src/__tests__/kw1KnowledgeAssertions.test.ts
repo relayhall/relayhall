@@ -67,7 +67,7 @@ beforeEach(() => {
  * own authority arms are drilled in the plane suite; here the request is
  * arranged so every arm passes and the evaluation is what we need.
  */
-async function mintedEvaluation(overrides: Record<string, unknown> = {}) {
+async function mintedEvaluation(overrides: Record<string, unknown> = {}, requestOverrides: Record<string, unknown> = {}) {
   const evaluator = await import('../services/KnowledgeArmEvaluator');
   const repo = await import('../services/AuthorizationRepository');
   // Admit whatever ids the evaluator asks about: the authority arms are
@@ -78,7 +78,7 @@ async function mintedEvaluation(overrides: Record<string, unknown> = {}) {
   jest.spyOn(repo.authorizationRepository, 'selectorCoveredIds')
     .mockImplementation(async (_a, _t, ids) => new Set(ids.map(String)));
   const req = {
-    principal: { id: ACCOUNT_ID, role: 'user' },
+    principal: { id: ACCOUNT_ID, role: 'user', kind: 'human', status: 'active', parentPrincipalId: null },
     userId: 'holder',
     credentialId: 'cred-1',
     scopes: ['knowledge-contents:read'],
@@ -91,7 +91,7 @@ async function mintedEvaluation(overrides: Record<string, unknown> = {}) {
       delegation: null,
     },
   };
-  return evaluator.evaluateKnowledgeArms(req as never, {
+  return evaluator.evaluateKnowledgeArms({ ...req, ...requestOverrides } as never, {
     id: SOURCE_ID,
     slug: 'engine',
     status: 'published',
@@ -289,7 +289,7 @@ describe('§5.2 — the header and payload are the ratified shape', () => {
 
 // ══════════════════ the jti seen-set, at its true strength ════════════════
 
-describe('§5.2 / sol R1-7 — core never emits a colliding `jti`', () => {
+describe('§5.2 / review R1-7 — core never emits a colliding `jti`', () => {
   it('records every emitted jti and refuses a collision', async () => {
     const arms = await mintedEvaluation();
     await signKnowledgeAssertion({ armEvaluation: arms as never, issuer: 'i', callerGroupIds: [] });
@@ -313,7 +313,7 @@ describe('§5.2 / sol R1-7 — core never emits a colliding `jti`', () => {
   });
 
   it('states the bound HONESTLY: emission, not replay detection', () => {
-    // sol R1-7. Replay at a relying source is bounded by TTL + channel auth.
+    // review R1-7. Replay at a relying source is bounded by TTL + channel auth.
     // Claiming otherwise is the overclaim the design refused, so the claim is
     // pinned where a future reader will meet it.
     const migration = readShippedSource('migrations/115_knowledge_assertion_jti.sql');
@@ -385,4 +385,69 @@ describe('§10.2 / D8 — the JWKS serves public keys only', () => {
     const route = readShippedSource('routes/knowledgeJwks.ts');
     expect(route).toContain('res.json({ keys: [] });');
   });
+});
+
+
+describe('delegated knowledge Account subject', () => {
+  const child = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const delegated = () => ({
+    principal: { id: child, kind: 'service', status: 'active', parentPrincipalId: ACCOUNT_ID },
+    authorizationActor: { principalId: child, authenticated: true, scopes: ['knowledge-contents:read'], delegation: null },
+    delegationLinks: [
+      { principalId: child, kind: 'service', parentPrincipalId: ACCOUNT_ID },
+      { principalId: ACCOUNT_ID, kind: 'human', parentPrincipalId: null },
+    ],
+  });
+  it('signs the same pairwise Account subject for human and delegated connector, retaining acting authorization', async () => {
+    const direct = await mintedEvaluation();
+    const childArms = await mintedEvaluation({}, delegated());
+    expect(childArms?.accountPrincipalId).toBe(ACCOUNT_ID);
+    const options = { issuer: 'https://board.example/api', callerGroupIds: [] };
+    const a = decode(await signKnowledgeAssertion({ ...options, armEvaluation: direct as never }));
+    const b = decode(await signKnowledgeAssertion({ ...options, armEvaluation: childArms as never }));
+    expect(b.claims.sub).toBe(a.claims.sub);
+    const repo = await import('../services/AuthorizationRepository');
+    expect(repo.authorizationRepository.authorizedIds).toHaveBeenLastCalledWith(expect.objectContaining({ principalId: child }), 'service', [SOURCE_ID], 'read');
+  });
+  it.each(['missing', 'empty', 'wrong-acting', 'broken-parent', 'cycle', 'non-account-terminal', 'inactive-acting'])('refuses malformed/unresolved delegation: %s', async (mode) => {
+    const req = delegated();
+    if (mode === 'missing') delete (req as Partial<typeof req>).delegationLinks;
+    if (mode === 'empty') req.delegationLinks = [];
+    if (mode === 'wrong-acting') req.delegationLinks[0].principalId = ACCOUNT_ID;
+    if (mode === 'broken-parent') req.delegationLinks[0].parentPrincipalId = 'other';
+    if (mode === 'cycle') req.delegationLinks[1].principalId = child;
+    if (mode === 'non-account-terminal') req.delegationLinks[1].kind = 'agent';
+    if (mode === 'inactive-acting') req.principal.status = 'disabled';
+    expect(await mintedEvaluation({}, req)).toBeNull();
+  });
+  it('resolves the terminal Account through a validated Agent/Connector chain', async () => {
+    const req = delegated();
+    const agent = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    req.principal = { id: agent, kind: 'agent', status: 'active', parentPrincipalId: child };
+    req.authorizationActor.principalId = agent;
+    req.delegationLinks.unshift({ principalId: agent, kind: 'agent', parentPrincipalId: child });
+    expect((await mintedEvaluation({}, req))?.accountPrincipalId).toBe(ACCOUNT_ID);
+  });
+
+  it('queries relevant membership for the resolved Account, never its Connector', async () => {
+    const { callerGroupIds } = await import('../routes/knowledge');
+    (pool.query as jest.Mock).mockResolvedValue({ rows: [{ group_id: 'group-1' }] });
+    expect(await callerGroupIds(delegated() as never)).toEqual(['group-1']);
+    expect(pool.query).toHaveBeenLastCalledWith(expect.stringContaining('gm.account_principal_id = $1'), [ACCOUNT_ID]);
+    (pool.query as jest.Mock).mockClear();
+    expect(await callerGroupIds({ ...delegated(), delegationLinks: [] } as never)).toEqual([]);
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it('resolves a Connector owned by a service Account without inventing source membership', async () => {
+    const req = delegated();
+    req.delegationLinks[1].kind = 'service';
+    const arms = await mintedEvaluation({}, req);
+    expect(arms?.accountPrincipalId).toBe(ACCOUNT_ID);
+    const assertion = decode(await signKnowledgeAssertion({ armEvaluation: arms as never, issuer: 'https://board.example/api', callerGroupIds: [] }));
+    const direct = await mintedEvaluation({}, { principal: { id: ACCOUNT_ID, kind: 'service', status: 'active', parentPrincipalId: null } });
+    const expected = decode(await signKnowledgeAssertion({ armEvaluation: direct as never, issuer: 'https://board.example/api', callerGroupIds: [] }));
+    expect(assertion.claims.sub).toBe(expected.claims.sub);
+  });
+
 });

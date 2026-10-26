@@ -6,13 +6,26 @@ import {
   BarChart3,
   Wrench,
   GraduationCap,
-  Radio,
+  Inbox,
   Briefcase,
   ClipboardList,
   Bot,
   BookOpen,
+  Network,
+  UsersRound,
+  Users,
+  KeyRound,
+  SlidersHorizontal,
+  ShieldCheck,
   LucideIcon
 } from 'lucide-react';
+import { MEMBER_ONLY, type MyLenses } from '../types/lenses';
+import {
+  settingsEntryVisible,
+  settingsNavEntries,
+  type SettingsNavAudience,
+  type SettingsNavEntryId,
+} from './settingsNavigation';
 
 /**
  * Navigation configuration - Single source of truth for all navigation items.
@@ -20,7 +33,17 @@ import {
  */
 
 /** Sidebar menu group identifiers */
-export type NavGroup = 'main' | 'workspace';
+export type NavGroup = 'main' | 'workspace' | 'administration';
+
+/**
+ * Which lens OFFERS an entry (RH-LENSES-d, card 4e159741; design 96f0bd3d
+ * s8.4). `member` is every signed-in person; `admin` is a root LOGIN SESSION,
+ * as `GET /principals/me/lenses` decides it; `manager` (LENSES-c c1-B, card
+ * b5c83682; design delta C.8) is a holder of a live owner or manager role in a
+ * Group. A lens decides only whether the entry is RENDERED: every page behind
+ * it keeps its own server ceiling.
+ */
+export type NavLens = 'member' | 'manager' | 'admin';
 
 export interface NavItem {
   /** Unique identifier for the nav item */
@@ -41,6 +64,15 @@ export interface NavItem {
   order: number;
   /** Sidebar group — 'main' (always visible) or 'workspace' (collapsible) */
   group: NavGroup;
+  /** The lens that offers it; absent means `member`. */
+  lens?: NavLens;
+  /**
+   * The Settings entry this destination IS, when it is one. A lens is
+   * NECESSARY, NEVER SUFFICIENT (design s8.4 rule 2): such an entry is offered
+   * only when the Settings shell would also show it to this session, which is
+   * the Access-surface arm's own answer (`settingsSurfaces`).
+   */
+  settingsEntry?: SettingsNavEntryId;
 }
 
 /** Group metadata for rendering collapsible sections */
@@ -66,6 +98,9 @@ export const navGroups: NavGroupMeta[] = [
   // capability word would be false about the last two); the owner can replace
   // this one string without touching anything else.
   { id: 'workspace', label: 'More', icon: Briefcase, collapsible: true, defaultCollapsed: false, order: 1 },
+  // RH-LENSES-d: the admin lens's sections (design 96f0bd3d s8.4; owner design
+  // record 99d6b0ad s3.3). Rendered only for a session the server names admin.
+  { id: 'administration', label: 'Administration', icon: ShieldCheck, collapsible: true, defaultCollapsed: false, order: 2 },
 ];
 
 /**
@@ -73,6 +108,7 @@ export const navGroups: NavGroupMeta[] = [
  * Add new pages here and they'll automatically appear in both sidebar and hero.
  */
 export const navigationItems: NavItem[] = [
+  { id: 'knowledge', path: '/knowledge', label: 'Knowledge', icon: BookOpen, showInSidebar: true, showInHero: false, order: 5, group: 'main' },
   // === Main group (always visible, not collapsible) ===
   {
     id: 'dashboard',
@@ -84,11 +120,15 @@ export const navigationItems: NavItem[] = [
     order: 0,
     group: 'main',
   },
+  // Owner ruling E453: the Action Center, directly under Dashboard. It holds
+  // Notifications (Needs your action), the Timeline, Approvals, My requests
+  // and Agent sessions, which left the menu for its tab (`/sessions` is an
+  // alias of that tab).
   {
-    id: 'sessions',
-    path: '/sessions',
-    label: 'Agent sessions',
-    icon: Radio,
+    id: 'action-center',
+    path: '/action-center',
+    label: 'Action Center',
+    icon: Inbox,
     showInSidebar: true,
     showInHero: true,
     order: 1,
@@ -124,6 +164,14 @@ export const navigationItems: NavItem[] = [
     showInHero: true,
     order: 4,
     group: 'main',
+  },
+  // LENSES-c c1-B (card b5c83682; design delta C.8, v7 s8.4 "My team"): the
+  // manager lens's one section - each Group the person live-stewards, its
+  // members, its roles and its team grants, and, for an owner, appointing and
+  // removing managers with a step-up. Every request it makes keeps its route.
+  {
+    id: 'team', path: '/team', label: 'My team', icon: UsersRound,
+    showInSidebar: true, showInHero: false, order: 6, group: 'main', lens: 'manager',
   },
   // === Workspace group (collapsible) ===
   {
@@ -189,22 +237,78 @@ export const navigationItems: NavItem[] = [
     order: 10,
     group: 'workspace',
   },
+  // === Administration group (the admin lens; RH-LENSES-d) ===
+  // Directory: Identity providers, their sync health and the remote-group
+  // catalog. Groups: board Groups, their directory binding and the featured
+  // flag. People, Access and Advanced are the Settings pages that already
+  // administer those things, offered here only when Settings would show them.
+  {
+    id: 'admin-directory', path: '/directory', label: 'Directory', icon: Network,
+    showInSidebar: true, showInHero: false, order: 20, group: 'administration', lens: 'admin',
+  },
+  {
+    id: 'admin-groups', path: '/groups', label: 'Groups', icon: UsersRound,
+    showInSidebar: true, showInHero: false, order: 21, group: 'administration', lens: 'admin',
+  },
+  {
+    id: 'admin-people', path: '/settings/principals', label: 'People', icon: Users,
+    showInSidebar: true, showInHero: false, order: 22, group: 'administration', lens: 'admin', settingsEntry: 'identities',
+  },
+  {
+    id: 'admin-access', path: '/settings/access', label: 'Access', icon: KeyRound,
+    showInSidebar: true, showInHero: false, order: 23, group: 'administration', lens: 'admin', settingsEntry: 'access-grants',
+  },
+  {
+    id: 'admin-advanced', path: '/settings/access-manager', label: 'Advanced', icon: SlidersHorizontal,
+    showInSidebar: true, showInHero: false, order: 24, group: 'administration', lens: 'admin', settingsEntry: 'access-manager',
+  },
 ];
+
+/**
+ * Who the sidebar is drawn for: the server's lens answer and the Settings
+ * shell's own audience. The default is a member whose Settings surfaces are
+ * unknown, which is the narrowest navigation there is.
+ */
+export interface NavAudience {
+  lenses: MyLenses;
+  settings: SettingsNavAudience;
+}
+
+export const MEMBER_AUDIENCE: NavAudience = {
+  lenses: MEMBER_ONLY,
+  settings: { surfaces: null, canManage: false },
+};
+
+/**
+ * Is this entry OFFERED to this audience? The lens first (an `admin` entry
+ * needs the admin lens), then, for an entry that is a Settings page, the
+ * Access-surface arm's answer for that page. Both must hold: the lens is
+ * necessary, never sufficient.
+ */
+export function navItemOffered(item: NavItem, audience: NavAudience = MEMBER_AUDIENCE): boolean {
+  if ((item.lens ?? 'member') === 'admin' && !audience.lenses.admin) return false;
+  if (item.lens === 'manager' && !audience.lenses.lenses.includes('manager')) return false;
+  if (item.settingsEntry) {
+    const entry = settingsNavEntries.find((candidate) => candidate.id === item.settingsEntry);
+    if (!entry || !settingsEntryVisible(entry, audience.settings)) return false;
+  }
+  return true;
+}
 
 /**
  * Get navigation items for sidebar (filtered and sorted)
  */
-export const getSidebarNavItems = (): NavItem[] => {
+export const getSidebarNavItems = (audience: NavAudience = MEMBER_AUDIENCE): NavItem[] => {
   return navigationItems
-    .filter(item => item.showInSidebar)
+    .filter(item => item.showInSidebar && navItemOffered(item, audience))
     .sort((a, b) => a.order - b.order);
 };
 
 /**
  * Get sidebar items grouped by their NavGroup
  */
-export const getSidebarGroups = (): { group: NavGroupMeta; items: NavItem[] }[] => {
-  const sidebarItems = getSidebarNavItems();
+export const getSidebarGroups = (audience: NavAudience = MEMBER_AUDIENCE): { group: NavGroupMeta; items: NavItem[] }[] => {
+  const sidebarItems = getSidebarNavItems(audience);
   return navGroups
     .sort((a, b) => a.order - b.order)
     .map(group => ({
@@ -219,7 +323,7 @@ export const getSidebarGroups = (): { group: NavGroupMeta; items: NavItem[] }[] 
  */
 export const getHeroNavItems = (): NavItem[] => {
   return navigationItems
-    .filter(item => item.showInHero)
+    .filter(item => item.showInHero && (item.lens ?? 'member') === 'member')
     .sort((a, b) => a.order - b.order);
 };
 

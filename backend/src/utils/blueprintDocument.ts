@@ -33,7 +33,10 @@ export function effectiveBlueprintCap(configuration: BlueprintBodyConfiguration)
   return Math.max(0, Math.min(currentBlueprintLimits().documentBytes, configuration.limit - BLUEPRINT_CAPS.envelopeBytes));
 }
 export class BlueprintError extends Error {
-  constructor(public status: number, public code: string, message: string, public field?: string) { super(message); }
+  /** `requiredScopes` is set only by a refusal whose cause is a missing scope
+   * (`requireBlueprintScope`); the route serialises it as `details.requiredScopes`. */
+  constructor(public status: number, public code: string, message: string, public field?: string,
+    public requiredScopes?: readonly string[]) { super(message); }
 }
 const fail = (field: string, message: string): never => { throw new BlueprintError(422, 'BLUEPRINT_DOCUMENT_REFUSED', message, field); };
 type RecordValue = { [key: string]: any };
@@ -68,6 +71,17 @@ export function credentialShaped(value: unknown): boolean {
   if (typeof value === 'string') return SECRET.test(value);
   if (Array.isArray(value)) return value.some(credentialShaped);
   return value !== null && typeof value === 'object' && Object.entries(value).some(([k, v]) => CREDENTIAL_WORD.test(k) || credentialShaped(v));
+}
+/**
+ * The credential VALUE shape alone (card bedf50cc, plugin settings): the same
+ * SECRET pattern over every string inside a value, and never a word match on a
+ * key name, so a setting called `token-sort` is accepted while a value that
+ * looks like an `rh_` credential is refused.
+ */
+export function credentialValueShaped(value: unknown): boolean {
+  if (typeof value === 'string') return SECRET.test(value);
+  if (Array.isArray(value)) return value.some(credentialValueShaped);
+  return value !== null && typeof value === 'object' && Object.values(value).some(credentialValueShaped);
 }
 export function stableBlueprintJson(value: any): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -226,7 +240,7 @@ export function validateBlueprintDocument(input: unknown, configuration: Bluepri
   const key = (row: RecordValue, f: string) => { slug(row.key, f + '.key'); if (keys.has(row.key)) fail(f, 'Duplicate local key'); keys.add(row.key); };
   for (const p of d.phases) { object(p, ['key', 'name', 'goal', 'position', 'status'], ['key', 'name'], 'phases'); key(p, 'phases'); text(p.name, 'phases.name', 200, 1); optionalText(p, ['goal'], 'phases'); if (p.status) choice(p.status, ['todo', 'in-progress', 'completed'], 'phases.status'); if (p.position !== undefined) integer(p.position, 'phases.position', 0, 100000); phases.add(p.key); }
   for (const t of d.tasks) {
-    object(t, ['key', 'title', 'description', 'definitionOfDone', 'successCriteria', 'constraints', 'notes', 'phase', 'status', 'priority', 'tags', 'thinking', 'subtasks', 'roles', 'defaults', 'references'], ['key', 'title'], 'tasks'); key(t, 'tasks'); tasks.add(t.key); text(t.title, 'tasks.title', 500, 1); optionalText(t, ['description', 'notes'], 'tasks');
+    object(t, ['key', 'title', 'description', 'definitionOfDone', 'successCriteria', 'constraints', 'notes', 'phase', 'status', 'priority', 'tags', 'thinking', 'subtasks', 'roles', 'defaults', 'references', 'verification'], ['key', 'title'], 'tasks'); key(t, 'tasks'); tasks.add(t.key); text(t.title, 'tasks.title', 500, 1); optionalText(t, ['description', 'notes'], 'tasks');
     for (const field of ['definitionOfDone', 'successCriteria', 'constraints']) {
       if (Array.isArray(t[field])) list(t[field], 'tasks.' + field, 100).forEach((value, index) => text(value, 'tasks.' + field + '.' + index));
       else optionalText(t, [field], 'tasks');
@@ -235,6 +249,13 @@ export function validateBlueprintDocument(input: unknown, configuration: Bluepri
     if (t.tags) strings(t.tags, 'tasks.tags'); if (t.references) strings(t.references, 'tasks.references', limits.references);
     if (t.subtasks) list(t.subtasks, 'tasks.subtasks', limits.subtasks).forEach(s => { object(s, ['text'], ['text'], 'subtasks'); text(s.text, 'subtasks.text', 1000, 1); });
     if (t.roles) { object(t.roles, ['shepherd', 'verifier'], [], 'tasks.roles'); optionalText(t.roles, ['shepherd', 'verifier'], 'tasks.roles', 68); }
+    // Section 6.8 (E462 S4b, VM-N6): the per-Task flag `verification: "none"`.
+    // Never beside a Verifier, and only on a Task the plan creates in To Do.
+    if (t.verification !== undefined) {
+      choice(t.verification, ['none'], 'tasks.verification');
+      if (t.roles?.verifier !== undefined) fail('tasks.verification', 'A Task with verification none names no Verifier');
+      if (t.status !== undefined && t.status !== 'todo') fail('tasks.verification', 'Verification none applies only to a Task created in To Do');
+    }
     if (t.defaults) {
       const f = object(t.defaults, ['personality', 'model', 'maxRetries', 'executionProfile'], [], 'tasks.defaults'); optionalText(f, ['personality', 'model'], 'tasks.defaults', 200);
       if (f.maxRetries !== undefined) {
@@ -243,8 +264,8 @@ export function validateBlueprintDocument(input: unknown, configuration: Bluepri
           const parameter = parameters.get(match[1]);
           if (!parameter || parameter.type !== 'integer' || !parameter.required && parameter.default == null
             || parameter.constraints?.min == null || parameter.constraints?.max == null
-            || parameter.constraints.min < 0 || parameter.constraints.max > 100) fail('maxRetries','Retry placeholder must be an integer bounded to 0..100');
-        } else integer(f.maxRetries, 'maxRetries', 0, 100);
+            || parameter.constraints.min < 1 || parameter.constraints.max > 10) fail('maxRetries','Retry placeholder must be an integer bounded to 1..10');
+        } else integer(f.maxRetries, 'maxRetries', 1, 10);
       }
       if (f.executionProfile) { const e = object(f.executionProfile, ['service', 'options', 'parameters'], ['service', 'options'], 'executionProfile'); text(e.service, 'executionProfile.service', 200, 1); if (!e.options || typeof e.options !== 'object' || Array.isArray(e.options)) fail('executionProfile.options', 'Expected options object'); if (Object.keys(e.options).some(key => /\{\{|\}\}/.test(key))) fail('executionProfile.options', 'Substitution is not allowed in field names'); if (e.parameters !== undefined) {
         if (!e.parameters || typeof e.parameters !== 'object' || Array.isArray(e.parameters)) fail('executionProfile.parameters','Expected parameter maps');

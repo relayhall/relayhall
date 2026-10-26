@@ -32,7 +32,7 @@
  *     `invalidResults`, because nothing was dropped.
  *   • TRUNCATE (result count over `limit`) — the RESULTS were dropped for
  *     volume, not for validity, and §7.3's modifiers keep the two apart:
- *     `truncatedResults`, never `invalidResults` (sol R1-5, R2-4).
+ *     `truncatedResults`, never `invalidResults` (review R1-5, R2-4).
  *
  * ── THE MIXED-RESPONSE RULE (R1-5, R2-4) ──
  *
@@ -50,6 +50,7 @@
  * quote (candidate D's item-4 drills prove that half, through those
  * surfaces).
  */
+import { OPAQUE_COMPARTMENT_PATTERN } from './KnowledgeV2';
 import { KNOWLEDGE_CONTENT_KINDS, type KnowledgeContentKind } from '../utils/serviceDescriptor';
 
 /** §7.2: `ref`/`parentRef` ≤512 printable-ASCII, no backticks/angle brackets. */
@@ -74,6 +75,8 @@ export interface ValidatedKnowledgeResult {
   snippet: string;
   contentKind: KnowledgeContentKind;
   compartment: string;
+  compartmentLabel?: string;
+  category?: string;
   score: number;
   updatedAt?: string;
   parentRef?: string;
@@ -88,6 +91,9 @@ export interface ValidationInput {
   declaredCompartments: readonly string[];
   /** `limitPerSource`. */
   limit: number;
+  protocolVersion?: 2;
+  categories?: readonly string[];
+  declaredCategories?: readonly string[];
 }
 
 export interface ValidationOutcome {
@@ -183,17 +189,27 @@ export function validateSourceResults(input: ValidationInput): ValidationOutcome
     // §7.2: "`compartment` REQUIRED and equality-matched to the declared list".
     // Equality, never prefix and never case-folded: the declared list is the
     // vocabulary, and a near-match is a different compartment.
-    if (typeof row.compartment !== 'string' || !declared.has(row.compartment)) {
+    const opaque = row.compartment as { id?: unknown; label?: unknown } | null;
+    if (input.protocolVersion === 2 ? (!opaque || typeof opaque.id !== 'string' || !OPAQUE_COMPARTMENT_PATTERN.test(opaque.id)
+      || (opaque.label !== undefined && (typeof opaque.label !== 'string' || Array.from(opaque.label).length > 128))
+      || typeof row.category !== 'string' || !(input.declaredCategories ?? []).includes(row.category)
+      || (input.categories !== undefined && !input.categories.includes(row.category))
+      || Array.from(row.title).length > 512 || typeof row.snippet !== 'string' || Array.from(row.snippet).length > 500
+      || typeof row.score !== 'number' || !Number.isFinite(row.score))
+      : (typeof row.compartment !== 'string' || !declared.has(row.compartment))) {
       invalidCount += 1; continue;
     }
 
-    const title = row.title.length > KNOWLEDGE_TITLE_MAX_LENGTH
-      ? row.title.slice(0, KNOWLEDGE_TITLE_MAX_LENGTH)
-      : row.title;
+    // JSON Schema maxLength and Python strings count Unicode code points.
+    // V2 has already passed those bounds; preserve its complete fenced text.
+    // Keep the legacy v1 truncation contract unchanged.
+    const title = input.protocolVersion === 2 || row.title.length <= KNOWLEDGE_TITLE_MAX_LENGTH
+      ? row.title
+      : row.title.slice(0, KNOWLEDGE_TITLE_MAX_LENGTH);
     const snippetRaw = typeof row.snippet === 'string' ? row.snippet : '';
-    const snippet = snippetRaw.length > KNOWLEDGE_SNIPPET_MAX_LENGTH
-      ? snippetRaw.slice(0, KNOWLEDGE_SNIPPET_MAX_LENGTH)
-      : snippetRaw;
+    const snippet = input.protocolVersion === 2 || snippetRaw.length <= KNOWLEDGE_SNIPPET_MAX_LENGTH
+      ? snippetRaw
+      : snippetRaw.slice(0, KNOWLEDGE_SNIPPET_MAX_LENGTH);
     const updatedAt = parseUpdatedAt(row.updatedAt);
 
     const validated: ValidatedKnowledgeResult = {
@@ -201,7 +217,8 @@ export function validateSourceResults(input: ValidationInput): ValidationOutcome
       title,
       snippet,
       contentKind: row.contentKind as KnowledgeContentKind,
-      compartment: row.compartment,
+      compartment: input.protocolVersion === 2 ? opaque!.id as string : row.compartment as string,
+      ...(input.protocolVersion === 2 ? { category: row.category as string, ...(typeof opaque!.label === 'string' ? { compartmentLabel: opaque!.label } : {}) } : {}),
       score: clampScore(row.score),
       ...(updatedAt ? { updatedAt } : {}),
       ...(typeof row.parentRef === 'string' ? { parentRef: row.parentRef } : {}),
@@ -215,7 +232,7 @@ export function validateSourceResults(input: ValidationInput): ValidationOutcome
     results.push(validated);
   }
 
-  // §7.3, sol R1-5/R2-4: "all-dropped ⇒ answered + invalidResults with an
+  // §7.3, review R1-5/R2-4: "all-dropped ⇒ answered + invalidResults with an
   // empty group; `truncatedResults` ONLY if an independent over-limit drop
   // also occurred". `stoppedForVolume` is that independent drop, and nothing
   // else sets it — so a response whose extra rows were all INVALID reports

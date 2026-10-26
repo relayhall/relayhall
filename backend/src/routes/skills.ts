@@ -1,13 +1,18 @@
 // skills.ts - immutable Agent Skills registry REST contract.
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import {
-  skillManager, SkillContractError, SkillProvenance, SkillVersionStatus,
+  skillManager, SkillContractError, SkillProvenance, SkillVersionStatus, type SkillViewer,
 } from '../services/SkillManager';
+import { skillViewerAccount } from '../utils/skillViewer';
+import { groupTransferStandingOf, sendGroupTransferRefusal, GroupOwnershipTransferError } from '../services/GroupOwnershipTransfer';
 import { lifecyclePolicyDenialEnvelope } from '../services/LifecyclePolicyService';
 import { AuthRequest } from '../middleware/auth';
 import { isStringTooLongError, sendStringTooLongError, sendApiError } from '../utils/apiErrors';
 import { logCaughtFailure } from '../utils/secretSafeLog';
-import { filterAuthorizedResources } from '../middleware/sharedAuthorization';
+import { filterAuthorizedResources, actorFromRequest } from '../middleware/sharedAuthorization';
+import { auditActorFromRequest } from '../utils/auditActor';
+import { markSkillRefusalRecorded, wasSkillRefusalRecorded, SkillRefusalAuditError } from '../utils/skillRefusalAudit';
+import { UUID_RE as PATH_UUID_RE } from '../middleware/validate';
 
 const router = Router();
 const VERSION_FIELDS = [
@@ -18,12 +23,29 @@ const CREATE_FIELDS = ['name', ...VERSION_FIELDS, 'is_global'];
 const QUERY_LIMITS = { category: 100, tag: 128, search: 256 } as const;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROVENANCE: SkillProvenance[] = ['human-authored', 'imported', 'agent-drafted'];
+/** skill_versions.version is a PostgreSQL integer. */
+const SKILL_VERSION_NUMBER_MAX = 2147483647;
 
 function actor(req: AuthRequest): string | undefined { return req.principal?.id; }
 function canManage(req: AuthRequest): boolean {
   return req.scopes?.includes('root') === true
     || req.scopes?.includes('skills:write') === true
     || req.scopes?.includes('skills:admin') === true;
+}
+/** Registry administration: root or skills:admin (publish, retire, audience, owner). */
+function administers(req: AuthRequest): boolean {
+  return req.scopes?.includes('root') === true || req.scopes?.includes('skills:admin') === true;
+}
+/** Card d67e6990: the caller's draft visibility (SkillManager.SkillViewer).
+ * Exported (card 5854f0d6): the Timeline builds its skill viewer HERE, so its
+ * draft rule cannot drift from the registry's. */
+export function viewerOf(req: AuthRequest, allOwners = false): SkillViewer {
+  return {
+    accountId: skillViewerAccount(actorFromRequest(req)),
+    manage: canManage(req),
+    administrator: administers(req),
+    allOwners,
+  };
 }
 function readIfMatchRevision(req: Request, res: Response): string | null {
   const raw = req.headers['if-match'];
@@ -120,13 +142,15 @@ function validateNoteOnly(body: unknown): string | null {
 }
 
 function sendSkillError(res: Response, error: unknown, context: string): void {
+  if (wasSkillRefusalRecorded(error)) markSkillRefusalRecorded(res);
+  if (error instanceof SkillRefusalAuditError) { const errorId = logCaughtFailure('[Skills audit] refusal failed:', error); sendApiError(res, 500, 'AUDIT_WRITE_FAILED', 'Failed to record the refused Skill act', undefined, { errorId }); return; }
   const policy = lifecyclePolicyDenialEnvelope(error);
   if (policy) {
     sendApiError(res, policy.status, policy.code, policy.message, undefined, policy.details);
     return;
   }
   if (error instanceof SkillContractError) {
-    sendApiError(res, error.status, error.code, error.message);
+    sendApiError(res, error.status, error.code, error.message, undefined, error.details);
     return;
   }
   if (isStringTooLongError(error)) { sendStringTooLongError(res, 'skill', error); return; }
@@ -144,18 +168,55 @@ function sendSkillError(res: Response, error: unknown, context: string): void {
   sendApiError(res, 500, 'INTERNAL_ERROR', 'Unexpected server error', undefined, { errorId });
 }
 
+// Card 9cdc6b27: skills.id and skill_versions.id are uuid columns, and the
+// authorization stage resolves a Skill by NAME as well as by id, so a Skill
+// name in the path reached a uuid-typed query and the cast failure surfaced
+// as a 500. Every :id and :version route refuses a malformed one by name here,
+// before its handler reads anything; an unknown UUID still answers 404 from
+// the read. A Version reference is a Version UUID or a Version number.
+router.param('id', (_req: Request, res: Response, next: NextFunction, id: string): void => {
+  if (!PATH_UUID_RE.test(id)) {
+    sendApiError(res, 400, 'INVALID_SKILL_ID', 'skill id must be a full UUID',
+      'Address a Skill by its id; find the id by name with GET /skills?search=<name>');
+    return;
+  }
+  next();
+});
+router.param('version', (_req: Request, res: Response, next: NextFunction, ref: string): void => {
+  const isNumber = /^\d+$/.test(ref) && Number(ref) <= SKILL_VERSION_NUMBER_MAX;
+  if (!isNumber && !PATH_UUID_RE.test(ref)) {
+    sendApiError(res, 400, 'INVALID_SKILL_VERSION_ID',
+      `skill version must be a full Version UUID or a Version number from 0 to ${SKILL_VERSION_NUMBER_MAX}`);
+    return;
+  }
+  next();
+});
+
 router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (!checkQueryKeys(req, res, ['category', 'tag', 'search'])) return;
-    const { category, tag, search } = req.query as Record<string, string | undefined>;
-    const listedSkills = await skillManager.list({ category, tag, search }, canManage(req));
+    if (!checkQueryKeys(req, res, ['category', 'tag', 'search', 'owner'])) return;
+    const { category, tag, search, owner } = req.query as Record<string, string | undefined>;
+    // Card d67e6990: `owner=all` is the registry administrator's view of every
+    // owner's drafts; the default lists published Skills, the caller's own
+    // (and its Groups') drafts, unowned drafts and, for an administrator, the
+    // review queue.
+    if (owner !== undefined && owner !== 'all') {
+      sendApiError(res, 400, 'INVALID_QUERY_VALUE', "Query parameter 'owner' must be 'all'"); return;
+    }
+    if (owner === 'all' && !administers(req)) {
+      sendApiError(res, 403, 'SKILLS_ADMIN_REQUIRED',
+        "owner=all lists every owner's drafts and requires skills:admin; omit it to list your own and the shared registry"); return;
+    }
+    const listedSkills = await skillManager.list({ category, tag, search }, viewerOf(req, owner === 'all'));
     const skills = await filterAuthorizedResources(
       req as AuthRequest,
       'read',
       listedSkills,
       (skill) => ({ type: 'skill', id: skill.id }),
     );
-    res.json({ success: true, skills });
+    // Card d67e6990: the view this list answers, so a dashboard can offer the
+    // administrator's every-owner view without a second read.
+    res.json({ success: true, skills, viewer: { administrator: administers(req), allOwners: owner === 'all' } });
   } catch (error) {
     sendSkillError(res, error, 'list');
   }
@@ -164,7 +225,7 @@ router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
 router.get('/:id/versions', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!checkQueryKeys(req, res, [])) return;
-    res.json({ success: true, versions: await skillManager.listVersions(req.params.id, canManage(req)) });
+    res.json({ success: true, versions: await skillManager.listVersions(req.params.id, viewerOf(req)) });
   } catch (error) { sendSkillError(res, error, 'list versions'); }
 });
 
@@ -179,7 +240,7 @@ router.get('/:id/versions', async (req: AuthRequest, res: Response): Promise<voi
 router.get('/:id/versions/:version/content', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!checkQueryKeys(req, res, [])) return;
-    const version = await skillManager.getVersion(req.params.id, req.params.version, true, canManage(req));
+    const version = await skillManager.getVersion(req.params.id, req.params.version, true, viewerOf(req));
     const etag = `"${version.content_sha256}"`;
     res.setHeader('ETag', etag);
     if (matchesIfNoneMatch(req.headers['if-none-match'], etag)) {
@@ -207,7 +268,7 @@ router.get('/:id/versions/:version', async (req: AuthRequest, res: Response): Pr
   try {
     if (!checkQueryKeys(req, res, [])) return;
     res.json({ success: true, version: await skillManager.getVersion(
-      req.params.id, req.params.version, false, canManage(req),
+      req.params.id, req.params.version, false, viewerOf(req),
     ) });
   } catch (error) { sendSkillError(res, error, 'read version'); }
 });
@@ -215,7 +276,7 @@ router.get('/:id/versions/:version', async (req: AuthRequest, res: Response): Pr
 router.get('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!checkQueryKeys(req, res, [])) return;
-    res.json({ success: true, skill: await skillManager.getById(req.params.id, canManage(req)) });
+    res.json({ success: true, skill: await skillManager.getById(req.params.id, viewerOf(req)) });
   } catch (error) { sendSkillError(res, error, 'read'); }
 });
 
@@ -227,7 +288,9 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
       invalid.startsWith('Unknown') ? 'UNKNOWN_FIELD' : 'INVALID_SKILL_VALUE', invalid); return; }
     const body = { ...req.body };
     if (body.provenance === undefined) body.provenance = req.principal?.kind === 'human' ? 'human-authored' : 'agent-drafted';
-    const skill = await skillManager.create(body, actor(req));
+    // Card d67e6990: the creating chain's Account owns the new Skill.
+    const skill = await skillManager.create(body, actor(req), auditActorFromRequest(req),
+      skillViewerAccount(actorFromRequest(req)));
     res.status(201).json({ success: true, skill });
   } catch (error) { sendSkillError(res, error, 'create'); }
 });
@@ -241,7 +304,7 @@ router.put('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
       invalid.startsWith('Unknown') ? 'UNKNOWN_FIELD' : 'INVALID_SKILL_VALUE', invalid); return; }
     const body = { ...req.body };
     if (body.provenance === undefined) body.provenance = req.principal?.kind === 'human' ? 'human-authored' : 'agent-drafted';
-    const skill = await skillManager.update(req.params.id, body, revision, actor(req));
+    const skill = await skillManager.update(req.params.id, body, revision, actor(req), auditActorFromRequest(req));
     res.status(201).json({ success: true, skill });
   } catch (error) { sendSkillError(res, error, 'create version'); }
 });
@@ -255,7 +318,7 @@ function transitionRoute(status: SkillVersionStatus) {
       if (invalid) { sendApiError(res, invalid.startsWith('Unknown') ? 400 : 422,
         invalid.startsWith('Unknown') ? 'UNKNOWN_FIELD' : 'INVALID_SKILL_VALUE', invalid); return; }
       const version = await skillManager.transition(req.params.id, req.params.version, status,
-        actor(req), req.body?.note, revision);
+        actor(req), req.body?.note, revision, auditActorFromRequest(req));
       res.json({ success: true, version });
     } catch (error) { sendSkillError(res, error, status); }
   };
@@ -273,8 +336,36 @@ router.patch('/:id/audience', async (req: AuthRequest, res: Response): Promise<v
     if (!req.body || Object.keys(req.body).length !== 1 || typeof req.body.is_global !== 'boolean') {
       sendApiError(res, 422, 'INVALID_SKILL_VALUE', 'request body must contain only boolean is_global'); return;
     }
-    res.json({ success: true, skill: await skillManager.setGlobal(req.params.id, req.body.is_global, revision) });
+    res.json({ success: true, skill: await skillManager.setGlobal(req.params.id, req.body.is_global, revision, auditActorFromRequest(req)) });
   } catch (error) { sendSkillError(res, error, 'audience'); }
+});
+
+// Card d67e6990 (D24 part 1): assign or change a Skill's owner. Ceiling
+// skills:admin, point action `admin`; a transfer involving a Group also needs a
+// login session, root or an administrator, and a step-up (AZ-A12 clause 9(e)).
+const OWNER_FIELDS = ['ownerPrincipalId', 'reason', 'stepUpToken'];
+router.put('/:id/owner', async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!checkQueryKeys(req, res, [])) return;
+    const revision = readIfMatchRevision(req, res); if (revision === null) return;
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      sendApiError(res, 422, 'INVALID_SKILL_VALUE', 'request body must be an object'); return;
+    }
+    const unknown = Object.keys(body).find(key => !OWNER_FIELDS.includes(key));
+    if (unknown) { sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown field '${unknown}' in request body`); return; }
+    if (body.stepUpToken !== undefined && typeof body.stepUpToken !== 'string') {
+      sendApiError(res, 422, 'INVALID_SKILL_VALUE', 'stepUpToken must be a string', undefined, { field: 'stepUpToken' }); return;
+    }
+    const result = await skillManager.changeOwner(req.params.id,
+      { ownerPrincipalId: body.ownerPrincipalId, reason: body.reason }, revision,
+      auditActorFromRequest(req), groupTransferStandingOf(req, body.stepUpToken));
+    res.json({ success: true, changed: result.changed, skill: result.skill });
+  } catch (error) {
+    // The standing test audited its own refusal outside the transaction.
+    if (error instanceof GroupOwnershipTransferError) { markSkillRefusalRecorded(res); sendGroupTransferRefusal(res, error); return; }
+    sendSkillError(res, error, 'owner');
+  }
 });
 
 router.delete('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
@@ -282,7 +373,7 @@ router.delete('/:id', async (req: AuthRequest, res: Response): Promise<void> => 
     if (!checkQueryKeys(req, res, [])) return;
     const revision = readIfMatchRevision(req, res); if (revision === null) return;
     if (Object.keys(req.body ?? {}).length) { sendApiError(res, 400, 'UNKNOWN_FIELD', 'DELETE takes no request body'); return; }
-    await skillManager.delete(req.params.id, revision);
+    await skillManager.delete(req.params.id, revision, auditActorFromRequest(req));
     res.json({ success: true, message: 'Skill catalog deleted' });
   } catch (error) { sendSkillError(res, error, 'delete'); }
 });

@@ -129,7 +129,7 @@ test('list: a FOREIGN error carrying a dispatch phrase is NOT sniffed into a 404
 });
 
 test('pin failure: envelope carries details.errorId and no caught text', async () => {
-  const { status, body } = await call('PUT', '/projects/p1/skills/s1', { version: '3' });
+  const { status, body } = await call('PUT', '/projects/p1/skills/5a1c7e2b-9d4f-4b8e-a1c3-0f2e4d6b8a11', { version: '3' });
   expect(status).toBe(500);
   expect(body).toMatchObject({ success: false, code: 'INTERNAL_ERROR' });
   expect(typeof body.details?.errorId).toBe('string');
@@ -138,7 +138,7 @@ test('pin failure: envelope carries details.errorId and no caught text', async (
 });
 
 test('unpin failure: envelope carries details.errorId and no caught text', async () => {
-  const { status, body } = await call('DELETE', '/projects/p1/skills/s1');
+  const { status, body } = await call('DELETE', '/projects/p1/skills/5a1c7e2b-9d4f-4b8e-a1c3-0f2e4d6b8a11');
   expect(status).toBe(500);
   expect(body).toMatchObject({ success: false, code: 'INTERNAL_ERROR' });
   expect(typeof body.details?.errorId).toBe('string');

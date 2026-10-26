@@ -1,6 +1,6 @@
 {
   "recordedAt": "2026-08-16T21:05:54.358Z",
-  "source": "DEV :18082, showcase fixture",
+  "source": "showcase fixture",
   "graph": {
     "keys": [
       "success",
@@ -84,5 +84,5 @@
       "deltaOf"
     ]
   },
-  "provenanceNote": "graph.task.json / graph.delta.json were recorded from the live DEV serializer BEFORE the section 3 taxonomy fields existed, so their nodes carry no agent or progress and the responses carry no reports key. That absence reflects the serializer at recording time, NOT the current wire. Tests needing taxonomy vary one field on top of these bodies and say so in place; report rows follow the serializer shape {id, taskId, title} returned by backend queryLinkedReports."
+  "provenanceNote": "graph.task.json / graph.delta.json were recorded from a showcase fixture BEFORE the section 3 taxonomy fields existed, so their nodes carry no agent or progress and the responses carry no reports key. That absence reflects the serializer at recording time, NOT the current wire. Tests needing taxonomy vary one field on top of these bodies and say so in place; report rows follow the serializer shape {id, taskId, title} returned by backend queryLinkedReports."
 }

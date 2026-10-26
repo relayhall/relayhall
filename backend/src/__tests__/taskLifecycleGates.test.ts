@@ -147,3 +147,10 @@ describe('TaskManagerDB.getAutoStartQueue', () => {
     expect(await manager.getNextTask()).toBeNull();
   });
 });
+
+
+describe('narrow human archive shape',()=>{
+  const {isTaskArchivePatch}=require('../utils/taskLifecycle');
+  test.each([{status:'archived'},{status:'archived',archiveReason:'file it'}])('admits shape, never authority: %j',value=>expect(isTaskArchivePatch(value)).toBe(true));
+  test.each([null,[],{status:'completed'},{status:'archived',autoStart:true},{status:'archived',restore:true},{status:'archived',archiveReason:3},{status:'archived',subtasks:[]}])('rejects mixed or malformed shape: %j',value=>expect(isTaskArchivePatch(value)).toBe(false));
+});

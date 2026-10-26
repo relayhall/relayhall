@@ -1,3 +1,4 @@
+import { telemetrySessionReference } from '../utils/telemetryPepper';
 /**
  * TelemetryPolicyEngine — the Tier-0 policy engine (RH-TW1a, card
  * `beac9c79`; TELEMETRY-DESIGN `7d5c0cdc` §6, sitting ruling TS-5, owner
@@ -537,10 +538,7 @@ function applyTier0(envelope: TelemetryEnvelope, options: TelemetryPolicyOptions
   // Derived from the SOURCE's own conversation/session identifier so that a
   // timeline can group a session's events, and pseudonymized so that the
   // grouping key itself carries no source-side identifier.
-  const sessionSeed = envelope.correlation?.conversation_id ?? envelope.correlation?.session_id ?? null;
-  const sessionRef = typeof sessionSeed === 'string' && sessionSeed.length > 0
-    ? telemetryPseudonym(TELEMETRY_PSEUDONYM_DOMAINS.sessionRef, `${envelope.source.product}|${sessionSeed}`)
-    : null;
+  const sessionRef = telemetrySessionReference(envelope.source.product, envelope.correlation);
 
   const instanceSeed = envelope.source.instance_id;
   const instanceRef = typeof instanceSeed === 'string' && instanceSeed.length > 0

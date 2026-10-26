@@ -22,12 +22,15 @@ export interface TaskActor {
   role?: string;
   authMethod?: import('./AuditService').AuditAuthMethod;
   credentialId?: string | null;
+  /** Server-resolved session identity; never accepted from a Task payload. */
+  sessionId?: string | null;
   /**
    * RH-P3.AZ-S7: the ASSIGNER's authorization identity, carried so the
    * assignment-access coupling can apply the R3 non-escalation cap
    * (ruling 7440b579) at the TaskManagerDB choke point. Required only for
-   * a write that SETS an execution assignment; every other task write
-   * ignores it.
+   * a write that SETS an execution assignment or uses the bounded planning
+   * or independent Verifier completion exception. No path permits an absent
+   * actor to gain authority.
    */
   authorization?: import('./AuthorizationService').AuthorizationActor;
 }
@@ -138,28 +141,33 @@ class TaskHistoryService {
   }
 
   /**
-   * Newest status→archived transition's prior value for a Task, or null.
-   * Variant-aware like recordChange above: the newer schema records the
-   * changed field in , the older live-compatibility schema in
-   *  (candidate A2; DEV runs the older variant — a query pinned
-   * to  silently degraded every unarchive to the fallback).
+   * Prior value only when the unique newest status transition enters Archived.
+   * Never skip later non-archive transitions to reuse an earlier archive cycle.
+   * Equal latest timestamps are ambiguous (UUID IDs cannot break chronology),
+   * so refuse rather than guessing. Both supported history schema variants use
+   * their own database timestamps; no application/database clock equality.
    */
-  async priorStatusBeforeArchive(taskId: string): Promise<string | null> {
+  async priorStatusBeforeArchive(taskId: string, client?: PoolClient): Promise<string | null> {
     try {
-      const columns = await this.getColumns();
+      const columns = await this.getColumns(client ?? pool);
       if (columns.size === 0) return null;
       const fieldColumn = columns.has('field') ? 'field' : (columns.has('event_type') ? 'event_type' : null);
       if (!fieldColumn) return null;
-      const result = await pool.query(
-        `SELECT old_value FROM task_history
-         WHERE task_id = $1 AND ${fieldColumn} = 'status' AND new_value = 'archived'
-         ORDER BY created_at DESC
-         LIMIT 1`,
+      const result = await (client ?? pool).query(
+        `SELECT old_value FROM (
+           SELECT old_value, new_value, created_at,
+             DENSE_RANK() OVER (ORDER BY created_at DESC NULLS FIRST) AS recency,
+             COUNT(*) OVER (PARTITION BY created_at) AS same_time
+           FROM task_history WHERE task_id = $1 AND ${fieldColumn} = 'status'
+         ) AS status_history
+         WHERE recency = 1 AND same_time = 1 AND created_at IS NOT NULL
+           AND new_value = 'archived'`,
         [taskId]
       );
       const prior = result.rows[0]?.old_value;
       return typeof prior === 'string' ? prior : null;
     } catch (err) {
+      if (client) throw err;
       logCaughtFailure('[TaskHistoryService] prior-status lookup failed', err);
       return null;
     }

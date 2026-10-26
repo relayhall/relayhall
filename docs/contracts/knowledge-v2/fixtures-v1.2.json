@@ -1,0 +1,480 @@
+[
+  {
+    "id": "query-include-archive-true",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "includeArchive": true
+    },
+    "valid": true
+  },
+  {
+    "id": "query-include-archive-false",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "includeArchive": false
+    },
+    "valid": true
+  },
+  {
+    "id": "query-include-archive-with-categories",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "categories": [
+        "relaybrain:note"
+      ],
+      "includeArchive": true
+    },
+    "valid": true
+  },
+  {
+    "id": "query-include-archive-string",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "includeArchive": "true"
+    },
+    "valid": false
+  },
+  {
+    "id": "query-include-archive-number",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "includeArchive": 1
+    },
+    "valid": false
+  },
+  {
+    "id": "query-include-archive-null",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "includeArchive": null
+    },
+    "valid": false
+  },
+  {
+    "id": "query-include-archive-snake-case",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "include_archive": true
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-without-archive",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "descriptor-archive-subset",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:archive"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "descriptor-archive-all",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "descriptor-archive-empty",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": []
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-archive-duplicate",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:archive",
+        "relaybrain:archive"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-archive-unnamespaced",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "archive"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-archive-not-array",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": "relaybrain:archive"
+    },
+    "valid": false
+  },
+  {
+    "id": "filter-archive-flag-injection",
+    "definition": "filter",
+    "input": {
+      "version": 2,
+      "kinds": [
+        "docs"
+      ],
+      "includeArchive": true
+    },
+    "valid": false
+  },
+  {
+    "id": "filter-narrowed-default-scope",
+    "definition": "filter",
+    "input": {
+      "version": 2,
+      "kinds": [
+        "docs"
+      ],
+      "categories": [
+        "relaybrain:note"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "descriptor-archive-subset",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:archive"
+      ]
+    },
+    "valid": true,
+    "semanticValid": true
+  },
+  {
+    "id": "descriptor-archive-all",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ]
+    },
+    "valid": true,
+    "semanticValid": true
+  },
+  {
+    "id": "descriptor-archive-outside-vocabulary",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note",
+        "relaybrain:archive"
+      ],
+      "archiveCategories": [
+        "relaybrain:snapshot"
+      ]
+    },
+    "valid": true,
+    "semanticValid": false
+  },
+  {
+    "id": "default-narrows-declared",
+    "definition": "defaultScope",
+    "input": {
+      "requested": null,
+      "declared": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": false
+    },
+    "expected": {
+      "categories": [
+        "relaybrain:note"
+      ],
+      "skipped": false
+    }
+  },
+  {
+    "id": "opt-in-unchanged",
+    "definition": "defaultScope",
+    "input": {
+      "requested": null,
+      "declared": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": true
+    },
+    "expected": {
+      "categories": null,
+      "skipped": false
+    }
+  },
+  {
+    "id": "default-narrows-requested",
+    "definition": "defaultScope",
+    "input": {
+      "requested": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "declared": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": false
+    },
+    "expected": {
+      "categories": [
+        "relaybrain:note"
+      ],
+      "skipped": false
+    }
+  },
+  {
+    "id": "opt-in-keeps-requested",
+    "definition": "defaultScope",
+    "input": {
+      "requested": [
+        "relaybrain:archive"
+      ],
+      "declared": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": true
+    },
+    "expected": {
+      "categories": [
+        "relaybrain:archive"
+      ],
+      "skipped": false
+    }
+  },
+  {
+    "id": "default-all-archive-skips",
+    "definition": "defaultScope",
+    "input": {
+      "requested": null,
+      "declared": [
+        "relaybrain:archive"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": false
+    },
+    "expected": {
+      "categories": [],
+      "skipped": true
+    }
+  },
+  {
+    "id": "opt-in-all-archive-consults",
+    "definition": "defaultScope",
+    "input": {
+      "requested": null,
+      "declared": [
+        "relaybrain:archive"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": true
+    },
+    "expected": {
+      "categories": null,
+      "skipped": false
+    }
+  },
+  {
+    "id": "no-archive-unaffected",
+    "definition": "defaultScope",
+    "input": {
+      "requested": null,
+      "declared": [
+        "relaybrain:note"
+      ],
+      "archive": [],
+      "includeArchive": false
+    },
+    "expected": {
+      "categories": null,
+      "skipped": false
+    }
+  },
+  {
+    "id": "default-archive-only-request-skips",
+    "definition": "defaultScope",
+    "input": {
+      "requested": [
+        "relaybrain:archive"
+      ],
+      "declared": [
+        "relaybrain:archive",
+        "relaybrain:note"
+      ],
+      "archive": [
+        "relaybrain:archive"
+      ],
+      "includeArchive": false
+    },
+    "expected": {
+      "categories": [],
+      "skipped": true
+    }
+  }
+]

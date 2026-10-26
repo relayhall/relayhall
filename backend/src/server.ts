@@ -1,3 +1,8 @@
+// FIRST, before any other module loads: refuse the .env.example placeholder
+// secrets with a readable reason and exit 1 (config/bootSecretsCheck).
+import './config/bootSecretsCheck';
+import { runWarrantLifecycleSweep } from './utils/warrantLifecycleSchedule';
+import { startKnowledgeLifecycleExporter } from './services/KnowledgeLifecycleExporter';
 import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -21,6 +26,9 @@ import { runFunctionalProbe } from './utils/functionalProbe';
 import { runStartupChecks } from './db/migrate';
 import { accessSurfaceService } from './services/AccessSurfaceService';
 import { WebSocketService } from './services/websocket';
+import { setProjectOwnerInvalidationSink } from './services/ProjectOwnershipService';
+import { ConnectorNotificationService } from './services/ConnectorNotificationService';
+import { connectorWakeService } from './services/ConnectorWakeService';
 import { taskManagerDB as taskManager } from './services/TaskManagerDB';
 import { taskAnalyzer } from './services/taskAnalyzer';
 import { autoArchive } from './services/autoArchive';
@@ -32,7 +40,13 @@ import { bootCheckProbePath, formatBootCheckProbeLine, runBootCheckProbe } from 
 import { PluginLoader } from './services/PluginLoader';
 import { appearanceService } from './services/AppearanceService';
 import { getLegacyAppearanceDisplayName } from './config/relayhall';
-import { RELAYHALL_VERSION } from './version';
+import { apiRootHandler } from './routes/apiRoot';
+import {
+  deploymentIdentityConfiguration,
+  formatDeploymentIdentityRefusal,
+  formatDeploymentIdentityResolved,
+  resolveDeploymentIdentity,
+} from './config/deploymentIdentity';
 
 // Load environment variables
 dotenv.config();
@@ -110,6 +124,13 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Initialize WebSocket service for real-time task events
 const wsService = new WebSocketService(server, '/ws');
+// AZ-A12 clause 13: the recipients are both owners and, for a Group owner, its active members.
+setProjectOwnerInvalidationSink((recipientIds) => {
+  wsService.broadcastToPrincipals(recipientIds, { type: 'project.authority_changed' });
+});
+// Card 6dea3cca: `?wake=1` sockets double as Connector wake endpoints; the
+// dispatcher itself starts below with the other background workers.
+const connectorNotifications = new ConnectorNotificationService(server, 1000, connectorWakeService);
 
 // Initialize Plugin Loader
 const PLUGINS_CONFIG = process.env.RELAYHALL_PLUGINS_CONFIG || './relayhall.plugins.json';
@@ -171,16 +192,9 @@ app.get('/health', healthHandler);
 // configured service - the reachability check. Same audience as /health.
 app.get('/health/orchestration', orchestrationConfigurationHandler);
 
-// API root
-app.get('/', (_req: Request, res: Response) => {
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({
-    name: 'RelayHall API',
-    version: RELAYHALL_VERSION,
-    environment: NODE_ENV,
-    status: 'running'
-  });
-});
+// API root: the version and the backend image's own build identity (card
+// 6d549392). Named, like healthHandler, so it is testable without a boot.
+app.get('/', apiRootHandler);
 
 // Routes
 import authRoutes from './routes/auth';
@@ -194,6 +208,8 @@ import { registerTelemetrySchedules } from './utils/telemetrySchedules';
 import { warrantService } from './services/WarrantService';
 import { oauthAuthorizationService } from './services/OAuthAuthorizationService';
 import { approvalService } from './services/ApprovalService';
+import { authorityEditExecutor } from './services/AuthorityEditExecutor';
+import { knowledgeSharedWriterService } from './services/KnowledgeSharedWriterService';
 import { loginSessionService } from './services/LoginSessionService';
 import { agentLifecycleService } from './services/AgentLifecycleService';
 import { setPluginLoader, publicPluginThemeRoutes } from './routes/plugins';
@@ -205,17 +221,37 @@ import { sharedAuthorizationMiddleware } from './middleware/sharedAuthorization'
 // (AUTHZ design 4d961e37 §7.5).
 import { registerProtectedRoutes } from './routeRegistry';
 import mcpRoutes, { MCP_ROUTE_PATH } from './mcp/httpRoute';
+// RH-TW1b slice 2 (card dac2ca71, estate card 928586a6): the OTLP/gRPC
+// receiver, a SECOND listener that dispatches into the telemetry registration
+// above. Imported AFTER routeRegistry, which it reads, so it adds no module
+// evaluation ahead of the route list under either build.
+import { startOtlpGrpcIngress, type OtlpGrpcIngressHandle } from './services/otlp/OtlpGrpcIngress';
+import { otlpGrpcPortFromEnv } from './utils/otlp/otlpGrpc';
 import { OAUTH_ROUTE_PATH, OAUTH_WELL_KNOWN_ROUTE_PATH } from './utils/oauthMetadata';
 import knowledgeJwksRoutes from './routes/knowledgeJwks';
 import { buildOpenApiSpec } from './openapi/spec';
 import { apiErrorHandler } from './utils/apiErrors';
 import { webhookDeliveryWorker } from './services/WebhookDeliveryWorker';
 import { createPluginProxy } from './middleware/pluginProxy';
+import { setPluginHostLoader, PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH, pluginEffectiveSettingsHandler } from './routes/pluginHost';
 import { refreshTrustedProxyAddresses } from './middleware/loginRateLimit';
 import { sweepExpiredIdempotencyRecords } from './middleware/idempotency';
 
+// RELAYHALL_OTLP_GRPC_PORT: unset or empty = no OTLP/gRPC listener. A value
+// that is not a port refuses the boot here, in boot-check mode too, so a typo
+// can never silently become "no receiver".
+let otlpGrpcPort: number | null = null;
+try {
+  otlpGrpcPort = otlpGrpcPortFromEnv(process.env.RELAYHALL_OTLP_GRPC_PORT);
+} catch {
+  console.error('🛑 RELAYHALL_OTLP_GRPC_PORT must be a TCP port number (1-65535), or empty to disable the OTLP/gRPC receiver — refusing to start');
+  process.exit(1);
+}
+let otlpGrpcIngress: OtlpGrpcIngressHandle | null = null;
+
 // Wire up route dependencies
 setPluginLoader(pluginLoader);
+setPluginHostLoader(pluginLoader);
 
 // One registration funnel for every protected router. Keeping the shared
 // predicate adjacent to authentication makes bypass a structural diff rather
@@ -264,6 +300,14 @@ app.use(OAUTH_WELL_KNOWN_ROUTE_PATH, knowledgeJwksRoutes);
 // Iframes can't send JWT headers, so plugin content must be unauthenticated
 app.use(createPluginProxy(pluginLoader));
 
+// Card bedf50cc (E380, design section 9, choice C8): the plugin BACKEND's
+// read of one Account's effective settings. Mounted here, beside the proxy and
+// BEFORE the protected funnel: it authenticates by the plugin assertion in
+// X-RelayHall-Assertion alone (HS256 pinned, audience, expiry, a core-issued
+// jti for that plugin and Account), never reads Authorization, and is not in
+// routeRegistry, so no other ingress reaches it.
+app.get(PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH, pluginEffectiveSettingsHandler);
+
 // The plugin theme stylesheet is PUBLIC (RH-DESIGN.6 §4.4): plugin iframes
 // cannot send a JWT, so an authenticated stylesheet is unreachable by the only
 // caller it has. It publishes canonical semantic token values and nothing else.
@@ -287,6 +331,7 @@ app.use(MCP_ROUTE_PATH, mcpRoutes);
 app.use(apiErrorHandler); // must stay after all routes: normalizes uncaught errors to the API envelope
 if (!BOOT_CHECK_MODE) {
   webhookDeliveryWorker.start();
+  connectorWakeService.start();
 }
 // Note: nginx strips /api/ prefix, so routes are registered without it
 
@@ -394,7 +439,12 @@ if (!BOOT_CHECK_MODE) {
 // services. Nothing decidable happens here.
 if (!BOOT_CHECK_MODE) {
   registerTelemetrySchedules({
-    sweepRetention: () => telemetryRetentionService.sweep(),
+    // Reuse the existing hourly retention tick. Product event detail must age
+    // out even on an idle deployment with no new completion to trigger pruning.
+    sweepRetention: async () => {
+      await telemetryRetentionService.sweep();
+      await pool.query('SELECT product_metric_prune()');
+    },
     evaluateAlarms: () => telemetryQuarantineService.evaluateAlarms(),
     // Identifiers and numbers only — the same rule the plane's audit writes
     // follow (§6.5.3). Nothing in the line comes from a payload.
@@ -410,8 +460,10 @@ if (!BOOT_CHECK_MODE) {
 // TTLs, bound-credential death) and emits their events, the §7.3 doctrine.
 if (!BOOT_CHECK_MODE) {
   setInterval(() => {
-    warrantService.sweepLifecycles().catch((err: unknown) => {
-      logCaughtWarning('[Startup] warrant lifecycle sweep failed', err as Error);
+    void runWarrantLifecycleSweep({
+      sweep: () => warrantService.sweepLifecycles(),
+      onRetryable: (record) => logCaughtWarning('[Startup] warrant lifecycle sweep retryable ' + JSON.stringify(record), new Error('Retry on a later periodic sweep')),
+      onFailure: (err) => logCaughtWarning('[Startup] warrant lifecycle sweep failed', err as Error),
     });
     approvalService.sweepTtls().catch((err: unknown) => {
       logCaughtWarning('[Startup] approval TTL sweep failed', err as Error);
@@ -438,6 +490,27 @@ if (!BOOT_CHECK_MODE) {
     // sweep persists the physical consequence and never extends a login session.
     loginSessionService.disposeRetainedTokensOnDeadLoginSessions().catch((err: unknown) => {
       logCaughtWarning('[Startup] retained ID-token disposal sweep failed', err as Error);
+    });
+    // Card 549cc51f (E298 Q5): a shared-area writer row whose expiry has
+    // passed is removed, audited as actor `system`. The snapshot exporter and
+    // the list already omit it live; the sweep persists the removal.
+    knowledgeSharedWriterService.sweepExpired().catch((err: unknown) => {
+      logCaughtWarning('[Startup] shared-area writer expiry sweep failed', err as Error);
+    });
+  }, 60_000).unref();
+}
+
+// AZ-A13 clause 6j (E94; card 1a38270d): revert every widening approved "until
+// this task ends" that is DUE - its date passed, or its related task is
+// completed or archived (the two terminal writers revert at once, in their own
+// transaction; this backstops them) - one transaction per revert. A
+// warrant-ceiling revert while tasks ride the warrant waits for a person's
+// acknowledgement. Its own timer, at the lifecycle sweep's cadence, so a date
+// revert is late by at most one minute.
+if (!BOOT_CHECK_MODE) {
+  setInterval(() => {
+    authorityEditExecutor.sweepReverts().catch((err: unknown) => {
+      logCaughtWarning('[Startup] authority-edit revert sweep failed', err as Error);
     });
   }, 60_000).unref();
 }
@@ -529,6 +602,43 @@ async function verifyTelemetryPepperOrExit(): Promise<void> {
   }
 }
 
+// Card 7f0c84f0 (owner ruling D33): the server refuses to serve without a
+// RESOLVED deployment identity - the named local administrator Account,
+// active, a parentless human, holding the root sentinel. The definition and
+// its five conditions live in `config/deploymentIdentity.ts`. Like the two
+// gates above it runs to completion BEFORE the listener exists and exits
+// non-zero with one line; unlike them it has no warn-and-continue arm. It
+// reads one row and changes nothing about how an identity is used once
+// resolved.
+//
+// Boot-check mode has no database by contract, so it checks the
+// configuration half only (the handle is well formed); everything else waits
+// for a real boot.
+function verifyDeploymentIdentityConfigurationOrExit(): void {
+  const configured = deploymentIdentityConfiguration();
+  if (!configured.ok) {
+    console.error(formatDeploymentIdentityRefusal(configured));
+    process.exit(1);
+  }
+}
+
+async function verifyDeploymentIdentityOrExit(): Promise<void> {
+  let outcome: Awaited<ReturnType<typeof resolveDeploymentIdentity>>;
+  try {
+    outcome = await resolveDeploymentIdentity(pool);
+  } catch (err) {
+    // The row could not be READ - not evidence that it is missing. Same
+    // redacting sink and the same exit as the gates above.
+    logCaughtFailure('🛑 [DeploymentIdentity] the local administrator Account could not be read — terminating before listen:', err);
+    process.exit(1);
+  }
+  if (!outcome.ok) {
+    console.error(formatDeploymentIdentityRefusal(outcome));
+    process.exit(1);
+  }
+  console.log(formatDeploymentIdentityResolved(outcome));
+}
+
 // Boot-check mode: bind must either succeed and exit 0 or fail and exit 1 —
 // never linger. The timeout(1) form of the old gate left orphaned node
 // children squatting the port (task 97cb6261); a hard in-process deadline and
@@ -567,27 +677,42 @@ const startListening = (): void => { server.listen(PORT, async () => {
         process.exit(0);
       });
     };
-    if (bootCheckProbe) {
-      // Card 590c638a: one self-request over the bound socket, printed on a
-      // single line; the drill judges it. Any failure here is a failed gate.
-      const address = server.address();
-      const boundPort = typeof address === 'object' && address ? address.port : Number(PORT);
-      runBootCheckProbe(boundPort, bootCheckProbe).then((answer) => {
-        console.log(formatBootCheckProbeLine(answer));
-        finish();
-      }).catch((err: unknown) => {
-        logCaughtFailure('❌ BOOT CHECK FAILED (probe request failed)', err);
-        process.exit(1);
-      });
-      return;
-    }
-    finish();
+    const runBootCheck = (): void => {
+      if (bootCheckProbe) {
+        // Card 590c638a: one self-request over the bound socket, printed on a
+        // single line; the drill judges it. Any failure here is a failed gate.
+        const address = server.address();
+        const boundPort = typeof address === 'object' && address ? address.port : Number(PORT);
+        runBootCheckProbe(boundPort, bootCheckProbe).then((answer) => {
+          console.log(formatBootCheckProbeLine(answer));
+          finish();
+        }).catch((err: unknown) => {
+          logCaughtFailure('❌ BOOT CHECK FAILED (probe request failed)', err);
+          process.exit(1);
+        });
+        return;
+      }
+      finish();
+    };
+    // RH-TW1b slice 2: when the OTLP/gRPC receiver is configured, the boot
+    // check binds it and closes it again, so a bind failure fails the gate.
+    // Binding touches no database: calls are dispatched only when they arrive.
+    if (otlpGrpcPort === null) { runBootCheck(); return; }
+    startOtlpGrpcIngress({ port: otlpGrpcPort }).then(async (ingress) => {
+      console.log(`✅ BOOT CHECK OTLP/gRPC receiver bound on port ${ingress.port}`);
+      await ingress.close();
+      runBootCheck();
+    }).catch((err: unknown) => {
+      logCaughtFailure('❌ BOOT CHECK FAILED (OTLP/gRPC listener)', err);
+      process.exit(1);
+    });
     return;
   }
 
   // Schema/migration consistency check (task 475a54c9) — logs a loud warning
   // on ledger-vs-directory drift or missing critical tables; never crashes.
   await runStartupChecks();
+  startKnowledgeLifecycleExporter();
 
   // SETGOV: the Access-surface census (design 7a9317b2 §3.3, acceptance annex
   // 85a2218d D2 clauses (i)(ii)(iii)(v)(vi)(vii), and D15's overlap refusal).
@@ -624,6 +749,21 @@ const startListening = (): void => { server.listen(PORT, async () => {
     // not an unsound catalogue. That is the redacting logger's case.
     logCaughtFailure('❌ Access-surface census could not run — refusing to serve', err);
     process.exit(1);
+  }
+
+  // RH-TW1b slice 2: the OTLP/gRPC receiver binds only AFTER the census has
+  // passed, so it never serves telemetry the census would have refused. A
+  // configured receiver that cannot bind refuses the process, as the census
+  // does: the operator asked for it, and a silent absence would look like an
+  // exporter fault.
+  if (otlpGrpcPort !== null) {
+    try {
+      otlpGrpcIngress = await startOtlpGrpcIngress({ port: otlpGrpcPort });
+      console.log(`✅ OTLP/gRPC receiver listening on port ${otlpGrpcIngress.port}`);
+    } catch (err: unknown) {
+      logCaughtFailure('❌ OTLP/gRPC receiver could not bind — refusing to serve', err);
+      process.exit(1);
+    }
   }
 
   try {
@@ -784,6 +924,11 @@ process.on('SIGTERM', async () => {
 
   // Shutdown WebSocket
   wsService.shutdown();
+  connectorWakeService.stop();
+  connectorNotifications.shutdown();
+
+  // Close the OTLP/gRPC listener (in-flight calls get a short grace).
+  if (otlpGrpcIngress) await otlpGrpcIngress.close();
 
   // Close HTTP server
   server.close(() => {
@@ -795,12 +940,16 @@ process.on('SIGTERM', async () => {
 
 // B4: the credential-keyset gate runs to completion BEFORE the socket is
 // exposed; only then do we start listening. Boot-check mode has no DB
-// activity by contract and starts directly.
+// activity by contract and starts directly once the identity configuration
+// is well formed. The deployment identity (card 7f0c84f0) is the LAST gate
+// before the listener, so every existing gate still runs first, unchanged.
 if (BOOT_CHECK_MODE) {
+  verifyDeploymentIdentityConfigurationOrExit();
   startListening();
 } else {
   void verifyCredentialKeysetOrExit()
     .then(verifyTelemetryPepperOrExit)
+    .then(verifyDeploymentIdentityOrExit)
     .then(startListening);
 }
 

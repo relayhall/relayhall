@@ -82,7 +82,8 @@ describe('report archive lifecycle routes', () => {
       expect(body.success).toBe(true);
       expect(body.report.status).toBe('archived');
     });
-    expect(manager.archive).toHaveBeenCalledWith(RID);
+    // Card 5854f0d6: the route passes the acting principal for the feed row.
+    expect(manager.archive).toHaveBeenCalledWith(RID, expect.objectContaining({ handle: 'agent' }));
   });
 
   it('POST /:id/unarchive returns the report to active and emits report.unarchived', async () => {
@@ -93,7 +94,7 @@ describe('report archive lifecycle routes', () => {
       const body = await res.json() as { report: { status: string } };
       expect(body.report.status).toBe('active');
     });
-    expect(manager.unarchive).toHaveBeenCalledWith(RID);
+    expect(manager.unarchive).toHaveBeenCalledWith(RID, expect.objectContaining({ handle: 'agent' }));
   });
 
   it('archive of a missing or non-active report is 404 and emits nothing', async () => {
@@ -168,13 +169,13 @@ describe('report archive lifecycle routes', () => {
       expect(bad.status).toBe(400);
       expect(((await bad.json()) as { code: string }).code).toBe('INVALID_STATUS');
     });
-    expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ status: 'archived' }));
+    expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ status: 'archived' }), expect.any(Function));
   });
 
   it('the default list neither filters explicitly nor opts into archived rows', async () => {
     await withServer(async base => {
       expect((await fetch(`${base}/reports`)).status).toBe(200);
     });
-    expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ status: undefined, include_archived: false }));
+    expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ status: undefined, include_archived: false }), expect.any(Function));
   });
 });

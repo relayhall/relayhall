@@ -43,7 +43,12 @@ import type { Pool } from 'pg';
 import { pool as defaultPool } from '../db/connection';
 
 /** The ingest surfaces budgeted separately. */
-export type TelemetryRateSurface = 'frames' | 'events' | 'events_batch';
+export type TelemetryRateSurface =
+  | 'frames' | 'events' | 'events_batch'
+  // RH-TW1b (card dac2ca71): one surface per OTLP signal, so a producer that
+  // exports logs and metrics on their own schedules does not refuse itself.
+  // Migration 163 widens the table's CHECK to exactly this vocabulary.
+  | 'otlp_traces' | 'otlp_logs' | 'otlp_metrics';
 
 /**
  * Minimum interval between ACCEPTED writes, per principal, per surface.
@@ -57,6 +62,12 @@ export const TELEMETRY_MIN_INTERVAL_MS: Readonly<Record<TelemetryRateSurface, nu
   frames: 5_000,
   events: 1_000,
   events_batch: 10_000,
+  // Per REQUEST: one OTLP export carries many records, as a batch does, but an
+  // OTel SDK exports on a short fixed schedule (Claude Code logs every 5 s by
+  // default) and retries a 429 with the batch it already holds.
+  otlp_traces: 1_000,
+  otlp_logs: 1_000,
+  otlp_metrics: 1_000,
 };
 
 /** Limiter rows untouched for this long are pruned; the state stays bounded. */

@@ -135,10 +135,41 @@ function longestBacktickRun(text: string): number {
 
 /** An MCP tool failure carrying an instructive message (§3, SEP-1303). */
 export class McpToolError extends Error {
-  constructor(message: string) {
+  /**
+   * The board's HTTP status when the board refused the call, else undefined
+   * (the tool refused it itself). Structured so the action log (card
+   * `ab8f78e9`) can state a closed error code without reading the message.
+   */
+  readonly httpStatus?: number;
+
+  constructor(message: string, httpStatus?: number) {
     super(message);
     this.name = 'McpToolError';
+    if (httpStatus !== undefined) this.httpStatus = httpStatus;
   }
+}
+
+/**
+ * The scopes the board itself named in a refusal.
+ *
+ * The route ceiling puts the scope it checked in `details.requiredScopes` when
+ * the credential carries neither that scope nor `root`, and so do the two
+ * handler-level scope refusals (Blueprint `SCOPE_REQUIRED`, project awareness
+ * `INSUFFICIENT_SCOPE`); it is absent for role, ownership, state and
+ * revoked-credential refusals. Only a body that carries the field yields
+ * advice: nothing here is inferred from the tool's declared scope, which can
+ * differ from the route's own requirement. A value that does not look like a
+ * scope name is dropped rather than echoed into model-facing text.
+ */
+function scopesNamedByBoard(body: unknown): string[] {
+  if (typeof body !== 'object' || body === null) return [];
+  const details = (body as Record<string, unknown>).details;
+  if (typeof details !== 'object' || details === null) return [];
+  const named = (details as Record<string, unknown>).requiredScopes;
+  if (!Array.isArray(named)) return [];
+  return named
+    .filter((value): value is string => typeof value === 'string' && /^[a-z][a-z-]{0,40}:[a-z][a-z-]{0,40}$/.test(value))
+    .slice(0, 8);
 }
 
 /**
@@ -159,22 +190,36 @@ export function errorFromRest(
   const code = typeof envelope.code === 'string' ? ` [${envelope.code}]` : '';
   const parts = [`${toolName} failed (HTTP ${status})${code}`];
   if (detail) parts.push(detail);
+  if (typeof envelope.auditRef === 'string' && /^ka_[0-9a-f]{32}$/.test(envelope.auditRef)) {
+    parts.push('Audit reference: ' + envelope.auditRef);
+  }
   if (status === 401) {
     parts.push('Your credential did not authenticate. Check RELAYHALL_TOKEN, and that the credential is neither revoked nor expired.');
   }
   if (status === 403) {
+    const boardScopes = scopesNamedByBoard(envelope);
     if (envelope.code === 'TRANSPORT_MISMATCH') {
-      parts.push('This credential is pinned to a different transport class. An mcp-pinned credential works only through MCP tools; an api-pinned one only over REST. Ask the board owner to re-pin it, or use the other surface.');
-    } else if (requiredScope) {
-      parts.push(`This call needs the \`${requiredScope}\` scope. Ask the board owner to issue or extend a credential that carries it; use relayhall_access_preview to see what yours carries today.`);
+      parts.push('This credential is pinned to a different transport class. An mcp-pinned credential works only through MCP tools; an api-pinned one only over REST. Use the other surface, or ask root or an administrator to edit the pin on this connection (only they loosen it, and it is never filed as a request).');
+    } else if (boardScopes.length > 0) {
+      // The board's own data: the scope its route ceiling checked, which this
+      // credential does not carry. This names the real scope, not the tool's
+      // declared one.
+      const many = boardScopes.length > 1;
+      const named = boardScopes.map((scope) => `\`${scope}\``).join(', ');
+      parts.push(`The board named the missing scope${many ? 's' : ''} for this call: ${named}. Your credential does not carry ${many ? 'them' : 'it'}. Use relayhall_principal_whoami to inspect the scopes your credential carries, then relayhall_access_preview for effective object access; the board owner can add ${many ? 'them' : 'it'} to this credential in place, and a Connector can ask for that with relayhall_access_request (action \`file\`, kind \`authority-edit\`, object {type: 'credential'}, addScopes ${named}).`);
+    } else if (requiredScope && (envelope.code === 'INSUFFICIENT_SCOPE' || envelope.code === 'SCOPE_REQUIRED')) {
+      // Reached only by an explicit scope code that carries no structured
+      // scope (the board's own emitters all do). The declared scope is shown as
+      // declared, never as the board's statement.
+      parts.push(`The board identified a missing scope for this call (declared tool scope: \`${requiredScope}\`). Use relayhall_principal_whoami to inspect credential scopes, then relayhall_access_preview for effective object access.`);
     } else {
-      parts.push('Your credential lacks the authority for this call. Use relayhall_access_preview to see what it carries.');
+      parts.push('The board refused this call; its error above is authoritative. Check the relevant object role, grant, state and scope before changing a credential. Use relayhall_principal_whoami to inspect credential scopes and relayhall_access_preview for effective object access.');
     }
   }
   if (status === 404) parts.push('Nothing with that id is visible to you — it may not exist, or your grants may not reach it.');
   if (status === 409) parts.push('The board refused this transition in the object\'s current state; read the object first and retry from a legal state.');
   if (status === 503) parts.push('The board failed this request closed rather than answer it with partial authority. Retry; if it persists, tell the board owner.');
-  return new McpToolError(parts.join('\n'));
+  return new McpToolError(parts.join('\n'), status);
 }
 
 /** Render a value as pretty JSON for `detailed` output. */

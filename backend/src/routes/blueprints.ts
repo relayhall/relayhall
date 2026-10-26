@@ -1,5 +1,5 @@
 import { WarrantError } from '../services/WarrantService';
-import { StepUpError } from '../services/StepUpService';
+import { StepUpError, stepUpChallengeBody } from '../services/StepUpService';
 import { blueprintReferenceRegistry } from '../services/BlueprintReferenceRegistry';
 import { BlueprintCaptureService } from '../services/BlueprintCaptureService';
 import { BlueprintSetupService } from '../services/BlueprintSetupService';
@@ -15,6 +15,7 @@ import { BlueprintError } from '../utils/blueprintDocument';
 import { ResourceContractError } from '../services/ProjectResourceService';
 import { jsonBodyOptions } from '../utils/jsonBodyTypes';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import { requiredScopesDetail } from '../utils/apiErrors';
 import { BlueprintRegistryService } from '../services/BlueprintRegistryService';
 import { BlueprintResolutionService } from '../services/BlueprintResolutionService';
 import { BlueprintInstantiationService, BlueprintCreationCaller } from '../services/BlueprintInstantiationService';
@@ -46,7 +47,7 @@ function handle(operation: (req: Request,res: Response) => Promise<void>) {
   return async (req: Request,res: Response): Promise<void> => {
     try { await operation(req,res); }
     catch (error) {
-      if (error instanceof WarrantError || error instanceof StepUpError || error instanceof BlueprintError || error instanceof ResourceContractError || error instanceof GrantError || error instanceof AssignmentAccessError || error instanceof ProfileValidationError) { res.status(error.status).json({ success:false,code:error.code,error:error.message,...('field' in error && error.field ? {field:error.field} : {}) }); return; }
+      if (error instanceof WarrantError || error instanceof StepUpError || error instanceof BlueprintError || error instanceof ResourceContractError || error instanceof GrantError || error instanceof AssignmentAccessError || error instanceof ProfileValidationError) { const scopes = requiredScopesDetail(error); res.status(error.status).json({ success:false,code:error.code,error:error.message,...('field' in error && error.field ? {field:error.field} : {}),...(scopes ? {details:scopes} : {}),...stepUpChallengeBody(error) }); return; }
       const errorId = logCaughtFailure('[Blueprint API] operation failed',error);
       res.status(503).json({ success:false,code:'BLUEPRINT_OPERATION_UNAVAILABLE',error:'Blueprint operation is unavailable',errorId });
     }

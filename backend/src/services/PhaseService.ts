@@ -19,10 +19,16 @@ import type { CreationTransaction } from '../db/creationTransaction';
 // additive explicit grants. The exceptional restricted-access flag is changed
 // only through the attributed owner-plane method below; adding a grant never
 // changes inheritance policy (owner ruling 44ee41f2).
+import type { PoolClient } from 'pg';
 import { pool } from '../db/connection';
 import { v4 as uuidv4 } from 'uuid';
-import { feedEventService } from './FeedEventService';
+import { feedEventService, feedActorFields, type FeedActorRef } from './FeedEventService';
+import { creationFeedActor, creationTransactionOf, type CreationWriter } from '../db/creationWriter';
 import { lifecyclePolicyService } from './LifecyclePolicyService';
+import { reapAccessRequestsAtTerminal } from '../utils/accessRequestTerminal';
+
+/** The audit actor of the AZ-A9 phase arm: Phase mutations carry no actor. */
+const PHASE_TERMINAL_ACTOR = { handle: 'system', authMethod: 'system' as const };
 
 export const PHASE_STATUSES = ['todo', 'in-progress', 'completed', 'archived'] as const;
 export type PhaseStatus = (typeof PHASE_STATUSES)[number];
@@ -34,6 +40,7 @@ export const PHASE_SETTABLE_STATUSES: PhaseStatus[] = ['todo', 'in-progress', 'c
 
 export const PHASE_NAME_MAX_LENGTH = 200;
 export const PHASE_GOAL_MAX_LENGTH = 8192;
+export const PHASE_DESCRIPTION_MAX_LENGTH = 20000;
 export const PHASE_POSITION_MAX = 100000;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -43,9 +50,12 @@ export interface Phase extends BlueprintProvenanceFields {
   projectId: string;
   name: string;
   goal: string | null;
+  description: string | null;
   status: PhaseStatus;
   position: number;
   restrictedAccess: boolean;
+  /** Card 41e24358 (migration 155): the Verifier new cards landing here inherit; written only by PUT /phases/:id/default-verifier. */
+  defaultVerifierPrincipalId: string | null;
   revision: string;
   createdAt: string;
   updatedAt: string;
@@ -99,9 +109,11 @@ function mapRow(row: any): Phase {
     projectId: row.project_id,
     name: row.name,
     goal: row.goal ?? null,
+    description: row.description ?? null,
     status: row.status,
     position: row.position,
     restrictedAccess: Boolean(row.restricted_access),
+    defaultVerifierPrincipalId: row.default_verifier_principal_id ?? null,
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -144,13 +156,25 @@ function validateName(value: unknown): string {
   return trimmed;
 }
 
-function validateGoal(value: unknown): string | null {
+/** Exported for the change-request filing of phase.goal (T2 S5), which validates the goal exactly as this writer does. */
+export function validateGoal(value: unknown): string | null {
   if (value === null) return null;
   if (typeof value !== 'string') {
     throw err(422, 'INVALID_PHASE_VALUE', 'goal must be a string or null', 'goal');
   }
   if (value.length > PHASE_GOAL_MAX_LENGTH) {
     throw err(422, 'INVALID_PHASE_VALUE', `goal must be at most ${PHASE_GOAL_MAX_LENGTH} characters`, 'goal');
+  }
+  return value.length === 0 ? null : value;
+}
+
+function validateDescription(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string') {
+    throw err(422, 'INVALID_PHASE_VALUE', 'description must be a string or null', 'description');
+  }
+  if (Array.from(value).length > PHASE_DESCRIPTION_MAX_LENGTH) {
+    throw err(422, 'INVALID_PHASE_VALUE', `description must be at most ${PHASE_DESCRIPTION_MAX_LENGTH} characters`, 'description');
   }
   return value.length === 0 ? null : value;
 }
@@ -196,6 +220,7 @@ export interface CreatePhaseInput {
   projectId?: unknown;
   name?: unknown;
   goal?: unknown;
+  description?: unknown;
   status?: unknown;
   position?: unknown;
 }
@@ -204,6 +229,7 @@ export interface UpdatePhaseInput {
   revision?: unknown;
   name?: unknown;
   goal?: unknown;
+  description?: unknown;
   status?: unknown;
   position?: unknown;
 }
@@ -270,8 +296,13 @@ export class PhaseService {
     return mapRow(result.rows[0]);
   }
 
-  /** Create a Phase under an ACTIVE Project. */
-  async create(input: CreatePhaseInput, transaction?: CreationTransaction): Promise<Phase> {
+  /**
+   * Create a Phase under an ACTIVE Project. `writer` is REQUIRED (card
+   * 5854f0d6, round 2): the composing creation transaction, or the acting
+   * principal, so phase.created always records who wrote it.
+   */
+  async create(input: CreatePhaseInput, writer: CreationWriter): Promise<Phase> {
+    const transaction: CreationTransaction | undefined = creationTransactionOf(writer);
     const projectId = requireUuid(input.projectId, 'projectId', 'projectId must be a project UUID');
     const client = transaction?.client ?? await pool.connect();
     try {
@@ -281,6 +312,7 @@ export class PhaseService {
       await lockProject(client, projectId, true);
       const name = validateName(input.name);
       const goal = input.goal === undefined ? null : validateGoal(input.goal);
+      const description = input.description === undefined ? null : validateDescription(input.description);
       const status = input.status === undefined ? 'todo' : validateSettableStatus(input.status);
       const position = input.position === undefined ? 0 : validatePosition(input.position);
       const phaseId = uuidv4();
@@ -290,15 +322,14 @@ export class PhaseService {
         proposed: { projectId, status, restrictedAccess: false },
       });
       const result = await client.query(
-        `INSERT INTO phases (id, project_id, name, goal, status, position)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [phaseId, projectId, name, goal, status, position],
+        `INSERT INTO phases (id, project_id, name, goal, description, status, position)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [phaseId, projectId, name, goal, description, status, position],
       );
       // RH-P3.C1: same-transaction feed emission.
       await feedEventService.emit(client, {
         name: 'phase.created',
-        actorPrincipalId: transaction?.actor.principalId ?? null,
-        actorHandle: transaction?.actor.handle ?? null,
+        ...creationFeedActor(writer),
         objectType: 'phase',
         objectId: phaseId,
         projectId,
@@ -319,7 +350,12 @@ export class PhaseService {
    * Phase is read-only (§4.4) — restore it first. `status` here may only be
    * one of the settable states; archiving has its own verb.
    */
-  async update(id: string, input: UpdatePhaseInput): Promise<Phase> {
+  /**
+   * `client` (T2 S5, card 9ce0b0b0): the caller's open transaction, held by a
+   * change-request decision that applies an approved phase.goal inside its own
+   * decide transaction; absent, this method opens and commits its own.
+   */
+  async update(id: string, input: UpdatePhaseInput, actor?: FeedActorRef, client?: PoolClient): Promise<Phase> {
     const revision = requireUuid(input.revision, 'revision', 'revision is required and must be the current revision UUID');
     const fields: string[] = [];
     const params: unknown[] = [];
@@ -328,9 +364,10 @@ export class PhaseService {
       fields.push(`${column} = $${params.length}`);
     };
 
-    return this.withPhaseLock(id, revision, { requireActivePhase: true }, async (client, current) => {
+    return this.withPhaseLock(id, revision, { requireActivePhase: true, actor, client }, async (client, current) => {
       if (input.name !== undefined) push('name', validateName(input.name));
       if (input.goal !== undefined) push('goal', validateGoal(input.goal));
+      if (input.description !== undefined) push('description', validateDescription(input.description));
       if (input.status !== undefined) push('status', validateSettableStatus(input.status));
       if (input.position !== undefined) push('position', validatePosition(input.position));
       if (fields.length === 0) {
@@ -351,7 +388,16 @@ export class PhaseService {
          WHERE id = $${params.length} RETURNING *`,
         params,
       );
-      return mapRow(result.rows[0]);
+      const updated = mapRow(result.rows[0]);
+      // AZ-A9 clause 12a, PHASE ARM (ratified 2026-10-10, E43 Q3 — see
+      // utils/accessRequestTerminal.ts): a phase reaching completed revokes the
+      // grant rows and the credential that requests naming only this phase
+      // made, and lapses those still waiting, never to be restored.
+      if (updated.status === 'completed' && current.status !== 'completed') {
+        await reapAccessRequestsAtTerminal(client, { type: 'phase', id, to: 'completed', via: 'phase.update' },
+          PHASE_TERMINAL_ACTOR);
+      }
+      return updated;
     });
   }
 
@@ -360,7 +406,7 @@ export class PhaseService {
    * atomically. Ordinary content edits and grant creation cannot reach this
    * method, so neither can silently change inheritance semantics.
    */
-  async setRestrictedAccess(id: string, input: SetPhaseAccessInput): Promise<Phase> {
+  async setRestrictedAccess(id: string, input: SetPhaseAccessInput, client?: PoolClient): Promise<Phase> {
     const revision = requireUuid(input.revision, 'revision', 'revision is required and must be the current revision UUID');
     const actorPrincipalId = requireUuid(
       input.actorPrincipalId, 'actorPrincipalId', 'a resolved Principal is required for access-policy changes',
@@ -372,7 +418,7 @@ export class PhaseService {
       throw err(422, 'INVALID_PHASE_ACCESS', 'reason must be 3..1000 characters', 'reason');
     }
     const reason = input.reason.trim();
-    return this.withPhaseLock(id, revision, { requireActivePhase: true }, async (client, current) => {
+    return this.withPhaseLock(id, revision, { requireActivePhase: true, actor: { principalId: actorPrincipalId }, client }, async (client, current) => {
       if (current.restrictedAccess === input.restricted) {
         throw err(409, 'PHASE_ACCESS_UNCHANGED', 'Phase access policy already has the requested value');
       }
@@ -389,6 +435,7 @@ export class PhaseService {
         name: 'phase.acl_changed',
         objectType: 'phase',
         objectId: id,
+        ...feedActorFields({ principalId: actorPrincipalId }),
         projectId: current.projectId ?? null,
         payload: {},
       });
@@ -397,9 +444,9 @@ export class PhaseService {
   }
 
   /** Archive — reversible, and the routine way a Phase leaves the board. */
-  async archive(id: string, revision: unknown): Promise<Phase> {
+  async archive(id: string, revision: unknown, actor?: FeedActorRef): Promise<Phase> {
     const rev = requireUuid(revision, 'revision', 'revision is required and must be the current revision UUID');
-    return this.withPhaseLock(id, rev, { requireActivePhase: false }, async (client, current) => {
+    return this.withPhaseLock(id, rev, { requireActivePhase: false, actor }, async (client, current) => {
       if (current.status === 'archived') {
         throw err(409, 'PHASE_ALREADY_ARCHIVED', 'Phase is already archived');
       }
@@ -414,14 +461,18 @@ export class PhaseService {
          WHERE id = $1 RETURNING *`,
         [id],
       );
+      // AZ-A9 clause 12a, phase arm (ratified, E43 Q3): archived is terminal
+      // too. Idempotent after an earlier completed.
+      await reapAccessRequestsAtTerminal(client, { type: 'phase', id, to: 'archived', via: 'phase.archive' },
+        PHASE_TERMINAL_ACTOR);
       return mapRow(result.rows[0]);
     });
   }
 
   /** Unarchive back to `todo` — the reversal §4.4 promises. */
-  async unarchive(id: string, revision: unknown): Promise<Phase> {
+  async unarchive(id: string, revision: unknown, actor?: FeedActorRef): Promise<Phase> {
     const rev = requireUuid(revision, 'revision', 'revision is required and must be the current revision UUID');
-    return this.withPhaseLock(id, rev, { requireActivePhase: false }, async (client, current) => {
+    return this.withPhaseLock(id, rev, { requireActivePhase: false, actor }, async (client, current) => {
       if (current.status !== 'archived') {
         throw err(409, 'PHASE_NOT_ARCHIVED', 'Phase is not archived');
       }
@@ -457,6 +508,18 @@ export class PhaseService {
       if (current.rows.length === 0) {
         throw err(404, 'PHASE_NOT_FOUND', 'Phase not found');
       }
+      // Card b13e5ac9: a Phase its Project names as the inbox phase is
+      // refused here, with a typed answer, rather than by the composite FK
+      // projects_inbox_phase_fk (migration 141) as an untranslated constraint
+      // violation. Deleting it must never silently clear where new cards land.
+      const inbox = await client.query('SELECT 1 FROM projects WHERE inbox_phase_id = $1 LIMIT 1', [id]);
+      if (inbox.rows.length > 0) {
+        throw err(
+          409,
+          'PHASE_IS_INBOX',
+          "Phase is its Project's inbox phase; name another inbox phase or clear it (PATCH /projects/{id} inboxPhaseId) first",
+        );
+      }
       const inUse = await client.query('SELECT COUNT(*)::int AS n FROM tasks WHERE phase_id = $1', [id]);
       if (inUse.rows[0].n > 0) {
         throw err(
@@ -471,6 +534,11 @@ export class PhaseService {
         current: { status: current.rows[0].status },
         proposed: null,
       });
+      // AZ-A9 clause 12a, phase arm: a deleted phase is terminal for its
+      // requests, reaped BEFORE the delete (related_phase_id is ON DELETE SET
+      // NULL and would otherwise detach the request from its rows).
+      await reapAccessRequestsAtTerminal(client, { type: 'phase', id, to: 'deleted', via: 'phase.remove' },
+        PHASE_TERMINAL_ACTOR);
       const result = await client.query('DELETE FROM phases WHERE id = $1 RETURNING *', [id]);
       // RH-P3.C1: the content-free deletion tombstone rides the deleting
       // transaction; the event row keeps project_id so delivery can still be
@@ -530,15 +598,17 @@ export class PhaseService {
   private async withPhaseLock<T>(
     id: string,
     revision: string,
-    opts: { requireActivePhase: boolean },
+    opts: { requireActivePhase: boolean; actor?: FeedActorRef; client?: PoolClient },
     run: (client: Queryable, current: Phase) => Promise<T>,
   ): Promise<T> {
     if (!UUID_PATTERN.test(id)) {
       throw err(404, 'PHASE_NOT_FOUND', 'Phase not found');
     }
-    const client = await pool.connect();
+    // A caller's open transaction (T2 S5): its owner begins, commits and rolls back.
+    const outer = opts.client;
+    const client = outer ?? await pool.connect();
     try {
-      await client.query('BEGIN');
+      if (!outer) await client.query('BEGIN');
       const found = await client.query('SELECT * FROM phases WHERE id = $1 FOR UPDATE', [id]);
       if (found.rows.length === 0) {
         throw err(404, 'PHASE_NOT_FOUND', 'Phase not found');
@@ -557,16 +627,18 @@ export class PhaseService {
         name: 'phase.updated',
         objectType: 'phase',
         objectId: id,
+        // Card 5854f0d6 (design section 4.3): the acting principal.
+        ...feedActorFields(opts.actor),
         projectId: current.projectId ?? null,
         payload: {},
       });
-      await client.query('COMMIT');
+      if (!outer) await client.query('COMMIT');
       return result;
     } catch (e) {
-      await client.query('ROLLBACK');
+      if (!outer) await client.query('ROLLBACK');
       throw e;
     } finally {
-      client.release();
+      if (!outer) (client as PoolClient).release();
     }
   }
 }

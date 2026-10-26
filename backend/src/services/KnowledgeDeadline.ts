@@ -91,6 +91,26 @@ export const KNOWLEDGE_ADMISSION_MAX_MS = 5000;
  */
 export const KNOWLEDGE_LEDGER_MAX_MS = 2000;
 
+/**
+ * Card 3e0ae06e — what a v2 source is told it may spend.
+ *
+ * Core never told a source how long it would wait, so the source bounded a
+ * search by its own constant, and that constant was shorter than the caller's
+ * budget: a first search for a new text answered `partial`/`deadline` with no
+ * rows inside an 8 s `timeoutMs`, and only a repeat answered. The v2 search
+ * request now carries `budget_ms`: this leg's dial budget (the one the dial
+ * client and the clock race both enforce) less a return margin, so a source
+ * that spends all of it still answers before core stops waiting. The margin
+ * covers the source's assembly after its own deadline, its audit append and
+ * the trip back.
+ */
+export const KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS = 300;
+
+/** `budget_ms` for one leg: its dial budget less the margin, never below 1. */
+export function knowledgeSourceBudgetMs(dialBudgetMs: number): number {
+  return Math.max(1, Math.floor(dialBudgetMs) - KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS);
+}
+
 /** How many sources are admitted, and later dialed, at once. */
 export const KNOWLEDGE_FANOUT_CONCURRENCY = 4;
 

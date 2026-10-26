@@ -113,6 +113,27 @@ describe('the Settings shell renders the information architecture', () => {
     expect(within(nav()).getByRole('link', { name: /Appearance/ })).not.toHaveAttribute('aria-current');
   });
 
+  // Owner bug report E406: the shell decides its current section by the same
+  // whole-segment, longest-match rule as the sidebar, so exactly one entry is
+  // the page, on every spelling the router sends to it.
+  test('exactly one entry is the current page, Access grants and Access manager never both', () => {
+    session(ROOT, ['root'], allSurfaces(true));
+    for (const [path, expected] of [
+      ['/settings/access-manager', 'Access manager'],
+      ['/settings/access', 'Access grants'],
+      ['/settings/access-manager/', 'Access manager'],
+      ['/settings/ACCESS', 'Access grants'],
+    ] as const) {
+      renderShell(path);
+      const links = within(nav()).getAllByRole('link');
+      const current = links.filter((link) => link.getAttribute('aria-current') === 'page');
+      expect(current.map((link) => link.querySelector('.settings-nav-label')?.textContent), path).toEqual([expected]);
+      const highlighted = links.filter((link) => link.classList.contains('settings-nav-link--active'));
+      expect(highlighted, path).toEqual(current);
+      cleanup();
+    }
+  });
+
   test('every rendered entry has a routed page behind it', () => {
     session(ROOT, ['root'], allSurfaces(true));
     renderShell('/settings/appearance');

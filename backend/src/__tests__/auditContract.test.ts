@@ -200,10 +200,13 @@ describe('required control-plane audit coverage', () => {
   const sources = [
     '../routes/auth.ts',
     '../routes/webhooks.ts',
+    '../routes/principals.ts',
     '../services/GrantService.ts',
     '../services/PrincipalService.ts',
     '../services/ServiceRegistry.ts',
+    '../services/SkillManager.ts',
     '../services/TaskManagerDB.ts',
+    '../services/CharterService.ts',
   ].map((relative) => fs.readFileSync(path.join(__dirname, relative), 'utf8')).join('\n');
 
   it.each([
@@ -217,13 +220,42 @@ describe('required control-plane audit coverage', () => {
     'credential.mint',
     'credential.revoke',
     'task.arm',
+    // Card 3fc32dd1: every claim decision, Succeeded and Refused.
+    'task.claim',
     'task.lifecycle_override.status',
     'task.lifecycle_override.force_release',
     'task.lifecycle_override.roles',
     // RH-P3.C3: one-click meltdown recovery (§2.6.4, C4).
     'task.lifecycle_override.recovery',
+    // Card eb7c0271: every Skill Version publication.
+    'skill.publish',
+    'charter.approve',
+    'skill.create',
+    'skill.create_version',
+    'skill.submit_review',
+    'skill.reject',
+    'skill.retire',
+    'skill.set_global',
+    'skill.delete',
+    'skill.project_pin',
+    'skill.project_unpin',
+    'principal.create',
+    'principal.update',
   ])('records %s', (action) => {
     expect(sources).toContain(`action: '${action}'`);
+  });
+
+  it('pins the Charter approval actor, project resource and three metadata-only fields at its single writer', () => {
+    const source = fs.readFileSync(path.join(__dirname, '../services/CharterService.ts'), 'utf8');
+    expect(source.match(/action: 'charter\.approve'/g)).toHaveLength(1);
+    expect(source).toContain("resourceType: 'project', resourceId: projectId");
+    // Card b5c83682 (LENSES-c gate (i), design delta C.5): the Group-owner arm's
+    // fields join the row for that arm only; every other row keeps exactly the three.
+    expect(source).toContain('metadata: { charterVersion, sha, previousVersion, ...(groupOwner ?? {}) }');
+    expect(source).toContain("'success', head.version, head.content_hash, previousVersion, client,");
+    const route = fs.readFileSync(path.join(__dirname, '../routes/projects.ts'), 'utf8');
+    expect(route).toContain('authMethod: req.authMethod, audit: auditActorFromRequest(req)');
+    expect(source).not.toMatch(/INSERT\s+INTO\s+audit_events/i);
   });
 
   it('does not put webhook secrets or delivery endpoints in audit metadata', () => {

@@ -15,6 +15,8 @@ export interface BoardOwnershipFilters {
   ownerPrincipalId?: string;
   ownerHandle?: string;
   unassigned?: boolean;
+  /** Card 41e24358: only cards without a usable Verifier (services/VerifierUsability). */
+  verifierUnusable?: boolean;
   /** Set when the request can only ever match nothing. */
   __empty?: true;
 }
@@ -43,8 +45,9 @@ export function buildBoardOwnershipFilters(
   const mine = scalarParam(query.mine);
   const owner = scalarParam(query.owner);
   const unassigned = scalarParam(query.unassigned);
+  const verifierUnusable = scalarParam(query.verifierUnusable);
 
-  if (mine === INVALID || owner === INVALID || unassigned === INVALID) {
+  if (mine === INVALID || owner === INVALID || unassigned === INVALID || verifierUnusable === INVALID) {
     return { __empty: true };
   }
 
@@ -58,6 +61,7 @@ export function buildBoardOwnershipFilters(
   if (ownerHandle) filters.ownerHandle = ownerHandle;
 
   if (unassigned === 'true') filters.unassigned = true;
+  if (verifierUnusable === 'true') filters.verifierUnusable = true;
 
   return filters;
 }

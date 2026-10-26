@@ -1,13 +1,15 @@
 import { authenticatedFetch } from '../utils/auth';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Plus, Search, SlidersHorizontal, GraduationCap, Globe, Tag, X } from 'lucide-react';
 import { Skill } from '../types/skill';
 import { SkillDetailModal } from '../components/skills/SkillDetailModal';
+import { skillOwnerLabel } from '../components/skills/skillOwner';
 import { Button } from '../components/Button';
 import { RequestStatus } from '../components/RequestStatus';
 import './SkillsPage.css';
 
-type ViewFilter = 'all' | 'global';
+type ViewFilter = 'all' | 'global' | 'owners';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -23,6 +25,18 @@ export const SkillsPage: React.FC = () => {
   const [showFilters, setShowFilters] = useState(false);
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  // `?skill=<id>` opens that Skill (card b1e3b16d): the approvals hub links a
+  // version waiting for review here, where versions are published or returned
+  // exactly as before — the link adds a way IN, not a way to decide.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const linkedSkillId = searchParams.get('skill');
+  const [linkMissing, setLinkMissing] = useState(false);
+  // Card d67e6990: the registry lists published Skills, this Account's own
+  // drafts and, for an administrator, the review queue; an administrator may
+  // also ask for every owner's drafts (owner=all). The list answer says
+  // whether this session administers the registry.
+  const [administrator, setAdministrator] = useState(false);
+  const allOwners = administrator && viewFilter === 'owners';
 
   const fetchSkills = useCallback(async () => {
     const request = ++requestSequence.current;
@@ -33,12 +47,14 @@ export const SkillsPage: React.FC = () => {
       if (searchQuery) params.set('search', searchQuery);
       if (categoryFilter) params.set('category', categoryFilter);
       if (tagFilter) params.set('tag', tagFilter);
+      if (allOwners) params.set('owner', 'all');
       const query = params.toString();
       const response = await authenticatedFetch(`${API_BASE_URL}/skills${query ? `?${query}` : ''}`);
       const data = await response.json();
       if (request !== requestSequence.current) return;
       if (response.ok && data.success) {
         setSkills(data.skills || []);
+        setAdministrator(data.viewer?.administrator === true);
       } else {
         setError(data.error || 'Failed to fetch skills');
       }
@@ -47,7 +63,7 @@ export const SkillsPage: React.FC = () => {
     } finally {
       if (request === requestSequence.current) setLoading(false);
     }
-  }, [searchQuery, categoryFilter, tagFilter]);
+  }, [searchQuery, categoryFilter, tagFilter, allOwners]);
 
   useEffect(() => {
     void fetchSkills();
@@ -61,16 +77,46 @@ export const SkillsPage: React.FC = () => {
   // Client-side filter for view toggle (global vs all)
   const displayedSkills = viewFilter === 'global' ? skills.filter(t => t.is_global) : skills;
 
+  // Open the linked Skill once the list it lives in has loaded; say so when
+  // this session's registry does not hold it, rather than opening nothing.
+  useEffect(() => {
+    if (!linkedSkillId || loading) return;
+    const linked = skills.find((skill) => skill.id === linkedSkillId);
+    if (linked) {
+      setSelectedSkill(linked);
+      setLinkMissing(false);
+    } else {
+      setLinkMissing(true);
+    }
+  }, [linkedSkillId, loading, skills]);
+
+  const clearSkillLink = useCallback(() => {
+    setLinkMissing(false);
+    setSearchParams((current) => {
+      if (!current.has('skill')) return current;
+      const params = new URLSearchParams(current);
+      params.delete('skill');
+      return params;
+    }, { replace: true });
+  }, [setSearchParams]);
+
+  const closeSelected = useCallback(() => {
+    setSelectedSkill(null);
+    clearSkillLink();
+  }, [clearSkillLink]);
+
   const handleSkillSaved = useCallback(() => {
     fetchSkills();
     setSelectedSkill(null);
     setShowCreateModal(false);
-  }, [fetchSkills]);
+    clearSkillLink();
+  }, [fetchSkills, clearSkillLink]);
 
   const handleSkillDeleted = useCallback(() => {
     fetchSkills();
     setSelectedSkill(null);
-  }, [fetchSkills]);
+    clearSkillLink();
+  }, [fetchSkills, clearSkillLink]);
 
   return (
     <div className="skills-page">
@@ -103,6 +149,14 @@ export const SkillsPage: React.FC = () => {
           <Globe size={16} />
           Global Skills ({skills.filter(t => t.is_global).length})
         </button>
+        {administrator && (
+          <button
+            className={`view-toggle-btn ${viewFilter === 'owners' ? 'view-toggle-btn--active' : ''}`}
+            onClick={() => setViewFilter('owners')}
+          >
+            Every owner&apos;s drafts
+          </button>
+        )}
       </div>
 
       {/* Controls */}
@@ -227,6 +281,10 @@ export const SkillsPage: React.FC = () => {
                 <div className="skill-card-category">{skill.provenance}</div>
               )}
 
+              {skill.owner_principal_id && (
+                <div className="skill-card-category">Owner: {skillOwnerLabel(skill)}</div>
+              )}
+
               {skill.tags && skill.tags.length > 0 && (
                 <div className="skill-card-tags">
                   {skill.tags.map(tag => (
@@ -239,11 +297,17 @@ export const SkillsPage: React.FC = () => {
         </div>
       )}
 
+      {linkMissing && (
+        <p className="skills-page-link-missing" role="status">
+          The linked skill is not in the registry this session can see.
+        </p>
+      )}
+
       {/* Skill Detail/Edit Modal */}
       {selectedSkill && (
         <SkillDetailModal
           skill={selectedSkill}
-          onClose={() => setSelectedSkill(null)}
+          onClose={closeSelected}
           onSaved={handleSkillSaved}
           onDeleted={handleSkillDeleted}
         />

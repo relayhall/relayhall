@@ -49,6 +49,10 @@ const PACK = {
   authoritySummary: { scopes: SESSION_SCOPES, rules: [] },
   previewPath: '/principals/me/effective-access',
   credentialPlaceholder: '',
+  // Card 94e8bb0b: the pack's bootstrap prompt rides every test below, so the
+  // credential-sighting counts include its block and prove it adds none.
+  bootstrapPrompt: 'Connect to the RelayHall MCP server "relayhall" at https://board.example/api/mcp with the credential from your secure store; never paste the credential into this chat.',
+  configurationGuidance: ['Register the MCP server as "relayhall" at https://board.example/api/mcp using the block for your client.'],
 };
 
 beforeEach(() => {
@@ -67,18 +71,29 @@ afterEach(cleanup);
 const renderWizard = () => render(<ConnectAgentWizard />);
 
 describe('step 1 — what is it for', () => {
-  it('offers exactly the six choices of the owner record, in its order', async () => {
+  it('offers the six choices of the owner record plus Antigravity, in the table order', async () => {
     renderWizard();
     const group = screen.getByRole('radiogroup', { name: 'What the connection is for' });
     const rendered = within(group).getAllByRole('radio').map((node) => (node.textContent || '').trim());
-    expect(rendered).toHaveLength(6);
-    // Order is the owner record's own order, and each choice is the table's.
+    expect(rendered).toHaveLength(7);
+    // Order is the table's own order, and each choice is the table's.
     CONNECTION_TEMPLATES.forEach((template, index) => {
       expect(rendered[index]).toContain(template.label);
     });
     expect(CONNECTION_TEMPLATES.map((t) => t.label)).toEqual(
-      ['Claude Code', 'Codex', 'VS Code', 'Generic MCP client', 'API script', 'Messaging gateway'],
+      ['Claude Code', 'Codex', 'VS Code', 'Antigravity', 'Generic MCP client', 'API script', 'Messaging gateway'],
     );
+  });
+
+  it('shows each harness template with the transport it pins, `any`, and the others as before', async () => {
+    renderWizard();
+    for (const [name, transport] of [
+      [/Claude Code/, 'any'], [/Codex/, 'any'], [/VS Code/, 'any'], [/Antigravity/, 'any'],
+      [/Generic MCP client/, 'mcp'], [/API script/, 'api'],
+    ] as const) {
+      const radio = screen.getByRole('radio', { name });
+      expect(within(radio).getByText(`Transport: ${transport}`)).toBeInTheDocument();
+    }
   });
 
   it('disables the messaging gateway and says why, because no gateway surface exists yet', async () => {
@@ -162,11 +177,15 @@ describe('a session whose authority resolves LATE (review finding P1)', () => {
   });
 });
 
-describe('the template recommendation (decision 1 stays the default)', () => {
+describe('the template recommendation (decision 1 stays the default for ordinary templates)', () => {
+  /** Generic MCP client: an ordinary template, so decision 1 governs it. (The
+   *  harness templates are measured in the administrator file and below.) */
+  const GENERIC = CONNECTION_TEMPLATES.find((template) => template.key === 'generic-mcp')!;
+
   it('offers the template set inside narrow-it, and does NOT apply it on its own', async () => {
     renderWizard();
     await waitFor(() => expect(screen.getByText(/everything you can do/)).toBeInTheDocument());
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
 
     // Decision 1: the DEFAULT is still everything the person can do.
@@ -174,22 +193,22 @@ describe('the template recommendation (decision 1 stays the default)', () => {
     expect(boxes().every((b) => b.checked)).toBe(true);
 
     // The recommendation is an ACTION the person takes.
-    await userEvent.click(screen.getByRole('button', { name: 'Use the recommended set for Claude Code' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Use the recommended set for Generic MCP client' }));
     const ticked = boxes().filter((b) => b.checked).map((b) => b.id.replace('conn-wizard-scope-', ''));
-    const expected = recommendedScopesFor(CONNECTION_TEMPLATES[0], SESSION_SCOPES)
+    const expected = recommendedScopesFor(GENERIC, SESSION_SCOPES)
       .map((s) => s.replace(/[^a-z0-9]+/gi, '-'));
     expect(ticked.sort()).toEqual(expected.sort());
   });
 
   it('the recommendation is INTERSECTED with the session — a template can only narrow', () => {
     // The session here holds three of the eight scopes the template names.
-    const recommended = recommendedScopesFor(CONNECTION_TEMPLATES[0], SESSION_SCOPES);
+    const recommended = recommendedScopesFor(GENERIC, SESSION_SCOPES);
     expect(recommended.length).toBeGreaterThan(0);
     expect(recommended.every((scope) => SESSION_SCOPES.includes(scope))).toBe(true);
     // The control can fire: the template genuinely names scopes this session
     // does NOT hold, so an unintersected implementation would differ here.
-    expect(CONNECTION_TEMPLATES[0].suggestedScopes.some((s) => !SESSION_SCOPES.includes(s))).toBe(true);
-    expect(recommendedScopesFor(CONNECTION_TEMPLATES[0], [])).toEqual([]);
+    expect(GENERIC.suggestedScopes.some((s) => !SESSION_SCOPES.includes(s))).toBe(true);
+    expect(recommendedScopesFor(GENERIC, [])).toEqual([]);
   });
 
   it('every template recommends only scopes the board can actually mint', () => {
@@ -233,7 +252,12 @@ describe('creating the connection', () => {
     expect(body.name).toBe('My Laptop');
     // The exact string the list maps back through the same table.
     expect(body.description).toBe(CONNECTION_TEMPLATES[0].registrationText);
-    expect(body.issueCredential.transport).toBe('mcp');
+    // Claude Code is a harness template (E462 S1): ONE token that works on REST
+    // and MCP, registered together with its first descriptor.
+    expect(body.issueCredential.transport).toBe('any');
+    expect(body.descriptor).toEqual({ options: [], telemetry: { tier: 'full', products: ['claude-code'] } });
+    // The session holds three scopes, all of them in the harness set, so the
+    // request is exactly the session's own three.
     expect(body.issueCredential.scopes).toEqual(SESSION_SCOPES);
     // Nothing that would ask for authority beyond the session, and no owner
     // other than the caller: the route refuses both, and the wizard never tries.
@@ -256,7 +280,11 @@ describe('creating the connection', () => {
     expect(screen.getByText(/shown once and is never stored on the board/)).toBeInTheDocument();
     // The Claude Code tab is selected and its block carries the real token.
     expect(screen.getByRole('radio', { name: 'Claude Code' })).toHaveAttribute('aria-checked', 'true');
-    expect(screen.getByText(new RegExp(REAL_TOKEN))).toBeInTheDocument();
+    const tabBlock = screen.getByTestId('tab-block');
+    expect(within(tabBlock).getByText(new RegExp(REAL_TOKEN))).toBeInTheDocument();
+    // A harness template also hands the token to the installer's hidden prompt,
+    // in a block of its own beside the install line.
+    expect(screen.getByTestId('installer-token').textContent).toBe(REAL_TOKEN);
     // The fixture is a REAL-SHAPED token, so the leak controls elsewhere are
     // matching the grammar the board actually mints.
     expect(CREDENTIAL_TOKEN_PATTERN.test(REAL_TOKEN)).toBe(true);
@@ -341,8 +369,9 @@ describe('creating the connection', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Create connection' }));
     await waitFor(() => expect(screen.getByText(/Paste this into your agent/)).toBeInTheDocument());
 
-    // The Claude Code template pins `mcp`, so these three are the enabled tabs.
-    for (const label of ['Claude Code', 'Codex', 'Generic MCP client']) {
+    // The Claude Code template pins `any` (E462 S1), so all four tabs are
+    // enabled: the one token works on REST and on MCP.
+    for (const label of ['Claude Code', 'Codex', 'Generic MCP client', 'CLI and scripts']) {
       await userEvent.click(screen.getByRole('radio', { name: label }));
       const seen = blocks().reduce((total, text) => total + sightings(text), 0);
       expect(`${label}: ${seen}`).toBe(`${label}: ${TOKEN_SIGHTINGS[label]}`);
@@ -394,7 +423,9 @@ describe('creating the connection', () => {
   });
 
   it('an mcp-pinned connection disables the CLI tab and names the reason, rather than handing out a snippet that would be refused', async () => {
-    await walkToCreate();
+    // Generic MCP client is the template that still pins `mcp`; the harness
+    // templates pin `any` and open every tab.
+    await walkToCreate(/Generic MCP client/);
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (String(url).endsWith('/principals/me')) return ok({ success: true, principal: { id: 'me' }, scopes: SESSION_SCOPES });
       if (String(url).endsWith('/services') && init?.method === 'POST') {

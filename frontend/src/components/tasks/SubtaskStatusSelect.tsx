@@ -50,6 +50,7 @@ interface SubtaskStatusSelectProps {
   subtaskText: string;
   className?: string;
   disabled?: boolean;
+  ownerControl?: boolean;
 }
 
 const statusLabel = (status: SubtaskStatus): string =>
@@ -61,6 +62,7 @@ export const SubtaskStatusSelect: React.FC<SubtaskStatusSelectProps> = ({
   subtaskText,
   className = '',
   disabled = false,
+  ownerControl = false,
 }) => {
   const actions = SUBTASK_LIFECYCLE_ACTIONS[value];
   return (
@@ -69,7 +71,7 @@ export const SubtaskStatusSelect: React.FC<SubtaskStatusSelectProps> = ({
       value={value}
       disabled={disabled || actions.length === 0}
       aria-label={`Lifecycle action for ${subtaskText}. Current status: ${statusLabel(value)}`}
-      title="Choose an allowed lifecycle action. Verifier-only actions are enforced by the server."
+      title={ownerControl ? "Account owner actions are recorded separately from independent verification." : "Choose an allowed lifecycle action. Verifier-only actions are enforced by the server."}
       onClick={(event) => event.stopPropagation()}
       onChange={(event) => {
         event.stopPropagation();
@@ -80,7 +82,7 @@ export const SubtaskStatusSelect: React.FC<SubtaskStatusSelectProps> = ({
       <option value={value}>Current: {statusLabel(value)}</option>
       {actions.map((option) => (
         <option key={option.value} value={option.value}>
-          {option.label}{option.authorityNote ? ` — ${option.authorityNote}` : ''}
+          {ownerControl && option.value === 'completed' ? 'Complete' : ownerControl && value === 'review' && option.value === 'empty' ? 'Return to not started' : option.label}{option.authorityNote ? ` — ${ownerControl ? 'account owner' : option.authorityNote}` : ''}
         </option>
       ))}
     </Select>

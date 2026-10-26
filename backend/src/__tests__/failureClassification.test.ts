@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { DatabaseError } from 'pg';
+import { KnowledgeSelectorError } from '../services/KnowledgeV2';
 import {
   identifyCaughtFailure,
   isFailureCode,
@@ -27,6 +28,13 @@ const databaseError = (code?: string): DatabaseError => {
 };
 
 describe('identifyCaughtFailure', () => {
+  it('identifies selector refusals without emitting their code, message or audit reference', () => {
+    const caught = new KnowledgeSelectorError('INVALID_SELECTOR', 400, PRIVATE_MARKER);
+    caught.message = PRIVATE_MARKER;
+    caught.code = PRIVATE_MARKER;
+    expect(identifyCaughtFailure(caught)).toEqual({ category: 'Error', errorClass: 'KnowledgeSelectorError', code: 'ERROR_UNCLASSIFIED' });
+    expect(JSON.stringify(identifyCaughtFailure(caught))).not.toContain(PRIVATE_MARKER);
+  });
   it('maps tabled SQLSTATEs to their own constant', () => {
     expect(identifyCaughtFailure(databaseError('57014')).code).toBe('DB_STATEMENT_TIMEOUT');
     expect(identifyCaughtFailure(databaseError('40001')).code).toBe('DB_SERIALIZATION_FAILURE');

@@ -113,8 +113,10 @@ describe('the tool advertises what the route requires', () => {
   });
 
   it('carries the optional executionWarrantId the route consumes beside it', () => {
+    // Card 785e1eed P2-B (AZ-A10 clause 6): and the reassignment's optional
+    // date, which the route consumes beside the profile too.
     expect(Object.keys(schema.properties).sort())
-      .toEqual(['executionProfile', 'executionWarrantId', 'reason', 'task']);
+      .toEqual(['executionProfile', 'executionWarrantId', 'reason', 'roleGrantExpiresAt', 'task']);
   });
 
   it('no longer advertises assignTo, which the route has never read', () => {
@@ -240,12 +242,12 @@ describe('a recovery actually happens', () => {
     const line =
       "      const envelope = await board(ctx, { method: 'POST', path: `/tasks/"
       + '${encodeURIComponent(taskId)}'
-      + "/recover`, body: pick(args, ['reason', 'executionProfile', 'executionWarrantId']), "
+      + "/recover`, body: pick(args, ['reason', 'executionProfile', 'executionWarrantId', 'roleGrantExpiresAt']), "
       + "requiredScope: 'tasks:write' });";
     const mutant = loadMutatedModule<typeof import('../mcp/registry')>('mcp/registry.ts', [{
       find: line,
       replace: line.replace(
-        "['reason', 'executionProfile', 'executionWarrantId']", "['reason']",
+        "['reason', 'executionProfile', 'executionWarrantId', 'roleGrantExpiresAt']", "['reason']",
       ),
     }]);
     const mutated = mutant.toolByName('relayhall_task_recover');

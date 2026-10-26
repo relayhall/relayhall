@@ -93,8 +93,8 @@ export class BlueprintResolutionService {
         // this query's grant relation; it writes nothing, invents no owner and
         // leaves delegation/own()/Agent caps in the canonical SQL unchanged.
         const result = await queryable.query(`WITH grants AS (
-          SELECT grantee_type,grantee_id,resource_type,resource_id,verb,expires_at FROM grants
-          UNION ALL SELECT 'principal'::text,$2::uuid,'project'::text,$1::uuid,verb,NULL::timestamptz
+          SELECT id,provenance,grantee_type,grantee_id,resource_type,resource_id,verb,expires_at FROM grants
+          UNION ALL SELECT NULL::uuid,NULL::text,'principal'::text,$2::uuid,'project'::text,$1::uuid,verb,NULL::timestamptz
           FROM unnest(ARRAY['read','write']::text[]) AS verb
         ) SELECT p.id FROM (SELECT $1::uuid AS id,NULL::uuid AS owner_principal_id,'private'::text AS visibility) p WHERE ${condition.sql}`, [target.projectId,caller.actor.principalId,...condition.params]);
         return result.rows.length === 1;
@@ -104,7 +104,7 @@ export class BlueprintResolutionService {
         return !!requirement.resourceId && (await authorizationRepository.authorizedIds(caller.actor,kind,[requirement.resourceId],'use',queryable)).has(requirement.resourceId);
       }
       if (requirement.operation === 'service.invoke') return !!requirement.resourceId && (await authorizationRepository.authorizedIds(caller.actor,'service',[requirement.resourceId],'invoke',queryable)).has(requirement.resourceId);
-      if (requirement.operation === 'task.create' || requirement.operation === 'task.roles') {
+      if (requirement.operation === 'task.create' || requirement.operation === 'task.roles' || requirement.operation === 'task.verification-none') {
         // The canonical predicate applies the Agent task cap and Shepherd
         // act to a new ordinary Task. Its non-UUID marker cannot equal any
         // persisted bound_task_id UUID; creation cannot be the bound Task.
@@ -113,6 +113,13 @@ export class BlueprintResolutionService {
         if (requirement.operation === 'task.create') {
           const link = caller.actor.delegation?.links[0];
           if (link?.kind === 'agent' && !link.legacyIdentity) return authorizationService.authorizeResource(caller.actor,'write',resource,[]).allowed;
+        } else if (requirement.operation === 'task.verification-none') {
+          // Section 6.8 (E462 S4b): the roles act's Shepherd authority on the
+          // new Task, never an Agent. The create itself re-decides it in its
+          // transaction (verificationNoneSetterBasis), with G(Task).
+          const link = caller.actor.delegation?.links[0];
+          if (link?.kind === 'agent') return false;
+          return authorizationService.authorizeResource(caller.actor,'shepherd',resource,[]).allowed;
         } else {
           if (!authorizationService.authorizeResource(caller.actor,'shepherd',resource,[]).allowed) return false;
           for (const id of requirement.principalIds || []) {

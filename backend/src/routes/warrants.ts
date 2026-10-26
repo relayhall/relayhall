@@ -18,8 +18,9 @@
 import { Router, Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { authorizedTaskNarrowing, filterAuthorizedResources } from '../middleware/sharedAuthorization';
+import { filterReadablePhases } from './phases';
 import { warrantService, WarrantError } from '../services/WarrantService';
-import { accessVehicleService } from '../services/AccessVehicleService';
+import { accessVehicleService, AssignmentAccessError } from '../services/AccessVehicleService';
 import { stepUpService, StepUpError } from '../services/StepUpService';
 import { credentialLifecycleService } from '../services/CredentialLifecycleService';
 import { auditService } from '../services/AuditService';
@@ -27,6 +28,11 @@ import { auditActorFromRequest } from '../utils/auditActor';
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { pool } from '../db/connection';
 import { isLoginSessionKind } from '../utils/administratorSession';
+import { authorityEditExecutor } from '../services/AuthorityEditExecutor';
+import {
+  auditRouteRefusal, canonicalObjectId, editorContext, editorStanding, editResponse, refuseStanding, sendAuthorityEditError,
+  splitEditBody,
+} from './authorityEditRoute';
 
 const router = Router();
 
@@ -65,19 +71,26 @@ export async function requireSessionViewer(req: AuthRequest, res: Response, surf
 }
 
 function sendWarrantError(res: Response, e: unknown): boolean {
-  if (e instanceof WarrantError || e instanceof StepUpError) {
-    res.status(e.status).json({ error: 'Refused', code: e.code, message: e.message });
+  if (e instanceof WarrantError || e instanceof StepUpError || (e instanceof AssignmentAccessError && e.code === 'ASSIGNMENT_REFERENCE_BUSY')) {
+    // Card 7a99d63e (SU-14): what to step up for, on STEP_UP_REQUIRED. Read
+    // inline (the same expression as `stepUpChallengeBody`): this mapper is
+    // compiled on its own by assignmentReferenceBusy.test.ts, so it names no
+    // helper beyond the classes it already guards on.
+    res.status(e.status).json({
+      error: 'Refused', code: e.code, message: e.message,
+      ...(e instanceof StepUpError && e.challenge ? { stepUp: e.challenge } : {}),
+    });
     return true;
   }
   return false;
 }
 
 /** Self-scope containment for a single warrant (§9.1): holder in the
- * viewer's subtree — 404-conceal otherwise. */
+ * viewer's subtree — 404-conceal otherwise. The rule lives in
+ * `credentialLifecycleService.holderConcealedFrom`, which the Access Explorer
+ * asks too (card 1e56dbef), so the two cannot drift apart. */
 async function concealForeign(viewer: SessionViewer, holderPrincipalId: string): Promise<boolean> {
-  if (viewer.isRoot) return false;
-  if (holderPrincipalId === viewer.principalId) return false;
-  return !(await credentialLifecycleService.isDescendant(viewer.principalId, holderPrincipalId));
+  return credentialLifecycleService.holderConcealedFrom(viewer, holderPrincipalId);
 }
 
 // GET /warrants — the registry, self-scoped.
@@ -202,6 +215,23 @@ router.get('/:id/linkage', async (req: AuthRequest, res: Response): Promise<void
     const readableAnchorTasks = new Set(await filterAuthorizedResources(
       req, 'read', anchoredTaskIds, (taskId) => ({ type: 'task', id: taskId }),
     ));
+    // A Phase ANCHOR follows the same rule through the one Phase read
+    // decision (card 1e0f3bd4): a restricted Phase suppresses what its Project
+    // lends (ruling 44ee41f2), and holding a Warrant anchored to it reads
+    // nothing of it, so its name and status are concealed like a Task's.
+    const readableAnchorPhases = new Set((await filterReadablePhases(req, anchors.rows
+      .filter((row) => row.anchor_type === 'phase')
+      .map((row) => ({ id: String(row.anchor_id) })))).map((phase) => phase.id));
+    // A Project ANCHOR follows the same rule through the Project read decision
+    // the Project lists ask (card bdf7b876): holding a Warrant anchored to a
+    // Project reads nothing of that Project, so its name and status are
+    // concealed like a Task's or a Phase's.
+    const readableAnchorProjects = new Set(await filterAuthorizedResources(
+      req, 'read', anchors.rows
+        .filter((row) => row.anchor_type === 'project')
+        .map((row) => String(row.anchor_id)),
+      (projectId) => ({ type: 'project', id: projectId }),
+    ));
     const carriedTasks = await filterAuthorizedResources(
       req,
       'read',
@@ -211,7 +241,9 @@ router.get('/:id/linkage', async (req: AuthRequest, res: Response): Promise<void
     res.json({
       success: true,
       anchors: anchors.rows.map((row) => {
-        const concealed = row.anchor_type === 'task' && !readableAnchorTasks.has(String(row.anchor_id));
+        const concealed = (row.anchor_type === 'task' && !readableAnchorTasks.has(String(row.anchor_id)))
+          || (row.anchor_type === 'project' && !readableAnchorProjects.has(String(row.anchor_id)))
+          || (row.anchor_type === 'phase' && !readableAnchorPhases.has(String(row.anchor_id)));
         return {
           anchorType: row.anchor_type,
           anchorId: String(row.anchor_id),
@@ -288,27 +320,90 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
   }
 });
 
-// PATCH /warrants/:id — name/description only. Authority fields are
-// immutable: widening is a NEW warrant under a fresh approval act.
+// PATCH /warrants/:id — name and description, and (AZ-A13 clause 10,
+// ratified 2026-10-11, E95) the warrant's authority IN PLACE: the ceiling
+// (re-pinned: `ceilingProfileId`, or `ceilingRules` the server publishes),
+// `ceilingScopes`, `maxConcurrent`, `maxTotal`, `expiresAt`, `transportPin`.
+// Holder, anchors, `agentMaxAgeHours` and status are still refused
+// WARRANT_AUTHORITY_IMMUTABLE. The editor is root, an administrator login
+// session, or the owning Account (clause 4a); a narrowing saves, a widening
+// takes `lifetime` and a step-up bound to ('warrant.edit', id) (clause 4b). A
+// ceiling edit while tasks ride the warrant needs `acknowledgeDependents`
+// (clause 10c). `applyRevert: <approvalId>` applies a due until-task revert
+// that waits on riding tasks (clause 6j with 10c). Every refusal of an edit
+// act writes a durable denied audit with the chain (clause 13), the 404
+// concealments included.
+const WARRANT_IMMUTABLE_FIELDS = ['holderPrincipalId', 'anchors', 'agentMaxAgeHours', 'status'];
 router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
   const viewer = await requireSessionViewer(req, res, 'warrant');
   if (!viewer) return;
   try {
-    const existing = await warrantService.get(req.params.id);
+    const id = canonicalObjectId(String(req.params.id ?? ''));
+    const { name, description, applyRevert, ...rest } = (req.body ?? {}) as Record<string, unknown>;
+    const { fields, controls } = splitEditBody(rest);
+    const forbidden = WARRANT_IMMUTABLE_FIELDS.filter((field) => req.body && field in req.body);
+    const authorityEdit = Object.keys(fields).length > 0;
+    // clause 13 / §5.2 rule 8: every refusal of an edit act writes a durable
+    // denied audit with the chain, the 404 concealments included (review
+    // 1a38270d r1 B2).
+    const editAct = authorityEdit || applyRevert !== undefined;
+    let existing: Awaited<ReturnType<typeof warrantService.get>>;
+    try {
+      existing = await warrantService.get(id);
+    } catch (e) {
+      if (editAct && e instanceof WarrantError && e.code === 'WARRANT_NOT_FOUND') {
+        await auditRouteRefusal(req, 'warrant', id, 'WARRANT_NOT_FOUND',
+          { clause: 'AZ-A13 clause 15', subject: 'target', rule: 'the edited object exists' });
+      }
+      throw e;
+    }
+    if (forbidden.length > 0) {
+      const refusal = {
+        rule: "a warrant's holder, anchors, agentMaxAgeHours and status never change", subject: 'editor',
+        clause: 'AZ-A13 clause 10a', fields: forbidden,
+      };
+      if (await concealForeign(viewer, existing.holderPrincipalId)) {
+        await auditRouteRefusal(req, 'warrant', id, 'WARRANT_AUTHORITY_IMMUTABLE', { ...refusal, answeredAs: 'WARRANT_NOT_FOUND' });
+        res.status(404).json({ error: 'Refused', code: 'WARRANT_NOT_FOUND', message: 'No such warrant' });
+        return;
+      }
+      await auditRouteRefusal(req, 'warrant', id, 'WARRANT_AUTHORITY_IMMUTABLE', refusal);
+      res.status(422).json({ error: 'Refused', code: 'WARRANT_AUTHORITY_IMMUTABLE', message: `a warrant's ${forbidden.join('/')} never change${forbidden.length > 1 ? '' : 's'} (AZ-A13 clause 10a): a different holder or anchor set is a new warrant`, ...refusal });
+      return;
+    }
+    if (editAct) {
+      // clause 4a: the administrator arm is admitted AHEAD of the self-scope
+      // concealment, for the edit acts only (D-10, D-11).
+      const standing = await editorStanding(req, existing.holderPrincipalId);
+      if (!standing) {
+        await refuseStanding(req, res, 'warrant', id, { concealAs: 'WARRANT_NOT_FOUND' });
+        return;
+      }
+      if (applyRevert !== undefined) {
+        const reverted = await authorityEditExecutor.applyDueRevert(
+          id, String(applyRevert), controls.acknowledgeDependents === true, auditActorFromRequest(req));
+        res.json({ success: true, revert: reverted, warrant: await warrantService.get(id) });
+        return;
+      }
+      const result = await authorityEditExecutor.editObject({
+        type: 'warrant', id, fields, editor: editorContext(req, standing),
+        stepUpToken: controls.stepUpToken, lifetime: controls.lifetime, reason: controls.reason,
+        narrowAgents: controls.narrowAgents, acknowledgeDependents: controls.acknowledgeDependents,
+      }, auditActorFromRequest(req));
+      const renamed = name !== undefined || description !== undefined
+        ? await warrantService.update(id, { name, description }, auditActorFromRequest(req))
+        : await warrantService.get(id);
+      res.json({ ...editResponse(result), warrant: renamed });
+      return;
+    }
     if (await concealForeign(viewer, existing.holderPrincipalId)) {
       res.status(404).json({ error: 'Refused', code: 'WARRANT_NOT_FOUND', message: 'No such warrant' });
       return;
     }
-    const forbidden = ['holderPrincipalId', 'anchors', 'ceilingProfileId', 'ceilingRules', 'ceilingScopes',
-      'expiresAt', 'transportPin', 'agentMaxAgeHours', 'maxConcurrent', 'maxTotal', 'status']
-      .filter((field) => req.body && field in req.body);
-    if (forbidden.length > 0) {
-      res.status(422).json({ error: 'Unprocessable Entity', code: 'WARRANT_AUTHORITY_IMMUTABLE', message: `warrant authority is immutable (${forbidden.join('/')}): widening is a NEW warrant, narrowing is revocation` });
-      return;
-    }
-    const warrant = await warrantService.update(req.params.id, req.body ?? {}, auditActorFromRequest(req));
+    const warrant = await warrantService.update(id, { name, description }, auditActorFromRequest(req));
     res.json({ success: true, warrant });
   } catch (e) {
+    if (sendAuthorityEditError(res, e)) return;
     if (sendWarrantError(res, e)) return;
     const errorId = logCaughtFailure('[Warrants API] update failed:', e);
     res.status(500).json({ error: 'Internal Server Error', code: 'WARRANT_UPDATE_FAILED', message: 'Failed to update the warrant', errorId });

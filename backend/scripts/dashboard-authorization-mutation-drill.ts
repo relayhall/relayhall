@@ -24,8 +24,8 @@
  *
  * The DATABASE is written to and must be disposable — same contract as the gate
  * it drives (`src/__tests__/listPointParity.test.ts`). Every file it touches is
- * restored, including on failure. Developer tool, not a CI step: never point it
- * at a tree with uncommitted work you care about.
+ * restored, including on failure. The full tier runs it in a throwaway checkout (job drill_controls, machinery queue 9b761f09);
+ * locally, never point it at a tree with uncommitted work you care about.
  */
 import { spawnSync } from 'child_process';
 import { Client } from 'pg';
@@ -170,17 +170,20 @@ export const MUTATIONS: Mutation[] = [
     id: 'M13',
     reintroduces: 'review 302a338f B1 - the POINT read resolves the handle spelling only',
     file: MANAGER,
-    // Both read queries carry the uuid arm, so the anchor names the one the
-    // point read owns: `WHERE r.id = $1`. Dropping it there is enough - the
-    // control asserts BOTH queries carry it, and the UUID-resolution
-    // assertion reads through `getById`.
-    find: '       LEFT JOIN principals api ON api.id::text = lower(r.author_actor_id)' + LF
+    // Re-anchored by name (machinery queue 9b761f09): review 99ba9444 B1
+    // replaced the two arms on the untagged `author_actor_id` with ONE join on
+    // the canonical `author_principal_id`, so the old anchor (the uuid arm)
+    // no longer exists. The defect is still expressible: the point read
+    // (`WHERE r.id = $1`, the read `getById` owns) joins the handle spelling
+    // instead of the canonical column.
+    find: '       LEFT JOIN principals ap ON ap.id = r.author_principal_id' + LF
       + '       WHERE r.id = $1',
-    replace: '       WHERE r.id = $1',
+    replace: '       LEFT JOIN principals ap ON ap.handle = r.author_actor_id' + LF
+      + '       WHERE r.id = $1',
     // ONE expectation, because only one control can see this. The
     // UUID-resolution assertions drive `mapRow` through a mocked pool that
     // returns the resolved columns whatever the SQL said, so they cannot
-    // notice a join disappearing; the SQL-shape control is what can. Naming
+    // notice the join changing; the SQL-shape control is what can. Naming
     // the second one here would be claiming more than the evidence covers.
     expects: ['BOTH read queries join the identity, so the list and the detail agree'],
   },
@@ -222,18 +225,18 @@ export const MUTATIONS: Mutation[] = [
     id: 'M18',
     reintroduces: 'review f0c51a8e B1 - the HANDLE arm wins a collision again, naming the wrong principal',
     file: MANAGER,
-    // Both read queries carry the precedence, so the anchor names the point
-    // one by its own `WHERE r.id = $1`. ONE expectation, for the same reason
-    // M13 has one: the row-level collision test drives `mapRow` through a
-    // mocked pool that hands back an already-coalesced row, so it cannot see
-    // which alias PostgreSQL would have preferred. The SQL-shape control can,
-    // and it checks BOTH queries, so mutating either reddens it.
-    find: 'COALESCE(api.display_name, ap.display_name) AS author_actor_display_name,' + LF
-      + '              COALESCE(api.handle, ap.handle) AS author_actor_handle' + LF
+    // Re-anchored by name (machinery queue 9b761f09): review 99ba9444 B1
+    // removed both arms on the untagged `author_actor_id`, so there is no
+    // precedence left to invert. The defect returns only with the arms, so
+    // the mutation puts both back on the point read (`WHERE r.id = $1`) with
+    // the handle arm preferred - the collision f0c51a8e B1 named. ONE
+    // expectation: the row-level collision test drives `mapRow` through a
+    // mocked pool, so only the SQL-shape control can see the arms.
+    find: 'ap.display_name AS author_actor_display_name,' + LF
+      + '              ap.handle AS author_actor_handle' + LF
       + '       FROM reports r' + LF
       + '       LEFT JOIN projects p ON r.project_id = p.id' + LF
-      + '       LEFT JOIN principals ap ON ap.handle = r.author_actor_id' + LF
-      + '       LEFT JOIN principals api ON api.id::text = lower(r.author_actor_id)' + LF
+      + '       LEFT JOIN principals ap ON ap.id = r.author_principal_id' + LF
       + '       WHERE r.id = $1',
     replace: 'COALESCE(ap.display_name, api.display_name) AS author_actor_display_name,' + LF
       + '              COALESCE(ap.handle, api.handle) AS author_actor_handle' + LF
@@ -242,7 +245,7 @@ export const MUTATIONS: Mutation[] = [
       + '       LEFT JOIN principals ap ON ap.handle = r.author_actor_id' + LF
       + '       LEFT JOIN principals api ON api.id::text = lower(r.author_actor_id)' + LF
       + '       WHERE r.id = $1',
-    expects: ['the SQL prefers api over ap in both read queries'],
+    expects: ['BOTH read queries join the identity, so the list and the detail agree'],
   },
   {
     id: 'M12',

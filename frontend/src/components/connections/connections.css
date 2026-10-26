@@ -72,6 +72,22 @@
 .conn-copybtn:hover { border-color: var(--border-accent); }
 .conn-copybtn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
 .conn-copyblock-body { margin: 0; padding: var(--space-3); max-height: 320px; overflow: auto; background: var(--bg-surface); color: var(--text-primary); font-family: var(--font-mono); font-size: var(--text-xs); line-height: var(--leading-normal); }
+/* Card 94e8bb0b: prose in a copy block wraps at every width, so the bootstrap
+   prompt never scrolls sideways on a phone. Declared after the base rule:
+   equal specificity, so source order decides. */
+.conn-copyblock-body--wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* E462 S1: the one install line and the installer token. Same look as a
+   copy block, but it always wraps, so a long board address never scrolls the page. */
+.conn-install-body { margin: 0; padding: var(--space-3); max-height: 320px; overflow: auto; background: var(--bg-surface); color: var(--text-primary); font-family: var(--font-mono); font-size: var(--text-xs); line-height: var(--leading-normal); white-space: pre-wrap; overflow-wrap: anywhere; }
+.conn-install { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
+/* E462 S2: under an install line the manual snippets fold into one closed
+   disclosure, because they put the token in the client's own configuration. */
+.conn-manual { margin-bottom: var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.conn-manual-summary { color: var(--text-primary); font-size: var(--text-sm); cursor: pointer; }
+.conn-manual-summary:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-ring-offset); }
+.conn-manual[open] > .conn-manual-summary { margin-bottom: var(--space-3); }
+.conn-bootstrap-prompt { margin-top: var(--space-3); }
+.conn-bootstrap-guidance { margin: 0; padding-left: var(--space-5); color: var(--text-primary); font-size: var(--text-sm); line-height: var(--leading-normal); overflow-wrap: anywhere; }
 
 .conn-state { display: flex; align-items: center; justify-content: center; gap: var(--space-2); min-height: 120px; color: var(--text-secondary); font-size: var(--text-sm); }
 
@@ -79,4 +95,14 @@
   .conn-wizard { padding: var(--space-3); }
   .conn-templates { grid-template-columns: 1fr; }
   .conn-actions { justify-content: stretch; }
+}
+
+.conn-permissions-editor > label,
+.conn-permissions-editor > div > label {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0;
+}
+.conn-permissions-editor select,
+.conn-permissions-editor input:not([type="checkbox"]) {
+  padding: 0.4rem; max-width: 100%; border: 1px solid var(--border-default);
+  border-radius: 4px; background: var(--bg-surface); color: var(--text-primary);
 }

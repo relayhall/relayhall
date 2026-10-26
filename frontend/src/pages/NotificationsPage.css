@@ -1,0 +1,112 @@
+/* The notification centre (card b1e3b16d, lane L1; Slice B of the
+   Notifications and Timeline design, card 5854f0d6). Theme tokens only. The
+   page frame, the tablist's place and the shared panel and state blocks; the
+   action list and the Timeline style their own rows. */
+
+.notifications-page {
+  max-width: 1000px;
+  min-width: 0;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  color: var(--text-primary);
+}
+
+.notifications-page-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.notifications-page-header h1 {
+  margin: 0;
+  font-size: var(--text-2xl);
+}
+
+.notifications-page-header > svg {
+  flex-shrink: 0;
+  color: var(--text-accent);
+}
+
+/* A panel's title row: its heading and its Refresh (the action list, the
+   Timeline, My requests). */
+.notifications-page-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.notifications-page-toolbar h2 {
+  flex: 1;
+  min-width: 120px;
+}
+
+/* The view switch keeps its own width rather than stretching across the
+   column like a toolbar, but never wider than the column: on a phone the five
+   tabs scroll inside their own row (E461) and the page stays put. */
+.notifications-page-tabs {
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.notifications-page-panel {
+  padding: var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+.notifications-page-panel h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+}
+
+.notifications-page-panel p {
+  max-width: 82ch;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.notifications-page-panel a {
+  color: var(--text-accent);
+}
+
+.notifications-page-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 90px;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.notifications-page-failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+  color: var(--text-error);
+  font-size: var(--text-sm);
+}
+
+/* Below 1280px the floating bar (menu control, identity chip, bell) sits over
+   the top of every route; the page starts below it. */
+@media (max-width: 1279px) {
+  .notifications-page {
+    padding-top: var(--space-12);
+  }
+}
+
+@media (max-width: 640px) {
+  .notifications-page-panel {
+    padding: var(--space-4);
+  }
+}

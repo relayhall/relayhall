@@ -256,6 +256,11 @@
 
 .task-detail-work {
   width: 100%;
+}
+
+/* Constrain the reading column, not its scrollport: the Work region must
+   reach the Timeline boundary even on a wide desktop. */
+.task-detail-work > #task-detail-panel-work {
   max-width: 76ch;
   margin-inline: auto;
 }
@@ -519,6 +524,35 @@
 
 .task-detail-markdown img {
   max-width: 100%;
+}
+
+/* E387(5): Description, Notes and the additional sections indent their lists
+   exactly as Definition of done does (.task-detail-structured-list), so the
+   markers sit inside the dotted frame instead of on or past its edge. */
+.task-detail-markdown :is(ul, ol) {
+  margin-block: var(--space-2);
+  padding-inline-start: var(--space-5);
+}
+
+.task-detail-markdown li + li {
+  margin-block-start: var(--space-1);
+}
+
+.task-detail-markdown li::marker {
+  color: var(--text-tertiary);
+}
+
+/* E388 W3: paragraph rhythm and a tint for inline code. */
+.task-detail-markdown p {
+  margin-block: 0 var(--space-2);
+  line-height: var(--leading-normal);
+}
+
+.task-detail-markdown :not(pre) > code {
+  padding-inline: var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-hover);
+  color: var(--text-secondary);
 }
 
 .task-detail-additional-section {
@@ -1077,4 +1111,707 @@
   display: block;
   color: var(--text-error);
   font-size: var(--text-sm);
+}
+
+/* ------------------------------------------------------------------------
+   E388 (owner, 20 Oct 2026): the holistic Task detail redesign. Presentation
+   only - header on top, then Details | Work | Timeline. Rules for the Task
+   page itself are scoped to .task-detail-page--view, so the Task create page
+   (which shares this sheet and the .task-detail-page root) keeps its look.
+   Containers mean one thing each: a dashed editable frame is the edit
+   affordance, a solid-hairline card is an item in a list, a tinted note block
+   with a stripe is a note. Text sits only on matrix pairs.
+   ------------------------------------------------------------------------ */
+.task-detail-page--view {
+  --task-detail-timeline-width: 24rem;
+}
+
+/* Header: the title wraps (2 lines, 3 on narrow) instead of ending in an
+   ellipsis; the full title is the h1's tooltip. */
+.task-detail-page--view .task-detail-heading {
+  align-items: flex-start;
+}
+
+.task-detail-page--view .task-detail-heading h1 {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+/* The page focuses the h1 on load so a screen reader starts at the Task. A
+   tabindex=-1 heading is never reached by Tab, so that focus needs no visible
+   ring and the title frame stays dashed; the pencil keeps its own ring. */
+.task-detail-page--view .task-detail-heading h1[tabindex="-1"]:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.task-detail-page--view .task-detail-heading .editable-frame:has(> h1[tabindex="-1"]:focus) {
+  border-style: dashed;
+  background: transparent;
+}
+
+.task-detail-page--view .task-detail-page-header button.task-detail-id {
+  min-block-size: var(--control-compact);
+  color: var(--text-tertiary);
+}
+
+/* The control row: State | Lifecycle | Utilities, with the Arm/Claim reason
+   as a caption line under it. */
+.task-detail-page--view .task-detail-page-header-controls {
+  column-gap: var(--space-4);
+  row-gap: var(--space-2);
+}
+
+.task-detail-header-cluster {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.task-detail-header-cluster + .task-detail-header-cluster:not(.task-detail-header-cluster--utilities) {
+  padding-inline-start: var(--space-4);
+  border-inline-start: 1px solid var(--border-subtle);
+}
+
+.task-detail-header-cluster--utilities {
+  margin-inline-start: auto;
+}
+
+.task-detail-header-caption {
+  flex-basis: 100%;
+  margin: var(--space-0);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+/* The activity badge reads as a pill in the State cluster, not a stray word.
+   Only the idle state paints its dot; an unpainted dot leaves no gap. */
+.task-detail-page--view .task-detail-page-header .task-activity:not(.session-status-idle) .session-status-dot {
+  display: none;
+}
+
+.task-detail-page--view .task-detail-page-header .task-activity {
+  align-items: center;
+  min-block-size: var(--control-compact);
+  padding-inline: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+}
+
+/* Columns: rail and timeline on the surface, Work on the page background;
+   the hairlines stay, because high-contrast binds both to black. */
+@media (min-width: 1280px) {
+  .task-detail-page--view .task-detail-layout {
+    grid-template-columns: minmax(var(--task-detail-left-compact-width), var(--task-detail-left-width)) minmax(0, 1fr) var(--task-detail-timeline-width);
+  }
+
+  .task-detail-page--view .task-detail-left-rail,
+  .task-detail-page--view .task-detail-timeline {
+    background: var(--bg-surface);
+  }
+
+  .task-detail-page--view .task-detail-timeline {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .task-detail-page--view .task-detail-work {
+    padding-inline: var(--space-6);
+  }
+
+  .task-detail-page--view .task-detail-work > #task-detail-panel-work {
+    margin-inline: 0 auto;
+  }
+
+  /* E387(3): Expand gives the Timeline the whole layout width; the rail and
+     Work leave the layout and the tab order until it is restored. */
+  .task-detail-page--timeline-expanded .task-detail-layout {
+    grid-template-columns: 0 0 minmax(0, 1fr);
+  }
+
+  .task-detail-page--timeline-expanded .task-detail-left-rail,
+  .task-detail-page--timeline-expanded .task-detail-work,
+  .task-detail-page--timeline-expanded .task-detail-timeline-resizer {
+    display: none;
+  }
+}
+
+/* Column titles: group-heading scale, so the hierarchy is page title >
+   section > group; they stay h2 for heading semantics. */
+.task-detail-page--view .task-detail-left-rail > h2,
+.task-detail-page--view .task-detail-timeline-title h2 {
+  display: flex;
+  align-items: center;
+  min-block-size: var(--control-compact);
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+  letter-spacing: 0.02em;
+}
+
+.task-detail-page--view .task-detail-left-rail > h2 {
+  margin-block-end: var(--space-3);
+}
+
+.task-detail-timeline-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-block-end: var(--space-3);
+}
+
+.task-detail-timeline-expand {
+  flex: none;
+}
+
+/* E387(3): the drag edge between Work and the Timeline. A wide hit area with
+   a 1px line that takes the accent on hover and focus. */
+.task-detail-timeline-resizer {
+  position: relative;
+  z-index: 3;
+  grid-column: 3;
+  grid-row: 1;
+  justify-self: start;
+  inline-size: var(--space-2);
+  margin-inline-start: calc(-1 * var(--space-1));
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.task-detail-timeline-resizer::after {
+  content: "";
+  position: absolute;
+  inset-block: var(--space-0);
+  inset-inline-start: 50%;
+  border-inline-start: 1px solid var(--border-default);
+}
+
+.task-detail-timeline-resizer:hover::after,
+.task-detail-timeline-resizer:focus-visible::after {
+  border-inline-start: 2px solid var(--accent-color);
+}
+
+@media (max-width: 1279px) {
+  .task-detail-page .task-detail-timeline-resizer,
+  .task-detail-page .task-detail-timeline-expand {
+    display: none;
+  }
+}
+
+/* Left rail: quieter frames, groups separated by space and their own h3
+   rather than hairlines. */
+.task-detail-page--view .task-detail-rail-group,
+.task-detail-page--view .task-detail-advanced {
+  padding-block: var(--space-0);
+  margin-block-end: var(--space-5);
+  border-block-start: 0;
+}
+
+.task-detail-page--view .task-detail-left-rail .editable-frame {
+  padding-block: var(--space-1);
+  border-color: var(--border-default);
+}
+
+.task-detail-page--view .task-detail-left-rail .editable-frame dl {
+  gap: var(--space-1);
+}
+
+.task-detail-page--view .task-detail-left-rail .editable-frame .task-detail-field {
+  grid-template-columns: 6rem minmax(0, 1fr);
+  column-gap: var(--space-3);
+  align-items: baseline;
+}
+
+.task-detail-dates-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* The Review banner: a note block after the People list. */
+.task-detail-page--view .task-detail-rail-group .task-detail-inline-warning {
+  margin-block-start: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--status-warning);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  line-height: var(--leading-normal);
+}
+
+/* E387(4): Account ownership, a nested disclosure of Advanced. */
+.task-detail-ownership-disclosure {
+  margin-block-start: var(--space-3);
+}
+
+.task-detail-ownership-disclosure > summary {
+  display: list-item;
+  min-block-size: var(--control-compact);
+  padding-block: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+  cursor: pointer;
+}
+
+.task-detail-ownership {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.task-detail-ownership p,
+.task-detail-ownership form > p {
+  margin: var(--space-0);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.task-detail-ownership p[role="alert"] {
+  color: var(--text-error);
+}
+
+.task-detail-ownership form,
+.task-detail-ownership label {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.task-detail-ownership label {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-ownership select,
+.task-detail-ownership textarea,
+.task-detail-ownership button {
+  inline-size: 100%;
+}
+
+.task-detail-ownership textarea {
+  min-block-size: calc(var(--space-20) + var(--space-4));
+  padding: var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-control);
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font: inherit;
+  resize: vertical;
+}
+
+/* Work: sections separated by space, not hairlines; the first section starts
+   on the column titles' line; captions instead of boxes inside frames. */
+.task-detail-page--view .task-detail-content-section {
+  padding-block: var(--space-0) var(--space-6);
+  border-block-end: 0;
+}
+
+.task-detail-page--view .task-detail-section-heading {
+  margin-block-end: var(--space-2);
+}
+
+.task-detail-page--view .task-detail-content-section .task-detail-advisory {
+  margin-block: var(--space-0) var(--space-2);
+  padding: var(--space-0);
+  border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.task-detail-page--view .task-detail-empty-line {
+  color: var(--text-tertiary);
+}
+
+.task-detail-page--view section[aria-labelledby="task-detail-verifier-heading"] {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+}
+
+.task-detail-page--view section[aria-labelledby="task-detail-verifier-heading"] > p {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* The add-a-subtask row lines up with the subtask cards. A modal sheet's
+   bare `form` rule pads every form on the page; the Task page's forms are
+   content, not dialogs. */
+.task-detail-page--view form {
+  padding: var(--space-0);
+}
+
+.task-detail-page--view .task-detail-inline-add {
+  margin-inline: var(--space-0);
+}
+
+.task-detail-page--view .task-detail-inline-add input {
+  min-block-size: var(--control-compact);
+}
+
+/* Reports: cards, with the summary as a note block without a status stripe. */
+.task-detail-page--view .task-detail-report-list > li {
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.task-detail-page--view .task-detail-report-list blockquote {
+  margin-block: var(--space-2) var(--space-0);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+/* Timeline: E387(1) sessions and verification in one closed disclosure.
+   Summaries stay list items so the native disclosure marker shows. */
+.task-timeline-runs {
+  margin-block-end: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+}
+
+.task-timeline-runs > summary {
+  display: list-item;
+  min-block-size: var(--control-compact);
+  padding-block: var(--space-2);
+  padding-inline: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--font-bold);
+  cursor: pointer;
+}
+
+.task-timeline-runs[open] > summary {
+  border-block-end: 1px solid var(--border-subtle);
+}
+
+.task-timeline-runs > section {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+}
+
+.task-timeline-runs h3 {
+  margin: var(--space-0);
+  font-size: var(--text-sm);
+}
+
+.task-timeline-runs p,
+.task-timeline-runs li {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.task-timeline-runs ul {
+  margin: var(--space-0);
+  padding-inline-start: var(--space-4);
+}
+
+/* The filter fits on one row at the default width. */
+.task-detail-page--view .task-timeline-filters .segmented-option {
+  padding-inline: var(--space-1);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* Events: system rows are compact and borderless, authored and reported
+   events are cards; a hairline rail runs behind the icons. */
+.task-detail-page--view .task-timeline-day ol {
+  position: relative;
+  gap: var(--space-2);
+}
+
+.task-detail-page--view .task-timeline-day ol::before {
+  content: "";
+  position: absolute;
+  inset-block: var(--space-3);
+  inset-inline-start: calc(var(--space-6) + 1px);
+  border-inline-start: 1px solid var(--border-subtle);
+}
+
+.task-detail-page--view .task-timeline-event {
+  position: relative;
+  border-radius: var(--radius-md);
+}
+
+.task-timeline-event--system {
+  padding-block: var(--space-1);
+  border-color: transparent;
+  background: transparent;
+}
+
+.task-detail-page--view .task-timeline-event-icon {
+  background: var(--bg-app);
+}
+
+/* The chevron sits in the card's corner, so a one-line title and its meta
+   line stay together instead of the 36px control setting the row height. */
+.task-detail-page--view .task-timeline-event-body {
+  position: relative;
+  padding-inline-end: calc(var(--control-compact) + var(--space-1));
+}
+
+.task-detail-page--view .task-timeline-event-summary {
+  display: block;
+  min-block-size: var(--space-6);
+}
+
+.task-detail-page--view .task-timeline-event-summary button {
+  position: absolute;
+  inset-block-start: calc(-1 * var(--space-1));
+  inset-inline-end: calc(-1 * var(--space-1));
+}
+
+.task-detail-page--view .task-timeline-event-summary > span {
+  display: block;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-page--view .task-timeline-event-summary strong {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  text-wrap: balance;
+}
+
+.task-detail-page--view .task-timeline-event-summary button {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.task-detail-page--view .task-timeline-event-summary button:hover,
+.task-detail-page--view .task-timeline-event-summary button:focus-visible {
+  border-color: var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+/* T9: the meta is one line; a long actor label is cut with an ellipsis
+   so the separator and the time never start a line of their own. */
+.task-detail-page--view .task-timeline-event-meta {
+  flex-wrap: nowrap;
+  gap: var(--space-0) var(--space-1);
+  min-width: 0;
+}
+
+.task-detail-page--view .task-timeline-event-meta > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-page--view .task-timeline-event-meta time {
+  flex: none;
+  white-space: nowrap;
+}
+
+.task-detail-page--view .task-timeline-event-meta time::before {
+  content: "\00B7\00A0";
+}
+
+/* T7: an authored or reported event previews its own text (plain, 3 lines). */
+.task-timeline-event-preview {
+  display: -webkit-box;
+  margin: var(--space-1) var(--space-0) var(--space-0);
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+/* E387(2): expanded detail in plain words. */
+.task-timeline-change,
+.task-timeline-detail-text {
+  margin: var(--space-0);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.task-timeline-detail-text {
+  white-space: pre-wrap;
+}
+
+.task-timeline-facts {
+  display: grid;
+  gap: var(--space-1);
+  margin: var(--space-2) var(--space-0) var(--space-0);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+.task-timeline-facts > div {
+  display: grid;
+  grid-template-columns: minmax(5rem, auto) minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.task-timeline-facts dt {
+  color: var(--text-tertiary);
+}
+
+.task-timeline-facts dd {
+  margin: var(--space-0);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.task-timeline-quote-label {
+  display: block;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.task-detail-page--view .task-timeline-quoted-content {
+  margin: var(--space-0);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.task-timeline-quoted-content p {
+  margin: var(--space-1) var(--space-0) var(--space-0);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+@media (min-width: 1280px) and (min-height: 480px) {
+  .task-detail-page--view .task-timeline-day h3 {
+    position: sticky;
+    inset-block-start: calc(-1 * var(--space-4));
+    z-index: 2;
+    padding-block: var(--space-2);
+    background: var(--bg-surface);
+    font-weight: var(--font-bold);
+  }
+
+  .task-detail-page--view .task-timeline-event--system .task-timeline-event-icon {
+    background: var(--bg-surface);
+  }
+}
+
+/* Region links below 1280px: one compact segmented row. */
+@media (max-width: 1279px) {
+  .task-detail-page--view .task-detail-tabs {
+    gap: var(--space-0);
+  }
+
+  .task-detail-page--view .task-detail-tabs a {
+    min-block-size: var(--control-compact);
+    border: 1px solid var(--border-default);
+    border-radius: var(--space-0);
+  }
+
+  .task-detail-page--view .task-detail-tabs a + a {
+    margin-inline-start: -1px;
+  }
+
+  .task-detail-page--view .task-detail-tabs a:first-child {
+    border-start-start-radius: var(--radius-control);
+    border-end-start-radius: var(--radius-control);
+  }
+
+  .task-detail-page--view .task-detail-tabs a:last-child {
+    border-start-end-radius: var(--radius-control);
+    border-end-end-radius: var(--radius-control);
+  }
+}
+
+@media (max-width: 767px) {
+  .task-detail-page--view .task-detail-heading h1 {
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+  }
+
+  /* H6: the header's Timeline button duplicated the region links below it;
+     the element-qualified selector outweighs the header button rule. */
+  .task-detail-page-header button.task-detail-timeline-toggle {
+    display: none;
+  }
+
+  /* H7: one six-column grid - Status | Priority, then activity | Arm |
+     Claim, then the utilities - so the header plus region links stay short. */
+  .task-detail-page--view .task-detail-page-header-controls {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: var(--space-2);
+  }
+
+  .task-detail-page--view .task-detail-header-cluster:not(.task-detail-header-cluster--utilities) {
+    display: contents;
+  }
+
+  .task-detail-page--view .task-detail-page-header-controls label {
+    grid-column: span 3;
+    min-width: 0;
+  }
+
+  .task-detail-page--view .task-detail-page-header-controls .task-activity,
+  .task-detail-page--view .task-detail-header-cluster:not(.task-detail-header-cluster--utilities) > button {
+    grid-column: span 2;
+    justify-content: center;
+    min-width: 0;
+  }
+
+  .task-detail-page--view .task-detail-header-cluster--utilities,
+  .task-detail-page--view .task-detail-header-caption {
+    grid-column: 1 / -1;
+  }
+
+  .task-detail-page--view .task-detail-header-cluster--utilities {
+    display: flex;
+    margin-inline-start: var(--space-0);
+  }
+
+  .task-detail-page--view .task-detail-page-header-controls label > select {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .task-detail-page--view .task-detail-page-header select,
+  .task-detail-page--view .task-detail-page-header button:not(.editable-frame-edit),
+  .task-detail-page--view .task-detail-back {
+    min-block-size: var(--control-compact);
+  }
+
+  .task-detail-page--view .task-detail-page-header .icon-btn {
+    inline-size: var(--control-compact);
+    block-size: var(--control-compact);
+  }
+
+  .task-detail-page--view .task-detail-tabs {
+    padding-block: var(--space-1);
+    border-block-end: 0;
+  }
 }

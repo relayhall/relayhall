@@ -43,7 +43,20 @@ Setting or changing a profile that targets a service requires
 **`services:invoke`** (or `root`) on top of the route's ordinary
 `tasks:write` — filling arguments is choosing what executes, so bare
 task-write is never enough. Clearing a profile (`executionProfile: null`)
-and basic tasks need only `tasks:write`.
+and basic tasks need only `tasks:write`. This also fully unassigns a Task
+whose assignment is Warrant-carried: the assignment and Warrant pointer clear
+together, and the Task's Warrant-derived access is revoked.
+
+Dropping the Warrant that carries an assignment (`executionWarrantId: null`
+with no profile beside it) keeps the assignee and carries its access on an
+auto-grant instead, so it needs `services:invoke` (or `root`) too. Without it
+the edit answers `403 WARRANT_DROP_INVOKE_REQUIRED` and nothing is written. On
+a Task no Warrant carries, the null changes nothing.
+
+The profile is the only way in. The Task stores the assignment it names as
+`executionServiceId` and `executionDescriptorVersion`, which reads report and
+no write accepts: a create or edit body carrying either is refused
+`400 SERVER_WRITTEN_FIELD`.
 
 ## The retired legacy shape
 

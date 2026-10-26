@@ -8,6 +8,7 @@ import { SystemStatus } from '../components/dashboard/SystemStatus';
 import { ReportsCard } from '../components/dashboard/ReportsCard';
 import { NotificationsCard } from '../components/dashboard/NotificationsCard';
 import { ConnectAgentCard } from '../components/dashboard/ConnectAgentCard';
+import { DecisionNotice } from '../components/approvals/DecisionNotice';
 import { Task } from '../types/task';
 import { authenticatedFetch } from '../utils/auth';
 import './DashboardPage.css';
@@ -137,6 +138,10 @@ export const DashboardPage: React.FC = () => {
     <div className="dashboard-page fade-in">
       {/* Hero Section */}
       <HeroCard />
+
+      {/* T1 (card b1e3b16d, lane L1): "N decisions need you", or an error
+          that never claims zero; nothing at all while loading or at zero. */}
+      <DecisionNotice />
 
       <ConnectAgentCard />
 

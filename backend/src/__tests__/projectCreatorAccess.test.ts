@@ -19,7 +19,8 @@ function fixture() {
   events.push(sql);
   if(sql.includes('SELECT id,status,legacy_identity')) return {rows:[{id:principalId,status:'active',legacy_identity:false}]};
   if(sql.includes('INSERT INTO grants')) {const [grantee_type,grantee_id,resource_type,resource_id,verb,granted_by_principal_id,expires_at]=params;const row={id:`grant-${verb}`,grantee_type,grantee_id,resource_type,resource_id,verb,granted_by_principal_id,expires_at};grants.push(row);return {rows:[row]};}
-  if(sql.includes('SELECT * FROM projects')) return {rows:[{id:projectId,name:'Created',status:'active'}]};
+  // AZ-A12 clause 12 (card a9b1e69c): the point read joins the owner's kind and name onto `p.*`.
+  if(sql.includes('SELECT * FROM projects')||sql.startsWith('SELECT p.*, ')) return {rows:[{id:projectId,name:'Created',status:'active'}]};
   return {rows:[]};
  })};
  (pool.connect as jest.Mock).mockResolvedValue(client);

@@ -92,6 +92,10 @@
   --red-600: #dc2626;
   --red-700: #b91c1c;
   --red-800: #991b1b;
+  /* Approved Map emphasis palette. */
+  --cyan-map-100: #7df9ff;
+  --cyan-map-400: #23d9ef;
+  --cyan-map-950: #071820;
   --cyan-300: #67e8f9;
   --cyan-400: #22d3ee;
   --cyan-700: #0e7490;
@@ -197,6 +201,7 @@
      Z-INDEX
      ======================================== */
   --z-modal: 400;
+  --z-tooltip: 500;
 
   /* ========================================
      LAYOUT
@@ -299,6 +304,13 @@ html:not([data-theme]),
   --glow-warning: 0 8px 32px var(--status-warning-soft);
   --glow-danger: 0 8px 32px var(--status-danger-soft);
   --glow-info: 0 8px 32px var(--status-info-soft);
+
+  /* Map hover emphasis and panel elevation. */
+  --map-hover-ink: var(--cyan-map-100);
+  --map-hover-glow: var(--cyan-map-400);
+  --map-hover-outline: var(--cyan-map-950);
+  --map-preview-shadow: 0 4px 18px #0008;
+  --map-header-shadow: 0 2px 8px rgb(0 0 0 / 12%);
 }
 
 [data-theme="relay-light"] {
@@ -395,6 +407,13 @@ html:not([data-theme]),
   --glow-warning: 0 8px 32px var(--status-warning-soft);
   --glow-danger: 0 8px 32px var(--status-danger-soft);
   --glow-info: 0 8px 32px var(--status-info-soft);
+
+  /* Map hover emphasis and panel elevation. */
+  --map-hover-ink: var(--cyan-700);
+  --map-hover-glow: var(--cyan-700);
+  --map-hover-outline: var(--bg-surface);
+  --map-preview-shadow: var(--shadow-2);
+  --map-header-shadow: var(--shadow-1);
 }
 
 [data-theme="high-contrast"] {
@@ -485,6 +504,13 @@ html:not([data-theme]),
   --glow-warning: 0 8px 32px var(--status-warning-soft);
   --glow-danger: 0 8px 32px var(--status-danger-soft);
   --glow-info: 0 8px 32px var(--status-info-soft);
+
+  /* Map hover emphasis and panel elevation. */
+  --map-hover-ink: var(--cyan-map-100);
+  --map-hover-glow: var(--cyan-map-400);
+  --map-hover-outline: var(--black);
+  --map-preview-shadow: var(--shadow-2);
+  --map-header-shadow: var(--shadow-1);
 }
 
 

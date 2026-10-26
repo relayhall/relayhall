@@ -17,8 +17,14 @@ import {
   type NotificationEndpointKind,
 } from '../services/NotificationEndpointService';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import { pathUuidParam } from '../middleware/validate';
 
 const router = Router();
+
+// Card bc847bd0: notification_endpoints.id is a uuid column; a malformed id
+// reached the delete and answered 500. Refused by name before any read; the
+// root route ceiling runs first.
+router.param('id', pathUuidParam('INVALID_NOTIFICATION_ENDPOINT_ID', 'notification endpoint'));
 
 function requestAuditActor(req: Request) {
   const authReq = req as AuthRequest;

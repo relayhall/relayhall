@@ -68,27 +68,9 @@ describe('discordLinks', () => {
   });
 
   describe('resolveTaskDiscordThreadId', () => {
-    it('prefers the persisted column', () => {
-      expect(
-        resolveTaskDiscordThreadId({
-          discordThreadId: '111111111111111111',
-          acpSessionKey: 'agent:main:discord:channel:222222222222222222',
-        }),
-      ).toBe('111111111111111111');
-    });
-
-    it('falls back through session keys in order', () => {
-      expect(
-        resolveTaskDiscordThreadId({
-          acpSessionKey: 'agent:main:main',
-          activeAgentSessionKey: 'agent:main:discord:channel:333333333333333333',
-        }),
-      ).toBe('333333333333333333');
-      expect(
-        resolveTaskDiscordThreadId({
-          completedBySessionKey: 'agent:main:discord:thread:444444444444444444:555555555555555555',
-        }),
-      ).toBe('555555555555555555');
+    it('uses only the persisted binding and never retired Task runtime keys', () => {
+      expect(resolveTaskDiscordThreadId({ discordThreadId: '555555555555555555' })).toBe('555555555555555555');
+      expect(resolveTaskDiscordThreadId({ acpSessionKey: 'agent:main:discord:channel:555555555555555555' } as any)).toBeNull();
       expect(resolveTaskDiscordThreadId({})).toBeNull();
     });
   });

@@ -14,7 +14,7 @@
 // warrants carry an explicit ceiling like everyone else's (AZ-31a — the
 // schema refuses unbounded ceilings).
 //
-// SELECTION (§6.3, sol M8): every mint NAMES its target Task; containment
+// SELECTION (§6.3, review M8): every mint NAMES its target Task; containment
 // is validated against the anchor union. An unnamed warrant auto-selects
 // ONLY when exactly one live warrant of the acting holder contains the
 // target; ANY multiplicity refuses — determinism beats cleverness.
@@ -44,14 +44,17 @@ import {
 } from './AccessProfileService';
 import {
   agentMintService,
+  normalizeMintRole,
   type MintAuthorityRequest, type MintedAgentPack,
 } from './AgentMintService';
 import {
-  rulesCovered, scopesWithin, sourcesFromEffectiveAccess, sourcesFromRules,
+  rulesCovered, rulesCoveredWithCoordinates, scopesWithin, sourcesFromEffectiveAccess, sourcesFromRules,
 } from '../utils/authorityContainment';
 import { isMintableScope } from '../utils/scopeMap';
 import { randomUUID } from 'crypto';
-import { accessVehicleService } from './AccessVehicleService';
+import { accessVehicleService, AssignmentAccessError } from './AccessVehicleService';
+import { delegationService } from './DelegationService';
+import type { AuthorizationActor } from './AuthorizationService';
 import type { AuthorizedTaskNarrowing } from '../middleware/sharedAuthorization';
 
 /**
@@ -314,6 +317,52 @@ export class WarrantService {
       anchors.push({ anchorType, anchorId });
     }
 
+    const authority = await this.prepareAuthorityFields(input, anchors);
+    const { expiresAt, hasProfile, ceilingProfileVersionId, ceilingRulesForCheck,
+      ceilingScopes, transportPin, maxConcurrent, maxTotal } = authority;
+
+    // Ceiling within the creator's authority AT CREATION (§6.2) — BOTH
+    // halves (review 1897c959 B1). A root session is the board-wide
+    // superset; a non-root Account session must prove containment of the
+    // OBJECT ceiling against its own sources AND of the SCOPE ceiling
+    // against its current effective session scopes (§5.2 rule 1: step-up
+    // authorized the act and never widened anything).
+    if (!creator.isRoot) {
+      const problem = await this.ceilingContainmentProblem(
+        creator.principalId, creator.sessionScopes ?? [], ceilingRulesForCheck, ceilingScopes);
+      if (problem) throw err(403, 'CEILING_EXCEEDS_CREATOR', problem.creatorMessage);
+    }
+    const agentMaxAgeHours = authority.intOrNull(input.agentMaxAgeHours, 'agentMaxAgeHours', 168);
+
+    return { name, description, anchors, expiresAt, hasProfile, ceilingProfileVersionId, ceilingRulesForCheck,
+      ceilingScopes, transportPin, agentMaxAgeHours, maxConcurrent, maxTotal };
+  }
+
+  /**
+   * THE WARRANT'S AUTHORITY VALIDATORS, extracted from `prepareCreate` (AUTHZ
+   * amendment AZ-A13 clause 8b, ratified 2026-10-11, E95): the expiry rule
+   * against the anchors (§6.2, EXPIRY_REQUIRED), exactly one ceiling form, a
+   * profile reference pinning the version PUBLISHED NOW (PROFILE_UNPUBLISHED),
+   * inline rules validated, the `ceilingScopes` closures, the transport pin and
+   * the cap bounds. Creation runs them on the new warrant; the in-place edit
+   * (`AuthorityEditExecutor`) runs them on the warrant's state AFTER the edit,
+   * so a validator dropped here is dropped for both.
+   */
+  async prepareAuthorityFields(input: {
+    ceilingProfileId?: unknown;
+    ceilingRules?: unknown;
+    ceilingScopes?: unknown;
+    expiresAt?: unknown;
+    transportPin?: unknown;
+    maxConcurrent?: unknown;
+    maxTotal?: unknown;
+  }, anchors: WarrantAnchorInput[], options: {
+    /** An edit that leaves the ceiling as it is names neither form: the pinned
+     * version (and its rules) stand, and nothing is republished (AZ-A13
+     * clause 10b: "The edit never republishes the profile the warrant pinned
+     * before"). Creation never passes this, so it still needs exactly one form. */
+    currentCeiling?: { versionId: string | null; rules: ProfileRule[] };
+  } = {}) {
     // Expiry (§6.2): MANDATORY — task-terminal expiry only for single-TASK
     // warrants; multi-anchor warrants require an explicit date.
     let expiresAt: Date | null = null;
@@ -332,7 +381,8 @@ export class WarrantService {
     // PUBLISHED NOW, or inline rules — exactly one form, never unbounded.
     const hasProfile = input.ceilingProfileId !== undefined && input.ceilingProfileId !== null;
     const hasRules = input.ceilingRules !== undefined && input.ceilingRules !== null;
-    if (hasProfile === hasRules) {
+    const keepsCurrent = !hasProfile && !hasRules && Boolean(options.currentCeiling);
+    if (hasProfile === hasRules && !keepsCurrent) {
       throw err(422, 'CEILING_REQUIRED',
         'a warrant ceiling is exactly one of: ceilingProfileId (an existing published profile) or ceilingRules (which the server publishes as a profile) — never both, never neither (AZ-31a)');
     }
@@ -343,7 +393,10 @@ export class WarrantService {
     // a failed warrant leaves no orphan profile.
     let ceilingProfileVersionId: string | null = null;
     let ceilingRulesForCheck: ProfileRule[];
-    if (hasProfile) {
+    if (keepsCurrent && options.currentCeiling) {
+      ceilingProfileVersionId = options.currentCeiling.versionId;
+      ceilingRulesForCheck = options.currentCeiling.rules;
+    } else if (hasProfile) {
       if (typeof input.ceilingProfileId !== 'string' || !UUID_PATTERN.test(input.ceilingProfileId)) {
         throw err(422, 'INVALID_WARRANT_VALUE', 'ceilingProfileId must be a full UUID');
       }
@@ -373,28 +426,6 @@ export class WarrantService {
       }
     }
 
-    // Ceiling within the creator's authority AT CREATION (§6.2) — BOTH
-    // halves (review 1897c959 B1). A root session is the board-wide
-    // superset; a non-root Account session must prove containment of the
-    // OBJECT ceiling against its own sources AND of the SCOPE ceiling
-    // against its current effective session scopes (§5.2 rule 1: step-up
-    // authorized the act and never widened anything).
-    if (!creator.isRoot) {
-      const sources = sourcesFromEffectiveAccess(await accessProfileService.effectiveAccess(creator.principalId));
-      const check = rulesCovered(sources, ceilingRulesForCheck);
-      if (!check.covered) {
-        throw err(403, 'CEILING_EXCEEDS_CREATOR',
-          `the warrant ceiling exceeds the creator's authority (§6.2): ${JSON.stringify(check.failing)}`);
-      }
-      if (ceilingScopes) {
-        const scopeCheck = scopesWithin(creator.sessionScopes ?? [], ceilingScopes);
-        if (!scopeCheck.within) {
-          throw err(403, 'CEILING_EXCEEDS_CREATOR',
-            `the warrant scope ceiling exceeds the creator's current effective scopes (§6.2): ${scopeCheck.exceeding.join(', ')}`);
-        }
-      }
-    }
-
     const transportPin = input.transportPin === undefined || input.transportPin === null ? 'any' : String(input.transportPin);
     if (!['any', 'mcp', 'api'].includes(transportPin)) {
       throw err(422, 'INVALID_WARRANT_VALUE', "transportPin must be 'any', 'mcp' or 'api'");
@@ -407,12 +438,42 @@ export class WarrantService {
       }
       return parsed;
     };
-    const agentMaxAgeHours = intOrNull(input.agentMaxAgeHours, 'agentMaxAgeHours', 168);
     const maxConcurrent = intOrNull(input.maxConcurrent, 'maxConcurrent', 1000);
     const maxTotal = intOrNull(input.maxTotal, 'maxTotal', 100000);
 
-    return { name, description, anchors, expiresAt, hasProfile, ceilingProfileVersionId, ceilingRulesForCheck,
-      ceilingScopes, transportPin, agentMaxAgeHours, maxConcurrent, maxTotal };
+    return { expiresAt, hasProfile, ceilingProfileVersionId, ceilingRulesForCheck,
+      ceilingScopes, transportPin, maxConcurrent, maxTotal, intOrNull };
+  }
+
+  /**
+   * The creation containment test (§6.2; review 1897c959 B1), stated once:
+   * the OBJECT ceiling within the principal's own effective access, and the
+   * SCOPE ceiling within the scope set it holds now. `prepareCreate` runs it
+   * with the creator (CEILING_EXCEEDS_CREATOR); the AZ-A13 owner's direct
+   * widening runs it with the owning Account in the creator's place (clause 8b,
+   * E94: EXCEEDS_ACCOUNT_AUTHORITY). Null when the ceiling is contained.
+   */
+  async ceilingContainmentProblem(
+    principalId: string, sessionScopes: string[], ceilingRules: ProfileRule[], ceilingScopes: string[] | null,
+  ): Promise<{ creatorMessage: string; failing: unknown; exceedingScopes: string[] } | null> {
+    const sources = sourcesFromEffectiveAccess(await accessProfileService.effectiveAccess(principalId));
+    const check = rulesCovered(sources, ceilingRules);
+    if (!check.covered) {
+      return {
+        creatorMessage: `the warrant ceiling exceeds the creator's authority (§6.2): ${JSON.stringify(check.failing)}`,
+        failing: check.failing, exceedingScopes: [],
+      };
+    }
+    if (ceilingScopes) {
+      const scopeCheck = scopesWithin(sessionScopes, ceilingScopes);
+      if (!scopeCheck.within) {
+        return {
+          creatorMessage: `the warrant scope ceiling exceeds the creator's current effective scopes (§6.2): ${scopeCheck.exceeding.join(', ')}`,
+          failing: null, exceedingScopes: scopeCheck.exceeding,
+        };
+      }
+    }
+    return null;
   }
   async previewCreate(input: Parameters<WarrantService['create']>[0], creator: Parameters<WarrantService['create']>[1], actor: AuditActor) {
     const prepared = await this.prepareCreate(input, creator, actor);
@@ -431,7 +492,9 @@ export class WarrantService {
     agentMaxAgeHours?: unknown;
     maxConcurrent?: unknown;
     maxTotal?: unknown;
-  }, creator: { principalId: string; isRoot: boolean; sessionScopes?: string[] | null; stepUp: { tokenId: string; method: string } | null }, actor: AuditActor, transactionClient?: PoolClient): Promise<WarrantRecord> {
+  }, creator: { principalId: string; isRoot: boolean; sessionScopes?: string[] | null; stepUp: { tokenId: string; method: string } | null;
+    /** Extra ledger fields on the warrant.create audit row (the decision of an approved warrant.create change, E325 section 7.1). */
+    auditMetadata?: Record<string, unknown> }, actor: AuditActor, transactionClient?: PoolClient): Promise<WarrantRecord> {
     let { name, description, anchors, expiresAt, hasProfile, ceilingProfileVersionId, ceilingRulesForCheck,
       ceilingScopes, transportPin, agentMaxAgeHours, maxConcurrent, maxTotal } = await this.prepareCreate(input, creator, actor);
     const client = transactionClient ?? await pool.connect();
@@ -481,6 +544,7 @@ export class WarrantService {
           ceilingProfileVersionId, ceilingScopes, expiresAt: expiresAt?.toISOString() ?? null,
           transportPin, maxConcurrent, maxTotal, stepUp: creator.stepUp,
           chain: await auditChainFor(client, String(input.holderPrincipalId)),
+          ...(creator.auditMetadata ?? {}),
         },
       }, client);
       if (!transactionClient) await client.query('COMMIT');
@@ -497,7 +561,7 @@ export class WarrantService {
     }
   }
 
-  private async rulesOfVersion(versionId: string): Promise<ProfileRule[]> {
+  async rulesOfVersion(versionId: string): Promise<ProfileRule[]> {
     const result = await pool.query(
       'SELECT resource_type, selector_form, selector_ids, verbs FROM access_profile_rules WHERE version_id = $1',
       [versionId],
@@ -510,8 +574,9 @@ export class WarrantService {
     }));
   }
 
-  /** Name/description touch-ups only — authority fields are immutable by
-   * construction; widening is a NEW warrant (re-approval). */
+  /** Name and description. The authority fields are edited in place by the
+   * AZ-A13 edit act (`AuthorityEditExecutor`, clause 10): narrowing saves,
+   * widening is an approved, step-up act that re-pins the ceiling. */
   async update(warrantId: string, input: { name?: unknown; description?: unknown }, actor: AuditActor): Promise<WarrantRecord> {
     const existing = await this.get(warrantId);
     const sets: string[] = [];
@@ -587,7 +652,15 @@ export class WarrantService {
      * REQUIRED, so a caller cannot forget which of the two it is handing over.
      */
     visible: AuthorizedTaskNarrowing,
-    options: { acknowledgeDependents?: boolean } = {},
+    options: {
+      acknowledgeDependents?: boolean;
+      /** A caller's transaction (the decision of an approved warrant.revoke
+       * change, E325 section 3): the revoke commits or rolls back with it, and
+       * the record is read back on that client. */
+      transactionClient?: PoolClient;
+      /** Extra ledger fields on the warrant.revoke audit row (the decision's). */
+      auditMetadata?: Record<string, unknown>;
+    } = {},
   ): Promise<WarrantRecord> {
     if (!options.acknowledgeDependents) {
       const dependents = await accessVehicleService.dependentOpenTasks(warrantId);
@@ -602,14 +675,15 @@ export class WarrantService {
           `revoking this warrant will UNASSIGN ${dependents.length} not-yet-terminal task(s) that ride it (ruling 7440b579 R4). Re-send with acknowledgeDependents to proceed: ${tail}`);
       }
     }
-    const client = await pool.connect();
+    const own = !options.transactionClient;
+    const client = options.transactionClient ?? await pool.connect();
     try {
-      await client.query('BEGIN');
+      if (own) await client.query('BEGIN');
       const row = await client.query('SELECT status FROM warrants WHERE id = $1 FOR UPDATE', [warrantId]);
       if (row.rows.length === 0) throw err(404, 'WARRANT_NOT_FOUND', 'No such warrant');
       if (row.rows[0].status === 'revoked') {
-        await client.query('ROLLBACK');
-        return this.get(warrantId); // idempotent
+        if (own) await client.query('ROLLBACK');
+        return own ? this.get(warrantId) : this.getWithin(client, warrantId); // idempotent
       }
       if (row.rows[0].status === 'expired') throw err(409, 'WARRANT_EXPIRED', 'an expired warrant is one-way (§6.2) and needs no revocation');
       await client.query(
@@ -627,25 +701,40 @@ export class WarrantService {
       });
       await auditService.record({
         action: 'warrant.revoke', actor, resourceType: 'warrant', resourceId: warrantId,
-        metadata: { reason, unassignedTaskIds: released.unassignedTaskIds },
+        metadata: { reason, unassignedTaskIds: released.unassignedTaskIds, ...(options.auditMetadata ?? {}) },
       }, client);
+      if (!own) return this.getWithin(client, warrantId);
       await client.query('COMMIT');
       return this.get(warrantId);
     } catch (e) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      if (own) await client.query('ROLLBACK').catch(() => undefined);
       throw e;
     } finally {
-      client.release();
+      if (own) client.release();
     }
+  }
+
+  /** One warrant read on a caller's transaction (its own uncommitted writes visible). */
+  async getWithin(client: PoolClient, warrantId: string): Promise<WarrantRecord> {
+    const result = await client.query(`${WARRANT_SELECT} WHERE w.id = $1`, [warrantId]);
+    if (result.rows.length === 0) throw err(404, 'WARRANT_NOT_FOUND', 'No such warrant');
+    const anchors = await client.query('SELECT anchor_type, anchor_id FROM warrant_anchors WHERE warrant_id = $1 ORDER BY anchor_type, anchor_id', [warrantId]);
+    return mapWarrant(result.rows[0], anchors.rows, await this.liveMintedCount(client, warrantId));
   }
 
   /** Resume (§6.4): a suspended warrant returns to service ONLY by this
    * re-approval act — the route gates it as human-plane step-up or root.
    * Resumption re-proves the creator live-cap first. */
-  async resume(warrantId: string, actor: AuditActor): Promise<WarrantRecord> {
-    const client = await pool.connect();
+  async resume(warrantId: string, actor: AuditActor, options: {
+    /** A caller's transaction (the decision of an approved warrant.resume change, E325 section 3). */
+    transactionClient?: PoolClient;
+    /** Extra ledger fields on the warrant.resume audit row (the decision's). */
+    auditMetadata?: Record<string, unknown>;
+  } = {}): Promise<WarrantRecord> {
+    const own = !options.transactionClient;
+    const client = options.transactionClient ?? await pool.connect();
     try {
-      await client.query('BEGIN');
+      if (own) await client.query('BEGIN');
       const row = await client.query(`${WARRANT_SELECT} WHERE w.id = $1 FOR UPDATE OF w`, [warrantId]);
       if (row.rows.length === 0) throw err(404, 'WARRANT_NOT_FOUND', 'No such warrant');
       if (row.rows[0].status !== 'suspended') throw err(409, 'WARRANT_NOT_SUSPENDED', `only a suspended warrant resumes (status: ${row.rows[0].status})`);
@@ -659,15 +748,16 @@ export class WarrantService {
       );
       await writeWarrantEvent(client, { warrantId, action: 'warrant.resumed', actor, metadata: {} });
       await auditService.record({
-        action: 'warrant.resume', actor, resourceType: 'warrant', resourceId: warrantId, metadata: {},
+        action: 'warrant.resume', actor, resourceType: 'warrant', resourceId: warrantId, metadata: { ...(options.auditMetadata ?? {}) },
       }, client);
+      if (!own) return this.getWithin(client, warrantId);
       await client.query('COMMIT');
       return this.get(warrantId);
     } catch (e) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      if (own) await client.query('ROLLBACK').catch(() => undefined);
       throw e;
     } finally {
-      client.release();
+      if (own) client.release();
     }
   }
 
@@ -677,7 +767,7 @@ export class WarrantService {
    * problem text, or null when the cap holds. NULL creator (pre-backfill
    * rows) fails closed.
    */
-  private async creatorCapProblem(
+  async creatorCapProblem(
     queryable: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> },
     warrantRow: any,
   ): Promise<string | null> {
@@ -722,7 +812,7 @@ export class WarrantService {
    * ratified 095 shape — immutable version, published pointer, append-only
    * event ledger.
    */
-  private async publishCeilingProfile(
+  async publishCeilingProfile(
     client: PoolClient,
     warrantName: string,
     rules: ProfileRule[],
@@ -763,7 +853,7 @@ export class WarrantService {
        VALUES ($1, $2, $3) RETURNING id`,
       [
         profileName,
-        `Published from the inline ceiling of warrant "${warrantName}" (AZ-A3). Edit by creating a new warrant; warrant authority is immutable.`,
+        `Published from the inline ceiling of warrant "${warrantName}" (AZ-A3). This version is immutable: a warrant's ceiling moves only by an AZ-A13 edit, which publishes a new profile and pins it.`,
         createdByPrincipalId,
       ],
     );
@@ -891,7 +981,7 @@ export class WarrantService {
   /**
    * WARRANT-MINT (§6.2–6.4, AZ-31b/AZ-33b): resolve the warrant (named, or
    * auto-selected only when exactly ONE live warrant contains the target —
-   * sol M8), take SELECT FOR UPDATE on its row (T18: serializes against
+   * review M8), take SELECT FOR UPDATE on its row (T18: serializes against
    * revoke and sibling mints), re-validate EVERYTHING live (holder match,
    * containment T4, creator live-cap with loud auto-suspend, caps T17,
    * ceiling T23, requester ⊆ T2), then mint in the same transaction. The
@@ -903,6 +993,7 @@ export class WarrantService {
     targetTaskId: string;
     warrantId?: string | null;
     authority: MintAuthorityRequest;
+    role?: 'implementer' | 'verifier' | 'shepherd';
     label?: string | null;
   }, actor: AuditActor): Promise<MintedAgentPack> {
     // Selection happens OUTSIDE the lock; every fact that matters is
@@ -917,7 +1008,7 @@ export class WarrantService {
         throw err(409, 'NO_CONTAINING_WARRANT', 'no live warrant of this holder contains the target task (§6.3)');
       }
       if (candidates.length > 1) {
-        // sol M8: ANY multiplicity refuses — determinism beats cleverness.
+        // review M8: ANY multiplicity refuses — determinism beats cleverness.
         throw err(409, 'AMBIGUOUS_WARRANT',
           `multiple live warrants contain the target task — name the warrant (warrantId) explicitly (§6.3): ${candidates.join(', ')}`);
       }
@@ -979,26 +1070,52 @@ export class WarrantService {
       const ceilingRules = warrant.ceiling_profile_version_id
         ? await this.rulesOfVersion(String(warrant.ceiling_profile_version_id))
         : (parseJsonColumn<ProfileRule[]>(warrant.ceiling_rules) ?? []);
-      const objectCheck = rulesCovered(sourcesFromRules(ceilingRules), input.authority.rules);
-      if (!objectCheck.covered) {
-        throw err(403, 'CEILING_EXCEEDED', `requested object authority exceeds the warrant ceiling (§6.2): ${JSON.stringify(objectCheck.failing)}`);
+      const requestedCheck = await rulesCoveredWithCoordinates(client, sourcesFromRules(ceilingRules),
+        input.authority.rules);
+      if (!requestedCheck.covered) {
+        throw err(403, 'CEILING_EXCEEDED',
+          `requested object authority exceeds the warrant ceiling (§6.2): ${JSON.stringify(requestedCheck.failing)}`);
       }
       const scopeCheck = scopesWithin(parseJsonColumn<string[]>(warrant.ceiling_scopes), input.authority.scopes);
       if (!scopeCheck.within) {
         throw err(403, 'CEILING_EXCEEDED', `requested scopes exceed the warrant scope ceiling: ${scopeCheck.exceeding.join(', ')}`);
+      }
+      const mintRole = normalizeMintRole(input.role, input.authority.scopes);
+      const chain = await delegationService.resolveChain(input.actingPrincipalId, client);
+      if (!chain.alive) throw err(409, 'REQUESTER_CHAIN_DEAD', 'mint requester chain is not live');
+      const assigner: AuthorizationActor = {
+        principalId: input.actingPrincipalId, handle: actor.handle, role: chain.links[0].role,
+        scopes: null, authenticated: true,
+        delegation: chain.links.length > 1 ? { links: chain.links } : null,
+      };
+      let planned;
+      try {
+        planned = await accessVehicleService.plannedRoleRules(client, input.targetTaskId, mintRole, assigner);
+      } catch (error) {
+        if (error instanceof AssignmentAccessError) throw err(error.status, error.code, error.message);
+        throw error;
+      }
+      const roleRules: ProfileRule[] = planned.map(row => ({
+        resourceType: row.resourceType, selectorForm: 'exact', selectorIds: [row.resourceId], verbs: [row.verb],
+      }));
+      const objectCheck = await rulesCoveredWithCoordinates(client, sourcesFromRules(ceilingRules),
+        [...input.authority.rules, ...roleRules]);
+      if (!objectCheck.covered) {
+        throw err(403, 'CEILING_EXCEEDED', `requested rules or role rows exceed the warrant ceiling (§6.2): ${JSON.stringify(objectCheck.failing)}`);
       }
 
       // The full shared validation (§8.1): requester live, task mintable,
       // writer slot, mint-time ⊆ against the requester's CURRENT authority.
       await agentMintService.assertRequesterLive(input.actingPrincipalId, null);
       await agentMintService.assertTaskMintable(client, input.targetTaskId);
-      await agentMintService.assertWriterSlotFree(client, input.targetTaskId, input.authority.scopes);
+      await agentMintService.assertWriterSlotFree(client, input.targetTaskId, input.authority.scopes, input.role);
       agentMintService.assertScopesWithinEffective(input.actingCredentialScopes, input.authority.scopes);
-      await agentMintService.assertObjectAuthorityCovers(input.actingPrincipalId, input.authority.rules);
+      await agentMintService.assertObjectAuthorityCovers(input.actingPrincipalId, input.authority.rules, client);
 
       const pack = await agentMintService.executeMint(client, {
         targetTaskId: input.targetTaskId,
         authority: input.authority,
+        role: input.role,
         // AZ-RT5: the parent is ALWAYS the acting credential's principal,
         // never the warrant holder.
         parentPrincipalId: input.actingPrincipalId,
@@ -1050,9 +1167,10 @@ export class WarrantService {
    * Mint enforcement is LIVE either way — the sweep persists state and
    * emits events (§7.3 doctrine).
    */
-  async sweepLifecycles(actor: AuditActor = { handle: 'system', authMethod: 'system' }): Promise<{ expired: number; suspended: number }> {
+  async sweepLifecycles(actor: AuditActor = { handle: 'system', authMethod: 'system' }): Promise<{ expired: number; suspended: number; retryable?: Array<{warrantId: string; status: 409; code: 'ASSIGNMENT_REFERENCE_BUSY'}> }> {
     let expired = 0;
     let suspended = 0;
+    const retryable: Array<{warrantId: string; status: 409; code: 'ASSIGNMENT_REFERENCE_BUSY'}> = [];
     const active = await pool.query(`SELECT id FROM warrants WHERE status IN ('active', 'suspended')`);
     for (const row of active.rows) {
       const warrantId = String(row.id);
@@ -1153,13 +1271,14 @@ export class WarrantService {
           }
         }
         await client.query('COMMIT');
-      } catch {
+      } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined);
+        if (error instanceof AssignmentAccessError && error.code === 'ASSIGNMENT_REFERENCE_BUSY') retryable.push({warrantId, status: 409, code: 'ASSIGNMENT_REFERENCE_BUSY'});
       } finally {
         client.release();
       }
     }
-    return { expired, suspended };
+    return { expired, suspended, ...(retryable.length ? {retryable} : {}) };
   }
 }
 

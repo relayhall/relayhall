@@ -60,7 +60,7 @@ vi.mock('../components/Toast', () => ({ ToastContainer: () => null }));
 const uuid = (n: number) => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
 const mkTask = (n: number, status: string, title?: string) => ({
   id: uuid(n), title: title ?? `Task ${n}`, description: '', status, priority: 'normal',
-  tags: [], subtasks: [], links: [], sessionRefs: [], autoCreated: false, autoStart: false,
+  tags: [], subtasks: [], links: [], autoStart: false,
   blockedBy: [], dependsOn: [], project: null, phaseId: null,
   created: '2026-08-16T10:00:00.000Z', updated: '2026-08-16T12:00:00.000Z',
 });

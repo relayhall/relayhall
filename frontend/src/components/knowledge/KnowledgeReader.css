@@ -1,0 +1,203 @@
+/* The shared knowledge reader (card 1fd5de08, line 1). A right-hand panel over a
+   scrim, the full width of a phone, the same shape as the approval drawer.
+   Knowledge content is set apart from the board's own chrome: a quoted frame
+   on the elevated surface with an accent rule and a monospaced body, under a
+   caption that says whose words these are. Theme tokens only, so each Theme
+   (dark, light, high contrast) draws it; every text/background pair used here
+   is a gated pair in docs/design-system.md. */
+
+.knowledge-reader-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.knowledge-reader {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: min(640px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-5);
+  border-left: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-3);
+}
+
+.knowledge-reader--expanded {
+  width: 100%;
+  border-left: 0;
+}
+
+.knowledge-reader:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.knowledge-reader-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.knowledge-reader-heading {
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.knowledge-reader-heading h2 {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-xl);
+  overflow-wrap: anywhere;
+}
+
+.knowledge-reader-eyebrow {
+  margin: 0;
+  color: var(--text-accent);
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-reader-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.knowledge-reader-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.knowledge-reader-refused {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--danger-color);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.knowledge-reader-refused p {
+  margin: 0;
+}
+
+.knowledge-reader-meta {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* The quoted frame: source-authored bytes live only in here. */
+.knowledge-reader-quote {
+  margin: 0;
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--accent-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.knowledge-reader-caption {
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.knowledge-reader-text {
+  max-height: 60vh;
+  margin: 0;
+  padding: var(--space-4);
+  overflow: auto;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-reader--expanded .knowledge-reader-text {
+  max-height: none;
+}
+
+.knowledge-reader-text--binary {
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+}
+
+.knowledge-reader-partial {
+  margin: 0;
+  color: var(--text-warning);
+  font-size: var(--text-sm);
+}
+
+.knowledge-reader-facts {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.knowledge-reader-facts dt {
+  color: var(--text-tertiary);
+}
+
+.knowledge-reader-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-reader-digest {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.knowledge-reader-why {
+  display: grid;
+  gap: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.knowledge-reader-why h3 {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 640px) {
+  .knowledge-reader {
+    width: 100%;
+    padding: var(--space-4);
+    border-left: 0;
+  }
+
+  .knowledge-reader-facts {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+
+  .knowledge-reader-facts dd {
+    margin-block-end: var(--space-2);
+  }
+}

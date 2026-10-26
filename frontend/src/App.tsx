@@ -12,7 +12,6 @@ import { ProjectsPage } from './pages/ProjectsPage';
 import { CharterPage } from './pages/CharterPage';
 import { PhasesPage } from './pages/PhasesPage';
 import { AuditPage } from './pages/AuditPage';
-import { SessionsPage } from './pages/SessionsPage';
 import { StatsPage } from './pages/StatsPage';
 import { SkillsPage } from './pages/SkillsPage';
 import { BlueprintsPage } from './pages/BlueprintsPage';
@@ -20,23 +19,32 @@ import { ToolsPage } from './pages/ToolsPage';
 import { PersonalitiesPage } from './pages/PersonalitiesPage';
 import { PersonalityDetailPage } from './pages/PersonalityDetailPage';
 import { PrincipalsPage } from './pages/PrincipalsPage';
+import { KnowledgePage } from './pages/KnowledgePage';
 import { ReportsPage } from './pages/ReportsPage';
 import { ReportDetailPage } from './pages/ReportDetailPage';
 import { LoginPage } from './pages/LoginPage';
 import { BreakGlassBanner } from './components/BreakGlassBanner';
 import { PreferencesPage } from './pages/PreferencesPage';
 import { AppearancePage } from './pages/AppearancePage';
+import { ServicesPage } from './pages/ServicesPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { GrantsPage } from './pages/GrantsPage';
 import { AccessManagerPage } from './pages/AccessManagerPage';
 import { MyConnectionsPage } from './pages/MyConnectionsPage';
 import { AboutPage } from './pages/AboutPage';
 import { OAuthConsentPage } from './pages/OAuthConsentPage';
+import { ApprovalsPage } from './pages/ApprovalsPage';
+import { ActionCenterAlias, NotificationsPage } from './pages/NotificationsPage';
+import { DirectoryPage } from './pages/DirectoryPage';
+import { GroupsPage } from './pages/GroupsPage';
+import { TeamPage } from './pages/TeamPage';
 import { ToastProvider } from './contexts/ToastContext';
 import { RelayHallConfigProvider, useRelayHallConfig } from './contexts/RelayHallConfigContext';
 import { PluginProvider, usePlugins } from './contexts/PluginContext';
 import { ThemeProvider } from './contexts/ThemeContext';
+import { PluginSettingsPage } from './pages/PluginSettingsPage';
 import { PluginFrame } from './components/PluginFrame';
+import { RouteUnavailablePage } from './pages/RouteUnavailablePage';
 import { auth } from './utils/auth';
 import { SettingsIndexRedirect, SettingsRouteAlias } from './pages/SettingsPage';
 import { SETTINGS_ROUTE_ALIASES } from './config/settingsRouteAliases';
@@ -57,6 +65,7 @@ import type { ReactNode } from 'react';
  */
 const SETTINGS_PAGES: Record<SettingsNavEntryId, ReactNode> = {
   preferences: <PreferencesPage />,
+  plugins: <PluginSettingsPage />,
   connections: <MyConnectionsPage />,
   // The Access manager (AZ-S4, design 4d961e37 A17.9): approvals, warrants,
   // inventory, reveals, remediation. Deep links land here (?approval=...) and
@@ -66,6 +75,8 @@ const SETTINGS_PAGES: Record<SettingsNavEntryId, ReactNode> = {
   'access-grants': <GrantsPage />,
   identities: <PrincipalsPage />,
   appearance: <AppearancePage />,
+  // Card 08792425 (member N6): knowledge source registration.
+  services: <ServicesPage />,
 };
 
 function App() {
@@ -187,8 +198,11 @@ function AppRoutes({ config }: { config: ReturnType<typeof useRelayHallConfig>['
       {config.features.projects && <Route path="/projects" element={<ProjectsPage />} />}
       {config.features.projects && <Route path="/projects/:id/charter" element={<CharterPage />} />}
       {config.features.projects && <Route path="/projects/:id/phases" element={<PhasesPage />} />}
-      <Route path="/sessions" element={<SessionsPage />} />
+      {/* Owner ruling E453: Agent sessions is a tab of the Action Center now;
+          the old path replaces itself with that tab, keeping a session link. */}
+      <Route path="/sessions" element={<ActionCenterAlias from="sessions" />} />
       {config.features.auditLog && <Route path="/audit" element={<AuditPage />} />}
+      <Route path="/knowledge" element={<KnowledgePage />} />
       <Route path="/reports" element={<ReportsPage />} />
       <Route path="/reports/:id" element={<ReportDetailPage />} />
       {config.features.skills && <Route path="/skills" element={<SkillsPage />} />}
@@ -203,6 +217,31 @@ function AppRoutes({ config }: { config: ReturnType<typeof useRelayHallConfig>['
           the app's own gate, and the request survives it because the URL
           does. */}
       <Route path="/oauth/consent" element={<OAuthConsentPage />} />
+      {/* Card b1e3b16d, lane L1 (design B.1): the approvals hub and the
+          notification centre. LINK-ONLY, like the routes above: the sidebar
+          bell, the dashboard's decision notice and the Access manager panel
+          reach them, and neither is a `navigationItems` entry or a Settings
+          child — the left menu stays as it is (E16). Each page guards itself
+          on a resolved principal, as the Access manager does. The hub is
+          also the notification centre's Approvals tab (owner E84, card
+          e2dd52b8), where the bell and the decision notice now lead; the
+          Access manager's link still leads here. */}
+      <Route path="/approvals" element={<ApprovalsPage />} />
+      {/* Owner ruling E453: the notification centre is the ACTION CENTER, and
+          the left menu's "Action Center" entry opens it. `/notifications`
+          keeps working: it replaces itself with the Action Center, carrying
+          the query and the fragment (`?tab=approvals&approval=<id>` and every
+          other deep link the board has published). */}
+      <Route path="/action-center" element={<NotificationsPage />} />
+      <Route path="/notifications" element={<ActionCenterAlias from="notifications" />} />
+      {/* RH-LENSES-d (card 4e159741; design 96f0bd3d s8.4): the admin lens's
+          two sections with no other home. The sidebar OFFERS them to a session
+          the server names admin; each page reads only through routes that keep
+          their own ceilings, so a direct visit by anyone else shows the empty
+          answer those routes give it, never more. */}
+      <Route path="/directory" element={<DirectoryPage />} />
+      <Route path="/groups" element={<GroupsPage />} />
+      <Route path="/team" element={<TeamPage />} />
       {/* RH-UI.SETTINGS.2 (card d0f030a9, contract 8dbc0b81) — ONE Settings
           shell. Every account-facing and administration surface is a child of
           it, and `config/settingsNavigation` is the single place their order,
@@ -242,6 +281,7 @@ function AppRoutes({ config }: { config: ReturnType<typeof useRelayHallConfig>['
           path={`${route.path}/*`}
           element={
             <PluginFrame
+              surface="route"
               pluginName={route.pluginName}
               proxyPath={route.proxy_to}
               apiBase={API_BASE}
@@ -249,6 +289,15 @@ function AppRoutes({ config }: { config: ReturnType<typeof useRelayHallConfig>['
           }
         />
       ))}
+
+      {/* The catch-all. Plugin routes above are registered FROM the per-Account
+          filtered registry, so a path this Account may not see matches nothing
+          and used to render an empty main area — indistinguishable from a
+          broken release. This renders the same generic state for a path that
+          never existed, a plugin that does not exist, and a plugin this Account
+          may not see, so it cannot be used to test whether a name is real.
+          It stays LAST: every real route must win over it. */}
+      <Route path="*" element={<RouteUnavailablePage pluginsLoading={pluginsLoading} />} />
     </Routes>
   );
 }

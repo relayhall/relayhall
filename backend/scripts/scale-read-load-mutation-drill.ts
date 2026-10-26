@@ -14,7 +14,14 @@
  * gate, which seeds thousands of rows and archives completed Tasks. Point
  * RELAYHALL_TEST_DB_URL at a disposable local database only.
  *
- *   RELAYHALL_TEST_DB_URL=postgres://scale:scale@127.0.0.1:15701/relayhall_scale \
+ * Each run starts from a freshly created and migrated database: the drill drops
+ * and re-creates the database RELAYHALL_TEST_DB_URL names, through the same
+ * server and credentials (machinery queue 9b761f09: it used to reach one
+ * developer's fixed container by name, so it ran nowhere else). The name must
+ * look disposable and the host must be loopback, or the CI service.
+ *
+ *   RELAYHALL_TEST_DB_URL=postgres://scale:scale@127.0.0.1:<port>/relayhall_scale \
+ *   DB_HOST=127.0.0.1 DB_PORT=<port> DB_NAME=relayhall_scale DB_USER=scale DB_PASSWORD=scale \
  *     node ./node_modules/.bin/tsx scripts/scale-read-load-mutation-drill.ts
  */
 import { execFileSync, spawnSync } from 'child_process';
@@ -176,8 +183,15 @@ const MUTATIONS: Mutation[] = [
   },
   {
     id: 'M10',
-    what: 'restore the fail-open guard in the seed script: read the ENVIRONMENT rather than what the pool resolves to',
-    reddens: 'an absent DB_NAME is refused, because the pool resolves it to a deployment database',
+    // Expected COMPENSATED since the D11 containment (incident 47718b8f) began
+    // refusing an unset DB_NAME when the connection module LOADS, before the
+    // seed's own guard is reached; the control was rewritten to assert that
+    // earlier boundary and renamed (machinery queue 9b761f09 re-anchored this
+    // entry by name). M10b removes the D11 refusal and proves it is the
+    // mechanism holding the property.
+    what: 'restore the fail-open guard in the seed script: read the ENVIRONMENT rather than what the pool resolves to (expected COMPENSATED: D11 refuses an unset DB_NAME at module load)',
+    reddens: 'an absent DB_NAME is refused before the seed can reach a pool',
+    expect: 'compensated',
     file: 'scripts/seed-scale-fixture.ts',
     find: `  const { databasePoolConfig } = require('../src/db/connection');
   const dbName = String(databasePoolConfig.database ?? '');
@@ -196,6 +210,15 @@ const MUTATIONS: Mutation[] = [
     },
   },
   {
+    id: 'M10b',
+    what: 'remove the D11 refusal of an unset DB_NAME at module load: the pool configuration is exposed and the seed guard is reached',
+    reddens: 'an absent DB_NAME is refused before the seed can reach a pool',
+    file: 'src/db/connection.ts',
+    // Never matches, so the refusal is inert while every identifier stays used.
+    find: "  if (name === '') refuse('', 'DB_NAME is unset, so the pool would choose a database nobody named');",
+    replace: "  if (name === '\\u0000') refuse('', 'DB_NAME is unset, so the pool would choose a database nobody named');",
+  },
+  {
     id: 'M11',
     what: 'CONFIGURATION AS THE MUTATION: run the unmutated gate with SCALE_LOAD_CONCURRENCY=0 — it must REFUSE rather than measure nothing',
     reddens: '<suite failed to run — no assertion was reached>',
@@ -211,10 +234,45 @@ const MUTATIONS: Mutation[] = [
   },
 ];
 
+/** The database the drill owns, refused unless it is disposable (the gate's own rule, plus `scale`). */
+function drillDatabase(): { url: URL; name: string } {
+  const url = new URL(String(process.env.RELAYHALL_TEST_DB_URL || ''));
+  const name = decodeURIComponent(url.pathname.slice(1));
+  const local = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) && /test|contract|fixture|scale/.test(name);
+  const ci = process.env.CI === 'true' && url.hostname === 'postgres' && name === 'relayhall_ci';
+  if (!['postgres:', 'postgresql:'].includes(url.protocol) || !/^[a-z_][a-z0-9_]*$/.test(name)
+    || ['relayhall', 'relayhall_dev', 'relayhall_tst', 'relayhall_prod'].includes(name) || (!local && !ci)) {
+    throw new Error('RELAYHALL_TEST_DB_URL must name a disposable database: loopback with test, contract, fixture or '
+      + 'scale in its name, or the CI service. The drill DROPS and re-creates it.');
+  }
+  return { url, name };
+}
+
+/**
+ * SQL on `database` of the server the drill's URL names, synchronously, through
+ * `pg` in a child process: no client binary and no container name, so the
+ * drill runs wherever its gate can.
+ */
+function sqlOn(database: string, statements: string[]): void {
+  const target = new URL(drillDatabase().url.toString());
+  target.pathname = `/${encodeURIComponent(database)}`;
+  execFileSync(process.execPath, ['-e', [
+    "const { Client } = require('pg');",
+    '(async () => {',
+    '  const client = new Client({ connectionString: process.env.SCALE_DRILL_SQL_URL });',
+    '  await client.connect();',
+    '  try { for (const statement of JSON.parse(process.env.SCALE_DRILL_SQL)) await client.query(statement); }',
+    '  finally { await client.end(); }',
+    '})().catch((error) => { console.error(error.message); process.exit(1); });',
+  ].join('\n')], {
+    cwd: BACKEND, stdio: 'inherit',
+    env: { ...process.env, SCALE_DRILL_SQL_URL: target.toString(), SCALE_DRILL_SQL: JSON.stringify(statements) },
+  });
+}
+
 function freshDatabase(): void {
-  execFileSync('docker', ['exec', 'rh-scale-pg', 'psql', '-U', 'scale', '-d', 'postgres', '-q', '-c',
-    'DROP DATABASE IF EXISTS relayhall_scale WITH (FORCE)', '-c', 'CREATE DATABASE relayhall_scale OWNER scale'],
-    { stdio: 'inherit' });
+  const { name } = drillDatabase();
+  sqlOn('postgres', [`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`, `CREATE DATABASE ${name}`]);
   execFileSync('node', ['scripts/load-base-schema.js'], { cwd: BACKEND, stdio: 'ignore', env: process.env });
   execFileSync('npm', ['run', 'migrate'], { cwd: BACKEND, stdio: 'ignore', env: process.env });
 }
@@ -306,8 +364,7 @@ function main(): void {
       workdir = temp;
     }
     if (mutation.sql) {
-      execFileSync('docker', ['exec', 'rh-scale-pg', 'psql', '-U', 'scale', '-d', 'relayhall_scale', '-q', '-c', mutation.sql],
-        { stdio: 'inherit' });
+      sqlOn(drillDatabase().name, [mutation.sql]);
     }
 
     const run = runGate(workdir, mutation.env ?? {});

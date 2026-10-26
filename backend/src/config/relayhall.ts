@@ -23,6 +23,10 @@ export interface RelayHallConfig {
   services: ServicesConfig;
   deployment: DeploymentConfig;
   plugins: PluginsConfig;
+  /** E462 slice S3: the deployment's NARROW-ONLY override of the connector trust policy
+   *  (rh.connector-trust-override/1), validated against the release ceiling before it is served;
+   *  see services/ConnectorTrustPolicy. Absent: the release policy alone. */
+  connectorTrustPolicy?: unknown;
 }
 
 const DEFAULT_CONFIG: RelayHallConfig = {

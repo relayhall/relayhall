@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import type { Task } from '../../types/task';
 import { fetchMapGraph, type MapGraphQuery, type MapGraphResponse } from './mapGraphApi';
-import type { MapGraph } from './mapGraphModel';
+import { uniqueMapEdges, type MapGraph } from './mapGraphModel';
 
 /**
  * The Map's data lifecycle (design 77950a97 §8): ONE read, WS patch-in-place,
@@ -57,10 +57,7 @@ export const DETAIL_MATRIX: Readonly<Record<DetailBand, {
  * (session key, pid, log path); the map shows and stores nothing but the name,
  * matching what the server projects into the graph read.
  */
-function agentNameOf(activeAgent: Task['activeAgent']): string | null {
-  if (!activeAgent) return null;
-  return typeof activeAgent === 'string' ? activeAgent : (activeAgent.name ?? null);
-}
+
 
 /** Subtask counts in the shape the tile bar consumes; null when there is nothing to show. */
 function progressOf(subtasks: Task['subtasks']): { done: number; total: number } | null {
@@ -71,9 +68,14 @@ function progressOf(subtasks: Task['subtasks']): { done: number; total: number }
 
 const PULSE_MS = 1400;
 const DELTA_DEBOUNCE_MS = 300;
+const MAX_ADMISSION_READS = 3;
 
 export interface UseMapDataResult {
   graph: MapGraph;
+  /** Invalidates supplementary layout membership even before its first response. */
+  authorityEpoch: number;
+  /** A whole read has succeeded for this mount, scope and authority epoch. */
+  authorityReady: boolean;
   generatedAt: string | null;
   fullCount: number;
   isLoading: boolean;
@@ -85,12 +87,67 @@ export interface UseMapDataResult {
 
 export function useMapData(query: MapGraphQuery): UseMapDataResult {
   const queryClient = useQueryClient();
-  const graphKey = useMemo(() => ['map-graph', JSON.stringify(query)] as const, [query]);
+  const [authorityEpoch, setAuthorityEpoch] = useState(0);
+  const [observerId] = useState(() => crypto.randomUUID());
+  const queryScope = JSON.stringify(query);
+  const graphKey = useMemo(() => ['map-graph', queryScope, observerId, authorityEpoch] as const,
+    [queryScope, observerId, authorityEpoch]);
+  // Cache writes from socket events are not evidence of a successful read.
+  const admission = useMemo(() => ({ ready: false, revision: 0, exhausted: false, wholeRead: null as object | null }), [graphKey]);
+  const admissionRef = useRef(admission);
+  admissionRef.current = admission;
+
+  // Manual delta reads are outside React Query's cancellation lifecycle.
+  // Abort for efficiency AND reject late completions, including transports
+  // that finish despite cancellation, before they can restore old authority.
+  const reconcileGenerationRef = useRef(0);
+  const reconcileAbortRef = useRef<AbortController | null>(null);
+  const deltaTimerRef = useRef<number | null>(null);
+  const cancelReconcile = useCallback(() => {
+    reconcileGenerationRef.current += 1;
+    reconcileAbortRef.current?.abort();
+    reconcileAbortRef.current = null;
+    if (deltaTimerRef.current !== null) window.clearTimeout(deltaTimerRef.current);
+    deltaTimerRef.current = null;
+  }, []);
+  useEffect(() => cancelReconcile, [graphKey, cancelReconcile]);
 
   const graphQuery = useQuery({
     queryKey: graphKey,
-    queryFn: () => fetchMapGraph(query),
+    queryFn: async ({ signal }) => {
+      cancelReconcile();
+      // A background whole read within this mount/scope/authority epoch may
+      // replace an already admitted snapshot. Keep that snapshot qualified
+      // while it loads so parent renders do not unmount moving members.
+      // Explicit refresh, scope changes, reconnect/focus and authority events
+      // create a fresh admission object; failures below revoke this one.
+      const readOwner = {};
+      admission.wholeRead = readOwner;
+      try {
+        // A socket event during the read may postdate its database snapshot.
+        // Finish with one uncontested whole read rather than drop that event
+        // or run a competing manual whole read against the same cache key.
+        for (let attempt = 0; attempt < MAX_ADMISSION_READS; attempt += 1) {
+          const revision = admission.revision;
+          const whole = await fetchMapGraph(query, undefined, signal);
+          if (signal.aborted) return whole;
+          if (revision !== admission.revision) continue;
+          admission.ready = true;
+          return whole;
+        }
+        admission.exhausted = true;
+        throw new Error('Map changed during loading. Retry when updates settle.');
+      } catch (error) {
+        if (!signal.aborted) admission.ready = false;
+        throw error;
+      } finally {
+        if (admission.wholeRead === readOwner) admission.wholeRead = null;
+      }
+    },
     staleTime: 15_000,
+    retry: false,
+    // Old scopes and epochs must not accumulate or survive a remount.
+    gcTime: 0,
   });
 
   const [pulsed, setPulsed] = useState<ReadonlySet<string>>(() => new Set());
@@ -121,12 +178,12 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
   const lastSyncRef = useRef<string | null>(null);
   const anchorKeyRef = useRef<string>('');
   useEffect(() => {
-    const key = JSON.stringify(query);
+    const key = JSON.stringify(graphKey);
     if (anchorKeyRef.current !== key) {
       anchorKeyRef.current = key;
       lastSyncRef.current = null;
     }
-  }, [query]);
+  }, [graphKey]);
   useEffect(() => {
     if (graphQuery.data?.generatedAt) lastSyncRef.current = graphQuery.data.generatedAt;
   }, [graphQuery.data]);
@@ -136,21 +193,50 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
   const graphKeyRef = useRef(graphKey);
   graphKeyRef.current = graphKey;
 
-  const deltaTimerRef = useRef<number | null>(null);
   const scheduleDeltaReconcile = useCallback(() => {
-    if (deltaTimerRef.current !== null) window.clearTimeout(deltaTimerRef.current);
+    admissionRef.current.revision += 1;
+    cancelReconcile();
     deltaTimerRef.current = window.setTimeout(async () => {
       deltaTimerRef.current = null;
-      const since = lastSyncRef.current;
+      const currentAdmission = admissionRef.current;
+      // Display qualification and read ownership are separate. The active
+      // whole read observes revision changes and serializes its replacement;
+      // a debounce must not start a competing delta against that snapshot.
+      if (currentAdmission.wholeRead) return;
+      if (!currentAdmission.ready) {
+        // The in-flight query owns whole reads and incorporates intervening
+        // events. A failed query is retried under a fresh authority identity.
+        if (!currentAdmission.exhausted
+          && queryClient.getQueryState(graphKeyRef.current)?.fetchStatus !== 'fetching') {
+          setAuthorityEpoch(value => value + 1);
+        }
+        return;
+      }
+      const since = currentAdmission.ready ? lastSyncRef.current : null;
       const key = graphKeyRef.current;
+      const scope = queryRef.current;
+      const generation = reconcileGenerationRef.current;
+      const controller = new AbortController();
+      reconcileAbortRef.current = controller;
+      const isCurrent = () => !controller.signal.aborted
+        && generation === reconcileGenerationRef.current
+        && key === graphKeyRef.current;
       try {
-        const delta = await fetchMapGraph(queryRef.current, since ?? undefined);
+        const delta = await fetchMapGraph(scope, since ?? undefined, controller.signal);
+        if (!isCurrent()) return;
+        if (!since) {
+          currentAdmission.ready = true;
+          queryClient.setQueryData<MapGraphResponse>(key, delta);
+          lastSyncRef.current = delta.generatedAt;
+          return;
+        }
         const existing = queryClient.getQueryData<MapGraphResponse>(key);
         // A PARTIAL read may not define a scope it never saw whole. With no
         // cache to merge into, "everything changed since T" would install a
         // one-or-two-task map as the entire estate.
         if (!existing && since) {
-          const whole = await fetchMapGraph(queryRef.current);
+          const whole = await fetchMapGraph(scope, undefined, controller.signal);
+          if (!isCurrent()) return;
           queryClient.setQueryData<MapGraphResponse>(key, whole);
           lastSyncRef.current = whole.generatedAt;
           return;
@@ -162,8 +248,7 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
           for (const node of delta.nodes) byId.set(node.id, node);
           // Progress for tasks whose subtasks moved without their row moving.
           // This is the only path by which a progress-only change reaches the
-          // screen; an agent change rides on its own node, because active_agent
-          // is a column on tasks and rotates updated_at.
+          // screen; Task metadata changes ride on their own updated node.
           const taxonomyById = new Map((delta.taxonomy ?? []).map(row => [row.id, row]));
           const nodes = [...byId.values()].map(node => {
             const taxonomy = taxonomyById.get(node.id);
@@ -188,20 +273,30 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
         // tombstones, so a merged graph holding MORE nodes than the server
         // counts is carrying ghosts. Fall back to a whole read.
         if (merged && merged.nodes.length > delta.fullCount) {
-          const whole = await fetchMapGraph(queryRef.current);
+          const whole = await fetchMapGraph(scope, undefined, controller.signal);
+          if (!isCurrent()) return;
           queryClient.setQueryData<MapGraphResponse>(key, whole);
           lastSyncRef.current = whole.generatedAt;
         }
       } catch {
         // The next event retries; a failed reconcile must never blank the map.
+      } finally {
+        if (reconcileAbortRef.current === controller) reconcileAbortRef.current = null;
       }
     }, DELTA_DEBOUNCE_MS);
-  }, [queryClient]);
-  useEffect(() => () => {
-    if (deltaTimerRef.current !== null) window.clearTimeout(deltaTimerRef.current);
-  }, []);
+  }, [queryClient, cancelReconcile]);
+
+  const invalidateGraph = useCallback(() => {
+    admissionRef.current.ready = false;
+    setAuthorityEpoch(value => value + 1);
+    cancelReconcile();
+    lastSyncRef.current = null;
+    void queryClient.invalidateQueries({ queryKey: ['map-graph'], refetchType: 'none' });
+  }, [queryClient, cancelReconcile]);
 
   const patchNode = useCallback((task: Task) => {
+    if (!admissionRef.current.ready) { scheduleDeltaReconcile(); return; }
+    if (admissionRef.current.wholeRead) admissionRef.current.revision += 1;
     let known = false;
     let mayHaveLeftScope = false;
     queryClient.setQueryData<MapGraphResponse>(graphKeyRef.current, previous => {
@@ -234,7 +329,7 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
           // the every-zoom badge would sit stale until something else moved.
           // A payload that OMITS the field must not clear it, so each is
           // applied only when the key is actually present.
-          ...('activeAgent' in task ? { agent: agentNameOf(task.activeAgent) } : {}),
+          agent: null, // Retired Task JSON is never a working-agent signal.
           ...(Array.isArray(task.subtasks) ? { progress: progressOf(task.subtasks) } : {}),
         } : node),
       };
@@ -251,12 +346,14 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
   }, [queryClient, pulse, scheduleDeltaReconcile]);
 
   const removeNode = useCallback((taskId: string) => {
+    if (!admissionRef.current.ready) { scheduleDeltaReconcile(); return; }
+    if (admissionRef.current.wholeRead) admissionRef.current.revision += 1;
     queryClient.setQueryData<MapGraphResponse>(graphKeyRef.current, previous => previous ? {
       ...previous,
       nodes: previous.nodes.filter(node => node.id !== taskId),
       edges: previous.edges.filter(edge => edge.from !== taskId && edge.to !== taskId),
     } : previous);
-  }, [queryClient]);
+  }, [queryClient, scheduleDeltaReconcile]);
 
   const { subscribe, connected } = useWebSocket();
   useEffect(() => {
@@ -280,32 +377,42 @@ export function useMapData(query: MapGraphQuery): UseMapDataResult {
         if (queryRef.current.includeArchived) scheduleDeltaReconcile(); else onRemove(event);
       }),
       subscribe('tasks.updated', scheduleDeltaReconcile),
+      subscribe('project.authority_changed', invalidateGraph),
     ];
     return () => subs.forEach(unsubscribe => unsubscribe?.());
-  }, [subscribe, patchNode, removeNode, scheduleDeltaReconcile]);
+  }, [subscribe, patchNode, removeNode, scheduleDeltaReconcile, invalidateGraph]);
 
-  // Reconnect reconciles through the SAME debounced delta. With the §5
-  // amendment there is no zoom level at which this is the wrong read, which
-  // is what made the old version fire a full fetch from far zoom.
+  // Whole reads reset outstanding manual deltas as well as React Query reads.
   useEffect(() => {
-    if (connected) scheduleDeltaReconcile();
-  }, [connected, scheduleDeltaReconcile]);
+    if (connected) invalidateGraph();
+  }, [connected, invalidateGraph]);
+  useEffect(() => {
+    const onFocus = invalidateGraph;
+    if (typeof window === 'undefined') return;
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [invalidateGraph]);
 
-  const data = graphQuery.data;
+  const authorityReady = admission.ready && graphQuery.isSuccess && !graphQuery.error;
+  const data = authorityReady ? graphQuery.data : undefined;
   const graph = useMemo<MapGraph>(() => ({
     nodes: data?.nodes ?? [],
-    edges: data?.edges ?? [],
+    // One edge per relationship identity, for every consumer at once: the
+    // read can list a relationship twice (card cae8dfe1, absorbed 01282f30).
+    edges: uniqueMapEdges(data?.edges ?? []),
     phases: data?.phases ?? [],
     reports: data?.reports ?? [],
   }), [data]);
 
   return {
     graph,
+    authorityEpoch,
+    authorityReady,
     generatedAt: data?.generatedAt ?? null,
     fullCount: data?.fullCount ?? 0,
     isLoading: graphQuery.isLoading,
     error: (graphQuery.error as Error | null) ?? null,
     pulsed,
-    refetch: () => { void graphQuery.refetch(); },
+    refetch: invalidateGraph,
   };
 }

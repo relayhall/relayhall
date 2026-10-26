@@ -1,6 +1,6 @@
 /* AuditPage — the board's action ledger (card 96aeacb7).
  *
- * OWNERSHIP. `.audit-header` is owned by styles/shared-components.css and
+ * OWNERSHIP. The Audit header rule is owned by styles/shared-components.css and
  * `.audit-page` picks up its phone padding from styles/responsive-phase3.css;
  * neither is re-declared here (the RH-UI.1b collision rule: a component sheet
  * may not own a class the global domain owns). The `.audit-btn`,

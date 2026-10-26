@@ -8,7 +8,7 @@
  * §4.2, on `knowledge_core_credential_ref`: "the credential (never on the
  * board) core resolves to authenticate ITSELF to this source: mutual TLS
  * client identity or a core bearer the source pins. **REQUIRED for every
- * external source in BOTH claims modes** (sol R1-2): every knowledge dial
+ * external source in BOTH claims modes** (review R1-2): every knowledge dial
  * (search and get) authenticates core to the source over this channel BEFORE
  * anything else is read — the assertion is attested data on an
  * already-authenticated channel, never the sole authenticator (§5.6). What
@@ -27,7 +27,7 @@
  *     channel-authenticate as core is refused BEFORE the assertion is read";
  *   • item 2: "a `none`-mode source STILL receives only channel-authenticated
  *     dials (mutation: disable channel auth for the `none` fixture, its drill
- *     fails; sol R1-2)";
+ *     fails; review R1-2)";
  *   • item 8: "channel-auth failure ⇒ `unavailable:transport`".
  *
  * The evidence report records this as a DECLARED substrate addition inside

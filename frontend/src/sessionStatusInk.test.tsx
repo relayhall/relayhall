@@ -66,6 +66,7 @@ describe('a session status is a word, so it takes a text tier', () => {
       <MemoryRouter>
         <TaskCard
           task={task}
+          taskActivity={{ state: 'idle', receivedAt: '2026-10-06T12:00:00Z' }}
           onDragStart={() => undefined}
           onDragEnd={() => undefined}
           onUpdate={() => undefined}
@@ -87,10 +88,11 @@ describe('a session status is a word, so it takes a text tier', () => {
   });
 
   test('the stylesheet parse found the state rules at all', () => {
+    // Card 376f500e: running, waiting and completed had no renderer once the
+    // session column retired (the activity badge renders only idle), and
+    // their rules were removed. Idle is the state left to hold to a text tier.
     const ink = stateInk();
-    expect(Object.keys(ink).sort()).toEqual(
-      ['session-status-completed', 'session-status-idle', 'session-status-running', 'session-status-waiting'],
-    );
+    expect(Object.keys(ink).sort()).toEqual(['session-status-idle']);
   });
 
   test('every session state paints from a text tier', () => {

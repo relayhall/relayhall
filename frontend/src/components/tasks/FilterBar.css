@@ -152,8 +152,41 @@
   align-items: center;
 }
 
+/* A filter's button and, while it has a selection, its clear x (owner ruling
+   E395): two sibling controls drawn as one joined segment. */
 .filter-dropdown {
   position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.filter-dropdown-button--clearable:is(.filter-dropdown-button) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.filter-dropdown-clear-x {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+}
+
+/* The dropdown's own "Clear", above its list. */
+.filter-dropdown-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-1);
+  border-bottom: 1px solid var(--border-default, var(--text-quaternary));
+  flex-shrink: 0;
+}
+
+/* The selected items, leading the list under a "Selected" label. */
+.filter-dropdown-selected {
+  border-bottom: 1px solid var(--border-default, var(--text-quaternary));
+}
+
+.filter-dropdown-selected + .filter-dropdown-group {
+  border-top: 0;
 }
 
 .filter-dropdown-button {
@@ -321,6 +354,61 @@
   height: 16px;
   cursor: pointer;
   accent-color: var(--accent-color);
+}
+
+/* Phase filter (card 096fda30): Phase names run long, and with no Project
+   selected the list is grouped under each Project's name. The phone layout
+   keeps the full-width sheet the @media block below gives every menu. */
+.filter-dropdown-menu-phases {
+  min-width: 280px;
+}
+
+.filter-dropdown-group {
+  padding: var(--space-1) 0;
+}
+
+.filter-dropdown-group + .filter-dropdown-group {
+  border-top: 1px solid var(--border-default, var(--text-quaternary));
+}
+
+.filter-dropdown-group-label {
+  padding: var(--space-1) 10px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+}
+
+/* The Phase scope notice is a live region that stays mounted; empty, it is
+   taken out of the bar's flow so it adds no gap. */
+.filter-bar-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-app);
+  border: 1px solid var(--status-info);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.filter-bar-notice:empty {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.filter-bar-notice-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.filter-bar-notice-dismiss {
+  flex-shrink: 0;
 }
 
 /* Priority dot indicators - subtle colored dots next to checkbox */

@@ -50,8 +50,25 @@ import { principalService, type Principal } from '../services/PrincipalService';
 import { oauthEndpointThrottle, oauthClientKey } from '../middleware/oauthRateLimit';
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import type { AuditActor } from '../services/AuditService';
+import { isFullUuid } from '../middleware/validate';
 
 const router = Router();
+
+/**
+ * Card bc847bd0: oauth_authorization_requests.id is a uuid column, and a
+ * malformed request id reached the consent read and the decision and answered
+ * 500. It is refused by name, after the session check and before any read, in
+ * the RFC shape this mount speaks, with the house code beside it.
+ */
+function refuseMalformedRequestId(req: Request, res: Response): boolean {
+  if (isFullUuid(req.params.requestId)) return false;
+  res.status(400).json({
+    error: 'invalid_request',
+    error_description: 'authorization request id must be a full UUID',
+    code: 'INVALID_AUTHORIZATION_REQUEST_ID',
+  });
+  return true;
+}
 
 /** The RFC 6749 §5.2 error body shape, used by every refusal on this mount. */
 function oauthErrorBody(error: OAuthError): Record<string, string> {
@@ -195,6 +212,7 @@ function consentActor(principal: Principal): AuditActor {
 router.get('/authorization-requests/:requestId', async (req: Request, res: Response): Promise<void> => {
   const account = await sessionAccount(req);
   if (!account) { unauthorized(res); return; }
+  if (refuseMalformedRequestId(req, res)) return;
   try {
     res.setHeader('Cache-Control', 'no-store');
     res.json(await oauthAuthorizationService.consentView(req.params.requestId, account.role));
@@ -207,6 +225,7 @@ router.get('/authorization-requests/:requestId', async (req: Request, res: Respo
 router.post('/authorization-requests/:requestId/decision', async (req: Request, res: Response): Promise<void> => {
   const account = await sessionAccount(req);
   if (!account) { unauthorized(res); return; }
+  if (refuseMalformedRequestId(req, res)) return;
   const body = (req.body ?? {}) as Record<string, unknown>;
   if (typeof body.approve !== 'boolean') {
     res.status(400).json({ error: 'invalid_request', error_description: 'approve must be true or false' });

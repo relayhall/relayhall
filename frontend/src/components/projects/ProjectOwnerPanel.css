@@ -1,0 +1,13 @@
+.project-owner-panel {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border-default);
+  border-radius: 0.5rem;
+}
+
+.project-owner-panel h4 { margin: 0 0 0.75rem; }
+.project-owner-panel label { display: block; margin: 0.9rem 0 0.35rem; }
+.project-owner-panel select { display: block; width: 100%; max-width: 32rem; margin-bottom: 0.75rem; }
+.project-owner-panel button { margin: 0.25rem 0.5rem 0.25rem 0; }
+.project-owner-note { max-width: 62ch; }
+.project-owner-confirm { margin-top: 0.75rem; padding: 0.75rem; border: 1px solid var(--border-default); border-radius: 0.4rem; }

@@ -89,8 +89,8 @@ export class IdentityLinkService {
     return result.rows[0] ? mapRow(result.rows[0]) : undefined;
   }
 
-  async findByAccount(identityProviderId: string, accountPrincipalId: string): Promise<IdentityLink | undefined> {
-    const result = await pool.query(
+  async findByAccount(identityProviderId: string, accountPrincipalId: string, queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool): Promise<IdentityLink | undefined> {
+    const result = await queryable.query(
       `SELECT ${SELECT_COLUMNS} FROM identity_links
         WHERE link_kind = 'sso' AND identity_provider_id = $1 AND account_principal_id = $2 AND revoked_at IS NULL`,
       [identityProviderId, accountPrincipalId],
@@ -265,9 +265,11 @@ export class IdentityLinkService {
   /**
    * Every live link an Account holds, revoked with its sessions.
    *
-   * This is the path Account `disable`/`terminate` (A17.10) reaches, and the
-   * acceptance asserts it agrees with `unlink`: both leave the same set of live
-   * sessions, which is empty.
+   * No route reaches this today: a board disable (`PATCH /principals/{id}`) is
+   * shallow and a SCIM disable revokes login sessions on its own path, so this
+   * is the seam the one disable cascade will call (change-request design
+   * section 3, `identity.status`, slice T2 S4). It agrees with `unlink`: both
+   * leave the same set of live sessions, which is empty.
    */
   async revokeAllForAccount(accountPrincipalId: string, reason: string): Promise<number> {
     const client = await pool.connect();

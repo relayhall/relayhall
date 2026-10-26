@@ -27,6 +27,7 @@ import {
   PreferencesValidationError,
   THEME_PREFERENCE_VALUES,
   REDUCED_MOTION_VALUES,
+  MAP_REPORTS_MODE_VALUES,
   DEFAULT_PREFERENCES,
 } from '../services/PrincipalPreferencesService';
 import preferencesRouter from '../routes/preferences';
@@ -95,7 +96,22 @@ describe('preference value space', () => {
 
   it('treats reduced motion as a tri-state defaulting to system', () => {
     expect([...REDUCED_MOTION_VALUES]).toEqual(['system', 'reduce', 'no-preference']);
-    expect(DEFAULT_PREFERENCES).toEqual({ theme: null, reducedMotion: 'system' });
+    expect(DEFAULT_PREFERENCES).toEqual({ theme: null, reducedMotion: 'system', mapReportsMode: 'collapsed' });
+  });
+
+  it('offers the Map Reports display as Collapsed (the default) or Expanded (card 742fae98)', () => {
+    expect([...MAP_REPORTS_MODE_VALUES]).toEqual(['collapsed', 'expanded']);
+    expect(DEFAULT_PREFERENCES.mapReportsMode).toBe('collapsed');
+  });
+
+  it('binds the same two values in the migration CHECK that stores them', () => {
+    const sql = fs.readFileSync(
+      path.join(__dirname, '..', 'migrations', '165_principal_map_reports_mode.sql'), 'utf8');
+    const check = sql.match(/CHECK\s*\(\s*map_reports_mode\s+IN\s*\(([^)]*)\)\s*\)/i);
+    expect(check).not.toBeNull();
+    const stored = (check![1].match(/'([^']+)'/g) ?? []).map((value) => value.slice(1, -1));
+    expect(stored).toEqual([...MAP_REPORTS_MODE_VALUES]);
+    expect(sql).toMatch(/DEFAULT\s+'collapsed'/i);
   });
 });
 
@@ -106,6 +122,15 @@ describe('parsePreferencesPatch', () => {
     }
     for (const reducedMotion of REDUCED_MOTION_VALUES) {
       expect(parsePreferencesPatch({ reducedMotion })).toEqual({ reducedMotion });
+    }
+    for (const mapReportsMode of MAP_REPORTS_MODE_VALUES) {
+      expect(parsePreferencesPatch({ mapReportsMode })).toEqual({ mapReportsMode });
+    }
+  });
+
+  it('rejects rather than coerces an unknown Map Reports display', () => {
+    for (const mapReportsMode of ['Collapsed', 'grouped', null, true, 1]) {
+      expect(() => parsePreferencesPatch({ mapReportsMode })).toThrow(PreferencesValidationError);
     }
   });
 
@@ -143,6 +168,15 @@ describe('the surface cannot name another principal', () => {
     expect(response.status).toBe(200);
     expect(principalPreferencesService.get).toHaveBeenCalledWith(ALICE);
     expect(response.json.data).toEqual({ theme: 'relay-light', reducedMotion: 'system' });
+  });
+
+  it('saves the Map Reports display for the authenticated principal alone', async () => {
+    (principalPreferencesService.save as jest.Mock).mockResolvedValue(
+      { theme: null, reducedMotion: 'system', mapReportsMode: 'expanded' });
+    const response = await call('PUT', '/preferences', { mapReportsMode: 'expanded', principalId: BOB });
+    expect(response.status).toBe(200);
+    expect(principalPreferencesService.save).toHaveBeenCalledWith(ALICE, { mapReportsMode: 'expanded' });
+    expect(response.json.data.mapReportsMode).toBe('expanded');
   });
 
   it('writes the row of the authenticated principal even when the body claims another', async () => {

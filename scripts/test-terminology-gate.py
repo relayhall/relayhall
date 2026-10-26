@@ -29,6 +29,15 @@ def load_gate():
 
 gate = load_gate()
 
+# The safety exception must not admit branding, altered denials or other paths.
+for declaration in gate.DB_DENIAL_DECLARATIONS:
+    assert gate.is_db_denial_declaration("backend/src/db/connection.ts", declaration)
+    assert not gate.is_db_denial_declaration("backend/src/app.ts", declaration)
+    assert not gate.is_db_denial_declaration("backend/src/db/connection.ts", declaration + " // ClawBoard")
+assert not gate.is_db_denial_declaration("backend/src/db/connection.ts", "const product = 'ClawBoard';")
+assert not gate.is_db_denial_declaration("backend/src/db/connection.ts", "export const REFUSED_DB_NAMES: readonly string[] = ['clawboard'];")
+
+
 # Each entry: (label, markdown text). MUST produce at least one failure.
 MUST_FAIL = [
     ("blueprint workflow template", "Create a workflow template for the project."),

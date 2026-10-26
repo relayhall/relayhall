@@ -136,4 +136,54 @@ describe('PrincipalsPage', () => {
     expect(screen.queryByText('No principals found.')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
+
+  // Card ff410dc4 (SQ-4): the owner's directory listed dozens of terminated
+  // archive rows interleaved with live ones. Non-active rows fold per kind,
+  // with a count, and stay readable; status and sort are controls.
+  const folding = [
+    ...directory,
+    { id: 'agt-2', kind: 'agent', handle: 'archive-agent-1', displayName: null, status: 'terminated', role: 'agent', provenance: 'managed', lastSeenAt: '2026-10-01T10:00:00.000Z' },
+    { id: 'agt-3', kind: 'agent', handle: 'archive-agent-2', displayName: null, status: 'disabled', role: 'agent', provenance: 'managed', lastSeenAt: '2026-10-19T10:00:00.000Z' },
+    { id: 'agt-4', kind: 'agent', handle: 'agent-zulu', displayName: null, status: 'active', role: 'agent', provenance: 'managed', lastSeenAt: '2026-10-20T10:00:00.000Z' },
+  ] as unknown as typeof directory;
+
+  test('non-active identities fold per kind into one collapsed section with a count (ff410dc4)', async () => {
+    routeMock({ principals: folding });
+    render(<PrincipalsPage />);
+    await screen.findByText('build-agent');
+    const live = screen.getAllByRole('table', { name: 'Accounts' });
+    expect(live.some(t => t.textContent?.includes('archive-agent-1'))).toBe(false);
+    const folded = screen.getByRole('table', { name: 'Non-active agent identities' });
+    expect(folded.closest('details')).not.toHaveAttribute('open');
+    expect(screen.getByText('Non-active agent identities (2)')).toBeInTheDocument();
+    expect(folded).toHaveTextContent('archive-agent-1');
+    expect(folded).toHaveTextContent('archive-agent-2');
+    expect(folded).not.toHaveTextContent('build-agent');
+    // The other kinds have nothing non-active, so nothing folds there.
+    expect(screen.queryByText(/Non-active human identities/)).not.toBeInTheDocument();
+  });
+
+  test('the Status filter shows only active or only non-active rows, opened (ff410dc4)', async () => {
+    routeMock({ principals: folding });
+    render(<PrincipalsPage />);
+    await screen.findByText('build-agent');
+    await userEvent.selectOptions(screen.getByLabelText('Status'), 'active');
+    expect(screen.queryByText('archive-agent-1')).not.toBeInTheDocument();
+    expect(screen.getByText('agent-zulu')).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText('Status'), 'non-active');
+    expect(screen.queryByText('build-agent')).not.toBeInTheDocument();
+    const folded = screen.getByRole('table', { name: 'Non-active agent identities' });
+    expect(folded.closest('details')).toHaveAttribute('open');
+  });
+
+  test('Sort by last seen orders each section newest first; the default is by handle (ff410dc4)', async () => {
+    routeMock({ principals: folding });
+    render(<PrincipalsPage />);
+    await screen.findByText('build-agent');
+    const handles = (name: string) => Array.from(screen.getByRole('table', { name }).querySelectorAll('[role="row"]'))
+      .slice(1).map(r => r.querySelector('.principals-open')?.textContent);
+    expect(handles('Non-active agent identities')).toEqual(['archive-agent-1', 'archive-agent-2']);
+    await userEvent.selectOptions(screen.getByLabelText('Sort'), 'last-seen');
+    expect(handles('Non-active agent identities')).toEqual(['archive-agent-2', 'archive-agent-1']);
+  });
 });

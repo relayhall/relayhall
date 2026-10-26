@@ -243,6 +243,50 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* What a Stats figure includes (card 0ac41d40): the Sessions and Events
+   totals count short sessions, and say so under the figure. A second <dd> of
+   the same pair, so it is read with the figure it qualifies. The descendant
+   rule restates the size because `.telemetry-stat dd` would otherwise give the
+   note the figure's 20px. */
+.telemetry-stat-note {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.telemetry-stat .telemetry-stat-note {
+  margin: var(--space-1) var(--space-0) var(--space-0);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-variant-numeric: normal;
+}
+
+/* ── the Sessions list's controls (card 0ac41d40) ───────────────────────── */
+
+/* The Reporter and Product selects and the "Show N short sessions" toggle,
+   on one wrapping row. The selects are the shared `.form-group` /
+   `.form-select` vocabulary; this only sets their width in the row. */
+.telemetry-session-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  margin-block-end: var(--space-3);
+}
+
+.telemetry-session-filter {
+  min-inline-size: 12rem;
+}
+
+.telemetry-session-controls > .telemetry-session-filter {
+  flex: 0 1 16rem;
+}
+
+.telemetry-load-more {
+  display: flex;
+  justify-content: center;
+  margin-block-start: var(--space-3);
+}
+
 /* ── inline notes ───────────────────────────────────────────────────────── */
 
 .telemetry-note,

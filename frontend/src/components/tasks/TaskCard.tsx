@@ -1,11 +1,14 @@
+import { activityApplies, type TaskActivity } from '../../hooks/useTaskActivity';
+import { TaskActivityBadge } from './TaskActivityBadge';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Task, type SubtaskTransitionHandler } from '../../types/task';
-import { AlertTriangle, Ban, Brain, CalendarClock, CheckCircle2, Clock, Cpu, Eye, Flag, Folder, GripVertical, Link, Lock, OctagonAlert, Radio, RefreshCw, Square, Tag, Terminal } from 'lucide-react';
+import { AlertTriangle, Ban, Brain, CalendarClock, CheckCircle2, Clock, Eye, Flag, Folder, GripVertical, Link, Lock, OctagonAlert, RefreshCw, Square, Tag, Terminal } from 'lucide-react';
 import { TaskCardMoveMenu } from './TaskCardMoveMenu';
 import { captureTaskBoardOrigin } from '../../utils/taskBoardNavigation';
 import { dueTone, formatDateTimeLong, formatRelativeDue } from '../../utils/dateFormat';
 import { PersonalityBadge } from '../PersonalityBadge';
+import { VerificationNoneBadge } from './VerificationNoneBadge';
 import { PrincipalAvatar } from '../PrincipalAvatar';
 import type { Principal } from '../../types/task';
 import './TaskCard.css';
@@ -41,7 +44,7 @@ interface TaskCardProps {
   onOpen?: () => void;
   onOpenerFocus?: (taskId: string) => void;
   onTagClick?: (tag: string) => void;
-  sessionActivityState?: 'active' | 'stale' | null;
+  taskActivity?: TaskActivity;
   deepLinkTaskId?: string | null;
   onDeepLinkHandled?: () => void;
   /** Principal directory for attribution; empty until the substrate is live. */
@@ -85,7 +88,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
   onOpen,
   onOpenerFocus,
   onTagClick,
-  sessionActivityState,
+  taskActivity,
   deepLinkTaskId,
   onDeepLinkHandled,
   principalsById,
@@ -136,6 +139,10 @@ export const TaskCard: React.FC<TaskCardProps> = ({
   }, [deepLinkTaskId, task.id, navigate, onDeepLinkHandled, location.pathname, location.search]);
 
   const isInteractive = task.executionMode === 'interactive';
+  // Card 30d198df (2): only an In Progress card shows activity; the board
+  // does not read it for any other card, so elsewhere it could only say Unknown.
+  const activityShown = activityApplies(task);
+  const shownActivity = activityShown ? taskActivity : undefined;
 
   // Duration timer for active interactive sessions
   useEffect(() => {
@@ -157,29 +164,6 @@ export const TaskCard: React.FC<TaskCardProps> = ({
     const interval = setInterval(updateElapsed, 60000);
     return () => clearInterval(interval);
   }, [isInteractive, task.startedAt, task.status]);
-
-  // Derive interactive session status
-  const getSessionStatus = (): { label: string; className: string } | null => {
-    if (!isInteractive) return null;
-    if (task.status === 'completed' || task.status === 'archived') {
-      return { label: 'Completed', className: 'session-status-completed' };
-    }
-    if (task.status === 'stuck') {
-      return { label: 'Waiting for Input', className: 'session-status-waiting' };
-    }
-    if (task.activeAgent && task.status === 'in-progress') {
-      if (sessionActivityState === 'stale') {
-        return { label: 'Idle', className: 'session-status-idle' };
-      }
-      return { label: 'Running', className: 'session-status-running' };
-    }
-    if (task.acpSessionKey && task.status === 'in-progress') {
-      return { label: 'Running', className: 'session-status-running' };
-    }
-    return { label: 'Idle', className: 'session-status-idle' };
-  };
-
-  const sessionStatus = getSessionStatus();
 
   // Check if any subtask is blocked
   const hasBlockedSubtask = task.subtasks?.some(s => s.status === 'stuck') || false;
@@ -307,7 +291,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
           (a7df1af repair, preserved). Drag initiates ONLY from the handle. */}
       <article
         ref={articleRef}
-        className={`task-card task-card-compact ${isDragging ? 'dragging' : ''} ${task.blocked ? 'task-blocked' : ''} ${hasBlockedSubtask ? 'subtask-blocked' : ''} ${task.activeAgent && task.status === 'in-progress' ? 'agent-active' : ''} ${sessionActivityState === 'active' ? 'session-active' : ''} ${sessionActivityState === 'stale' ? 'session-stale' : ''}`}
+        className={`task-card task-card-compact ${isDragging ? 'dragging' : ''} ${task.blocked ? 'task-blocked' : ''} ${hasBlockedSubtask ? 'subtask-blocked' : ''} ${shownActivity?.state === 'active' ? 'agent-active session-active' : ''} ${shownActivity?.state === 'stale' ? 'session-stale' : ''}`}
       >
         {/* Left-edge grip-strip drag handle: 24px visible, 44px hit (§2.1).
             Enter/Space/click opens the keyboard move menu. */}
@@ -358,7 +342,7 @@ export const TaskCard: React.FC<TaskCardProps> = ({
             </button>
           </h3>
           
-          {/* Header Icons: Auto-start, Blocked/NeedsReview, Session Link */}
+          {/* Header Icons: Auto-start, Blocked/NeedsReview */}
           {task.autoStart === true && (
             <span className="task-card-icon-flag" title="Auto-pickup enabled (orchestrator may pick this up)">
               <Flag size={16} />
@@ -374,41 +358,18 @@ export const TaskCard: React.FC<TaskCardProps> = ({
               <AlertTriangle size={16} />
             </span>
           )}
-          
-          {/* Active Agent Session Link. A CHIP, exempt from the s7 two-size
-              rule by owner ruling de70a6dd R7 (declared amendment 7-A1 on
-              design 77950a97): inline metadata inside a dense record surface,
-              a shortcut rather than the card's primary action, and never the
-              only route to what it does. */}
-          {task.activeAgent && typeof task.activeAgent === 'object' && task.activeAgent.sessionKey && task.activeAgent.sessionKey !== 'pending' && (
-            <button
-              className="task-card-session-link"
-              onClick={(e) => {
-                e.stopPropagation();
-                const sessionKey = typeof task.activeAgent === 'object' && task.activeAgent ? task.activeAgent.sessionKey : '';
-                navigate(`/sessions?session=${sessionKey}`);
-              }}
-              title={`View agent session: ${typeof task.activeAgent === 'object' ? task.activeAgent.sessionKey : ''}`}
-              aria-label="View active agent session"
-            >
-              <Radio size={16} />
-            </button>
-          )}
         </div>
 
-        {/* Interactive Session Badge + Status */}
+        {activityShown && (
+          <TaskActivityBadge activity={taskActivity} />
+        )}
+        {/* Interactive Session Badge */}
         {isInteractive && (
           <div className="task-card-interactive-row">
             <span className="task-card-interactive-badge">
               <Terminal size={16} />
               <span>Interactive</span>
             </span>
-            {sessionStatus && (
-              <span className={`task-card-session-status ${sessionStatus.className}`}>
-                <span className="session-status-dot" />
-                <span>{sessionStatus.label}</span>
-              </span>
-            )}
             {elapsed && task.status !== 'completed' && task.status !== 'archived' && (
               <span className="task-card-session-timer">
                 <Clock size={16} />
@@ -438,6 +399,9 @@ export const TaskCard: React.FC<TaskCardProps> = ({
         {(task as any).personality && (
           <PersonalityBadge personality={(task as any).personality} size="sm" />
         )}
+
+        {/* E462 S4b: verification mode none (its finish completes the Task) */}
+        {task.verificationNone === true && <VerificationNoneBadge />}
 
         {/* Tags — after project */}
         {task.tags && task.tags.length > 0 && (
@@ -519,24 +483,6 @@ export const TaskCard: React.FC<TaskCardProps> = ({
             <span>Blocks {dependentTasks.length} task{dependentTasks.length > 1 ? 's' : ''}</span>
           </div>
         )}
-
-        {/* Working now: who is on this task. Prefers the resolved spawn
-            principal; falls back to the free-text agent name that predates
-            attribution so historical/unresolved rows read exactly as before. */}
-        {task.activeAgent && (() => {
-          const agentName = typeof task.activeAgent === 'string'
-            ? task.activeAgent
-            : task.activeAgent?.name || 'agent';
-          const principalId = typeof task.activeAgent === 'object' ? task.activeAgent?.principalId : undefined;
-          const principal = principalId ? principalsById?.get(principalId) : undefined;
-          return (
-            <div className="task-card-agent-compact">
-              {principal
-                ? <PrincipalAvatar principal={principal} size="sm" />
-                : <><Cpu size={16} /><span>{agentName}</span></>}
-            </div>
-          );
-        })()}
 
         {/* Assignee, shown only when it ISN'T you. Historical rows carry none
             by design, and a chip repeating your own name on every card is

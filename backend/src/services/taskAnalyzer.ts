@@ -13,6 +13,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { taskManagerDB as taskManager, type Task, type Subtask } from './TaskManagerDB';
 import { EventEmitter } from 'events';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import type { FeedActorRef } from './FeedEventService';
 
 export interface BreakdownResult {
   subtasks: Subtask[];
@@ -139,14 +140,17 @@ export class TaskAnalyzer extends EventEmitter {
   /**
    * Generate subtasks for a task
    */
-  async generateSubtasks(task: Task): Promise<BreakdownResult> {
+  async generateSubtasks(task: Task, feedActor?: FeedActorRef): Promise<BreakdownResult> {
     console.log(`[TaskAnalyzer] Generating subtasks for: "${task.title}"`);
 
     const result = this.analyzeAndBreakdown(task);
 
     if (result.subtasks.length > 0) {
       // Save subtasks to the task
-      await taskManager.updateTask(task.id, { subtasks: result.subtasks });
+      // Card 5854f0d6, round 2: a requested breakdown is the requester's write
+      // in the feed; the status listener's own breakdown stays the board's.
+      if (feedActor) await taskManager.updateTask(task.id, { subtasks: result.subtasks }, undefined, undefined, undefined, undefined, undefined, feedActor);
+      else await taskManager.updateTask(task.id, { subtasks: result.subtasks });
       console.log(`[TaskAnalyzer] Created ${result.subtasks.length} subtasks (${result.method}, confidence: ${result.confidence})`);
 
       this.emit('subtask.generated', {
@@ -303,10 +307,10 @@ export class TaskAnalyzer extends EventEmitter {
   /**
    * Manually trigger breakdown for a specific task (API use)
    */
-  async breakdownTask(taskId: string): Promise<BreakdownResult | null> {
+  async breakdownTask(taskId: string, feedActor?: FeedActorRef): Promise<BreakdownResult | null> {
     const task = await taskManager.getTask(taskId);
     if (!task) return null;
-    return this.generateSubtasks(task);
+    return this.generateSubtasks(task, feedActor);
   }
 }
 

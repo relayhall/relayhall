@@ -11,8 +11,8 @@ name: CI
 #
 # WHAT IS NOT HERE HAS NOT BEEN DROPPED. Every real-PostgreSQL gate, mutation
 # drill and red-proof control now lives in `ci-full.yml`, which runs on
-# `workflow_dispatch`, on `release/**` and `ci-full/**` pushes and on `v*`
-# tags. `scripts/check-workflow-shape.py` holds a census of every gate step
+# `workflow_dispatch` and on `ci-full/**` pushes, and on nothing else.
+# `scripts/check-workflow-shape.py` holds a census of every gate step
 # name on main and fails closed if one is in NEITHER file, so a gate cannot be
 # lost between the two tiers.
 #
@@ -35,22 +35,24 @@ on:
     # code; it is a SHA that has already had its fast-tier run on the branch it
     # came from.
     branches: ['**', '!ci-full/**']
-    # A branch filter alone does not schedule tag refs, so without this a
-    # release tag would run no CI at all. Tags keep the fast tier, all of them:
-    # the publication, terminology and residue gates live here, and a release
-    # is the last ref that should lose them.
-    tags: ['**']
+    # EVERY tag except a release tag. A branch filter alone does not schedule
+    # tag refs, so this line is what keeps the fast tier on any other tag. A
+    # `v*` release tag runs NO CI: it is placed only after a full-tier green
+    # on its exact SHA and a green readback, on a SHA whose fast tier already
+    # ran on the branch it came from, so a run on the tag re-tests nothing and
+    # takes one of the runner's four job slots (runs 5800-5804). Spelled
+    # `tags-ignore` because `tags` and `tags-ignore` cannot share one event.
+    tags-ignore: ['v*']
   pull_request:
 
 permissions:
   contents: read
 
+# Unique groups preserve every main/release/tag/manual run, including pending runs.
+# Event identity keeps push and PR checks independent; branch identity isolates work.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Superseded iteration runs are cancelled. Runs on main and on tags are not:
-  # both are promotion gates, and each needs its own recorded fast-tier result
-  # rather than being discarded by whatever arrives next.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}-${{ (github.ref_name == 'main' || contains(github.ref, '/release/') || startsWith(github.ref, 'refs/tags/')) && github.run_id || 'dev' }}
+  cancel-in-progress: true
 
 jobs:
   # PATH FOCUS. This job answers one question - which areas did this push
@@ -64,6 +66,8 @@ jobs:
   # that "outside" set on purpose, because a change there can alter what any
   # job measures.
   changes:
+    # Same-repository PR heads already receive push CI; fork PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !github.event.pull_request.head.ref || startsWith(github.event.pull_request.head.ref, 'ci-full/') }}
     name: Changed areas
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -133,6 +137,8 @@ jobs:
   # path of this tier (about 5-7 minutes, paced by the publication gate) and
   # it is the one job a documentation-only push still needs.
   repository-contract:
+    # Same-repository PR heads already receive push CI; fork PRs still run.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !github.event.pull_request.head.ref || startsWith(github.event.pull_request.head.ref, 'ci-full/') }}
     name: Repository and deployment contract
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -157,6 +163,12 @@ jobs:
         run: python3 scripts/check-workflow-shape.py
       - name: Prove the workflow-shape gate itself
         run: python3 scripts/test-workflow-shape-gate.py
+      # E473: the Frontend unit tests run as parallel shards. This is the part of
+      # that contract that needs no node: every way a shard plan can lose a test
+      # is made red here. The part that needs vitest (the real file list and the
+      # real filter selection) is the `check` step of the `frontend` job.
+      - name: Prove the frontend shard assignment gate itself
+        run: python3 scripts/test-frontend-test-shard-gate.py
       - name: Validate shell scripts
         run: bash -n setup.sh backend/entrypoint.sh database/backup.sh database/restore.sh scripts/test-deployment-safety.sh scripts/publish-to-github.sh scripts/test-publish-gate.sh scripts/configure-github-repository.sh scripts/test-github-config.sh
       - name: Validate secret-scan preprocessor
@@ -168,6 +180,14 @@ jobs:
         run: python3 scripts/check-public-allowlist.py
       - name: Test setup and backup failure boundaries
         run: scripts/test-deployment-safety.sh
+      # E490: setup.sh generates the backend's four key sets once, never
+      # changes one, keeps a value supplied another way, and Compose passes
+      # them on without changing a deployment that has none. Needs only the
+      # docker CLI (`compose config` is client-side), no daemon.
+      - name: Prove a fresh install provisions its key sets
+        run: python3 scripts/test-first-install.py
+      - name: Prove the fresh-install test itself
+        run: python3 scripts/test-first-install.py --self-proof
       - name: Test publication failure boundaries
         run: scripts/test-publish-gate.sh
       - name: Test GitHub configuration contract
@@ -231,6 +251,12 @@ jobs:
         run: python3 scripts/check-emoji-chrome.py
       - name: Prove the emoji-chrome gate itself
         run: python3 scripts/test-emoji-chrome-gate.py
+      # Card c3cdcf88: the gate scripts and the workflows carry no invisible
+      # characters (format and control characters a reviewer cannot see).
+      - name: Reject invisible characters in the gate machinery
+        run: python3 scripts/check-invisible-characters.py
+      - name: Prove the invisible-character gate itself
+        run: python3 scripts/test-invisible-characters-gate.py
       - name: Enforce the type scale and control metrics
         run: python3 scripts/check-type-scale.py
       - name: Prove the type-scale gate itself
@@ -239,6 +265,12 @@ jobs:
         run: python3 scripts/check-brand-assets.py
       - name: Prove the brand-asset gate itself
         run: python3 scripts/test-brand-asset-gate.py
+      # CVE-2026-111497 (Node.js Brotli decoder): every Node image is an exact
+      # patched release pinned by digest, never a floating tag.
+      - name: Pin every Node image to a patched release by digest
+        run: python3 scripts/check-node-base-images.py
+      - name: Prove the Node base-image gate itself
+        run: python3 scripts/test-node-base-image-gate.py
       - name: Reject private deployment residue
         env:
           RELAYHALL_RESIDUE_PATTERNS: ${{ secrets.RELAYHALL_RESIDUE_PATTERNS }}
@@ -348,7 +380,14 @@ jobs:
       # the BUILD emits, not only the source: Vite minifies inline scripts.
       - name: Pin the BUILT theme boot snippet to the same CSP hash
         run: python3 ../scripts/check-theme-boot-hash.py --html dist/index.html
-      - run: npm run test:unit
+      # The unit tests do NOT run in this job any more: they run in the
+      # `frontend-unit` shards below, in parallel with this job. This step is the
+      # proof that cutting them lost nothing - every file `npm run test:unit` would
+      # run is in exactly one shard, and each shard's filters select exactly its
+      # own files. Rule 10 of the shape gate holds the workflow half (the matrix
+      # is the declared shard list, no serial `npm run test:unit` step is left).
+      - name: Prove the frontend unit-test shards cover the whole file set
+        run: python3 ../scripts/frontend-test-shard.py check
       - name: Accessibility smoke set (axe)
         run: npm run test:a11y
       - name: Blueprint interview real-red controls in isolated source (7e202fca)
@@ -369,6 +408,48 @@ jobs:
         run: npm run test:unit:tz
       - name: FEAT-A frontend red proofs (7d38a6e0)
         run: python3 ../scripts/feata-mutation-drill.py --suite frontend
+
+  # THE FRONTEND UNIT TESTS, CUT INTO PARALLEL SHARDS (owner ruling E473). The
+  # serial `npm run test:unit` step was 800 s of the 1250 s Frontend job and
+  # growing, on one vitest worker, so it was the critical path of the whole fast
+  # tier. Each shard runs the same command shape the serial step used
+  # (NODE_ENV=test, forks, one worker) over its own slice of the same file set;
+  # `scripts/frontend-test-shard.py` computes the slice from vitest's own file
+  # list and the measured weights in `scripts/frontend-test-shards.json`, and the
+  # `check` step of the `frontend` job proves the slices cover that list exactly
+  # once. The `a11y` smoke file is in the set too, exactly as it is in
+  # `test:unit`; the separate axe step in `frontend` still runs it once more, as
+  # it always did.
+  #
+  # Same `needs` and same `if` as `frontend`, on purpose and by rule 10 of the
+  # shape gate: a shard that runs while its job is skipped, or the reverse, is a
+  # test that stops running. `fail-fast: false` so every shard reports.
+  #
+  # The job name carries the shard (`Frontend unit tests (shard 2 of 3)`); the
+  # release decision reads job names and needs them (docs/ci.md).
+  frontend-unit:
+    name: Frontend unit tests (shard ${{ matrix.shard }} of 3)
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Frontend unit tests (one shard of the file set)
+        run: python3 ../scripts/frontend-test-shard.py run --shard ${{ matrix.shard }}/3
 
   # Skipped when nothing under cli/ changed, on the same terms.
   cli:

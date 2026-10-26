@@ -84,6 +84,8 @@ export const ROLE_ACT_REQUIRES_SESSION = 'ROLE_ACT_REQUIRES_SESSION';
 export const ROLE_ACT_REQUIRES_ADMINISTRATOR = 'ROLE_ACT_REQUIRES_ADMINISTRATOR';
 export const PASSWORD_ACT_REQUIRES_SESSION = 'PASSWORD_ACT_REQUIRES_SESSION';
 export const PASSWORD_ACT_REQUIRES_ADMINISTRATOR = 'PASSWORD_ACT_REQUIRES_ADMINISTRATOR';
+export const APPROVAL_DECIDE_REQUIRES_SESSION = 'APPROVAL_DECIDE_REQUIRES_SESSION';
+export const APPROVAL_DECIDE_REQUIRES_ADMINISTRATOR = 'APPROVAL_DECIDE_REQUIRES_ADMINISTRATOR';
 
 /**
  * ONE CLASSIFICATION, MORE THAN ONE ACT (card bc5cd9f0).
@@ -126,6 +128,140 @@ export const PASSWORD_ACT: AdministratorAct = {
 };
 
 /**
+ * AZ-A9 clause 6 (ratified 2026-10-10 (E43), card 785e1eed; owner rulings
+ * E15 and E43 Q1): deciding an Approval of ANY kind decided on /approvals —
+ * `agent-mint`, `grant`, `credential` and each AZ-A9 follow-on kind — is open
+ * to root OR an administrator login session, each with the single-use step-up
+ * bound to (`approval.decide`, approval id). The administrator half is THIS
+ * predicate with this act's own codes, so a refused decision is told apart in
+ * the ledger from a refused role or password act. For `agent-mint`, §6.1's
+ * deciders (the owning Account over its own subtree, and root) stay beside the
+ * administrator arm; only grant and credential items (and the follow-on kinds)
+ * reach this act's refusal, so its description names them.
+ */
+export const APPROVAL_DECIDE_ACT: AdministratorAct = {
+  description: 'Deciding a grant or credential request',
+  requiresSession: APPROVAL_DECIDE_REQUIRES_SESSION,
+  requiresAdministrator: APPROVAL_DECIDE_REQUIRES_ADMINISTRATOR,
+};
+
+export const CHANGE_REQUEST_REQUIRES_SESSION = 'CHANGE_REQUEST_REQUIRES_SESSION';
+export const CHANGE_REQUEST_REQUIRES_ADMINISTRATOR = 'CHANGE_REQUEST_REQUIRES_ADMINISTRATOR';
+
+/**
+ * Card 502fb19e (change-request design section 4.1, ratified by owner ruling
+ * E325): the FILING tier of a login session. An administrator login session
+ * may ask for anything a root session could apply (E309, "administrator
+ * anything but root"), naming any Account or Group; this predicate with this
+ * act's own codes is what tells it apart from an ordinary user's session. It
+ * decides nothing: a filing is decided on /approvals by APPROVAL_DECIDE_ACT and
+ * the ordered predicate of section 5.1.
+ */
+export const CHANGE_REQUEST_ACT: AdministratorAct = {
+  description: 'Filing a change request for another Account or Group',
+  requiresSession: CHANGE_REQUEST_REQUIRES_SESSION,
+  requiresAdministrator: CHANGE_REQUEST_REQUIRES_ADMINISTRATOR,
+};
+
+export const SHARED_WRITER_REQUIRES_SESSION = 'SHARED_WRITER_REQUIRES_SESSION';
+export const SHARED_WRITER_REQUIRES_ADMINISTRATOR = 'SHARED_WRITER_REQUIRES_ADMINISTRATOR';
+
+/**
+ * Card 549cc51f (owner rulings E298 Q2 (a) and E299, the F1 repair): changing
+ * a knowledge source's shared-area writer list is open to root OR an
+ * administrator login session, each with the single-use step-up bound to
+ * (`knowledge.shared-writer.add` or `.remove`, the Account id). The
+ * administrator half is THIS predicate with this act's own codes, so a refused
+ * change is told apart in the ledger from every other act. No Access profile
+ * reaches it: its surface is always-self and the handler decides.
+ */
+export const SHARED_WRITER_ACT: AdministratorAct = {
+  description: 'Changing the shared-area writer list',
+  requiresSession: SHARED_WRITER_REQUIRES_SESSION,
+  requiresAdministrator: SHARED_WRITER_REQUIRES_ADMINISTRATOR,
+};
+
+export const AUTHORITY_EDIT_REQUIRES_SESSION = 'AUTHORITY_EDIT_REQUIRES_SESSION';
+export const AUTHORITY_EDIT_REQUIRES_ADMINISTRATOR = 'AUTHORITY_EDIT_REQUIRES_ADMINISTRATOR';
+
+/**
+ * AUTHZ amendment AZ-A13 clause 4 (ratified 2026-10-11, E95; card 1a38270d):
+ * editing a Connector credential or a warrant IN PLACE. An administrator login
+ * session may save a NARROWING directly (clause 4a) and perform the one-act
+ * WIDENING with a step-up bound to the object (clause 4b), under D-10's
+ * act-scoped declaration of §5.2 rule 4. Root and the owning Account are
+ * admitted by the edit routes beside this arm; everyone else is refused with
+ * this act's own codes, so a refused edit is told apart in the ledger from a
+ * refused role, password or decide act. Grants stay root-only (clause 4a).
+ */
+export const AUTHORITY_EDIT_ACT: AdministratorAct = {
+  description: 'Editing a connection credential or a warrant in place',
+  requiresSession: AUTHORITY_EDIT_REQUIRES_SESSION,
+  requiresAdministrator: AUTHORITY_EDIT_REQUIRES_ADMINISTRATOR,
+};
+
+export const GROUP_OWNER_SESSION_ONLY = 'GROUP_OWNER_SESSION_ONLY';
+export const GROUP_OWNER_REQUIRES_ADMINISTRATOR = 'GROUP_OWNER_REQUIRES_ADMINISTRATOR';
+
+/**
+ * AUTHZ amendment AZ-A12 clause 9(e) (ratified 2026-10-10, E72; rulings E58
+ * and E59; card 311229fd): every transfer of an object's ownership INTO, OUT
+ * OF or BETWEEN Groups is open to root OR an administrator login session, each
+ * with the single-use step-up bound to (`ownership.transfer`, object id). The
+ * administrator half is THIS predicate with this act's own codes (E59 (a): the
+ * existing administrator set, through the existing check), so a refused
+ * transfer is told apart in the ledger from every other act. It is the one
+ * act-scoped administrator exception clause 14 declares on §5.2 rule 4's scope
+ * sentence; Group-role appointment and Group-principal enable/disable stay
+ * root login-session acts (DD-12).
+ */
+export const GROUP_OWNERSHIP_TRANSFER_ACT: AdministratorAct = {
+  description: "Transferring an object's ownership to, from or between Groups",
+  requiresSession: GROUP_OWNER_SESSION_ONLY,
+  requiresAdministrator: GROUP_OWNER_REQUIRES_ADMINISTRATOR,
+};
+
+export const PLUGIN_ADMIN_REQUIRES_SESSION = 'PLUGIN_ADMIN_REQUIRES_SESSION';
+export const PLUGIN_ADMIN_REQUIRES_ADMINISTRATOR = 'PLUGIN_ADMIN_REQUIRES_ADMINISTRATOR';
+
+/**
+ * Card bedf50cc (plugin availability and settings, owner ruling E380, design
+ * section 7, choices C5 and C11): setting a plugin's availability, its
+ * deployment values and locks, and cleaning up stale values is an
+ * administrator LOGIN-SESSION act. THIS predicate with this act's own codes,
+ * and the plugin routes then also require the resolved role to be one of
+ * ADMINISTRATOR_ROLES (`admin`, `operator`) as the design names them. Each
+ * write burns a single-use step-up bound to (`plugin.admin`, plugin name).
+ * Root BEARERS are refused (C11): plugin policy is a human-plane act, and a
+ * bearer never reaches the role question.
+ */
+export const PLUGIN_ADMIN_ACT: AdministratorAct = {
+  description: "Changing a plugin's availability or deployment settings",
+  requiresSession: PLUGIN_ADMIN_REQUIRES_SESSION,
+  requiresAdministrator: PLUGIN_ADMIN_REQUIRES_ADMINISTRATOR,
+};
+
+export const KNOWLEDGE_SOURCE_REGISTER_REQUIRES_SESSION = 'KNOWLEDGE_SOURCE_REGISTER_REQUIRES_SESSION';
+export const KNOWLEDGE_SOURCE_REGISTER_REQUIRES_ADMINISTRATOR = 'KNOWLEDGE_SOURCE_REGISTER_REQUIRES_ADMINISTRATOR';
+
+/**
+ * Card 08792425 (member N6, the core half of two-way registration; the
+ * default-store design's choice C7): registering a knowledge source from an
+ * installer's bundle on the Services page is open to root OR an administrator
+ * LOGIN SESSION, each with the single-use step-up bound to
+ * (`knowledge.source.register`, the bundle's certificate fingerprint). Every
+ * bearer credential, a root bearer included, and every API key is refused with
+ * this act's own session code, so the act is never reachable over MCP; the
+ * administrator half is THIS predicate with this act's own codes, so a refused
+ * registration is told apart in the ledger from every other act.
+ */
+export const KNOWLEDGE_SOURCE_REGISTER_ACT: AdministratorAct = {
+  description: 'Registering a knowledge source',
+  requiresSession: KNOWLEDGE_SOURCE_REGISTER_REQUIRES_SESSION,
+  requiresAdministrator: KNOWLEDGE_SOURCE_REGISTER_REQUIRES_ADMINISTRATOR,
+};
+
+/**
  * THE CLASSIFICATION, AND THE ONLY COPY OF IT.
  *
  * "This request arrived on a LOGIN SESSION and presents no bearer credential."
@@ -143,7 +279,13 @@ export const PASSWORD_ACT: AdministratorAct = {
  * SERVER-DERIVED `req.authMethod` and never on a header.
  */
 export function isLoginSessionKind(authMethod: string | undefined): boolean {
-  return authMethod === 'session' || authMethod === 'dashboard_jwt';
+  return isStoredLoginSessionKind(authMethod) || authMethod === 'dashboard_jwt';
+}
+
+/** The cookie-backed family whose authority can be re-read in auth_sessions.
+ * A dashboard JWT remains a login kind, but is not a stored session. */
+export function isStoredLoginSessionKind(authMethod: string | undefined): boolean {
+  return authMethod === 'session';
 }
 
 /**

@@ -1,0 +1,222 @@
+/* The Knowledge search console (card 1fd5de08, line 1). Theme tokens only, so each
+   Theme draws it; the cited revision opens in the shared reader
+   (components/knowledge/KnowledgeReader.css), which carries the distinct
+   styling for knowledge content itself. */
+.knowledge-page {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6);
+  color: var(--text-primary);
+}
+.knowledge-page header {
+  margin-bottom: 28px;
+}
+.knowledge-eyebrow {
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  color: var(--text-accent);
+  font-size: var(--text-xs);
+}
+.knowledge-page h1 {
+  font-size: var(--text-2xl);
+  margin: var(--space-2) 0;
+}
+.knowledge-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  padding: 22px;
+  margin: var(--space-4) 0;
+}
+.knowledge-query {
+  display: grid;
+  gap: var(--space-2);
+}
+.knowledge-query input {
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-app);
+  color: inherit;
+  border: 1px solid var(--border-default);
+}
+.knowledge-selectors {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+.knowledge-selectors fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.knowledge-selectors label {
+  display: flex;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+  overflow-wrap: anywhere;
+}
+.knowledge-selectors legend {
+  font-weight: 600;
+}
+.knowledge-source-option {
+  margin: var(--space-2) 0;
+}
+.knowledge-source-option label {
+  margin: 0;
+}
+.knowledge-source-note {
+  display: block;
+  margin-left: var(--space-6);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+.knowledge-disclosure,.knowledge-tags,.knowledge-page small {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.knowledge-error {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
+  border: 1px solid var(--danger-color);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+}
+.knowledge-error p {
+  margin: 0;
+}
+
+/* Coverage: the verdict first, in words; the left rule repeats it for a
+   glance and never carries it alone. */
+.knowledge-outcome {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--border-strong);
+  font-weight: 600;
+}
+.knowledge-outcome--complete {
+  border-left-color: var(--status-success);
+}
+.knowledge-outcome--partial {
+  border-left-color: var(--status-warning);
+}
+.knowledge-outcome--none-answered {
+  border-left-color: var(--status-danger);
+}
+.knowledge-source-states {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-5);
+  overflow-wrap: anywhere;
+}
+
+/* Results: one list per source, in the source's own order. */
+.knowledge-results {
+  margin-top: 28px;
+}
+.knowledge-empty {
+  margin: var(--space-4) 0;
+  color: var(--text-secondary);
+}
+.knowledge-group {
+  margin-top: 28px;
+}
+.knowledge-group h2 {
+  font-size: var(--text-xl);
+  margin: 0 0 var(--space-2);
+  overflow-wrap: anywhere;
+}
+.knowledge-result-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.knowledge-result {
+  margin: var(--space-3) 0;
+  padding: var(--space-4) var(--space-5);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--border-accent);
+  border-radius: var(--radius-md);
+}
+.knowledge-result-title {
+  margin: var(--space-1) 0;
+  font-size: var(--text-xl);
+}
+.knowledge-title {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-accent);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.knowledge-title:hover {
+  text-decoration-thickness: 2px;
+}
+.knowledge-title:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
+}
+.knowledge-snippet {
+  margin: var(--space-2) 0;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.knowledge-result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+.knowledge-explain {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: var(--space-2) var(--space-3);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  font-size: var(--text-sm);
+}
+.knowledge-explain[hidden] {
+  display: none;
+}
+.knowledge-explain dt {
+  color: var(--text-tertiary);
+}
+.knowledge-explain dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 768px) {
+  .knowledge-selectors {
+    grid-template-columns: 1fr;
+  }
+  .knowledge-page {
+    padding: var(--space-5) 14px;
+  }
+  .knowledge-explain {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+}
+
+@media (max-width: 1279px) {
+  .knowledge-page {
+    padding-top: var(--space-16);
+  }
+}

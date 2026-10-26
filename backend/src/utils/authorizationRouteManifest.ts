@@ -46,16 +46,37 @@ export const PUBLIC_ROUTE_MOUNTS = [
  * ceiling — see mcp/inProcess. This list has exactly one entry, and growing
  * it is a security-significant code-review event of the first order.
  */
-export const SELF_AUTHENTICATING_ROUTE_MOUNTS = ['/mcp'] as const;
+export const SELF_AUTHENTICATING_ROUTE_MOUNTS = [
+  '/mcp',
+  // Card bedf50cc (E380, design section 9): the plugin backend's effective
+  // settings read. It authenticates by the plugin assertion alone (a
+  // core-issued jti for that plugin and Account) and never by a board
+  // credential; it is mounted before the protected funnel, beside the proxy.
+  '/plugin-host/:name/settings/effective',
+] as const;
 
 export const PROTECTED_ROUTE_MOUNTS = [
   '/appearance',
   '/plugins',
+  '/plugin-host',
+  // Card bedf50cc (E380): plugin availability and deployment settings.
+  // `authenticated` in the scope map with the administrator login-session
+  // gate (admin or operator, a step-up per write) in the handler.
+  '/plugin-admin',
   '/audit',
   // RH-P3.C1: the cursor event feed — read-only, tasks:read ceiling,
   // per-event grant scoping in the handler.
   '/events',
+  // Card 5854f0d6 (E394): Needs your action and the Timeline -- tasks:read
+  // ceiling, every object arm narrowed IN the query by its own ceiling and
+  // list scope (the shared predicate in correlated form), never a post-filter.
+  // Not ROW_AUTHORIZED: it owns no rows; it lists other families' rows through
+  // their own list scopes.
+  '/notifications',
   '/telemetry',
+  // E208 metrics is a read-only task/project projection. Its service composes
+  // the same live object predicates, not a separately grantable metrics row.
+  '/metrics',
   '/notification-endpoints',
   // RH-P5.SSO.W2: the Identity provider owner-plane surface — root in the
   // scope map, audited by its service, and never returning a client secret.
@@ -86,9 +107,27 @@ export const PROTECTED_ROUTE_MOUNTS = [
   // are `service` projections plus, for the board pseudo-source, rows the
   // board adapter draws through the shipped predicate IN-QUERY.
   '/knowledge-queries',
+  // RB-11 Governor v0 (card b796067e, D-8): the three write verbs. PROTECTED,
+  // `knowledge-contents:write` in the scope map for exactly those three POSTs
+  // and `root` for anything else under the mount. Not ROW_AUTHORIZED for the
+  // same reason as its three siblings: it addresses `service` rows through
+  // the same shared predicate and owns no rows of its own.
+  '/knowledge-writes',
+  // Card 549cc51f (E298, E299, E310): the shared-area writer list. PROTECTED,
+  // `services:read` for the list and `authenticated` for the two changes in the
+  // scope map, with the root-or-administrator login-session gate in the
+  // handler. Not ROW_AUTHORIZED: its rows are a property of a `service` row,
+  // read through the same shared predicate as its knowledge siblings.
+  '/knowledge-shared-writers',
+  // Card 08792425 (member N6): knowledge source registration. PROTECTED,
+  // `authenticated` in the scope map with the root-or-administrator
+  // login-session gate in the handler and a step-up on the act. Not
+  // ROW_AUTHORIZED: its rows are a property of a `service` row it creates.
+  '/knowledge-source-registrations',
   '/tasks',
   '/webhooks',
   '/openapi.json',
+  '/tool-catalogue',
   '/projects',
   '/principals',
   '/preferences',
@@ -104,6 +143,7 @@ export const PROTECTED_ROUTE_MOUNTS = [
   // RH-P3.AZ-S2: Access profiles — mutation owner-plane (root), listings
   // principals:read, what-if/events root, per the scope map.
   '/access-profiles',
+  '/access-explorer',
   // RH-P3.AZ-S4: Warrants + Approvals — session-only human surfaces with
   // the §6.1 self-scope step-up arm in the handlers; /delegation carries
   // the one mint route dispatched by authentication kind (§9.2).
@@ -122,6 +162,10 @@ export const PROTECTED_ROUTE_MOUNTS = [
   '/directory-group-references',
   '/models',
   '/litellm',
+  // E462 slice S3: GET /connectors/trust-policy, the narrow-only override of
+  // the connector trust policy. A route ceiling and no row authority: it
+  // serves no board object.
+  '/connectors',
   '/sessions',
   '/reports',
 ] as const;

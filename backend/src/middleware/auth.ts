@@ -1,7 +1,6 @@
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { pool } from '../db/connection';
 import {
   getApiKey,
   getReportsReadKey,
@@ -14,8 +13,9 @@ import type { AuditAuthMethod } from '../services/AuditService';
 import { isFlagOn, FLAG_AUTH_REQUIRE_PRINCIPAL, FLAG_SESSIONS } from '../utils/featureFlags';
 import { LEGACY_SERVICE_SCOPES, scopesForRole } from '../utils/identityScopes';
 import { resolveActorRole } from '../utils/taskAutomationRole';
-import { delegationService, DelegationEvaluatorError } from '../services/DelegationService';
+import { delegationService, DelegationEvaluatorError, boundAgentContextIsLive } from '../services/DelegationService';
 import { SESSION_COOKIE_NAME, loginSessionService } from '../services/LoginSessionService';
+import { resolveActiveLoginSession, SessionAuthenticationUnavailableError } from '../services/sessionAuthentication';
 import { readCookie } from '../utils/cookies';
 import { evaluateTransportPin } from '../utils/credentialAcceptance';
 import type { TransportClass } from '../utils/transportMap';
@@ -176,6 +176,12 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
         res.status(401).json({ error: 'Unauthorized', message: 'Invalid token' });
         return;
       }
+      // AZ-A12 clause 3(a): a Group principal never authenticates, so a token
+      // naming one is answered exactly like a disabled identity's.
+      if (principal && principal.kind === 'group') {
+        res.status(401).json({ error: 'Unauthorized', message: 'Invalid token' });
+        return;
+      }
       if (principal) {
         req.principal = principal;
         req.userId = principal.handle;
@@ -188,6 +194,11 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
       // behaviour and feeds the telemetry that gates the CB-8 flag flip.
       const { principal, degraded } = await principalService.resolveHandle(decoded.userId);
       if (principal && principal.status !== 'active') {
+        res.status(401).json({ error: 'Unauthorized', message: 'Invalid token' });
+        return;
+      }
+      // AZ-A12 clause 3(a): the handle path refuses a Group principal too.
+      if (principal && principal.kind === 'group') {
         res.status(401).json({ error: 'Unauthorized', message: 'Invalid token' });
         return;
       }
@@ -221,6 +232,11 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
 
     next();
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[Auth] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     if (error instanceof jwt.TokenExpiredError) {
       res.status(401).json({ error: 'Unauthorized', message: 'Token expired' });
       return;
@@ -239,7 +255,7 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
 /**
  * Session-cookie resolution (spec §2.1 step 6). Returns true only when a
  * live, unexpired, un-idled, unrevoked session row resolves to an active
- * principal; every other outcome falls through to the JWT branch.
+ * principal. An unreadable lookup throws a typed unavailable outcome.
  *
  * The row lookup and both expiry predicates live in `LoginSessionService`,
  * which is also where the session was minted — so the door that issues a
@@ -254,26 +270,21 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
  * `__tests__/sessionRoleSnapshot.test.ts`.
  */
 async function attachSessionPrincipal(req: AuthRequest, sessionToken: string): Promise<boolean> {
-  try {
-    const session = await loginSessionService.resolve(sessionToken);
-    if (!session) return false;
-    const principal = await principalService.getPrincipalById(session.principalId);
-    if (!principal || principal.status !== 'active') return false;
-    loginSessionService.touch(session.sessionId);
-    req.principal = principal;
-    req.userId = principal.handle;
-    req.sessionId = session.sessionId;
-    req.sessionRole = session.roleSnapshot;
-    req.scopes = scopesForRole(resolveActorRole({
-      handle: req.userId,
-      principalRole: principal.role,
-      sessionRole: req.sessionRole,
-    }));
-    req.authMethod = 'session';
-    return true;
-  } catch {
-    return false;
-  }
+  const resolved = await resolveActiveLoginSession(sessionToken);
+  if (!resolved) return false;
+  const { session, principal } = resolved;
+  loginSessionService.touch(session.sessionId);
+  req.principal = principal;
+  req.userId = principal.handle;
+  req.sessionId = session.sessionId;
+  req.sessionRole = session.roleSnapshot;
+  req.scopes = scopesForRole(resolveActorRole({
+    handle: req.userId,
+    principalRole: principal.role,
+    sessionRole: req.sessionRole,
+  }));
+  req.authMethod = 'session';
+  return true;
 }
 
 /** REST ingress provenance: stamped after transport termination, never read
@@ -366,17 +377,7 @@ export async function acceptPrincipalKey(
         if (acting.kind === 'agent' && acting.boundTaskId) {
           // §7.3/T6: bound-task terminal status and lease expiry are
           // evaluated LIVE — a between-sweep replay dies here.
-          const taskState = await pool.query(
-            `SELECT t.status,
-                    EXISTS (SELECT 1 FROM task_execution_leases l
-                             WHERE l.task_id = t.id AND l.status = 'active' AND l.expires_at <= NOW()) AS lease_expired
-               FROM tasks t WHERE t.id = $1`,
-            [acting.boundTaskId],
-          );
-          const taskRow = taskState.rows[0];
-          if (!taskRow || ['completed', 'archived'].includes(String(taskRow.status)) || taskRow.lease_expired === true) {
-            boundTaskDead = true;
-          }
+          boundTaskDead = !(await boundAgentContextIsLive(acting));
         }
       }
     } catch (err) {
@@ -398,6 +399,7 @@ export async function acceptPrincipalKey(
       role: link.role,
       parentPrincipalId: link.parentPrincipalId,
       boundTaskId: link.boundTaskId,
+      boundTaskRole: link.boundTaskRole,
       legacyIdentity: link.legacyIdentity,
       ownExpression: link.ownExpression,
     }));

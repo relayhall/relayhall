@@ -59,12 +59,20 @@ describe('login page product attribution (RH-DESIGN.6 §5.3)', () => {
     expect(screen.getByText('Powered by SomethingElse')).toHaveClass('login-title');
   });
 
-  test('a private build links nowhere at all', () => {
-    // Publication is an owner gate (b547f64e / c2885bbd) and the flag defaults
-    // to private, so an unset build argument must never produce a public link.
-    // Tests run without VITE_PUBLIC_BUILD, which is exactly the default case.
+  test('the licence and source are real links in every build', () => {
+    // E504: the public repository exists, so there is no private presentation
+    // left to fall back to. Tests run with no build flag set, which used to
+    // render both as plain text.
     const { container } = render(<LoginPage onLoginSuccess={vi.fn()} />);
-    expect(container.querySelectorAll('a')).toHaveLength(0);
-    expect(screen.getByText('Private working repo')).toBeInTheDocument();
+    const licence = screen.getByRole('link', { name: 'MIT licensed' });
+    const source = screen.getByRole('link', { name: 'Source' });
+    expect(licence).toHaveAttribute('href', 'https://github.com/relayhall/relayhall/blob/main/LICENSE');
+    expect(source).toHaveAttribute('href', 'https://github.com/relayhall/relayhall');
+    for (const link of [licence, source]) {
+      expect(link).toHaveAttribute('target', '_blank');
+      expect(link.getAttribute('rel')?.split(/\s+/).sort()).toEqual(['noopener', 'noreferrer']);
+    }
+    expect(container.querySelectorAll('.login-attribution-links a')).toHaveLength(2);
+    expect(screen.queryByText('Private working repo')).toBeNull();
   });
 });

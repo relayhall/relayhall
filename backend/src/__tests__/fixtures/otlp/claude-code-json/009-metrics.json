@@ -1,0 +1,12 @@
+{
+  "producer": "claude-code",
+  "producerVersion": "2.1.246",
+  "note": "Claude Code OTLP export, http/json, one print-mode session with one Read tool call",
+  "signal": "metrics",
+  "path": "/v1/metrics",
+  "contentType": "application/json",
+  "userAgent": "OTel-OTLP-Exporter-JavaScript/0.208.0",
+  "bytes": 1358,
+  "sha256": "65a3fff7b5456ccf1c7e3ee75327c382a07e2ae8bc5dd14e9858b327b1b716db",
+  "bodyText": "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"host.arch\",\"value\":{\"stringValue\":\"amd64\"}},{\"key\":\"os.type\",\"value\":{\"stringValue\":\"windows\"}},{\"key\":\"os.version\",\"value\":{\"stringValue\":\"10.0.26300\"}},{\"key\":\"service.name\",\"value\":{\"stringValue\":\"claude-code\"}},{\"key\":\"service.version\",\"value\":{\"stringValue\":\"2.1.246\"}}],\"droppedAttributesCount\":0},\"scopeMetrics\":[{\"scope\":{\"name\":\"com.anthropic.claude_code\",\"version\":\"2.1.246\"},\"metrics\":[{\"name\":\"claude_code.active_time.total\",\"description\":\"Total active time in seconds\",\"unit\":\"s\",\"sum\":{\"aggregationTemporality\":1,\"isMonotonic\":true,\"dataPoints\":[{\"attributes\":[{\"key\":\"user.id\",\"value\":{\"stringValue\":\"68b1cdf0f0230f07f084b13870ef137ed1fa046e19c23b8f94a9da6e31196a3f\"}},{\"key\":\"session.id\",\"value\":{\"stringValue\":\"f69e372a-ae0c-4302-84c2-02fc8c3ff833\"}},{\"key\":\"organization.id\",\"value\":{\"stringValue\":\"894197d8-484c-4a86-8e42-c0961ed2c40a\"}},{\"key\":\"user.email\",\"value\":{\"stringValue\":\"p@sample.invalid\"}},{\"key\":\"user.account_uuid\",\"value\":{\"stringValue\":\"03b8b374-6fa7-4aeb-8ec4-a8dd0a32dd6e\"}},{\"key\":\"user.account_id\",\"value\":{\"stringValue\":\"user_01SAMPLE57A3DF7581FF6BF7\"}},{\"key\":\"terminal.type\",\"value\":{\"stringValue\":\"mingw64\"}},{\"key\":\"type\",\"value\":{\"stringValue\":\"cli\"}}],\"startTimeUnixNano\":\"1792414288608000000\",\"timeUnixNano\":\"1792414288612000000\",\"asDouble\":5.443}]}}]}]}]}"
+}

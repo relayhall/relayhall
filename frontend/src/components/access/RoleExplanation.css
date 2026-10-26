@@ -1,0 +1,18 @@
+/* The role catalogue's one rendering (card a2d1e317). */
+.role-expl { display: grid; gap: var(--space-1); color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-normal); }
+.role-expl-purpose { margin: 0; color: var(--text-primary); }
+.role-expl-facts { display: grid; gap: var(--space-1); margin: 0; }
+.role-expl-fact { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr); gap: var(--space-2); }
+.role-expl-fact dt { font-weight: var(--font-semibold); color: var(--text-primary); }
+.role-expl-fact dd { margin: 0; }
+.role-expl-kinds { margin: 0; color: var(--text-tertiary); }
+.role-expl-status { margin: 0; color: var(--text-tertiary); font-size: var(--text-sm); }
+
+.role-cat-list { display: grid; gap: var(--space-3); margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+.role-cat-item { display: grid; grid-template-columns: minmax(7rem, 1fr) minmax(0, 4fr); gap: var(--space-3); padding-bottom: var(--space-3); border-bottom: 1px solid var(--border-subtle); }
+.role-cat-item:last-child { padding-bottom: 0; border-bottom: 0; }
+.role-cat-name { font-family: var(--font-mono); font-weight: var(--font-semibold); color: var(--text-primary); }
+
+@media (max-width: 640px) {
+  .role-expl-fact, .role-cat-item { grid-template-columns: 1fr; gap: var(--space-1); }
+}

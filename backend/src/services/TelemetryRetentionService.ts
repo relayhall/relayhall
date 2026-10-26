@@ -43,6 +43,9 @@ export const TELEMETRY_RETENTION_CLASSES = [
   'telemetry_event_metadata',
   'telemetry_raw_blob',
   'telemetry_quarantine',
+  'native_review_session_link',
+  'native_execution_session_link',
+  'mcp_action_log',
 ] as const;
 export type TelemetryRetentionClass = (typeof TELEMETRY_RETENTION_CLASSES)[number];
 
@@ -76,7 +79,7 @@ export class TelemetryRetentionService {
   constructor(private readonly pool: Pool = defaultPool) {}
 
   /**
-   * Expire everything past its bound and write the three receipts.
+   * Expire everything past its bound and write one receipt per governed class.
    *
    * Returns one receipt per class, always — including for a class that removed
    * nothing, because an unbroken receipt series is what lets an auditor tell
@@ -144,6 +147,41 @@ export class TelemetryRetentionService {
         FROM examined, evidence
       RETURNING receipt_id, copies_examined, copies_removed, evidence_hash`, [now]));
 
+    receipts.push(await this.run('native_review_session_link', `
+      WITH examined AS (SELECT COUNT(*)::int AS n FROM task_native_review_sessions),
+      removed AS (DELETE FROM task_native_review_sessions WHERE expires_at < $1 RETURNING review_id, pepper_id),
+      evidence AS (SELECT COUNT(*)::int AS n,
+        encode(sha256(coalesce(string_agg(review_id::text || ':' || pepper_id, ',' ORDER BY review_id, pepper_id), '')::bytea), 'hex') AS hash FROM removed)
+      INSERT INTO session_retention_receipts ${RECEIPT_COLUMNS}
+      SELECT $2,NULL,'native_review_session_link',NULL,'expired',examined.n,evidence.n,evidence.hash
+      FROM examined,evidence RETURNING receipt_id,copies_examined,copies_removed,evidence_hash`, [now]));
+    receipts.push(await this.run('native_execution_session_link', `
+      WITH examined AS (SELECT COUNT(*)::int AS n FROM task_native_execution_sessions),
+      removed AS (DELETE FROM task_native_execution_sessions WHERE expires_at < $1 RETURNING id),
+      evidence AS (SELECT COUNT(*)::int AS n, ${EVIDENCE('id')} AS hash FROM removed)
+      INSERT INTO session_retention_receipts ${RECEIPT_COLUMNS}
+      SELECT $2,NULL,'native_execution_session_link',NULL,'expired',examined.n,evidence.n,evidence.hash
+      FROM examined,evidence RETURNING receipt_id,copies_examined,copies_removed,evidence_hash`, [now]));
+
+    // 6 — THE MCP ACTION LOG (card ab8f78e9; E89 (c), E91). The SAME bound as
+    // the event metadata above (`cutoff`), so a session's action log never
+    // outlives the session rows it belongs to and is never kept longer than
+    // the deployment told telemetry to keep identity-bound metadata.
+    receipts.push(await this.run('mcp_action_log', `
+      WITH examined AS (
+        SELECT COUNT(*)::int AS n FROM mcp_action_log
+      ), removed AS (
+        DELETE FROM mcp_action_log
+              WHERE observed_at < $1
+          RETURNING id
+      ), evidence AS (
+        SELECT COUNT(*)::int AS n, ${EVIDENCE('id')} AS hash FROM removed
+      )
+      INSERT INTO session_retention_receipts ${RECEIPT_COLUMNS}
+      SELECT $2, NULL, 'mcp_action_log', NULL, 'expired',
+             examined.n, evidence.n, evidence.hash
+        FROM examined, evidence
+      RETURNING receipt_id, copies_examined, copies_removed, evidence_hash`, [cutoff]));
     return { cutoff, receipts };
   }
 

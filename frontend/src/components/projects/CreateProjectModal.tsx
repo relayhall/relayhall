@@ -1,17 +1,26 @@
 import React, { useState } from 'react';
 import { X } from 'lucide-react';
-import { CreateProjectInput, ProjectStatus } from '../../types/project';
+import { CreateProjectInput, OwnerGroupChoice, ProjectStatus } from '../../types/project';
 import './CreateProjectModal.css';
 
 interface CreateProjectModalProps {
   onClose: () => void;
   onCreate: (project: CreateProjectInput) => void;
+  /**
+   * AZ-A12 clauses 10(b) and 12: the Groups this session may make the owner.
+   * Offered only to root and administrator sessions (the page decides); empty
+   * or absent hides the selector, and the Project is created as before.
+   */
+  ownerGroups?: OwnerGroupChoice[];
+  /** A refusal of the last submission, shown in the form. */
+  submitError?: string | null;
 }
 
-export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ onClose, onCreate }) => {
+export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ onClose, onCreate, ownerGroups = [], submitError = null }) => {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [status, setStatus] = useState<ProjectStatus>('active');
+  const [ownerGroupId, setOwnerGroupId] = useState('');
   const [error, setError] = useState('');
   
   const handleSubmit = (e: React.FormEvent) => {
@@ -25,7 +34,8 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ onClose,
     onCreate({
       name: name.trim(),
       description: description.trim() || undefined,
-      status
+      status,
+      ...(ownerGroupId ? { ownerGroupId } : {}),
     });
   };
   
@@ -77,6 +87,31 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({ onClose,
             </select>
           </div>
           
+          {ownerGroups.length > 0 && (
+            <div className="form-group create-project-modal-form-group">
+              <label htmlFor="project-owner-group">Owner</label>
+              <select
+                id="project-owner-group"
+                value={ownerGroupId}
+                onChange={(e) => setOwnerGroupId(e.target.value)}
+              >
+                <option value="">You (the creator)</option>
+                <optgroup label="Groups">
+                  {ownerGroups.map((group) => (
+                    <option key={group.id} value={group.id}>{group.name}{group.featured ? ' (featured)' : ''}</option>
+                  ))}
+                </optgroup>
+              </select>
+              {ownerGroupId && (
+                <span className="create-project-modal-hint">
+                  The Group will own this Project. You will be asked to confirm it is you.
+                </span>
+              )}
+            </div>
+          )}
+
+          {submitError && <p role="alert" className="create-project-modal-error-message">{submitError}</p>}
+
           <div className="modal-actions">
             <button className="btn btn-secondary" onClick={onClose} type="button">
               Cancel

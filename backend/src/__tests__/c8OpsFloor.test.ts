@@ -402,12 +402,18 @@ describe('exception dispatch — ID-only, loop-guarded, best-effort', () => {
   });
 
   test('the sweep wires the announced episode into BOTH human paths, post-commit', () => {
+    // Card 5854f0d6 (choice C10): the UI path IS the committed feed row (the
+    // notification history and the Stuck action item read it); the legacy
+    // file writer is gone, so nothing UI-side may run before or after the
+    // COMMIT. The endpoint dispatch stays post-commit.
     const src = readFileSync(join(__dirname, '../services/TelemetryService.ts'), 'utf8');
+    const feedAt = src.indexOf("name: 'task.stuck',");
     const commitAt = src.indexOf("await client.query('COMMIT');");
-    const uiAt = src.indexOf('notificationManager.notifyException');
     const hookAt = src.indexOf('notificationEndpointService.dispatchException');
-    expect(uiAt).toBeGreaterThan(commitAt);
-    expect(hookAt).toBeGreaterThan(uiAt);
+    expect(feedAt).toBeGreaterThan(-1);
+    expect(commitAt).toBeGreaterThan(feedAt);
+    expect(hookAt).toBeGreaterThan(commitAt);
+    expect(src).not.toMatch(/notificationManager|NotificationManager/);
   });
 });
 

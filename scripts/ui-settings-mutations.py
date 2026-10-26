@@ -52,6 +52,19 @@ def run():
     env = {k: v for k, v in os.environ.items() if not k.startswith('DB_') and k != 'RELAYHALL_TEST_DB_URL'}
     env.update(NODE_ENV='test', CI='true')
     receipts = []
+    # Each file's test inventory as the baseline measured it; every later run
+    # must measure exactly its files' baseline inventory (no test lost, renamed
+    # or skipped under a mutation). This replaced three literal counts
+    # (79/11/68), the class repaired in ui-refinement-mutations.py on
+    # 19 Oct 2026 (machinery queue 9b761f09).
+    inventory = {}
+
+    def inventory_of(data):
+        found = {}
+        for f in data['testResults']:
+            relative = os.path.relpath(f['name'], clone / 'frontend')
+            found[relative] = sorted(a['fullName'] for a in f['assertionResults'])
+        return found
 
     def suite(name, selected, expected):
         report = output / (name + '.json')
@@ -65,13 +78,29 @@ def run():
         assert sorted(a['title'] for a in failed) == sorted(expected), f'{name}: wrong failed test set'
         assert not data.get('testExecError') and data.get('numRuntimeErrorTestSuites', 0) == 0, f'{name}: runtime failure'
         assert proc.returncode == (1 if expected else 0), f'{name}: unexpected exit'
-        assert len(assertions) == (79 if len(selected) == 2 else 11 if selected[0] == LOAD else 68), f'{name}: inventory drift'
+        measured = inventory_of(data)
+        assert sorted(measured) == sorted(selected), f'{name}: a selected file reported no results'
+        if not inventory:
+            assert all(measured[path] for path in selected), f'{name}: a suite file measured no tests'
+            inventory.update(measured)
+        assert all(measured[path] == inventory[path] for path in selected), f'{name}: inventory drift'
         receipts.append({'name': name, 'accepted': True, 'exit': proc.returncode, 'assertions': len(assertions), 'failed': [a['title'] for a in failed], 'report_sha256': hashlib.sha256(report.read_bytes()).hexdigest()})
         (output / 'summary.json').write_text(json.dumps({'source_sha': sha, 'controls': receipts, 'complete': False}, indent=2) + '\n')
         print(name + ': accepted', flush=True)
 
     try:
+        # Every anchor, before anything runs: a drifted one stops the drill by
+        # its control's name.
+        for name, relative, old, _new, _test, _expected in CONTROLS:
+            assert (clone / 'frontend' / relative).read_text().count(old) == 1, name + ': ambiguous or missing source target'
         suite('baseline', FILES, [])
+        # Every declared test must be exactly one test of its file.
+        baseline = json.loads((output / 'baseline.json').read_text())
+        by_file = {os.path.relpath(f['name'], clone / 'frontend'): [a['title'] for a in f['assertionResults']]
+                   for f in baseline['testResults']}
+        for name, _relative, _old, _new, test, expected in CONTROLS:
+            for title in expected:
+                assert by_file.get(test, []).count(title) == 1, f'{name}: declared test {title!r} is not exactly one test of {test}'
         for name, relative, old, new, test, expected in CONTROLS:
             path = clone / 'frontend' / relative
             original = path.read_text()

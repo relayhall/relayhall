@@ -12,7 +12,7 @@
 // it fails at channel authentication before it is ever read. So the evidence
 // may claim exchange-never-passthrough at exactly that strength and no more.
 //
-// ── THE jti BOUND, STATED HONESTLY (sol R1-7) ──
+// ── THE jti BOUND, STATED HONESTLY (review R1-7) ──
 //
 // Core keeps a TTL-bounded seen-set of EMITTED jti values and never emits a
 // collision. That is a guarantee about EMISSION. Replay at a relying source
@@ -23,8 +23,11 @@ import crypto from 'crypto';
 import { pool } from '../db/connection';
 import {
   isKnowledgeArmEvaluation,
+  isKnowledgeWriteArmEvaluation,
   ARM_EVALUATION_MAX_AGE_SECONDS,
   type KnowledgeArmEvaluation,
+  type KnowledgeWriteArmEvaluation,
+  type KnowledgeWriteOp,
 } from './KnowledgeArmEvaluator';
 
 /** §5.2: TTL default 30s, max 60s, skew budget ±10s. */
@@ -160,7 +163,7 @@ const base64url = (value: Buffer | string): string =>
  * HMAC keyed with the ACTIVE assertion key's raw bytes, so the pseudonym is
  * unguessable without the deployment's own key material.
  */
-function pairwiseSubject(accountPrincipalId: string, sourceId: string): string {
+export function pairwiseSubject(accountPrincipalId: string, sourceId: string): string {
   const { keys, activeKeyId } = keyset();
   const seed = (keys.get(activeKeyId) as crypto.KeyObject).export({ format: 'der', type: 'pkcs8' });
   return crypto.createHmac('sha256', seed).update(`${accountPrincipalId}|${sourceId}`).digest('base64url');
@@ -265,4 +268,107 @@ export async function signKnowledgeAssertion(input: SignAssertionInput): Promise
   const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
   const signature = crypto.sign(null, Buffer.from(signingInput, 'utf8'), key);
   return `${signingInput}.${signature.toString('base64url')}`;
+}
+
+// ═══════════════ RB-11 Governor v0 — the WRITE assertion ═══════════════
+//
+// Card `b796067e`, ratified design C.3 (ruling E97), declared change D-8.
+//
+// A SEPARATE assertion type: header `typ` = `rh-knowledge-write-assertion+jwt`.
+// A read assertion can never authorise a write and a write assertion can never
+// authorise a read, because a relying source pins the `typ` per endpoint. The
+// key, `kid`, issuer, audience, pairwise subject, group minimisation, lifetime
+// and skew are the read assertion's own (B.1), so the source verifies both
+// against one published keyset.
+//
+// Claims: the read claim set, plus `op` (the verb this assertion authorises)
+// and `tsk` + `prj` — the core-attested task context, both present or both
+// absent, never taken from a request body.
+//
+// THE jti, ONCE MORE. Core emits a fresh `jti` per act and records it in the
+// same emitted-jti set as reads, so it never emits a collision. For WRITES the
+// relying source also keeps a jti seen-set and refuses a replayed write
+// assertion (C.3, `write_jti`); writes do not inherit the read path's
+// deferral of source-side replay detection (`d77d1f53`). That replay set lives
+// at the SOURCE, not here.
+
+export const WRITE_ASSERTION_TYP = 'rh-knowledge-write-assertion+jwt';
+
+export interface KnowledgeWriteAssertionClaims extends KnowledgeAssertionClaims {
+  op: KnowledgeWriteOp;
+  tsk?: string;
+  prj?: string;
+}
+
+export interface SignWriteAssertionInput {
+  /** The ONLY way in: an evaluation this deployment's WRITE arm evaluator minted. */
+  armEvaluation: KnowledgeWriteArmEvaluation;
+  issuer: string;
+  callerGroupIds: readonly string[];
+  ttlSeconds?: number;
+}
+
+export interface SignedKnowledgeWriteAssertion {
+  token: string;
+  /** The emitted jti — the core audit row's join key to the source's write event. */
+  jti: string;
+  claims: KnowledgeWriteAssertionClaims;
+}
+
+/**
+ * Sign one WRITE assertion.
+ *
+ * THE ISSUANCE PREDICATE IS THE FIRST STATEMENT, as for reads: everything
+ * below is unreachable without an evaluation the WRITE evaluator minted. A
+ * READ evaluation is refused here, and a write evaluation is refused by
+ * `signKnowledgeAssertion` — the two producer sets are disjoint.
+ */
+export async function signKnowledgeWriteAssertion(input: SignWriteAssertionInput): Promise<SignedKnowledgeWriteAssertion> {
+  if (!isKnowledgeWriteArmEvaluation(input.armEvaluation)) {
+    throw new KnowledgeAssertionError(
+      'WRITE_ASSERTION_WITHOUT_WRITE_ARM_EVALUATION',
+      'the write signer refuses any call not carrying an evaluation the write arm evaluator minted (RB-11 Governor v0, C.3)',
+    );
+  }
+  const arms = input.armEvaluation;
+  if (arms.claimsMode !== 'asserted') {
+    throw new KnowledgeAssertionError('ASSERTION_NOT_FOR_CLAIMS_MODE', 'a write source is always in claims mode asserted (RB-11 Governor v0, C.4)');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (now - arms.at > ARM_EVALUATION_MAX_AGE_SECONDS) {
+    throw new KnowledgeAssertionError('ASSERTION_ARM_EVALUATION_STALE', 'the write arm evaluation is too old to sign against');
+  }
+
+  const ttl = Math.min(input.ttlSeconds ?? ASSERTION_DEFAULT_TTL_SECONDS, ASSERTION_MAX_TTL_SECONDS);
+  const { keys, activeKeyId } = keyset();
+  const key = keys.get(activeKeyId) as crypto.KeyObject;
+
+  const relevant = new Set(arms.relevantGroups);
+  const grp = input.callerGroupIds.filter((id) => relevant.has(id));
+
+  const claims: KnowledgeWriteAssertionClaims = {
+    iss: input.issuer,
+    act: 'relayhall-core',
+    sub: arms.subjectMode === 'direct'
+      ? arms.accountPrincipalId
+      : pairwiseSubject(arms.accountPrincipalId, arms.sourceId),
+    grp,
+    aud: arms.sourceId,
+    iat: now,
+    nbf: now - ASSERTION_SKEW_SECONDS,
+    exp: now + ttl,
+    jti: crypto.randomBytes(18).toString('base64url'),
+    op: arms.op,
+    // C.3: both or neither — the evaluation carries one object or null.
+    ...(arms.taskContext ? { tsk: arms.taskContext.taskId, prj: arms.taskContext.projectId } : {}),
+  };
+  const header = { alg: 'EdDSA', typ: WRITE_ASSERTION_TYP, kid: activeKeyId };
+
+  if (!await recordEmittedJti(claims.jti, new Date(claims.exp * 1000), arms.sourceId)) {
+    throw new KnowledgeAssertionError('ASSERTION_JTI_COLLISION', 'refusing to emit a colliding jti (RB-11 Governor v0, C.3)');
+  }
+
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
+  const signature = crypto.sign(null, Buffer.from(signingInput, 'utf8'), key);
+  return { token: `${signingInput}.${signature.toString('base64url')}`, jti: claims.jti, claims };
 }

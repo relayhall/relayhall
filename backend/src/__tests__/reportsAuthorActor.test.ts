@@ -66,7 +66,7 @@ describe('author_actor_id provenance', () => {
       expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({
         author: 'friendly-label',
         author_actor_id: 'service_account',
-      }));
+      }), expect.objectContaining({ principalId: null, handle: 'service_account' }));
     });
   });
 
@@ -139,7 +139,7 @@ describe('ReportManager author_actor_id persistence', () => {
     const pool = fakePool();
     await new ReportManager(pool as never).create({
       title: 'T', content: 'C', author: 'label', author_actor_id: 'service_account',
-    });
+    }, {});
     const insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.text).toContain('author_actor_id');
     expect(insert.params).toEqual(expect.arrayContaining(['label', 'service_account']));
@@ -267,7 +267,7 @@ describe('the verified attribution', () => {
     };
     await new ReportManager(pool as never).create({
       title: 'T', content: 'C', author_actor_id: 'ada',
-    });
+    }, {});
     const insert = pool.queries.find((q) => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.params).toContain('ada');
     expect(insert.params).not.toContain('system');
@@ -371,7 +371,7 @@ describe('both author_actor_id spellings, and the owner column', () => {
     };
     await new ReportManager(pool as never).create({
       title: 'T', content: 'C', author_actor_id: 'ada', author_principal_id: UUID,
-    });
+    }, {});
     const insert = queries.find((q) => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.text).toContain('author_principal_id');
     expect(insert.params).toContain(UUID);

@@ -27,13 +27,16 @@
 import { Router, Request, Response } from 'express';
 import { pool } from '../db/connection';
 import { readCookie } from '../utils/cookies';
-import { logCaughtFailure } from '../utils/secretSafeLog';
+import { logCaughtFailure, logCaughtFailureAs } from '../utils/secretSafeLog';
+import { resolveLoginSession, SessionAuthenticationUnavailableError } from '../services/sessionAuthentication';
 import { isFlagOn, FLAG_SESSIONS } from '../utils/featureFlags';
-import { SESSION_COOKIE_NAME, loginSessionService, sessionAbsoluteMs } from '../services/LoginSessionService';
+import { SESSION_COOKIE_NAME, sessionAbsoluteMs } from '../services/LoginSessionService';
 import { identityProviderService } from '../services/identity/IdentityProviderService';
 import {
   SSO_STATE_COOKIE_NAME,
   SsoAuthenticationError,
+  SsoStepUpCallbackError,
+  StepUpRefusalAuditError,
   assertNotACallerComposedTarget,
   ssoAuthenticationService,
 } from '../services/identity/SsoAuthenticationService';
@@ -109,6 +112,10 @@ const SSO_REFUSAL_MESSAGES: Record<string, string> = {
   LOGOUT_TOKEN_INVALID: 'the logout token was refused',
   LOGOUT_TOKEN_REPLAYED: 'that logout token has already been used',
   LOGOUT_NOT_ADVERTISED: 'back-channel logout is not enabled for that Identity provider',
+  SSO_STEP_UP_UNAVAILABLE: 'this Account holds no proven Identity link at an enabled Identity provider',
+  SSO_STEP_UP_SUBJECT_MISMATCH: 'the Identity provider authenticated a different Account than the one stepping up',
+  SSO_STEP_UP_NOT_FRESH: 'the Identity provider reused an earlier sign-in instead of authenticating again, so the step-up was not confirmed',
+  SSO_STEP_UP_PROVIDER_DECLINED: 'the Identity provider declined to re-authenticate the person as the step-up asked',
 };
 
 function refusalMessage(code: string): string {
@@ -141,8 +148,26 @@ function ssoRefusalCode(error: unknown): string | null {
   return null;
 }
 
-function sendSsoRefusal(res: Response, error: unknown): boolean {
-  const code = ssoRefusalCode(error);
+/**
+ * Card 7a99d63e (SU-10): the code a refused STEP-UP callback answers with.
+ *
+ * The login arm's collapse above stays: an attacker probing a login learns
+ * only that the ID token was refused. A step-up is different in who asks: it
+ * can only be started from the Account's OWN login session (`POST
+ * /auth/step-up` refuses every bearer), so naming the cause tells that person
+ * something about their own provider session and an outsider nothing. Only
+ * refusal 9 gets a name (`SSO_STEP_UP_NOT_FRESH`: the provider reused an
+ * older sign-in, or sent no `auth_time`); every other ID-token refusal still
+ * answers `SSO_ID_TOKEN_REFUSED`. `SSO_STEP_UP_PROVIDER_DECLINED` is the
+ * service's own typed code and passes through `ssoRefusalCode` unchanged.
+ */
+export function stepUpRefusalCode(error: unknown): string | null {
+  if (error instanceof IdTokenError && error.code === 'AUTH_TIME_STALE') return 'SSO_STEP_UP_NOT_FRESH';
+  return ssoRefusalCode(error);
+}
+
+export function sendSsoRefusal(res: Response, error: unknown, codeOf: (error: unknown) => string | null = ssoRefusalCode): boolean {
+  const code = codeOf(error);
   if (!code) return false;
   const status = code === 'SSO_NOT_CONFIGURED' || code === 'SSO_PROVIDER_INACTIVE'
     ? 503
@@ -171,6 +196,29 @@ function sendSsoRefusal(res: Response, error: unknown): boolean {
 const LOGIN_PAGE_PATH = '/dashboard/';
 function refusedLoginPageUrl(code: string): string {
   return `${LOGIN_PAGE_PATH}?sso_refused=${encodeURIComponent(code)}`;
+}
+
+/**
+ * Card a3e76724: where the step-up WINDOW lands. The dashboard opened the
+ * Identity provider in a window of its own, so the callback lands that window
+ * on a dashboard URL the page recognises as a step-up landing: it tells the
+ * dialog that opened it (by request id) and closes. The URL carries the
+ * request id and, on a refusal, the named code — never a token, never a
+ * secret. The token is minted only when the dialog COLLECTS the proof, from
+ * the same Account's session (`POST /auth/step-up/collect`).
+ */
+function stepUpLandingUrl(requestId: string, refusalCode: string | null): string {
+  const query = new URLSearchParams({ step_up: refusalCode ? 'refused' : 'complete', request: requestId });
+  if (refusalCode) query.set('code', refusalCode);
+  return `${LOGIN_PAGE_PATH}?${query.toString()}`;
+}
+
+/** Shared with `POST /auth/step-up`, which begins a step-up's flow. */
+export function issueSsoStateCookie(res: Response, value: string, expiresAt: Date): void {
+  res.cookie(SSO_STATE_COOKIE_NAME, value, {
+    ...STATE_COOKIE_OPTIONS,
+    maxAge: Math.max(0, expiresAt.getTime() - Date.now()),
+  });
 }
 
 /**
@@ -204,10 +252,7 @@ router.post('/start', async (req: Request, res: Response): Promise<void> => {
       stepUp: body.stepUp === true,
     });
 
-    res.cookie(SSO_STATE_COOKIE_NAME, started.stateCookieValue, {
-      ...STATE_COOKIE_OPTIONS,
-      maxAge: Math.max(0, started.expiresAt.getTime() - Date.now()),
-    });
+    issueSsoStateCookie(res, started.stateCookieValue, started.expiresAt);
     // The authorize URL is returned rather than redirected to, so the browser
     // makes the navigation and the caller can be a fetch() from the login page.
     res.json({ authorizeUrl: started.authorizeUrl, expiresAt: started.expiresAt.toISOString() });
@@ -222,7 +267,7 @@ router.post('/start', async (req: Request, res: Response): Promise<void> => {
 router.get('/callback', async (req: Request, res: Response): Promise<void> => {
   const query = req.query as Record<string, unknown>;
   try {
-    const completed = await ssoAuthenticationService.completeAuthentication({
+    const outcome = await ssoAuthenticationService.completeCallback({
       state: typeof query.state === 'string' ? query.state : null,
       code: typeof query.code === 'string' ? query.code : null,
       iss: typeof query.iss === 'string' ? query.iss : null,
@@ -232,6 +277,16 @@ router.get('/callback', async (req: Request, res: Response): Promise<void> => {
       ip: req.ip,
       userAgent: req.headers['user-agent'],
     });
+
+    if (outcome.kind === 'step_up') {
+      // Card a3e76724: a step-up proves the SAME person again. It mints no
+      // login session and touches no session cookie — the person is already
+      // signed in — and it carries no token: the dialog collects one.
+      res.clearCookie(SSO_STATE_COOKIE_NAME, CLEAR_STATE_COOKIE_OPTIONS);
+      res.redirect(302, stepUpLandingUrl(outcome.stepUp.requestId, null));
+      return;
+    }
+    const completed = outcome.login;
 
     // T-SS15: the pre-login state cookie is DISCARDED, never upgraded, and the
     // session token is freshly random (minted in LoginSessionService).
@@ -247,6 +302,34 @@ router.get('/callback', async (req: Request, res: Response): Promise<void> => {
     res.redirect(302, completed.returnTo);
   } catch (error) {
     res.clearCookie(SSO_STATE_COOKIE_NAME, CLEAR_STATE_COOKIE_OPTIONS);
+    // Card a3e76724: a refused STEP-UP lands in the step-up window with its
+    // named code, and the JSON caller gets the original refusal's envelope.
+    if (error instanceof SsoStepUpCallbackError) {
+      // Card 7a99d63e (SU-10): the step-up arm names its causes; the login
+      // arm below keeps the one collapsed ID-token code.
+      const stepUpCode = stepUpRefusalCode(error.refusal);
+      // Card 72b8fb97: a refusal whose audit row could not be written fails
+      // the callback. The insert's own failure and the original refusal are
+      // logged under ONE failure id, the one the 500 answers with.
+      if (error.refusal instanceof StepUpRefusalAuditError) {
+        const errorId = logCaughtFailure('[SSO] step-up refusal could not be recorded:', error.refusal.auditFailure);
+        logCaughtFailureAs('[SSO] the unrecorded step-up refusal was:', error.refusal.refusal, errorId);
+        if (req.accepts(['json', 'html']) === 'html') {
+          res.redirect(302, stepUpLandingUrl(error.requestId, 'SSO_STEP_UP_FAILED'));
+          return;
+        }
+        res.status(500).json({ error: 'Internal Server Error', code: 'SSO_STEP_UP_FAILED', message: 'SSO step-up failed', errorId });
+        return;
+      }
+      if (req.accepts(['json', 'html']) === 'html') {
+        res.redirect(302, stepUpLandingUrl(error.requestId, stepUpCode ?? 'SSO_STEP_UP_FAILED'));
+        return;
+      }
+      if (sendSsoRefusal(res, error.refusal, stepUpRefusalCode)) return;
+      const errorId = logCaughtFailure('[SSO] step-up callback failed:', error.refusal);
+      res.status(500).json({ error: 'Internal Server Error', code: 'SSO_STEP_UP_FAILED', message: 'SSO step-up failed', errorId });
+      return;
+    }
     // a07f3277: a person is sent back to the login page with the named
     // refusal; everything else keeps the JSON envelope. No login-session
     // cookie is set on either path — the refusal happened before the mint.
@@ -270,7 +353,7 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
       return;
     }
     const token = readCookie(req.headers.cookie, SESSION_COOKIE_NAME);
-    const session = token ? await loginSessionService.resolve(token) : undefined;
+    const session = token ? await resolveLoginSession(token) : undefined;
     if (!session) {
       res.status(401).json({ error: 'Unauthorized', message: 'No live login session' });
       return;
@@ -297,6 +380,11 @@ router.post('/logout', async (req: Request, res: Response): Promise<void> => {
     res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
     res.json({ success: true, providerLogoutUrl });
   } catch (error) {
+    if (error instanceof SessionAuthenticationUnavailableError) {
+      const errorId = logCaughtFailure('[SSO] session authentication lookup unavailable:', error.cause);
+      res.status(503).json({ error: 'Service Unavailable', code: 'SESSION_AUTH_UNAVAILABLE', message: 'Session authentication is temporarily unavailable', errorId });
+      return;
+    }
     const errorId = logCaughtFailure('[SSO] logout failed:', error);
     res.status(500).json({ error: 'Internal Server Error', code: 'SSO_LOGOUT_FAILED', message: 'Logout failed', errorId });
   }
@@ -326,7 +414,7 @@ router.post('/backchannel-logout', async (req: Request, res: Response): Promise<
 }
 
 /** Which Identity provider proved this session, if any (SS-19). */
-async function providerIdForSession(sessionId: string): Promise<string | null> {
+export async function providerIdForSession(sessionId: string): Promise<string | null> {
   const result = await pool.query('SELECT identity_provider_id FROM auth_sessions WHERE id = $1', [sessionId]);
   const value = result.rows[0]?.identity_provider_id;
   return value === null || value === undefined ? null : String(value);

@@ -3,7 +3,7 @@ import {
   TaskReviewerService,
   type ReviewerDependencies,
 } from '../services/TaskReviewerService';
-import { buildCanonicalReviewSlice } from '../services/TaskReviewAttemptService';
+import { buildCanonicalReviewSlice, hashReviewReports } from '../services/TaskReviewAttemptService';
 import type { ReviewHistoryEntry } from '../services/TaskManagerDB';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -17,8 +17,6 @@ function makeTask(overrides: Partial<Task> = {}): Task {
       { id: 'sub-1', text: 'Ship feature', status: 'review' },
     ],
     links: [],
-    sessionRefs: ['sess-1'],
-    autoCreated: false,
     autoStart: true,
     blockedBy: [],
     tags: ['qa'],
@@ -38,11 +36,34 @@ function createDeps(task: Task, reports: Array<{ id: string; title: string; summ
       reviewHistory: updates.reviewHistory as ReviewHistoryEntry[] | undefined,
     } as Task)),
     getReportsForTask: jest.fn(async () => reports),
+    getExecutionEvidence: jest.fn(async () => ({ sessionRefs: ['sess-1'], completedBy: null })),
     notifyEscalation: jest.fn(async () => undefined),
   };
 }
 
 describe('TaskReviewerService', () => {
+  test('normalizes empty Report summaries identically at review read and raw verdict', () => {
+    const report = { id: 'r1', title: 'Evidence', summary: '', content: 'checked' };
+    expect(hashReviewReports([{ ...report, summary: null }])).toBe(hashReviewReports([report]));
+  });
+
+  test('preserves version-1 rejection receipt and does not depend on Report lookup', async () => {
+    const task = makeTask();
+    const deps = createDeps(task);
+    (deps.getReportsForTask as jest.Mock).mockRejectedValue(new Error('Report reader unavailable'));
+    const attemptService = {
+      beginAttempt: jest.fn(async () => ({ id: 'attempt-v1', attemptNo: 1, status: 'running', reviewSlice: [], idempotencyKey: 'v1' })),
+      recordVerdict: jest.fn(async () => ({ status: 'todo', attemptCount: 1, applied: true })),
+    };
+    await new TaskReviewerService(deps, attemptService as any).rejectTask(task.id, 'first reason');
+    await new TaskReviewerService(deps, attemptService as any).rejectTask(task.id, 'different reason');
+    expect(deps.getReportsForTask).not.toHaveBeenCalled();
+    expect((attemptService.beginAttempt as jest.Mock).mock.calls[0][1]).toEqual({
+      successCriteria: [], reports: [], sessionRefs: ['sess-1'], completedBy: null,
+    });
+    expect((attemptService.beginAttempt as jest.Mock).mock.calls[1][1])
+      .toEqual((attemptService.beginAttempt as jest.Mock).mock.calls[0][1]);
+  });
   test('passes tasks that have explicit criteria, review-ready subtasks, and evidence', async () => {
     const task = makeTask({ successCriteria: ['All Verifier tests pass', 'Report includes proof'] as any });
     const deps = createDeps(task, [
@@ -97,7 +118,7 @@ describe('TaskReviewerService', () => {
       successCriteria: ['Reviewed prefix is independently verifiable'],
     });
     const slice = buildCanonicalReviewSlice(task);
-    expect(slice.map((item) => item.index)).toEqual([1]);
+    expect(slice.map((item) => 'index' in item ? item.index : null)).toEqual([1]);
 
     const deps = createDeps(task, [{
       id: 'report-prefix',
@@ -125,6 +146,32 @@ describe('TaskReviewerService', () => {
 
     expect(outcome.decision).toBe('reject');
     expect(outcome.findings.some((finding) => finding.message.includes('No linked review report'))).toBe(true);
+  });
+
+  test('accepts a flat Task with explicit criteria and linked Report without inventing a subtask', async () => {
+    const task = makeTask({ subtasks: [], successCriteria: ['Design is source-cited'] });
+    const deps = createDeps(task, [{
+      id: 'report-flat', title: 'Independent design review', summary: 'Source-cited design accepted',
+      content: 'Reviewer inspected the complete design and accepted the contract.',
+    }]);
+    const outcome = await new TaskReviewerService(deps).runReview(task.id);
+    expect(outcome.decision).toBe('pass');
+    expect(outcome.applied.status).toBe('completed');
+    expect(outcome.findings.some((finding) => finding.message.includes('not ready for review'))).toBe(false);
+    expect(deps.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: 'completed', subtasks: [] }));
+  });
+
+  test('flat manual rejection records linked evidence and returns To Do without a subtask', async () => {
+    const task = makeTask({ subtasks: [], successCriteria: ['Resolve independent findings'] });
+    const deps = createDeps(task, [{
+      id: 'report-corrections', title: 'Independent Verifier', summary: 'Changes required',
+      content: 'The resumed-session uniqueness invariant is contradictory.',
+    }]);
+    const outcome = await new TaskReviewerService(deps).rejectTask(task.id, 'Resolve the report findings');
+    expect(outcome.decision).toBe('reject');
+    expect(outcome.applied.status).toBe('todo');
+    expect(outcome.evidence.reports).toEqual([expect.objectContaining({ id: 'report-corrections' })]);
+    expect(deps.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: 'todo' }));
   });
 
   test('rejects an unresolved failing test signal even when a report exists', async () => {

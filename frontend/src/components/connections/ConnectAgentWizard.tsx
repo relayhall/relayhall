@@ -5,8 +5,10 @@ import { authenticatedFetch } from '../../utils/auth';
 import { useMyPrincipal } from '../../hooks/usePrincipals';
 import {
   CONNECTION_TEMPLATES, ConnectionTemplate, OnboardingPack, SCOPE_DISCLOSURE_LABEL,
-  chosenAuthoritySentence, connectableScopes, defaultAuthoritySentence,
-  defaultScopesFor, holdsRoot, lostCredentialRecovery, recommendedScopesFor,
+  chosenAuthoritySentence, connectableScopes, connectorDescriptorFor, defaultAuthoritySentence,
+  defaultScopesFor, harnessAuthoritySentence, harnessDelegationWarning, harnessScopesMissing, holdsRoot,
+  installLineFor, installNoteFor, isHarnessTemplate, lostCredentialRecovery, recommendedScopesFor,
+  scopeCeilingFor,
   connectionRefusalMessage, slugForName, slugIsLegal, slugRefusal,
 } from '../../types/connections';
 import { BootstrapPane } from './BootstrapPane';
@@ -51,12 +53,29 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
  *
  * WHY THERE IS NO SECOND ARM ANY MORE (owner ruling 2026-09-07, card
  * `07d09eaf`). Declared amendment UX-A1 briefly made an administrator's default
- * the step-1 template's working set. A credential carrying only that set cannot
- * bootstrap — `relayhall_brief_compile {session: true}` needs `principals:read`
- * and no template names it — so the flow ended in a 403 instead of a 500. The
- * owner ruled the default rather than the check: every session, every template,
- * starts from the full delegable catalogue and narrows from there. The rule and
- * the copy both live in `types/connections`, so this file chooses nothing.
+ * the step-1 template's working set. A credential carrying only that set could
+ * not bootstrap — `relayhall_brief_compile {session: true}` then needed
+ * `principals:read` and no template names it — so the flow ended in a 403
+ * instead of a 500. The owner ruled the default: every session, every template,
+ * starts from the full delegable catalogue and narrows from there. (Card
+ * 1118fefa later made the session brief a self-identity read, so a narrower set
+ * bootstraps as well; the default is unchanged.) The rule and the copy both
+ * live in `types/connections`, so this file chooses nothing.
+ *
+ * THE HARNESS TEMPLATES (E462 slice S1, universal harness connector design v1.5
+ * sections 3.1 and 9). Claude Code, Codex, VS Code and Antigravity make ONE
+ * `any`-pinned token with the harness scope set and register their connector
+ * WITH its first descriptor (telemetry tier and product), published in the same
+ * call, so the wake and the telemetry have the one published service they need.
+ * For these the ceiling is the harness set rather than everything the person
+ * may delegate (see `scopeCeilingFor`), the authority sentence says so, and step
+ * 3 leads with the install line. Every other template is exactly as before.
+ *
+ * E462 S2: when the session cannot delegate part of the harness set, the
+ * wizard says WHICH scopes the token will lack (`harnessDelegationWarning`),
+ * instead of counting a cut-down ceiling as if it were the whole set. The
+ * warning waits for the principal to load, so "reading what you can do" is
+ * never shown as "you can pass on nothing".
  *
  * THE PACK IS NEVER FETCHED AGAIN. It is not stored server-side (§7.4), so step
  * 3 holds the only copy there will ever be, in this page, until it is closed.
@@ -94,12 +113,37 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
   /** Whether this session holds the sentinel it can never pass on. */
   const sessionHoldsRoot = useMemo(() => holdsRoot(scopes), [scopes]);
 
-  /** What this connection MAY be given: the ceiling, the menu and the default's
-   *  source. Never the caller's literal `root` — see `connectableScopes`. */
-  const available = useMemo(
+  /** What the session may DELEGATE: never the caller's literal `root` — see
+   *  `connectableScopes`. */
+  const connectable = useMemo(
     () => connectableScopes(scopes, delegableScopes),
     [scopes, delegableScopes],
   );
+
+  /** What THIS connection may be given: the ceiling, the menu and the default's
+   *  source. For a harness template it is the harness set (E462 S1), cut down to
+   *  what the session may delegate; for every other template it is the whole
+   *  delegable set, which is decision 1. */
+  const available = useMemo(
+    () => scopeCeilingFor(template, connectable),
+    [template, connectable],
+  );
+  const harness = isHarnessTemplate(template);
+  /** The harness scopes this session cannot pass on, named (E462 S2). */
+  const harnessMissing = useMemo(
+    () => (harness && !principalLoading ? harnessScopesMissing(connectable) : []),
+    [harness, principalLoading, connectable],
+  );
+  const delegationWarning = harnessDelegationWarning(harnessMissing);
+
+  /** Choosing a template keeps the person's edits unless the CEILING changes
+   *  kind (harness set <-> whole delegable set): a selection made against one
+   *  menu is not carried onto another, because it could name scopes the new
+   *  ceiling does not offer. Harness to harness keeps it, the menu is identical. */
+  const selectTemplate = (candidate: ConnectionTemplate) => {
+    if (isHarnessTemplate(candidate) !== harness) setScopesEdited(false);
+    setTemplate(candidate);
+  };
 
   useEffect(() => {
     // Decision 1: everything you may delegate, selected by default, every time
@@ -107,10 +151,12 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
     // person has edited the selection themselves. The gate is "have they chosen
     // something?", never "have they opened the panel?".
     //
-    // `template` is NOT a dependency, and that is the 2026-09-07 ruling in one
-    // line: the default no longer depends on what the connection is for, so
-    // changing the step-1 choice cannot silently rewrite an authority the
-    // person has already read.
+    // The 2026-09-07 ruling in one line: for the ordinary templates the default
+    // does not depend on what the connection is for, so changing the step-1
+    // choice cannot silently rewrite an authority the person has already read.
+    // A HARNESS template is the one named exception (design v1.5 section 3.1):
+    // its token is the harness set, and the authority sentence on screen says
+    // so the moment the choice is made.
     if (!scopesEdited) setChosenScopes(defaultScopesFor(available));
   }, [available, scopesEdited]);
 
@@ -129,6 +175,11 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
     setSubmitting(true);
     setError(null);
     try {
+      // A harness template registers AND publishes in this one call: the first
+      // descriptor (telemetry tier and product) rides the registration, so the
+      // connector is never left unpublished. The scopes are cut to the ceiling
+      // once more here, so nothing outside it can reach the request.
+      const descriptor = connectorDescriptorFor(template);
       const response = await authenticatedFetch(`${API_BASE}/services`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -137,8 +188,9 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
           name: name.trim(),
           description: template.registrationText,
           kind: 'connector',
+          ...(descriptor ? { descriptor } : {}),
           issueCredential: {
-            scopes: chosenScopes,
+            scopes: chosenScopes.filter((scope) => available.includes(scope)),
             label: name.trim().slice(0, 128),
             transport: template.transport,
           },
@@ -176,9 +228,11 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
     }
   };
 
-  const authoritySentence = narrowing
-    ? chosenAuthoritySentence(chosenScopes.length, available.length, sessionHoldsRoot)
-    : defaultAuthoritySentence(sessionHoldsRoot);
+  const authoritySentence = harness
+    ? harnessAuthoritySentence(narrowing ? chosenScopes.length : available.length)
+    : narrowing
+      ? chosenAuthoritySentence(chosenScopes.length, available.length, sessionHoldsRoot)
+      : defaultAuthoritySentence(sessionHoldsRoot);
 
   return (
     <section className="conn-wizard" aria-labelledby="conn-wizard-heading">
@@ -209,7 +263,7 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
                     aria-disabled={unavailable || undefined}
                     disabled={unavailable}
                     className={selected ? 'conn-template-btn conn-template-btn--on' : 'conn-template-btn'}
-                    onClick={() => setTemplate(candidate)}
+                    onClick={() => selectTemplate(candidate)}
                   >
                     <span className="conn-template-label">{candidate.label}</span>
                     <span className="conn-template-blurb">{candidate.blurb}</span>
@@ -232,14 +286,21 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
                 </button>
               )}
             </p>
+            {delegationWarning && (
+              <p className="conn-warn" role="status" data-testid="harness-delegation-warning">
+                {delegationWarning}
+              </p>
+            )}
             {narrowing && (
               <ScopeNarrowing
                 available={available}
                 selected={chosenScopes}
                 onChange={chooseScopes}
                 idPrefix="conn-wizard-scope"
-                recommended={template ? recommendedScopesFor(template, available) : undefined}
-                recommendedLabel={template ? `Use the recommended set for ${template.label}` : undefined}
+                // A harness template's menu IS its recommended set, so the
+                // button would offer nothing; every other template keeps it.
+                recommended={template && !harness ? recommendedScopesFor(template, available) : undefined}
+                recommendedLabel={template && !harness ? `Use the recommended set for ${template.label}` : undefined}
               />
             )}
             {principalLoading && (
@@ -306,6 +367,10 @@ export const ConnectAgentWizard: React.FC<ConnectAgentWizardProps> = ({ onCreate
             mcpConfig={pack.mcpConfig}
             cliEnv={pack.cliEnv}
             bootstrapLine={pack.bootstrapLine}
+            bootstrapPrompt={pack.bootstrapPrompt}
+            configurationGuidance={pack.configurationGuidance}
+            installLine={installLineFor(template, pack.boardEndpoint)}
+            installNote={installNoteFor(template)}
             boardEndpoint={pack.boardEndpoint}
             transport={template?.transport ?? 'any'}
             initialTab={template?.defaultTab}

@@ -306,17 +306,32 @@ describe('Blueprint live creation, visibility and retry boundaries',()=>{
  test('D-15/D-20 real REST, executable CLI and registered MCP share use-only plans, complete receipts and refusal behavior',async()=>{
   const doc=document(true);const id=await publish(doc);const project=await target();
   const limited=await narrow(['blueprints:use','projects:write','phases:write','tasks:write','reports:write']);await grant(limited,'blueprint',id,['use']);await grant(limited,'project',project,['read','write']);
+  // A second use-granted Blueprint, so the MCP page boundary below cuts a real two-row list.
+  const sibling=await publish(document());await grant(limited,'blueprint',sibling,['use']);
   const body=request(project);const before=await population();
   const restGet=ok(await call(limited,'GET',`/blueprints/${id}`));const cliGet=await cli(limited,['get',id]);expect(cliGet.code).toBe(0);expect(cliGet.body).toEqual(restGet);expect(await mcp(limited,'get',{blueprintId:id})).toEqual(restGet);
-  const restList=ok(await call(limited,'GET','/blueprints'));expect((await cli(limited,['list'])).body).toEqual(restList);expect(await mcp(limited,'list')).toEqual(restList);
+  // List parity (docs/api.md "Listing Blueprints", docs/mcp.md "Conventions"): REST and the CLI answer the caller's whole
+  // visible list, byte-for-byte the same. MCP pages THAT list like every other MCP list: the REST envelope with `blueprints`
+  // cut to the requested page of the REST rows, in REST order, plus an additive `pagination` (default limit 20).
+  const restList=ok(await call(limited,'GET','/blueprints'));expect((await cli(limited,['list'])).body).toEqual(restList);
+  expect(restList.blueprints.map((row:any)=>row.id).sort()).toEqual([id,sibling].sort());const [first,second]=restList.blueprints;
+  const restPaged=await call(limited,'GET','/blueprints?limit=1');expect({status:restPaged.status,code:restPaged.body.code}).toEqual({status:422,code:'BLUEPRINT_INPUT_INVALID'});
+  expect(await mcp(limited,'list')).toEqual({...restList,blueprints:[first,second],pagination:{limit:20,offset:0,total:2,returned:2,hasMore:false}});
+  expect(await mcp(limited,'list',{limit:1})).toEqual({...restList,blueprints:[first],pagination:{limit:1,offset:0,total:2,returned:1,hasMore:true}});
+  expect(await mcp(limited,'list',{limit:1,offset:1})).toEqual({...restList,blueprints:[second],pagination:{limit:1,offset:1,total:2,returned:1,hasMore:false}});
+  expect(await mcp(limited,'list',{offset:2})).toEqual({...restList,blueprints:[],pagination:{limit:20,offset:2,total:2,returned:0,hasMore:false}});
   const preview=ok(await call(limited,'POST',`/blueprints/${id}/instantiations/preview`,body));const cliPreview=await cli(limited,['preview',id,'--project',project]);expect(cliPreview.code).toBe(0);expect(cliPreview.body).toEqual(preview);expect(await mcp(limited,'preview',{blueprintId:id,...body})).toEqual(preview);expect(await population()).toEqual(before);
   const key=tag();const receipt=ok(await call(limited,'POST',`/blueprints/${id}/instantiations`,body,key),201);const after=await population();
   const cliReplay=await cli(limited,['instantiate',id,'--project',project,'--idempotency-key',key]);expect(cliReplay.code).toBe(0);expect(cliReplay.body).toEqual(receipt);expect(cliReplay.stderr).toContain('Idempotency-Key: '+key);expect(await mcp(limited,'instantiate',{blueprintId:id,...body,idempotencyKey:key})).toEqual(receipt);expect(await population()).toEqual(after);
   const cliFresh=await cli(limited,['instantiate',id,'--project',project,'--idempotency-key',tag()]);expect(cliFresh.code).toBe(0);const afterCli=await population();
   const mcpFresh=await mcp(limited,'instantiate',{blueprintId:id,...body,idempotencyKey:tag()});const afterMcp=await population();
   const difference=(next:Record<string,any>,prior:Record<string,any>)=>Object.fromEntries(Object.keys(next).map(name=>[name,next[name]-prior[name]]));
-  const expectedDelta={projects:0,phases:preview.plan.counts.phases,tasks:preview.plan.counts.tasks,subtasks:preview.plan.counts.subtasks,task_dependencies:preview.plan.counts.dependencies,reports:preview.plan.counts.reports,blueprint_instantiations:1,blueprint_instantiation_requests:1,grants:0};
+  // AZ-A10 clause 1(d): the creating Connector is stamped shepherd of each created Task in the create transaction and holds
+  // exactly one shepherd role row (read on that Task). Those rows are the whole Grant delta: no creator or Project Grant.
+  const expectedDelta={projects:0,phases:preview.plan.counts.phases,tasks:preview.plan.counts.tasks,subtasks:preview.plan.counts.subtasks,task_dependencies:preview.plan.counts.dependencies,reports:preview.plan.counts.reports,blueprint_instantiations:1,blueprint_instantiation_requests:1,grants:preview.plan.counts.tasks};
   expect([difference(after,before),difference(afterCli,after),difference(afterMcp,afterCli)]).toEqual([expectedDelta,expectedDelta,expectedDelta]);
+  const shepherdRows=async(value:any)=>(await pool.query("SELECT g.resource_id FROM grants g WHERE g.grantee_type='principal' AND g.grantee_id=$1 AND g.resource_type='task' AND g.verb='read' AND g.provenance='assignment:grant' AND g.resource_id=ANY($2::uuid[]) AND EXISTS(SELECT 1 FROM access_vehicle_links l WHERE l.target_kind='grant' AND l.target_id=g.id AND l.vehicle_kind='role' AND l.role='shepherd' AND l.task_id=g.resource_id) ORDER BY g.resource_id",[limited.id,Object.values(value.tasks)])).rows.map((row:any)=>row.resource_id);
+  for(const value of [receipt,cliFresh.body,mcpFresh])expect(await shepherdRows(value)).toEqual([...Object.values(value.tasks)].sort());
   expect(new Set([receipt,cliFresh.body,mcpFresh].map(value=>value.instantiationId)).size).toBe(3);
   for(const value of [receipt,cliFresh.body,mcpFresh]){expect(Object.keys(value.tasks)).toEqual(preview.plan.tasks.map((task:any)=>task.key));expect(value.blueprint).toEqual(receipt.blueprint)}
   expect(new Set([receipt,cliFresh.body,mcpFresh].flatMap(value=>Object.values(value.tasks))).size).toBe(3*preview.plan.counts.tasks);
@@ -385,8 +400,9 @@ describe('Phase capture owner contract', () => {
    const projectId = await target();
    const phaseId = ok(await call(author,'POST','/phases',{projectId,name:'Delivery',goal:'A reusable outcome'}),201).phase.id;
    const task = ok(await call(author,'POST','/tasks',{project:projectId,phaseId,title:'Prepare work',description:'Describe the work',
-     definitionOfDone:['Reviewed','Recorded'],successCriteria:['Proof passes'],constraints:['Use fixtures'],
+     definitionOfDone:['Reviewed','Recorded'],constraints:['Use fixtures'],
      priority:'high',subtasks:[{text:'Inspect',status:'empty',completed:false}]}),201).task;
+   ok(await call(author,'PATCH',`/tasks/${task.id}/success-criteria`,{successCriteria:['Proof passes']}));
    return {projectId,phaseId,task};
  }
  test('CAPTURE-1 preserves the plan through independent publication, export and renamed import', async () => {

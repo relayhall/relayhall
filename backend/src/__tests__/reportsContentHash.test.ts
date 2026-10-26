@@ -46,7 +46,7 @@ describe('report content_hash (server-computed sha256)', () => {
 
   it('INSERT includes content_hash derived from content', async () => {
     const pool = fakePool();
-    await new ReportManager(pool as never).create({ title: 'T', content: '# body\nline' });
+    await new ReportManager(pool as never).create({ title: 'T', content: '# body\nline' }, {});
     const insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.text).toContain('content_hash');
     expect(insert.params[2]).toBe(sha256('# body\nline'));

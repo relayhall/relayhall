@@ -30,6 +30,7 @@ import {
 } from '../utils/serviceDescriptor';
 import {
   isKnowledgeCapable,
+  isKnowledgeWriteCapable,
   KnowledgePolicyError,
   RESERVED_SERVICE_SLUGS,
   validateAllowedNetworks,
@@ -88,6 +89,12 @@ export interface ServiceRecord {
    */
   knowledgeQueryEndpoint: string | null;
   knowledgeGetEndpoint: string | null;
+  /**
+   * RB-11 Governor v0 (card `b796067e`, D-8/D-9): the base URL of the
+   * source's write surface; core appends the verb. Owner plane only, like
+   * every other knowledge field.
+   */
+  knowledgeWriteEndpoint: string | null;
   knowledgeCoreCredentialRef: string | null;
   knowledgeClaimsMode: KnowledgeClaimsMode;
   knowledgeSubjectMode: KnowledgeSubjectMode;
@@ -128,6 +135,14 @@ export class ServiceRegistryError extends Error {
 const err = (status: number, code: string, message: string, field?: string) =>
   new ServiceRegistryError(status, code, message, field);
 
+/** Card bc847bd0: service_descriptor_versions.version is a PostgreSQL integer;
+ * a Version number past it reached the read and answered 500 (22003). */
+function refuseVersionPastInteger(version: number): void {
+  if (version > 2147483647) {
+    throw err(400, 'INVALID_QUERY_VALUE', 'version must be a positive integer up to 2147483647', 'version');
+  }
+}
+
 function sha256Hex(content: string): string {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
@@ -164,6 +179,7 @@ function mapRow(row: any): ServiceRecord {
     currentDescriptorVersion: row.current_descriptor_version ?? null,
     knowledgeQueryEndpoint: row.knowledge_query_endpoint ?? null,
     knowledgeGetEndpoint: row.knowledge_get_endpoint ?? null,
+    knowledgeWriteEndpoint: row.knowledge_write_endpoint ?? null,
     knowledgeCoreCredentialRef: row.knowledge_core_credential_ref ?? null,
     knowledgeClaimsMode: row.knowledge_claims_mode ?? 'asserted',
     knowledgeSubjectMode: row.knowledge_subject_mode ?? 'pairwise',
@@ -273,6 +289,24 @@ export interface RegisterServiceInput {
    * explicitly; non-root callers may only target themselves (the route
    * enforces that split). Defaults to the acting principal. */
   ownerAccountId?: unknown;
+  /**
+   * E462 slice S1 (universal harness connector design v1.5, sections 3.1 and
+   * 9): the Connector's FIRST capability descriptor, published in the SAME
+   * transaction as the registration, after which the service is `published`.
+   *
+   * Why it rides the registration instead of two follow-up calls: the wake
+   * needs exactly one PUBLISHED service for a connector principal and quota and
+   * session telemetry need the descriptor's declared tier and product, so a
+   * connector that exists without them is silently broken, and the wizard that
+   * makes it has no way to repair it. One transaction makes the half-made
+   * connector unrepresentable (the reasoning of card 3f145fa3).
+   *
+   * Connector kind only. The descriptor is validated and published by the
+   * ordinary `publishDescriptor` and `update` paths, so nothing here widens
+   * what `services:write` could already do through `PUT /services/:id/descriptor`
+   * and `PATCH /services/:id`.
+   */
+  descriptor?: unknown;
 }
 
 export interface UpdateServiceInput {
@@ -293,6 +327,8 @@ export interface OwnerPlaneInput {
   /** KNOWLEDGE-DESIGN `94747de9` §4.2 — subscription-class, root only. */
   knowledgeQueryEndpoint?: unknown;
   knowledgeGetEndpoint?: unknown;
+  /** RB-11 Governor v0 — the write surface's base URL; root only. */
+  knowledgeWriteEndpoint?: unknown;
   knowledgeCoreCredentialRef?: unknown;
   knowledgeClaimsMode?: unknown;
   knowledgeSubjectMode?: unknown;
@@ -301,13 +337,15 @@ export interface OwnerPlaneInput {
 }
 
 /**
- * The seven §4.2 fields, declared ONCE. The owner-plane route's body-key
- * allowlist and the branch below both read this list, so a field cannot be
- * accepted by the route and ignored by the act, or the reverse.
+ * The seven §4.2 fields plus RB-11 Governor v0's write endpoint, declared
+ * ONCE. The owner-plane route's body-key allowlist and the branch below both
+ * read this list, so a field cannot be accepted by the route and ignored by
+ * the act, or the reverse.
  */
 export const KNOWLEDGE_OWNER_PLANE_FIELDS = [
   'knowledgeQueryEndpoint',
   'knowledgeGetEndpoint',
+  'knowledgeWriteEndpoint',
   'knowledgeCoreCredentialRef',
   'knowledgeClaimsMode',
   'knowledgeSubjectMode',
@@ -351,6 +389,31 @@ export interface MutationOptions {
 
 const finish = (client: Queryable, dryRun: boolean | undefined) =>
   client.query(dryRun ? 'ROLLBACK' : 'COMMIT');
+
+/**
+ * The transaction a mutation runs in (card 08792425, two-way registration of a
+ * knowledge source): the CALLER's, when `MutationOptions.transaction` is given,
+ * or one this module opens and owns. The registration act creates a Service,
+ * publishes its descriptor, publishes the Service and sets its knowledge
+ * fields as ONE act, so a refusal at any step leaves nothing behind, exactly
+ * as `register` and the first credential commit together (card 3f145fa3).
+ * A caller transaction and a dry run are mutually exclusive, as in `register`.
+ */
+async function openMutation(options: MutationOptions): Promise<{ client: PoolClient; owns: boolean }> {
+  if (options.transaction && options.dryRun) {
+    throw err(500, 'DRY_RUN_IN_CALLER_TRANSACTION',
+      "A dry run cannot run inside a caller-owned transaction: the rollback that makes it dry is the caller's to issue");
+  }
+  if (options.transaction) return { client: options.transaction, owns: false };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+  } catch (e) {
+    client.release();
+    throw e;
+  }
+  return { client, owns: true };
+}
 
 async function lockService(executor: Queryable, id: string): Promise<any> {
   const result = await executor.query('SELECT * FROM services WHERE id = $1 FOR UPDATE', [id]);
@@ -428,9 +491,21 @@ export class ServiceRegistry {
         ? 'direct'
         : validateChoice(input.runtimeMode, RUNTIME_MODES, 'runtimeMode');
     refuseBrokered(runtimeMode);
+    // The first descriptor is validated BEFORE anything is written, so a
+    // malformed one is a named refusal that never opened a transaction, and its
+    // declared tier can seed the registry column (an explicit `telemetryTier`
+    // on the registration still wins).
+    let firstDescriptor: ServiceDescriptor | null = null;
+    if (input.descriptor !== undefined) {
+      if (kind !== 'connector') {
+        throw err(422, 'INVALID_SERVICE_VALUE',
+          'A first descriptor at registration applies only to connector-kind registrations', 'descriptor');
+      }
+      firstDescriptor = validateDescriptor(input.descriptor);
+    }
     const telemetryTier =
       input.telemetryTier === undefined
-        ? 'none'
+        ? (firstDescriptor?.telemetry?.tier ?? 'none')
         : validateChoice(input.telemetryTier, TELEMETRY_TIERS, 'telemetryTier');
 
     // A caller transaction and a dry run are mutually exclusive by
@@ -466,6 +541,11 @@ export class ServiceRegistry {
         if (!owner || owner.parent_principal_id || owner.kind === 'agent' || owner.status !== 'active' || owner.legacy_identity) {
           throw err(422, 'CONNECTOR_NEEDS_ACCOUNT', 'A Connector parent must be an active, non-legacy, parentless Account (design 4d961e37 §3)');
         }
+        // AZ-A12 clause 3(b): a Group principal is parentless but never a
+        // parent: no Connector is minted under a Group.
+        if (owner.kind === 'group') {
+          throw err(422, 'CONNECTOR_NEEDS_ACCOUNT', 'A Connector parent must be an Account; a Group principal is never a parent (AZ-A12 clause 3b)');
+        }
         // The principals.handle column is VARCHAR(64) (062) while slugs run
         // to 64 chars (review 2fcd548c B4): the derivation keeps the plain
         // 'connector-<slug>' form whenever it fits and otherwise truncates
@@ -489,8 +569,21 @@ export class ServiceRegistry {
          RETURNING *`,
         [slug, name, description, kind, runtimeMode, telemetryTier, connectorPrincipalId, actorPrincipalId],
       );
+      let record = mapRow(result.rows[0]);
+      if (firstDescriptor) {
+        // Publish version 1 and move to `published` on THIS client, through the
+        // same two methods `PUT /descriptor` and `PATCH /services/:id` use, so
+        // validation, the lifecycle-policy check and the revision discipline
+        // are the ones that already exist. `publishDescriptor` re-validates the
+        // raw input, which is idempotent.
+        const publication = await this.publishDescriptor(
+          record.id, input.descriptor, record.revision, actorPrincipalId, { transaction: client });
+        record = await this.update(
+          record.id, { status: 'published' }, publication.service.revision, actorPrincipalId,
+          { transaction: client });
+      }
       if (ownsTransaction) await finish(client, options.dryRun);
-      return mapRow(result.rows[0]);
+      return record;
     } catch (e) {
       // The caller's transaction is the caller's to unwind: rolling it back
       // here would silently discard writes it made BEFORE calling us, and the
@@ -512,9 +605,8 @@ export class ServiceRegistry {
     actorPrincipalId: string | null,
     options: MutationOptions = {},
   ): Promise<ServiceRecord> {
-    const client = await pool.connect();
+    const { client, owns } = await openMutation(options);
     try {
-      await client.query('BEGIN');
       const head = await lockService(client, id);
       requireRevision(revision, head);
       refuseRetired(head);
@@ -563,13 +655,14 @@ export class ServiceRegistry {
          WHERE id = $1 RETURNING *`,
         params,
       );
-      await finish(client, options.dryRun);
+      if (owns) await finish(client, options.dryRun);
       return mapRow(result.rows[0]);
     } catch (e) {
-      await client.query('ROLLBACK');
+      // The caller's transaction is the caller's to unwind (see register).
+      if (owns) await client.query('ROLLBACK');
       throw e;
     } finally {
-      client.release();
+      if (owns) client.release();
     }
   }
 
@@ -585,9 +678,8 @@ export class ServiceRegistry {
     actorPrincipalId: string | null,
     options: MutationOptions = {},
   ): Promise<ServiceRecord> {
-    const client = await pool.connect();
+    const { client, owns } = await openMutation(options);
     try {
-      await client.query('BEGIN');
       const head = await lockService(client, id);
       requireRevision(revision, head);
       refuseRetired(head);
@@ -705,6 +797,15 @@ export class ServiceRegistry {
             : input.knowledgeGetEndpoint === null
               ? null
               : validateKnowledgeEndpoint(input.knowledgeGetEndpoint, 'knowledgeGetEndpoint', allowedNetworks);
+          // RB-11 Governor v0: the write surface rides the SAME outbound
+          // policy as the read endpoints — https only, no credentials or
+          // fragment, a literal host classified under the same allowed
+          // networks — because core dials it the same way.
+          const writeEndpoint = input.knowledgeWriteEndpoint === undefined
+            ? ((head.knowledge_write_endpoint ?? null) as string | null)
+            : input.knowledgeWriteEndpoint === null
+              ? null
+              : validateKnowledgeEndpoint(input.knowledgeWriteEndpoint, 'knowledgeWriteEndpoint', allowedNetworks);
           const credentialRef = input.knowledgeCoreCredentialRef === undefined
             ? ((head.knowledge_core_credential_ref ?? null) as string | null)
             : input.knowledgeCoreCredentialRef === null
@@ -720,7 +821,7 @@ export class ServiceRegistry {
             ? validateRelevantGroups(input.knowledgeRelevantGroups, 'knowledgeRelevantGroups')
             : ((head.knowledge_relevant_groups ?? []) as string[]);
 
-          // §4.2, sol R1-2: "REQUIRED for every external source in BOTH
+          // §4.2, review R1-2: "REQUIRED for every external source in BOTH
           // claims modes ... a source with no core-credential arrangement
           // cannot be registered at all". The claims mode is deliberately
           // NOT consulted: what `claims_mode='none'` omits is the
@@ -741,8 +842,28 @@ export class ServiceRegistry {
               'knowledgeGetEndpoint',
             );
           }
+          // RB-11 Governor v0: a write surface is a write surface OF a
+          // knowledge source — the committed note is read back through the
+          // same source — so it needs the query endpoint (and therefore,
+          // through the rule above, the channel credential).
+          if (writeEndpoint !== null && queryEndpoint === null) {
+            throw err(
+              422,
+              'KNOWLEDGE_ENDPOINT_INCOMPLETE',
+              'knowledgeWriteEndpoint requires knowledgeQueryEndpoint — a write surface belongs to a knowledge source that can be read back (RB-11 Governor v0, D-8)',
+              'knowledgeWriteEndpoint',
+            );
+          }
+          if (writeEndpoint !== null && claimsMode !== 'asserted') {
+            throw err(
+              422,
+              'KNOWLEDGE_WRITE_REQUIRES_ASSERTED',
+              "knowledgeWriteEndpoint requires knowledgeClaimsMode 'asserted' — a write is attributed to the RelayHall Account the assertion attests (RB-11 Governor v0, C.4)",
+              'knowledgeWriteEndpoint',
+            );
+          }
 
-          // §4.2, sol R1-1/R1-3: the owner-plane act REFUSES an endpoint set
+          // §4.2, review R1-1/R1-3: the owner-plane act REFUSES an endpoint set
           // against a descriptor with no block or an empty compartment list.
           // Read inside THIS transaction, under the row lock taken above, so
           // a concurrent descriptor publish cannot slip between check and
@@ -755,6 +876,21 @@ export class ServiceRegistry {
                 [id, head.current_descriptor_version],
               );
             const block = descriptorRows.rows[0]?.descriptor?.knowledgeSource ?? null;
+            // RB-11 Governor v0: the WRITE half, asked of the ONE write
+            // predicate. Checked first so an endpoint against a block with no
+            // `write` declaration is refused by its own name.
+            if (writeEndpoint !== null && isKnowledgeCapable({ slug: head.slug, knowledgeQueryEndpoint: queryEndpoint }, block)
+              && !isKnowledgeWriteCapable({
+                slug: head.slug, knowledgeQueryEndpoint: queryEndpoint,
+                knowledgeWriteEndpoint: writeEndpoint, knowledgeClaimsMode: claimsMode,
+              }, block)) {
+              throw err(
+                422,
+                'KNOWLEDGE_WRITE_BLOCK_REQUIRED',
+                "setting knowledgeWriteEndpoint requires the current descriptor to be a protocol_version 2 dynamic-opaque knowledgeSource block carrying write {protocol_version: 1, kinds: ['note']} — publish that descriptor version first (RB-11 Governor v0, D-9)",
+                'knowledgeWriteEndpoint',
+              );
+            }
             // The ONE capability predicate (KnowledgeSourcePolicy). The act
             // refuses exactly the states the predicate would refuse, so the
             // row can never hold a configuration the reader will not honour.
@@ -770,6 +906,7 @@ export class ServiceRegistry {
 
           push('knowledge_query_endpoint', queryEndpoint);
           push('knowledge_get_endpoint', getEndpoint);
+          push('knowledge_write_endpoint', writeEndpoint);
           push('knowledge_core_credential_ref', credentialRef);
           push('knowledge_claims_mode', claimsMode);
           push('knowledge_subject_mode', subjectMode);
@@ -817,13 +954,14 @@ export class ServiceRegistry {
           },
         }, client);
       }
-      await finish(client, options.dryRun);
+      if (owns) await finish(client, options.dryRun);
       return mapRow(result.rows[0]);
     } catch (e) {
-      await client.query('ROLLBACK');
+      // The caller's transaction is the caller's to unwind (see register).
+      if (owns) await client.query('ROLLBACK');
       throw e;
     } finally {
-      client.release();
+      if (owns) client.release();
     }
   }
 
@@ -839,9 +977,8 @@ export class ServiceRegistry {
     actorPrincipalId: string | null,
     options: MutationOptions = {},
   ): Promise<{ service: ServiceRecord; descriptorVersion: DescriptorVersion }> {
-    const client = await pool.connect();
+    const { client, owns } = await openMutation(options);
     try {
-      await client.query('BEGIN');
       const head = await lockService(client, id);
       requireRevision(revision, head);
       refuseRetired(head);
@@ -865,6 +1002,24 @@ export class ServiceRegistry {
           'KNOWLEDGE_DESCRIPTOR_BLOCK_REQUIRED',
           'this Service has a knowledge endpoint configured on the owner plane, so its descriptor must keep a knowledgeSource block with a NON-EMPTY compartment list — clear the endpoint on the owner plane first (design 94747de9 §4.2)',
           'descriptor.knowledgeSource',
+        );
+      }
+      // RB-11 Governor v0, the same rule for the WRITE half: a publish may
+      // not drop the `write` block from under a configured write endpoint.
+      if (head.knowledge_write_endpoint && !isKnowledgeWriteCapable(
+        {
+          slug: head.slug,
+          knowledgeQueryEndpoint: head.knowledge_query_endpoint,
+          knowledgeWriteEndpoint: head.knowledge_write_endpoint,
+          knowledgeClaimsMode: head.knowledge_claims_mode ?? 'asserted',
+        },
+        descriptor.knowledgeSource ?? null,
+      )) {
+        throw err(
+          422,
+          'KNOWLEDGE_WRITE_BLOCK_REQUIRED',
+          'this Service has a knowledge write endpoint configured on the owner plane, so its descriptor must keep the knowledgeSource write block — clear knowledgeWriteEndpoint on the owner plane first (RB-11 Governor v0, D-9)',
+          'descriptor.knowledgeSource.write',
         );
       }
 
@@ -910,17 +1065,18 @@ export class ServiceRegistry {
          WHERE id = $1 RETURNING *`,
         [id, nextVersion, actorPrincipalId],
       );
-      await finish(client, options.dryRun);
+      if (owns) await finish(client, options.dryRun);
       const row = inserted.rows[0];
       return {
         service: mapRow(updated.rows[0]),
         descriptorVersion: { ...mapVersionMeta(row), descriptor },
       };
     } catch (e) {
-      await client.query('ROLLBACK');
+      // The caller's transaction is the caller's to unwind (see register).
+      if (owns) await client.query('ROLLBACK');
       throw e;
     } finally {
-      client.release();
+      if (owns) client.release();
     }
   }
 
@@ -949,6 +1105,7 @@ export class ServiceRegistry {
     if (!Number.isInteger(version) || version < 1) {
       throw err(400, 'INVALID_QUERY_VALUE', 'version must be a positive integer', 'version');
     }
+    refuseVersionPastInteger(version);
     const service = await this.getByIdOrSlug(id);
     const result = await pool.query(
       `SELECT version, descriptor, content_hash, created_by_principal_id, created_at, retired_at
@@ -1027,6 +1184,7 @@ export class ServiceRegistry {
     if (!Number.isInteger(version) || version < 1) {
       throw err(400, 'INVALID_QUERY_VALUE', 'version must be a positive integer', 'version');
     }
+    refuseVersionPastInteger(version);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');

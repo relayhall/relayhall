@@ -79,10 +79,12 @@ export interface WebhookSubscriptionRow {
  *
  * The `*.acl_changed` family spans all six feed object types because
  * GrantService derives the name from the granted resource type, so
- * `project.acl_changed` is producible even though project LIFECYCLE events
- * are not — Project-object emission is a C1-declared, still-unimplemented
- * seam, and registering project.created/updated/deleted here would promise
- * events the tree structurally cannot emit.
+ * `project.acl_changed` is producible even though most project LIFECYCLE
+ * events are not — Project-object emission is a C1-declared, still-unimplemented
+ * seam, and registering project.created/deleted here would promise events the
+ * tree structurally cannot emit. `project.updated` IS emitted, by the default
+ * Verifier write (card 41e24358, routes/defaultVerifierRoute.ts), so it is
+ * registered.
  *
  * Six pre-C2 names are NOT here: report.archived, report.unarchived and the
  * five skill.version.* / skill.pin.changed names. They were emitter-only and
@@ -99,9 +101,9 @@ export interface WebhookSubscriptionRow {
  */
 export const WEBHOOK_EVENTS = [
   'task.created', 'task.updated', 'task.deleted', 'task.archived',
-  'task.ready', 'task.stuck', 'task.acl_changed',
+  'task.ready', 'task.stuck', 'task.review_requested', 'task.acl_changed',
   'phase.created', 'phase.updated', 'phase.deleted', 'phase.acl_changed',
-  'project.acl_changed',
+  'project.updated', 'project.acl_changed',
   'report.created', 'report.updated', 'report.deleted', 'report.acl_changed',
   'skill.created', 'skill.updated', 'skill.deleted', 'skill.acl_changed',
   'personality.created', 'personality.updated', 'personality.deleted',

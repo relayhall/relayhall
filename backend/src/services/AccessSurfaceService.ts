@@ -24,7 +24,7 @@
  * The arm carries no state in any token and memoises no answer, so a
  * membership removal or a `status='disabled'` write is honoured on the VERY
  * NEXT request. The only memoisation in this seam is
- * `enumerateProtectedRouteFamilies()`, which describes the CODE (the routers
+ * `deriveProtectedRouteFamilies()`, which describes the CODE (the routers
  * are constructed at import and cannot change while the process runs) and
  * never a principal's authority.
  */
@@ -32,7 +32,7 @@ import { pool } from '../db/connection';
 import { grantService } from './GrantService';
 import { accessProfileService, renderAuthoritySeam } from './AccessProfileService';
 import {
-  enumerateProtectedRouteFamilies,
+  deriveProtectedRouteFamilies,
   familyMatchesRequest,
   familyPathMatches,
   familyPathsOverlap,
@@ -209,19 +209,34 @@ export const UNGOVERNED_ROOT_FAMILIES: ReadonlyArray<{ family: string; reason: s
       'RH-LENSES-b design 96f0bd3d s7.2 (acceptance A-L38): clearing every Account home pointer at one Group is the owner-plane act that makes GroupService.remove\'s GROUP_IS_A_HOME_GROUP refusal actionable. It writes other Accounts\' pointers in one transaction, one audited home_group.clear each, so it is root-session administration of the same class as the two directory-reference acts above -- not an operation delegated through an Access bundle. Declared ungoverned rather than surfaced: putting it on a bundle would widen who may clear another Account\'s pointer, which is a decision this composition does not make.',
   },
   {
+    family: 'PUT /groups/:id/ownership-status',
+    reason:
+      "AZ-A12 clause 2 and clause 14 (card 20f40e40; DD-12): enabling or disabling a Group principal is on §5.2 rule 4's closed list and stays a ROOT LOGIN-SESSION act with step-up; no administrator, operator or bearer path is ruled. Declared ungoverned rather than surfaced: placing it on an Access surface would make it reachable through a bundle, which is exactly the widening DD-12 leaves unruled.",
+  },
+  {
+    family: 'POST /groups/:id/stewards',
+    reason:
+      "LENSES-c design delta C.3 (card 46cfbd1d; E57, E98) and AZ-A12 clause 5: appointing a Group role is on §5.2 rule 4's closed list (Group-role appointment and removal) and is a ROOT LOGIN-SESSION act; no administrator, operator or bearer path is ruled (DD-12). Declared ungoverned rather than surfaced: an Access bundle reaching it would be an administrator path to Group-role appointment, which the amendment rules out.",
+  },
+  {
+    family: 'DELETE /groups/:id/stewards/:principalId',
+    reason:
+      "LENSES-c design delta C.3 (card 46cfbd1d; E57, E98): removing a Group role row is the same rule-4 act as appointing one and stays a ROOT LOGIN-SESSION act. The only other removal path is a Group owner removing a manager row (DELETE /groups/:id/managers/:principalId), whose ceiling is not root. Declared ungoverned for the reason the appointment is.",
+  },
+  {
     family: 'PUT /projects/:id/charter',
     reason:
       'Design 7a9317b2 §1.6: the Charter is a work-plane document whose root gate encodes an owner ruling about WHO MAY AUTHOR it ("agents propose, the owner approves"), not about who may administer a deployment. It is root-gated, so it COULD be governable, and deliberately is not.',
   },
   {
-    family: 'GET /plugins',
-    reason:
-      'Design 7a9317b2 §1.4/§5.3: the plugin registry read is root only by FALLTHROUGH — `/plugins` has no rule in scopeMap. §5.3 gives it a `principals:read`-class rule narrowed in-handler to the surfaces the caller reaches. That change lands in SETGOV candidate B with the /access-bundles router; until then the family stays ungoverned rather than being declared on a surface it does not yet serve.',
-  },
-  {
     family: 'GET /plugins/:name',
     reason:
-      'Design 7a9317b2 §1.4/§5.3: the per-plugin registry read, root by the same fallthrough as `GET /plugins`, and narrowed by the same candidate-B change.',
+      'P02 plugin host v1: single-plugin detail remains root-only legacy administration. Account-scoped discovery GET /plugins is separately governed by services:read and narrowed to installed Account grants; that permission does not widen this detail endpoint.',
+  },
+  {
+    family: 'POST /grants/bulk-revoke',
+    reason:
+      'Owner ruling E413: the bulk revoke of grants that change no access is a ROOT LOGIN-SESSION act with a step-up per batch, "root scope like DELETE /grants/:id". Declared ungoverned rather than surfaced: placing it on an Access surface would make a batch revoke reachable through a bundle, a widening no ruling makes.',
   },
 ];
 
@@ -703,7 +718,13 @@ export class AccessSurfaceService {
   ): string[] {
     const findings: string[] = [];
     const live = surfaces.filter((surface) => surface.retiredAt === null);
-    const registered = enumerateProtectedRouteFamilies();
+    // A nested router whose mount prefix the route census cannot prove is a
+    // finding in its own right (card 2c000125): its routes are absent from
+    // `registered`, so every clause below would otherwise be measuring a tree
+    // smaller than the one the app serves.
+    const derivation = deriveProtectedRouteFamilies();
+    findings.push(...derivation.underivable);
+    const registered = derivation.families;
     const registeredByKey = new Map(registered.map((family) => [family.key, family]));
 
     // Every declared family must name a route the protected registrations

@@ -99,14 +99,17 @@ describe('AZ.PROJ-a — the query seam that feeds the point mapping', () => {
     // SQL indentation is not the contract; the columns and their order are.
     const flatten = (text: string) => text.replace(/\s+/g, ' ').trim();
     const projection = flatten(pointQuery.slice(
-      pointQuery.indexOf('SELECT t.id'), pointQuery.indexOf('FROM tasks t')));
+      pointQuery.indexOf('SELECT '), pointQuery.indexOf('FROM tasks t')));
     expect(projection).toBe(
-      'SELECT t.id, t.owner_principal_id, t.creator_principal_id, t.visibility,'
+      'SELECT ${assignedClaimEligibleSql("t")} AS assigned_claim_eligible, ${assignedClaimPrincipalSql("t")} AS assigned_claim_principal_id, t.id, t.owner_principal_id, t.creator_principal_id, t.visibility,'
+      + ' t.account_owner_principal_id, p.owner_principal_id AS project_owner_principal_id,'
       + ' t.project_id, t.restricted_access,'
       + ' ph.restricted_access AS phase_restricted_access,'
       + ' p.visibility AS project_visibility, p.status AS project_status,'
       + " to_jsonb(t)->>'shepherd_principal_id' AS shepherd_principal_id,"
-      + " to_jsonb(t)->>'verifier_principal_id' AS verifier_principal_id",
+      + " to_jsonb(t)->>'verifier_principal_id' AS verifier_principal_id,"
+      // Owner ruling E462 S4b (migration 170): `none` keeps the legacy arm off the Task.
+      + " to_jsonb(t)->>'verification_none' AS verification_none",
     );
     const from = flatten(pointQuery.slice(
       pointQuery.indexOf('FROM tasks t'), pointQuery.indexOf('WHERE t.id')));

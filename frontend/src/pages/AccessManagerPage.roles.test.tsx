@@ -14,7 +14,10 @@
  *    route refuses by name, so those refusals are unreachable rather than
  *    merely explained;
  *  - the act goes to the route, as a POST carrying only the role;
- *  - a server refusal is surfaced VERBATIM rather than reinterpreted.
+ *  - a server refusal is surfaced VERBATIM rather than reinterpreted;
+ *  - (card a2d1e317) every role is explained from the board's role catalogue,
+ *    under the selector, in the role list and in the confirmation the act now
+ *    asks for, and the explanations equal the catalogue.
  */
 import '@testing-library/jest-dom/vitest';
 import axe from 'axe-core';
@@ -22,6 +25,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, test, vi } from 'vitest';
+import catalogueFixture from '../components/access/roleCatalogue.generated.json';
 
 const useMyPrincipal = vi.fn();
 const usePrincipals = vi.fn();
@@ -35,7 +39,10 @@ const responses = { role: null as null | { ok: boolean; status: number; body: un
 vi.mock('../utils/auth', () => ({
   authenticatedFetch: vi.fn(async (url: string, options?: RequestInit) => {
     fetchCalls.push({ url, options });
-    if (url.includes('/role')) {
+    if (url.endsWith('/principals/roles')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, roles: catalogueFixture.roles }) };
+    }
+    if (url.endsWith('/role')) {
       const scripted = responses.role ?? {
         ok: true, status: 200,
         body: {
@@ -75,6 +82,18 @@ function renderAs(me: unknown, scopes: string[] | null) {
 const rolesSection = () => screen.getByRole('heading', { name: /^Roles$/ }).closest('section')!;
 
 afterEach(() => { cleanup(); vi.clearAllMocks(); fetchCalls.length = 0; responses.role = null; });
+
+const CATALOGUE = catalogueFixture.roles;
+const entryOf = (role: string) => CATALOGUE.find((entry) => entry.role === role)!;
+
+/** Choose an Account and a role, press Change role, and return the dialog. */
+async function openConfirmation(role: string) {
+  const section = rolesSection();
+  await userEvent.selectOptions(within(section).getByLabelText('Account'), 'p-tessa');
+  await userEvent.selectOptions(within(section).getByLabelText(/New role/), role);
+  await userEvent.click(within(section).getByRole('button', { name: 'Change role' }));
+  return screen.findByRole('dialog', { name: 'Change role?' });
+}
 
 describe('who is offered the control', () => {
   test('an admin session', async () => {
@@ -156,10 +175,8 @@ describe('what the control does', () => {
   test('POSTs the role to the act and reports what the server said', async () => {
     renderAs(ME_ADMIN, ['root']);
     await screen.findByRole('heading', { name: /^Roles$/ });
-    const section = rolesSection();
-    await userEvent.selectOptions(within(section).getByLabelText('Account'), 'p-tessa');
-    await userEvent.selectOptions(within(section).getByLabelText(/New role/), 'editor');
-    await userEvent.click(within(section).getByRole('button', { name: 'Change role' }));
+    const dialog = await openConfirmation('editor');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Change role' }));
 
     await waitFor(() => expect(fetchCalls.some((call) => call.url.endsWith('/principals/p-tessa/role'))).toBe(true));
     const call = fetchCalls.find((entry) => entry.url.endsWith('/principals/p-tessa/role'))!;
@@ -179,10 +196,8 @@ describe('what the control does', () => {
     };
     renderAs(ME_ADMIN, ['root']);
     await screen.findByRole('heading', { name: /^Roles$/ });
-    const section = rolesSection();
-    await userEvent.selectOptions(within(section).getByLabelText('Account'), 'p-tessa');
-    await userEvent.selectOptions(within(section).getByLabelText(/New role/), 'editor');
-    await userEvent.click(within(section).getByRole('button', { name: 'Change role' }));
+    const dialog = await openConfirmation('editor');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Change role' }));
     expect(await screen.findByText(/above your own authority/)).toBeInTheDocument();
   });
 
@@ -193,6 +208,67 @@ describe('what the control does', () => {
     expect(within(section).getByRole('button', { name: 'Change role' })).toBeDisabled();
     await userEvent.selectOptions(within(section).getByLabelText('Account'), 'p-tessa');
     expect(within(section).getByRole('button', { name: 'Change role' })).toBeDisabled();
-    expect(fetchCalls.some((call) => call.url.includes('/role'))).toBe(false);
+    expect(fetchCalls.some((call) => call.url.endsWith('/role'))).toBe(false);
+  });
+
+  test('pressing Change role asks first, and Cancel sends nothing', async () => {
+    renderAs(ME_ADMIN, ['root']);
+    await screen.findByRole('heading', { name: /^Roles$/ });
+    const dialog = await openConfirmation('editor');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(fetchCalls.some((call) => call.url.endsWith('/role'))).toBe(false);
+  });
+});
+
+describe('every role is explained from the catalogue (card a2d1e317)', () => {
+  test('the catalogue is read from the board, once', async () => {
+    renderAs(ME_ADMIN, ['root']);
+    await screen.findByRole('heading', { name: /^Roles$/ });
+    await waitFor(() => expect(fetchCalls.filter((call) => call.url.endsWith('/principals/roles'))).toHaveLength(1));
+  });
+
+  test('the role list in the Roles section equals the catalogue', async () => {
+    renderAs(ME_ADMIN, ['root']);
+    await screen.findByRole('heading', { name: /^Roles$/ });
+    const list = await within(rolesSection()).findByRole('list', { name: 'Role catalogue' });
+    const items = within(list).getAllByRole('listitem');
+    expect(items.map((item) => item.querySelector('.role-cat-name')?.textContent)).toEqual(CATALOGUE.map((entry) => entry.role));
+    items.forEach((item, index) => {
+      const entry = CATALOGUE[index];
+      expect(item).toHaveTextContent(entry.purpose);
+      expect(item).toHaveTextContent(entry.mayReach);
+      expect(item).toHaveTextContent(entry.neverReaches);
+      expect(item).toHaveTextContent(entry.meantForText);
+    });
+  });
+
+  test('every role the selector offers has its entry under the selector', async () => {
+    renderAs(ME_ADMIN, ['root']);
+    await screen.findByRole('heading', { name: /^Roles$/ });
+    await within(rolesSection()).findByRole('list', { name: 'Role catalogue' });
+    const section = rolesSection();
+    await userEvent.selectOptions(within(section).getByLabelText('Account'), 'p-tessa');
+    const select = within(section).getByLabelText(/New role/) as HTMLSelectElement;
+    const offered = Array.from(select.querySelectorAll('option')).map((option) => option.value).filter(Boolean);
+    expect(offered.length).toBe(CATALOGUE.length);
+    for (const role of offered) {
+      await userEvent.selectOptions(select, role);
+      const explanation = section.querySelector('#axm-role-description .role-expl')!;
+      expect(explanation.getAttribute('data-role')).toBe(role);
+      expect(explanation.querySelector('.role-expl-purpose')?.textContent).toBe(entryOf(role).purpose);
+    }
+  });
+
+  test('the confirmation names the Account and both roles, and shows the same entry as the list', async () => {
+    renderAs(ME_ADMIN, ['root']);
+    await screen.findByRole('heading', { name: /^Roles$/ });
+    await within(rolesSection()).findByRole('list', { name: 'Role catalogue' });
+    const dialog = await openConfirmation('editor');
+    expect(dialog).toHaveTextContent(/carries the role viewer now/);
+    const inDialog = dialog.querySelector('.role-expl[data-role="editor"]')!;
+    const inList = rolesSection().querySelector('.role-cat-list .role-expl[data-role="editor"]')!;
+    expect(inDialog.textContent).toBe(inList.textContent);
+    expect(inDialog).toHaveTextContent(entryOf('editor').neverReaches);
   });
 });

@@ -1,6 +1,6 @@
 /* RH-UI.17i LOD — rendered Task card width in CSS pixels:
- * full >=160: full Task; compact >=96: compact Task;
- * aggregate >=40: simplified Task; silhouette <40: status shape.
+ * full >=192: full Task; compact >=136: compact Task;
+ * aggregate >=96: simplified Task; silhouette <96: status shape.
  * Every Project/Phase uses the same inside-top caption and done/active/next/
  * blocked fields. Captions cross-fade at a fixed origin; layout never reads
  * this band. Geometry stays size-truthful. Reduced motion removes transitions.
@@ -75,6 +75,108 @@
   white-space: nowrap;
 }
 
+/* E464: on a phone the whole control area is ONE line that scrolls sideways
+   inside itself (the Action Center tab row pattern, E461). The rules above are
+   the desktop toolbar and stay exactly as they are: at 769 px and wider
+   nothing here applies, so the wrapped desktop toolbar is pixel-identical.
+   Every control keeps its natural width (flex 0 0 auto), keeps its place in
+   the tab order, and scrolls itself into view when it takes focus (the
+   browser scrolls the nearest scroller). The page never scrolls sideways: the
+   row is capped at its column and clips its own overflow. The two fades
+   follow the segmented control recipe (the lower pair is an edge shadow shown
+   only where content is hidden, the upper pair covers it at the ends; the
+   fade layers are clipped to the padding box so the bottom border is never lit
+   and the surface colour stays under the border).
+
+   E466: the count is the START of the row, so it is seen without scrolling
+   (a visual order only: it is not a control, so the tab order is untouched),
+   and Re-pack layout, Show as list and Map and list are icon-only squares: their
+   words stay in the markup as the accessible name, hidden visually the way
+   .sr-only hides them (never display:none, which would drop the name), and
+   their title is the tooltip. */
+@media (max-width: 768px) {
+  .map-toolbar {
+    flex-wrap: nowrap;
+    gap: var(--space-2);
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    scroll-padding-inline: var(--space-3);
+    background-image:
+      linear-gradient(to right, var(--bg-surface) 50%, transparent),
+      linear-gradient(to left, var(--bg-surface) 50%, transparent),
+      linear-gradient(to right, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent),
+      linear-gradient(to left, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent),
+      none;
+    background-position: left center, right center, left center, right center, 0 0;
+    background-repeat: no-repeat;
+    background-size: 24px 100%, 24px 100%, 12px 100%, 12px 100%, auto;
+    background-attachment: local, local, scroll, scroll, scroll;
+    background-clip: padding-box, padding-box, padding-box, padding-box, border-box;
+  }
+
+  .map-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .map-toolbar > * {
+    flex: 0 0 auto;
+  }
+
+  /* The touch floor (44 px) for every control of the row, so the zoom group,
+     the buttons and the segmented controls all stand at the same height and
+     share one top edge. */
+  .map-toolbar .btn {
+    min-height: 44px;
+    max-width: none;
+    white-space: nowrap;
+  }
+
+  .map-toolbar .icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .map-toolbar .segmented-control {
+    max-width: none;
+  }
+
+  /* The global touch floor of the segmented control stops at 767 px; the row
+     keeps it up to 768 px. */
+  .map-toolbar .segmented-option {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* The class leads the selector (the rendered-class gate reads its owner from
+     the first compound) and is joined to .btn so it outweighs .btn-compact. */
+  .map-toolbar-iconbtn.btn {
+    min-width: 44px;
+    padding: 0;
+  }
+
+  .map-toolbar-iconbtn.btn .btn-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .map-toolbar .map-scope-count {
+    order: -1;
+    margin-left: 0;
+  }
+}
+
 /* ============================================================
    Canvas and plane — the pan/zoom surface
    ============================================================ */
@@ -109,7 +211,7 @@
   left: 0;
   top: 0;
   transform-origin: 0 0;
-  will-change: transform;
+  /* Do not promote the entire estate to an oversized cached bitmap. */
 }
 
 /* ============================================================
@@ -430,6 +532,13 @@
 .map-tree button:hover {
   background: var(--bg-surface-hover);
   border-color: var(--border-subtle);
+}
+
+/* Hover linking (card cae8dfe1): the row whose tile the reader points at or
+   focuses on the map reads as hovered, edged in the map's own hover ink. */
+.map-tree [data-map-linked] button {
+  background: var(--bg-surface-hover);
+  border-color: var(--map-hover-ink);
 }
 
 .map-tree button:focus-visible {
@@ -831,6 +940,92 @@
   color: var(--text-accent);
 }
 
+/* ======================================================================
+   REPORTS DISPLAY MODE — card 742fae98 (epic 5854f0d6).
+
+   Collapsed: ONE "Reports · N" node per task, in the Report pill's cell
+   (PLANE_METRICS.pillReserveW x pillReserveH = 96 x 48), so it inherits the
+   cell bound `.map-report-pill` declares. Same dashed-accent family as the
+   Report pill; above about ten Reports it takes the warning tint. Below the
+   close band it shows N alone, enlarged against the zoom by an inline scale
+   the component caps inside the cell.
+
+   Expanded: the report area, the Report colour family laid behind a task's
+   Report cells. It is ink, not a control: the Report nodes inside it are.
+   ====================================================================== */
+
+.map-toolbar-reports {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.map-toolbar-label {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.map-report-pill .map-report-group {
+  inline-size: 88px;
+  padding-inline: var(--space-1);
+  border: 1px dashed var(--accent-color);
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  color: var(--text-accent);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The warning tint above about ten Reports. Declared standalone so the class
+   has an owner; the scoped rule below outranks the kit Button's own colours. */
+.map-report-group--many {
+  border-style: solid;
+}
+
+.map-report-pill .map-report-group--many {
+  border-style: solid;
+  border-color: var(--status-warning);
+  background: var(--status-warning-soft);
+  color: var(--text-primary);
+}
+
+.map-report-group-count {
+  display: inline-block;
+  font-weight: var(--font-semibold);
+  transform-origin: center;
+}
+
+.map-report-area {
+  position: absolute;
+  /* Under the Report nodes (3) it frames, beside the lane header layer. */
+  z-index: 2;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--accent-color);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+}
+
+.map-report-area-count {
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  color: var(--text-accent);
+  transform-origin: center;
+}
+
+.map-report-preview-list {
+  margin: 0;
+  padding-inline-start: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
 /* List mode REPLACES the canvas (§6). The canvas keeps its DOM node — §8
    requires it to stay mounted, and unmounting is how the abandoned attempt
    lost its listeners — but it leaves the visual flow entirely, so it cannot
@@ -847,12 +1042,86 @@
   flex: 1 1 auto;
 }
 
+/* ============================================================
+   The Map and list split (card cae8dfe1, RH-UI.17d)
+   The map stays the map and the list sits below it, divided by a separator
+   the reader drags or keys. The list's height arrives on the section as
+   --map-split-list-size (useMapSplit clamps it so neither pane reaches
+   nothing); before anything is chosen it is the 40% drawer it used to be.
+   The canvas takes the rest, and a resized canvas changes only the camera's
+   viewport, never the plane's layout (owner ruling E386).
+   ============================================================ */
+.map-view--split {
+  /* COMPONENT token (design-system §4.1, as --map-lane-progress): the
+     default is the old drawer's share; the section's inline style carries
+     the reader's chosen height, and a drag writes it between commits. */
+  --map-split-list-size: 40%;
+}
+
+.map-view--split .map-tree {
+  max-block-size: none;
+  min-block-size: 0;
+  flex: 0 0 var(--map-split-list-size);
+}
+
+.map-split-separator {
+  position: relative;
+  flex: none;
+  block-size: var(--space-3);
+  background: var(--bg-surface);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.map-split-separator::after {
+  content: "";
+  position: absolute;
+  inset-inline: var(--space-0);
+  inset-block-start: 50%;
+  border-block-start: 1px solid var(--border-default);
+}
+
+.map-split-separator:hover::after,
+.map-split-separator:focus-visible::after {
+  border-block-start: 2px solid var(--accent-color);
+}
+
+.map-split-separator:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Hover linking, list to map (card cae8dfe1, RH-UI.17e): ONE ring over the
+   linked tile's box, placed by MapView in the DOM. It is the tiles' own
+   hover ink (the rule below names it beside .map-tile:hover), above the
+   tiles and outside their opacity, so a tile the chain selection dims is
+   still found while the selection stays exactly as it was. */
+.map-link-ring {
+  position: absolute;
+  display: none;
+  z-index: 7;
+  box-sizing: border-box;
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+
+.map-link-ring[data-active] {
+  display: block;
+}
+
 /* A relationship the router could not clear. A2 forbids dropping it silently,
    so it is still drawn - but marked, so a reader is not told a clean
    connection exists where one could not be found. */
 .map-edge--unrouted {
   stroke-dasharray: 2 6;
   opacity: 0.45;
+}
+
+/* Temporary connections differ from completed routes that remain clipped.
+   A CSS selector is needed: presentation attributes lose to the rule above. */
+.map-edge[data-route-state="pending"],
+.map-edge[data-route-state="failed"] {
+  stroke-dasharray: 3 5;
 }
 
 /* The aggregate's own control: it carries the node's name and toggles the §4
@@ -1198,6 +1467,19 @@
   font-size: var(--text-sm);
 }
 
+/* Keep the same section-title token throughout Map detail transitions.
+   The plane provides continuous zoom; typography stays on the product scale. */
+.map-plane[data-plane-lod] .task-card-title-compact {
+  font-size: var(--text-xl);
+  line-height: 1.25;
+}
+
+/* Zoom already supplies continuous opacity values. A second CSS fade lags
+   behind the gesture and leaves newly exposed work looking half-painted. */
+.map-plane[data-plane-lod] :is(.map-tile, .map-container, .map-band-chip, .map-lane-header) {
+  transition-property: left, top;
+}
+
 .map-plane[data-plane-lod] .map-aggregate-select {
   grid-column: 1 / -1;
 }
@@ -1229,10 +1511,10 @@
   .map-aggregate-lane { grid-column: 2; }
   .map-aggregate-counters { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; }
 }
-[data-plane-lod="silhouette"] :is(.map-container-card, .map-band-chip, .map-lane-header) {
-  visibility: hidden;
-  pointer-events: none;
-}
+/* Task silhouettes do not suppress the dominant Project/Phase caption.
+   MapView already selects one interactive tier and bounds its card to the
+   rendered region. Hiding that tier at overview zoom leaves only anonymous
+   geometry and removes the only usable control in the region. */
 
 /* Organic's region is the branch network and its phase clusters. The project
    wrapper owns caption placement and hit testing, while the underlay owns the
@@ -1295,4 +1577,119 @@
 }
 .map-plane[data-plane-lod] :is(.map-phase-ground, .map-organic-region .map-hull, .map-organic-region--core ellipse) {
   stroke-width: calc(1px * var(--map-plane-inverse-scale));
+}
+
+/* Compact overview labels live in free screen-space gutters. Leader lines
+   preserve the connection to unchanged world-space phase/project regions. */
+.map-overview-caption {
+  position: absolute;
+  z-index: 5;
+  inline-size: 184px;
+  block-size: 56px;
+  box-sizing: border-box;
+  transform: scale(var(--map-plane-inverse-scale, 1));
+  transform-origin: top left;
+  padding: var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+.map-overview-context {
+  display: block;
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.map-overview-caption .map-aggregate-select { display: flex; }
+.map-overview-caption .map-aggregate-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.map-overview-leader {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: visible;
+  pointer-events: none;
+  stroke: var(--border-strong);
+  stroke-width: 1px;
+}
+
+.map-container--annotated { overflow: visible; }
+
+.map-overview-caption .btn-text { min-inline-size: 0; }
+
+/* Archive report controls travel with their task; the camera never participates. */
+.map-archive-motion {
+  --map-archive-duration: 1000ms;
+}
+.map-plane--branched .map-archive-motion {
+  transition: transform var(--map-archive-duration, 1000ms) linear, left var(--map-archive-duration, 1000ms) linear, top var(--map-archive-duration, 1000ms) linear, opacity var(--transition-base) var(--ease-out);
+}
+/* This follows the branched rule so reduced motion cannot be overridden. */
+@media (prefers-reduced-motion: reduce) {
+  .map-plane--branched .map-tile,
+  .map-plane--branched .map-archive-motion { transition: none; }
+}
+
+/* Owner Map preview: retain usable task silhouettes above region backgrounds. */
+.map-tile--shape { pointer-events: auto; cursor: pointer; z-index: 6; }
+.map-tile--shape:focus-visible { outline: 2px solid var(--status-info); outline-offset: 3px; }
+.map-container { pointer-events: none; background: transparent; }
+.map-container .map-container-card, .map-container .map-overview-caption { pointer-events: auto; }
+.map-edge[data-edge-from] { vector-effect: non-scaling-stroke; pointer-events: stroke; }
+.map-edge--hovered { stroke-width: 4; filter: drop-shadow(0 0 3px var(--bg-surface)); }
+.map-task-preview {
+  position: absolute; z-index: 30; pointer-events: none; width: 260px;
+  padding: var(--space-3); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text-primary);
+  display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-sm);
+  box-shadow: var(--map-preview-shadow);
+}
+
+/* Rectangular headers occupy their reserved strip as one glass panel. */
+.map-plane--rectangular :is(.map-band-chip, .map-lane-header, .map-container-card) {
+  background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  align-content: start;
+  box-shadow: var(--map-header-shadow);
+}
+.map-plane--rectangular :is(.map-band-chip, .map-lane-header, .map-container-card) .map-aggregate-select {
+  background: transparent;
+  box-shadow: none;
+}
+
+.map-connection-ghost { animation: map-connection-fade 220ms ease-out both; }
+.map-connection-reveal { stroke-dasharray: 1; animation: map-connection-draw 360ms ease-out both; }
+@keyframes map-connection-fade { from { opacity: .3; } to { opacity: 0; } }
+@keyframes map-connection-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .map-connection-ghost { display: none; }
+  .map-connection-reveal { animation: none; stroke-dasharray: none; }
+}
+
+/* Owner-ratified routes: emphasis changes ink only, never path geometry. */
+.map-edge[data-edge-from].map-edge--hovered,
+.map-edge[data-edge-from].map-edge--lit {
+  stroke: var(--map-hover-ink);
+  stroke-width: 3;
+  filter: drop-shadow(0 0 1px var(--map-hover-outline)) drop-shadow(0 0 4px var(--map-hover-glow));
+}
+.map-tile--lit {
+  outline: calc(1px * var(--map-plane-inverse-scale, 1)) solid var(--map-hover-ink);
+  outline-offset: calc(2px * var(--map-plane-inverse-scale, 1));
+}
+.map-tile:hover,
+.map-tile:focus-visible,
+.map-link-ring[data-active] {
+  outline: calc(2px * var(--map-plane-inverse-scale, 1)) solid var(--map-hover-ink);
+  outline-offset: calc(3px * var(--map-plane-inverse-scale, 1));
+  box-shadow: 0 0 12px var(--map-hover-glow);
 }

@@ -21,6 +21,12 @@ Entries are append-only. Oversized text (more than 8192 characters) is filed as 
 
 `POST /tasks/{id}/finish` is the handback boundary. It appends the Handover, creates or links a Report, and moves the Task from In Progress to Review in one database transaction. The call fails without committing any part if the Task or a Subtask is not ready.
 
+Only the claimant or the Shepherd may finish (`403 TASK_ROLE_REQUIRED`); the assigned Verifier never may, whatever other role it holds (`403 CLAIMANT_VERIFIER_CONFLICT`).
+
+**Dry run.** `dryRun: true` is the same finish up to its first write. It takes the same Task lock and makes every refusal the real call makes, in the same order: the Task role and the Verifier separation, the In Progress state (`409 TASK_NOT_FINISHABLE`), a saved Task Report's provenance and current authority, the Subtasks (`409 SUBTASK_NOT_HANDED_BACK`), whether a named Report can be linked (`400 REPORT_NOT_LINKABLE`), whether an oversized Handover can become the Report (when it would be quarantined instead, the real call and the dry run both answer `500 REPORT_LINK_MISSING`), and the native-generation gate. It then rolls back and answers `{ "valid": true, "dryRun": true, "targetStatus": "review" }`, having written no Report, stream entry, Reference, feed event or status. One step is not rehearsed: the recomputation of the Task's role Grants that linking a Report runs, which decides nothing about who may finish.
+
+Finish takes no `Idempotency-Key`, so a dry run reserves nothing and may be repeated. After a successful finish, an exact retry is refused `409 TASK_NOT_FINISHABLE` with the Task already in Review, and so is a dry run.
+
 CLI example:
 
 ```bash

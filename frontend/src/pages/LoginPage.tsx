@@ -3,7 +3,7 @@ import { auth } from '../utils/auth';
 import { StatusOrb } from '../components/StatusOrb';
 import { Wordmark } from '../components/Wordmark';
 import { useRelayHallConfig } from '../contexts/RelayHallConfigContext';
-import { IS_PUBLIC_BUILD, LICENSE_URL, SOURCE_LABEL, SOURCE_URL } from '../utils/build';
+import { LICENSE_URL, SOURCE_LABEL, SOURCE_URL } from '../utils/build';
 import { RELAYHALL_VERSION } from '../utils/releaseInfo';
 import './LoginPage.css';
 import { AlertTriangle } from 'lucide-react';
@@ -42,6 +42,35 @@ export function ssoRefusalFromSearch(search: string): { code: string; message: s
   if (!code || !/^[A-Z0-9_]{1,64}$/.test(code)) return null;
   return { code, message: SSO_REFUSAL_COPY[code] ?? 'The sign-in could not be completed.' };
 }
+
+/**
+ * Whether the BROWSER says this page is not a secure context. An Account
+ * session rides a `Secure` cookie, which a browser keeps only from a secure
+ * context (HTTPS, or `localhost`); over plain HTTP at a LAN address or a host
+ * name the sign-in answers 200, the cookie is dropped, and the person lands
+ * back on an empty form with no message. The browser's own flag is the input,
+ * not a guess from the host name: it already knows that `localhost` counts.
+ * Strictly `false`: a browser that does not report the flag is not warned.
+ */
+export function browserReportsInsecureOrigin(): boolean {
+  return typeof window !== 'undefined' && window.isSecureContext === false;
+}
+
+const INSECURE_ORIGIN_LOGIN = 'Account sign-in needs HTTPS or localhost. This address is neither, so the '
+  + 'browser will not keep the sign-in: it seems to work and you land back here. Open the board over HTTPS, '
+  + 'or at localhost on its own machine. The deployment password (Account left blank) still works here.';
+
+const INSECURE_ORIGIN_FIRST_RUN = 'Account sign-in needs HTTPS or localhost. This address is neither: the '
+  + 'administrator would be created, but you could not sign in as it from here, because the browser will not '
+  + 'keep the sign-in. Open the board over HTTPS, or at localhost on its own machine, before you create it.';
+
+/** Said before anything is sent, so nobody creates an Account they cannot use from here. */
+const InsecureOriginNotice: React.FC<{ firstRun: boolean }> = ({ firstRun }) => (
+  <div className="login-error" role="alert" data-insecure-origin="">
+    <span className="error-icon"><AlertTriangle size={16} aria-hidden="true" /></span>
+    <span>{firstRun ? INSECURE_ORIGIN_FIRST_RUN : INSECURE_ORIGIN_LOGIN}</span>
+  </div>
+);
 
 /** The client-side half of the password policy. The server is authoritative
  * (`checkPasswordPolicy`); this only spares a round trip and says the rule
@@ -252,6 +281,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [firstRunDismissed, setFirstRunDismissed] = useState(false);
   const firstRunMode = config.auth.firstRun && !firstRunDismissed;
 
+  // Read once: whether this origin can keep an Account sign-in at all.
+  const [insecureOrigin] = useState(browserReportsInsecureOrigin);
+
   const handleSso = async () => {
     setError('');
     setSsoLoading(true);
@@ -309,6 +341,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
             <span className="error-icon"><AlertTriangle size={16} aria-hidden="true" /></span>
             <span>Sign-in refused: {ssoRefusal.message} (reason {ssoRefusal.code})</span>
           </div>
+        )}
+
+        {insecureOrigin && (firstRunMode || sessionsAvailable) && (
+          <InsecureOriginNotice firstRun={firstRunMode} />
         )}
 
         {firstRunMode ? (
@@ -413,19 +449,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
             <span>v{RELAYHALL_VERSION}</span>
           </p>
           <p className="login-attribution-links">
-            {IS_PUBLIC_BUILD ? (
-              <>
-                <a href={LICENSE_URL} target="_blank" rel="noreferrer noopener">MIT licensed</a>
-                <span className="login-attribution-separator" aria-hidden="true">·</span>
-                <a href={SOURCE_URL} target="_blank" rel="noreferrer noopener">{SOURCE_LABEL}</a>
-              </>
-            ) : (
-              <>
-                <span>MIT licensed</span>
-                <span className="login-attribution-separator" aria-hidden="true">·</span>
-                <span>{SOURCE_LABEL}</span>
-              </>
-            )}
+            <a href={LICENSE_URL} target="_blank" rel="noreferrer noopener">MIT licensed</a>
+            <span className="login-attribution-separator" aria-hidden="true">·</span>
+            <a href={SOURCE_URL} target="_blank" rel="noreferrer noopener">{SOURCE_LABEL}</a>
           </p>
         </div>
       </div>

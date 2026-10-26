@@ -30,6 +30,7 @@ jest.mock('../db/connection', () => ({
 }));
 
 import crypto from 'crypto';
+import { createLifecyclePayload, validateLifecycleConfig } from '../services/KnowledgeLifecycleExporter';
 import https from 'https';
 import os from 'os';
 import { pool } from '../db/connection';
@@ -56,6 +57,8 @@ import {
   KNOWLEDGE_FANOUT_CONCURRENCY,
   knowledgeAdmissionBudgetMs,
   knowledgeMaxAssertionAgeMs,
+  KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS,
+  knowledgeSourceBudgetMs,
 } from '../services/KnowledgeDeadline';
 import { ARM_EVALUATION_MAX_AGE_SECONDS } from '../services/KnowledgeArmEvaluator';
 import { KNOWLEDGE_BOARD_SOURCE_SLUG } from '../services/KnowledgeSourcePolicy';
@@ -70,6 +73,9 @@ import * as boardAdapter from '../services/KnowledgeBoardAdapter';
 import * as armEvaluator from '../services/KnowledgeArmEvaluator';
 import * as dialClient from '../services/KnowledgeDialClient';
 import ts from 'typescript';
+import express from 'express';
+import type { AddressInfo } from 'net';
+import { knowledgeQueriesRouter } from '../routes/knowledge';
 import { loadMutatedModule, readShippedSource, applyMutations } from './support/moduleMutation';
 
 jest.setTimeout(120_000);
@@ -231,7 +237,7 @@ beforeEach(() => {
 });
 
 const caller = (scopes: string[] = ['knowledge-contents:read']) => ({
-  principal: { id: ACCOUNT_ID, role: 'user' },
+  principal: { id: ACCOUNT_ID, role: 'user', kind: 'human', status: 'active', parentPrincipalId: null },
   userId: 'holder',
   credentialId: 'cred-1',
   scopes,
@@ -513,7 +519,7 @@ describe('§5.2 / item 13 — signings are counted at the ONE assertion-signer s
     expect(quiet.requests[0].headers.authorization).toBe('Bearer core-to-quiet-token');
 
     // THE MUTATION: disable channel auth for the `none` fixture. The drill
-    // must redden — that is sol R1-2's whole point, that `none` omits the
+    // must redden — that is review R1-2's whole point, that `none` omits the
     // ASSERTION and never the channel.
     quiet.requests.length = 0;
     process.env.RELAYHALL_KNOWLEDGE_SOURCE_CREDENTIALS = JSON.stringify({});
@@ -944,7 +950,7 @@ describe('§5.2 / item 2 — the staleness bound is DOCUMENTED, not drilled as p
     // §5.2 caps the TTL; §11.2 asks for "<=TTL source staleness asserted as a
     // DOCUMENTED bound", and the deferred register says replay at a relying
     // source is bounded by TTL + channel authentication and is NOT drilled as
-    // prevented (sol R1-7, the `d77d1f53` class). This assertion is that bound
+    // prevented (review R1-7, the `d77d1f53` class). This assertion is that bound
     // and claims nothing beyond it.
     expect(ASSERTION_MAX_TTL_SECONDS).toBe(60);
   });
@@ -1548,8 +1554,9 @@ describe('round-5 — one KnowledgeRequestClock owns the request', () => {
     // The forensic record was WRITTEN. The reviewer's probe of the shipped
     // predecessor found the query still pending with no audit row at all.
     expect(searchAudit).toHaveLength(1);
+    // Card 40e0e542 (rider): every entry also carries the caller's archive opt-in.
     expect(JSON.parse(String(searchAudit[0][5])))
-      .toEqual([{ sourceId: BOARD_ID, sourceSlug: KNOWLEDGE_BOARD_SOURCE_SLUG, outcome: 'timedOut' }]);
+      .toEqual([{ sourceId: BOARD_ID, sourceSlug: KNOWLEDGE_BOARD_SOURCE_SLUG, outcome: 'timedOut', archiveIncluded: false }]);
   }, 60_000);
 
   it('MUTATION: a board branch that awaits searchBoard directly hangs the whole request', async () => {
@@ -1676,6 +1683,8 @@ describe('round-5 — one KnowledgeRequestClock owns the request', () => {
       'clock.mustSettle', 'clock.mustSettle', 'clock.mustSettle',
       // admission, the board leg, the dial, the §7.7 ledger write
       'clock.race', 'clock.race', 'clock.race', 'clock.race',
+      // success and fan-out refusal share the same clock-bounded ledger helper
+      'writeSearchAudit', 'writeSearchAudit',
       // the two halves of ONE admission chain — the chain itself is the
       // promise `clock.race` above races, so neither can outlive phase 1
       'evaluateKnowledgeArms',
@@ -1894,5 +1903,246 @@ describe('round-1 P4 — the byte budget belongs to the RESPONSE, not to each so
     // The coverage record itself is not charged against the budget — §7.3
     // makes it the thing that must survive.
     expect(answer.coverage.consulted).toHaveLength(11);
+  });
+});
+
+describe('v2 native category and opaque Compartment contract', () => {
+  const compartment = 'c1111111-1111-4111-8111-111111111111';
+  const descriptor = { options: [], knowledgeSource: { classes: [{ key: 'docs', content: 'docs' }], compartments: [], protocol_version: 2, compartment_mode: 'dynamic-opaque', categories: ['relaybrain:note','relayhall:report'] } };
+  const row = (overrides = {}) => externalRow({ descriptor, ...overrides });
+  const answer = (category = 'relaybrain:note') => ({ protocol_version: 2, retrieval: {status:'complete',reasons:[]}, results: [{ref:'rb://source/doc@hash',title:'Note',snippet:'Snippet',contentKind:'docs',category,compartment:{id:compartment,label:'Private label'},score:.5}] });
+  it('sends exact hard filters over authenticated JSON POST, seals opaque ID and returns partial coverage', async () => {
+    sourceRows=[row()];
+    asserted.behaviour={requireBearer:'Bearer core-to-engine-token',body:JSON.stringify({...answer(),retrieval:{status:'partial',reasons:['store-unavailable']}})};
+    const response=await search({protocol_version:2,kinds:['docs'],categories:['relaybrain:note']});
+    expect(response.coverage.answered).toEqual([ASSERTED_ID]);
+    expect(response.coverage.partialSources).toEqual([{id:ASSERTED_ID,reasons:['store-unavailable']}]);
+    const wire=JSON.parse(asserted.requests[0].body);
+    expect(wire.filter).toEqual({version:2,kinds:['docs'],categories:['relaybrain:note']});
+    expect(wire.protocol_version).toBe(2);expect(wire.assertion).toEqual(expect.any(String));expect(wire.sources).toBeUndefined();
+    const hit=response.groups[0].results[0];
+    expect(hit.compartment).toEqual({id:compartment,label:'Private label'});
+    const handle=unsealKnowledgeHandle(hit.handle);expect(handle.v).toBe(2);expect(handle.c).toBe(compartment);expect(handle.f).toEqual(wire.filter);
+  });
+  it('preserves the legacy 1MiB dial ceiling while v2 refuses the same oversized envelope', async () => {
+    const body=JSON.stringify({results:Array.from({length:40},(_,index)=>({
+      ref:'legacy-'+index,title:'t'.repeat(4000),snippet:'s'.repeat(4000),
+      contentKind:'docs',compartment:'corpus',score:.5,
+    }))});
+    expect(Buffer.byteLength(body)).toBeGreaterThan(256*1024);
+    expect(Buffer.byteLength(body)).toBeLessThan(1024*1024);
+    asserted.behaviour={body};
+    sourceRows=[externalRow({})];
+    const legacy=await search({limitPerSource:8});
+    expect(legacy.coverage.answered).toEqual([ASSERTED_ID]);
+    expect(legacy.coverage.unavailable).toEqual([]);
+    expect(legacy.coverage.truncatedResults).toEqual([ASSERTED_ID]);
+    expect(legacy.groups[0].results).toHaveLength(8);
+    sourceRows=[row()];
+    const strict=await search({protocol_version:2,limitPerSource:8});
+    expect(strict.coverage.unavailable).toEqual([{id:ASSERTED_ID,reason:'transport'}]);
+    expect(strict.groups).toEqual([]);
+  });
+  it('rejects an over-256KiB v2 source envelope before parsing and keeps a small answer working', async () => {
+    sourceRows=[row()];
+    asserted.behaviour={body:JSON.stringify({...answer(),padding:'x'.repeat(300*1024)})};
+    const oversized=await search({protocol_version:2});
+    expect(oversized.coverage.unavailable).toEqual([{id:ASSERTED_ID,reason:'transport'}]);
+    expect(oversized.groups).toEqual([]);
+    asserted.behaviour={body:JSON.stringify(answer())};
+    expect((await search({protocol_version:2})).coverage.answered).toEqual([ASSERTED_ID]);
+  });
+  it('preserves fenced astral titles and schema-length snippets/labels without UTF-16 corruption', async () => {
+    sourceRows=[row()];
+    const valid=answer();
+    const title='[untrusted]'+String.fromCodePoint(0x1f600).repeat(400)+'[/untrusted]';
+    valid.results[0].title=title;
+    valid.results[0].snippet=String.fromCodePoint(0x1f600).repeat(500);
+    valid.results[0].compartment.label=String.fromCodePoint(0x1f600).repeat(128);
+    asserted.behaviour={body:JSON.stringify(valid)};
+    const result=await search({protocol_version:2});
+    expect(result.coverage.invalidResults).toEqual([]);
+    expect(result.groups[0].results[0]).toMatchObject({title,snippet:valid.results[0].snippet,compartment:valid.results[0].compartment});
+    for(const dimension of ['title','snippet','label']) {
+      const invalid=answer();
+      if(dimension==='label') invalid.results[0].compartment.label=String.fromCodePoint(0x1f600).repeat(129);
+      else invalid.results[0][dimension as 'title'|'snippet']=String.fromCodePoint(0x1f600).repeat(dimension==='title'?513:501);
+      asserted.behaviour={body:JSON.stringify(invalid)};
+      const rejected=await search({protocol_version:2});
+      expect(rejected.coverage.invalidResults).toEqual([ASSERTED_ID]);
+      expect(rejected.groups[0].results).toEqual([]);
+    }
+  });
+  it('drops mixed-source out-of-filter category and preserves a valid sibling', async () => {
+    sourceRows=[row()];const valid=answer();valid.results.push(answer('relayhall:report').results[0]);
+    asserted.behaviour={body:JSON.stringify(valid)};
+    const response=await search({protocol_version:2,categories:['relaybrain:note']});
+    expect(response.groups[0].results).toHaveLength(1);expect(response.coverage.invalidResults).toEqual([ASSERTED_ID]);
+  });
+  it('does not dial a v1 source when categories are requested or disclose hidden category vocabulary', async () => {
+    sourceRows=[externalRow({}),row({id:NONE_ID})];
+    jest.spyOn(authorizationRepository,'selectorCoveredIds').mockResolvedValue(new Set([ASSERTED_ID]));
+    await expect(search({protocol_version:2,categories:['relaybrain:note']})).rejects.toMatchObject({code:'INVALID_SELECTOR'});
+    expect(asserted.requests).toHaveLength(0);
+  });
+  it('rejects seventeen eligible sources before signing or dialing; hidden extras do not count', async () => {
+    sourceRows=Array.from({length:17},(_,i)=>row({id:'a1111111-1111-4111-8111-'+String(i).padStart(12,'0')}));
+    const sign=jest.spyOn(signer,'signKnowledgeAssertion');
+    const refusal = await search({protocol_version:2}).catch(error => error);
+    expect(refusal).toMatchObject({code:'SOURCE_SELECTION_TOO_BROAD',status:422});
+    expect(refusal.auditRef).toMatch(/^ka_[0-9a-f]{32}$/);
+    expect(searchAudit).toHaveLength(1);
+    expect(searchAudit[0][0]).toBe(refusal.auditRef);
+    expect(JSON.parse(searchAudit[0][5] as string)).toEqual([]);
+    expect(sign).not.toHaveBeenCalled();expect(asserted.requests).toHaveLength(0);
+    jest.spyOn(authorizationRepository,'selectorCoveredIds').mockResolvedValue(new Set());
+    expect((await search({protocol_version:2})).coverage.consulted).toEqual([]);
+    expect(asserted.requests).toHaveLength(0);
+  });
+  it('a dynamically provisioned account still cannot search or get an A21-denied source', async () => {
+    const config=validateLifecycleConfig({enabled:true,accountSelection:'all-human',projectSelection:'all-projects',accountIds:[],projectIds:[],sourceId:ASSERTED_ID,expectedServiceRevision:ASSERTED_ID,sourceConfigVersion:'v1',issuer:ISSUER,actorRef:'owner',projectGrants:[],personalConsents:[],keyRef:'file:/etc/lifecycle/key',kid:'test',outputPath:'/var/lib/lifecycle/snapshot',generationPath:'/var/lib/lifecycle/state'});
+    const provisioned=createLifecyclePayload(config,{source:{id:ASSERTED_ID,slug:'brain',status:'published',retired_at:null,revision:ASSERTED_ID,knowledge_query_endpoint:'https://source.invalid/search',knowledge_claims_mode:'asserted',knowledge_subject_mode:'direct',knowledge_relevant_groups:[],descriptor},accounts:[{id:ACCOUNT_ID,display_name:'Account',handle:'account',status:'active',kind:'human'}],projects:[],groups:[]},1,100);
+    expect(provisioned.accounts).toEqual([expect.objectContaining({id:ACCOUNT_ID,active:true})]);
+    sourceRows=[row()];
+    jest.spyOn(authorizationRepository,'selectorCoveredIds').mockResolvedValue(new Set());
+    const sign=jest.spyOn(signer,'signKnowledgeAssertion');
+    const result=await search({protocol_version:2});
+    expect(result.coverage.consulted).toEqual([]);expect(result.groups).toEqual([]);
+    const handle=sealKnowledgeHandle({s:ASSERTED_ID,c:compartment,r:'doc',dv:1,f:{version:2,kinds:['docs']}});
+    expect(await executeKnowledgeGet(caller() as never,{handle},{issuer:ISSUER})).toMatchObject({ok:false,refused:'not_authorized'});
+    expect(sign).not.toHaveBeenCalled();expect(asserted.requests).toHaveLength(0);
+  });
+  // ── Card 3e0ae06e: the caller's budget reaches the source, and a deadline says whose ──
+  //
+  // A first search for a new text answered partial/deadline with 0 rows inside an 8 s caller budget,
+  // because the source bounded itself by its own shorter constant: core never told it how long core
+  // would wait. The source is now told (budget_ms), and a source deadline names the budget that fired.
+  it('a v2 source is told the budget core waits for it: the dial budget less the return margin (card 3e0ae06e)', async () => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify(answer())};
+    for (const timeoutMs of [8000, 3000]) {
+      await search({protocol_version:2,timeoutMs});
+      const wire=JSON.parse(asserted.requests[asserted.requests.length-1].body);
+      expect(Number.isInteger(wire.budget_ms)).toBe(true);
+      expect(wire.budget_ms).toBeLessThanOrEqual(timeoutMs-KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS);
+      expect(wire.budget_ms).toBeGreaterThan(timeoutMs-KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS-1000);
+    }
+    // A v1 source's wire is unchanged.
+    sourceRows=[externalRow({})];asserted.behaviour={body:resultBody(1)};
+    await search({});
+    expect(JSON.parse(asserted.requests[asserted.requests.length-1].body).budget_ms).toBeUndefined();
+  });
+  it('the source budget keeps the return margin and is never below 1 ms (card 3e0ae06e)', () => {
+    expect(KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS).toBe(300);
+    expect(knowledgeSourceBudgetMs(8000)).toBe(7700);
+    expect(knowledgeSourceBudgetMs(3000)).toBe(2700);
+    expect(knowledgeSourceBudgetMs(KNOWLEDGE_SOURCE_BUDGET_MARGIN_MS)).toBe(1);
+    expect(knowledgeSourceBudgetMs(1)).toBe(1);
+  });
+  it("core's per-source deadline does not fire below the caller's: a source answering after 6 s is answered inside timeoutMs 8000 (card 3e0ae06e)", async () => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify(answer()),delayMs:6000};
+    const started=Date.now();
+    const response=await search({protocol_version:2,timeoutMs:8000});
+    expect(Date.now()-started).toBeGreaterThanOrEqual(6000);
+    expect(response.coverage.answered).toEqual([ASSERTED_ID]);
+    expect(response.coverage.timedOut).toEqual([]);
+    expect(response.groups[0].results).toHaveLength(1);
+  }, 20_000);
+  it('a partial answer names which budget fired, and a source that names none keeps the earlier shape (card 3e0ae06e)', async () => {
+    sourceRows=[row()];
+    for (const fired of ['caller_deadline','source_deadline']) {
+      asserted.behaviour={body:JSON.stringify({...answer(),results:[],retrieval:{status:'partial',reasons:['deadline']},deadline_fired:fired})};
+      const response=await search({protocol_version:2,timeoutMs:8000});
+      expect(response.coverage.answered).toEqual([ASSERTED_ID]);
+      expect(response.coverage.partialSources).toEqual([{id:ASSERTED_ID,reasons:['deadline'],deadlineFired:fired}]);
+    }
+    // A source that names no budget keeps the earlier shape.
+    asserted.behaviour={body:JSON.stringify({...answer(),retrieval:{status:'partial',reasons:['deadline']}})};
+    expect((await search({protocol_version:2})).coverage.partialSources).toEqual([{id:ASSERTED_ID,reasons:['deadline']}]);
+  });
+  // Card 3e0ae06e, repair round: each malformed `deadline_fired` is its own test, so no case
+  // can hide behind an earlier assertion. Every answer below carries a valid row, so "no rows"
+  // measures the rejection and not an empty answer.
+  it.each([
+    ['null', {retrieval:{status:'partial',reasons:['deadline']},deadline_fired:null}],
+    ['a number (7)', {retrieval:{status:'partial',reasons:['deadline']},deadline_fired:7}],
+    ['an unknown name (core_deadline)', {retrieval:{status:'partial',reasons:['deadline']},deadline_fired:'core_deadline'}],
+    ['a valid name on a partial answer without the deadline reason', {retrieval:{status:'partial',reasons:['store-unavailable']},deadline_fired:'caller_deadline'}],
+    ['a valid name on a complete answer', {retrieval:{status:'complete',reasons:[]},deadline_fired:'source_deadline'}],
+  ])('a malformed deadline_fired, %s, makes the source unavailable (transport) with no rows (card 3e0ae06e)', async (_label, bad) => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify({...answer(),...bad})};
+    const response=await search({protocol_version:2});
+    expect(response.coverage.unavailable).toEqual([{id:ASSERTED_ID,reason:'transport'}]);
+    expect(response.coverage.answered).toEqual([]);
+    expect(response.coverage.partialSources).toBeUndefined();
+    expect(response.groups).toEqual([]);
+  });
+  // Card 3e0ae06e, repair round: the card's goal end to end. A caller that sends no timeoutMs
+  // (the MCP tool forwards none) reaches a source whose store needs about 6 s for a text it has
+  // never searched. The source honours budget_ms as RelayBrain does: it stops at the budget core
+  // sent and answers partial/caller_deadline with no rows, or answers rows when the budget covers
+  // the cold search. The route's default decides which.
+  it('a first search with the default budget answers rows from a source whose cold search takes 6 s, through the route (card 3e0ae06e)', async () => {
+    const COLD_SEARCH_MS = 6000;
+    const SOURCE_DEFAULT_MS = 2500;
+    sourceRows=[row()];
+    asserted.behaviour={requireBearer:'Bearer core-to-engine-token',body:'{}',respond:(raw)=>{
+      const sent=(JSON.parse(raw) as {budget_ms?:unknown}).budget_ms;
+      const deadline=typeof sent==='number'?sent:SOURCE_DEFAULT_MS;
+      if (deadline<COLD_SEARCH_MS) {
+        return {delayMs:deadline,body:JSON.stringify({...answer(),results:[],retrieval:{status:'partial',reasons:['deadline']},deadline_fired:typeof sent==='number'?'caller_deadline':'source_deadline'})};
+      }
+      return {delayMs:COLD_SEARCH_MS,body:JSON.stringify(answer())};
+    }};
+    const realDial=dialClient.dialKnowledgeSource;
+    jest.spyOn(dialClient,'dialKnowledgeSource').mockImplementation(async (options) =>
+      realDial({...options,trustAnchors:[asserted.certificate.cert]}));
+    const app=express();
+    app.use(express.json());
+    app.use((req,_res,next)=>{Object.assign(req,caller());next();});
+    app.use('/knowledge-queries',knowledgeQueriesRouter);
+    const server=app.listen(0,'127.0.0.1');
+    try {
+      await new Promise<void>((resolve,reject)=>{server.once('listening',resolve);server.once('error',reject);});
+      const started=Date.now();
+      const response=await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/knowledge-queries`,{
+        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({protocol_version:2,q:'a text never searched before'}),
+      });
+      const elapsed=Date.now()-started;
+      expect(response.status).toBe(200);
+      const json=await response.json() as {coverage:{answered:string[];timedOut:string[];partialSources?:unknown};groups:{results:unknown[]}[]};
+      expect(json.coverage.partialSources).toBeUndefined();
+      expect(json.coverage.answered).toEqual([ASSERTED_ID]);
+      expect(json.coverage.timedOut).toEqual([]);
+      expect(json.groups[0].results).toHaveLength(1);
+      expect(asserted.requests).toHaveLength(1);
+      expect(JSON.parse(asserted.requests[0].body).budget_ms).toBeGreaterThanOrEqual(COLD_SEARCH_MS);
+      expect(elapsed).toBeGreaterThanOrEqual(COLD_SEARCH_MS);
+    } finally {
+      await new Promise<void>((resolve)=>server.close(()=>resolve()));
+    }
+  }, 20_000);
+  it('v2 malformed optional truncated is unavailable, never complete', async () => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify({...answer(),truncated:'yes'})};
+    const response=await search({protocol_version:2});
+    expect(response.coverage.unavailable).toEqual([{id:ASSERTED_ID,reason:'transport'}]);
+    expect(response.groups).toEqual([]);
+  });
+  it('v2 missing retrieval is unavailable rather than false complete', async () => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify({protocol_version:2,results:[]})};
+    const response=await search({protocol_version:2});expect(response.coverage.unavailable).toEqual([{id:ASSERTED_ID,reason:'transport'}]);
+  });
+  it('v2 cited GET enforces current grants before ETag and sends a sealed continuation hash', async () => {
+    sourceRows=[row()];asserted.behaviour={body:JSON.stringify(answer())};
+    const result=await search({protocol_version:2,categories:['relaybrain:note']});
+    const handle=result.groups[0].results[0].handle;
+    const bytes=Buffer.from('original bytes');
+    const sha256=crypto.createHash('sha256').update(bytes).digest('hex');
+    asserted.behaviour={body:JSON.stringify({protocol_version:2,status:'content',content_base64:bytes.toString('base64'),sha256,compartment:{id:compartment},contentKind:'docs',category:'relaybrain:note',offset:0,byteLength:bytes.length,totalBytes:bytes.length,truncated:false,retrieval:{status:'complete',reasons:[]}})};
+    const fetched=await executeKnowledgeGet(caller() as never,{handle},{issuer:ISSUER,callerGroupIds:['group-1'],trustAnchors:[asserted.certificate.cert]});
+    expect(fetched).toMatchObject({ok:true,protocol_version:2,sha256,content_base64:bytes.toString('base64')});
+    const calls=asserted.requests.length;
+    jest.spyOn(authorizationRepository,'selectorCoveredIds').mockResolvedValue(new Set());
+    expect(await executeKnowledgeGet(caller() as never,{handle,ifNoneMatch:sha256},{issuer:ISSUER})).toMatchObject({ok:false,refused:'not_authorized',protocol_version:2,status:'refused'});
+    expect(asserted.requests.length).toBe(calls);
   });
 });

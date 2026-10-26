@@ -10,10 +10,18 @@
  *
  * "Vehicle" stays in the identifiers and out of the labels (review bedc25f3
  * B1): it is descriptive prose in ruling 7440b579, not a declared noun.
+ *
+ * AZ-A10 clauses 6 and 8 (card 785e1eed P2-B): each grant row also says when
+ * it expires. The date shown is the row's EFFECTIVE one (the latest over every
+ * Task that links it, or an owner-plane row's own date), which is the date the
+ * assignee's access actually ends; when this Task's assigning act set a
+ * different date for its own link, that is shown beside it. Whether a row has
+ * expired is the server's answer, never this browser's clock.
  */
 import { useEffect, useState } from 'react';
 import { KeyRound } from 'lucide-react';
 import { authenticatedFetch } from '../../utils/auth';
+import { formatDateTime, formatInstantUtc } from '../../utils/dateFormat';
 import './AccessVehicle.css';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
@@ -29,6 +37,27 @@ interface VehicleLink {
   resourceId: string | null;
   verb: string | null;
   profileName: string | null;
+  /** The date this Task's assigning act set for its link; null = until the Task ends. */
+  roleGrantExpiresAt?: string | null;
+  /** The row's effective date; null = no date on the row. */
+  expiresAt?: string | null;
+  expired?: boolean;
+}
+
+/** The row's expiry, as a reader needs it: when the access ends. */
+function rowExpiry(link: VehicleLink): string {
+  if (link.expiresAt) {
+    return `${link.expired ? 'expired' : 'expires'} ${formatDateTime(link.expiresAt)}`;
+  }
+  return link.createdByAssignment ? 'until the Task ends' : 'no expiry date';
+}
+
+/** This Task's own date, when it differs from the row's effective one. */
+function assignmentDate(link: VehicleLink): string | null {
+  if (link.roleGrantExpiresAt === undefined || link.roleGrantExpiresAt === link.expiresAt) return null;
+  return link.roleGrantExpiresAt
+    ? `this assignment set ${formatDateTime(link.roleGrantExpiresAt)}`
+    : 'this assignment set no end date';
 }
 
 interface VehicleAssignment {
@@ -104,6 +133,15 @@ export default function TaskAccessVehicle({ taskId }: { taskId: string }) {
                 <span>profile &ldquo;{link.profileName}&rdquo;</span>
               )}
               {link.landedOnHandle && <span>held by <code>{link.landedOnHandle}</code></span>}
+              {link.targetKind === 'grant' && (
+                <span
+                  className="access-vehicle-expiry"
+                  title={link.expiresAt ? formatInstantUtc(link.expiresAt) : undefined}
+                >
+                  {rowExpiry(link)}
+                  {assignmentDate(link) ? ` (${assignmentDate(link)})` : ''}
+                </span>
+              )}
               {!link.createdByAssignment && (
                 <span className="access-vehicle-owned">
                   pre-existing — this assignment only depends on it, and will not remove it

@@ -1,6 +1,6 @@
 # RelayHall design system
 
-**Authority:** the ratified RH-DESIGN.6 specification (board report `9f01ba4b`, 2026-08-10) governs
+**Authority:** the ratified RH-DESIGN.6 specification (2026-08-10) governs
 this contract; this document is its in-repo carrier and the reference the gates enforce. Naming
 follows the vocabulary authority. Direction: **slate ledger** — audit-grade sobriety, near-monochrome
 slate surfaces, one restrained teal accent, typography-led identity, minimal ornament.
@@ -151,7 +151,7 @@ same letterforms cut to `RH` for compact contexts.
 
 A third tile (slate ground with a slate edge) was cut and **not adopted**: its 12-unit edge falls
 under one device pixel at 16px, so it collapsed into Tile A at exactly the size it existed to
-differentiate. Measured, not argued — owner ruling `9aa295f2`.
+differentiate. Measured, not argued.
 
 **The favicon has three cuts, one per Theme**, because the three Themes bind three different accents
 and three different on-fill inks; `THEME_FAVICONS` in `frontend/src/utils/theme.ts` selects between
@@ -286,7 +286,31 @@ cascade (`--bg-app`) rather than duplicated in TypeScript. The favicon variant i
 **Preferences are per principal and IDOR-proof by construction.** `principal_preferences` is keyed
 on the principal itself, and `GET`/`PUT /api/preferences` derive the principal from the
 authenticated session: no identifier is accepted in a path or a body, so there is no row for a
-request to address but its own.
+request to address but its own. The same row carries the Map's Reports display
+(`mapReportsMode`: `collapsed`, the default, draws one "Reports · N" node per task; `expanded`
+draws every Report node inside a report area), so the Map's "Reports: Collapsed | Expanded"
+switch follows the user across reloads and devices.
+
+**The Map's layout fits what is shown and is not stored**. Phase and project
+areas, and the Organic and Radial regions and archive core, are sized to the cards on screen in
+every organization: hiding archived work shrinks them back to the exact rectangles they had, a phase
+with no shown task is not drawn, and a lane with nothing shown takes no ground. The layout keeps only
+an in-memory ORDER for the session (lanes first-seen, phases in declared flow order, each card's
+place in its phase's sequence) and no coordinate: geometry is a function of what is shown and of
+that order, so ordinary board updates do not reshuffle the plane and a round trip through "show
+archived" is exact. Nothing about the layout is written to the browser, and a stored record from an
+earlier release is removed unread when the Map loads. The toolbar's "Re-pack layout" control
+discards that order and lays the plane out afresh.
+
+**The Map and list split remembers a screen preference, never layout**. "Map and
+list" opens the list below the map behind a separator (`role="separator"`, horizontal, with
+`aria-valuenow`/`min`/`max` in pixels of list height; ArrowUp/ArrowDown, PageUp/PageDown, Home/End,
+or a pointer drag). Both panes keep a floor. The open state and the list height are kept for the
+tab in `sessionStorage` (`relayhall_map_split_v1`), like the view state; resizing changes the
+camera's viewport and nothing the plane's layout reads. "Show as list" still replaces the map.
+In the split, hover and focus link the two readings both ways in the map's hover ink: a list row
+marks its card with one ring placed in the DOM (no plane render, the chain selection untouched),
+and a card marks its list row and scrolls the list to it when it is out of sight.
 
 ## 6. Interaction and state patterns
 

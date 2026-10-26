@@ -30,6 +30,11 @@ const EXPECTED_AUTH_ROUTES = [
   // Pre-existing: the browser capability cookie and AZ-S3 step-up.
   'POST /browser-session',
   'POST /step-up',
+  // Card a3e76724: step-up for an Account whose proof is its Identity
+  // provider. Both resolve the calling Account themselves and answer 401
+  // without one; neither is an unauthenticated act.
+  'GET /step-up/methods',
+  'POST /step-up/collect',
 ].sort();
 
 /** Read the router's own registration table — not a hand-kept list. */

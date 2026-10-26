@@ -22,7 +22,6 @@ function baseTask(overrides: Record<string, any> = {}): any {
     created: '2026-08-01T00:00:00.000Z',
     updated: '2026-08-14T12:00:00.000Z',
     startedAt: '2026-08-02T00:00:00.000Z',
-    sessionRefs: [],
     reviewHistory: [],
     ...overrides,
   };
@@ -56,9 +55,9 @@ const options = (over: Partial<{ filter: 'all' | 'handover' | 'system'; before: 
 });
 
 describe('unified timeline merge (§4.1)', () => {
-  test('merges all four sources and orders at DESC, source, id DESC', () => {
+  test('merges the three durable sources and orders at DESC, source, id DESC', () => {
     const task = baseTask({
-      sessionRefs: ['sess-1'],
+
       reviewHistory: [{ id: 'r1', decision: 'pass', completedAt: '2026-08-11T00:00:00.000Z', triggeredBy: 'system' }],
     });
     const result = unifiedTaskTimeline.merge(
@@ -68,7 +67,7 @@ describe('unified timeline merge (§4.1)', () => {
       options(),
     );
     expect(result.sourcesUnavailable).toEqual([]);
-    expect(result.events.map(e => e.source)).toEqual(['history', 'review', 'stream', 'session']);
+    expect(result.events.map(e => e.source)).toEqual(['history', 'review', 'stream']);
     const ats = result.events.map(e => e.at);
     expect([...ats].sort().reverse()).toEqual(ats);
   });
@@ -131,7 +130,7 @@ describe('unified timeline merge (§4.1)', () => {
     const task = baseTask({ sessionRefs: ['sess-1'] });
     const result = unifiedTaskTimeline.merge(task, new Error('db down'), [], options());
     expect(result.sourcesUnavailable).toEqual(['stream']);
-    expect(result.events.map(e => e.source)).toEqual(['session']);
+    expect(result.events.map(e => e.source)).toEqual([]);
     const both = unifiedTaskTimeline.merge(task, new Error('a'), new Error('b'), options());
     expect(both.sourcesUnavailable).toEqual(['stream', 'history']);
   });
@@ -166,13 +165,13 @@ describe('attribution honesty (§4.1)', () => {
     const pre063 = mapHistoryRow({ id: 1, field: 'status', old_value: 'todo', new_value: 'review', changed_by: 'system', note: null, actor_principal_id: null, created_at: '2026-08-10T00:00:00.000Z' });
     expect(pre063.actor).toBe('system');
     expect(pre063.actorDetail).toBeNull();
-    const marker = mapHistoryRow({ id: 3, event_type: 'status', old_value: null, new_value: 'todo', note: 'changedBy=wadera|x', actor_principal_id: null, created_at: '2026-08-10T00:00:00.000Z' });
-    expect(marker.actor).toBe('wadera');
+    const marker = mapHistoryRow({ id: 3, event_type: 'status', old_value: null, new_value: 'todo', note: 'changedBy=river|x', actor_principal_id: null, created_at: '2026-08-10T00:00:00.000Z' });
+    expect(marker.actor).toBe('river');
     expect(marker.actorDetail).toBeNull();
     // The authenticated 063 column is the ONLY source of the structured
     // record, and it carries no handle claim.
-    const newer = mapHistoryRow({ id: 2, event_type: 'status', old_value: null, new_value: 'todo', note: 'changedBy=wadera|x', actor_principal_id: 'cccccccc-0000-4000-8000-000000000001', created_at: '2026-08-10T00:00:00.000Z' });
-    expect(newer.actor).toBe('wadera');
+    const newer = mapHistoryRow({ id: 2, event_type: 'status', old_value: null, new_value: 'todo', note: 'changedBy=river|x', actor_principal_id: 'cccccccc-0000-4000-8000-000000000001', created_at: '2026-08-10T00:00:00.000Z' });
+    expect(newer.actor).toBe('river');
     expect(newer.actorDetail).toEqual({ principalId: 'cccccccc-0000-4000-8000-000000000001', handle: null, role: null });
   });
 
@@ -185,14 +184,10 @@ describe('attribution honesty (§4.1)', () => {
     expect(event.eventType).toBe('review.reject');
   });
 
-  test('synthesized timestamps are stable: sessionRefs use startedAt/created, never updated', () => {
-    const task = baseTask({ sessionRefs: ['s1'] });
-    const [event] = new UnifiedTaskTimeline().buildSessionEvents(task);
-    expect(event.at).toBe('2026-08-02T00:00:00.000Z');
-    const neverStarted = baseTask({ sessionRefs: ['s1'], startedAt: null });
-    const [fallback] = new UnifiedTaskTimeline().buildSessionEvents(neverStarted);
-    expect(fallback.at).toBe('2026-08-01T00:00:00.000Z');
-    // review fallback likewise avoids task.updated
+  test('retired Task session JSON never synthesizes a session; review timestamps stay stable', () => {
+    const task = baseTask({ sessionRefs: ['s1'] } as any);
+    const result = new UnifiedTaskTimeline().merge(task, [], [], { filter: 'all', before: null, limit: 100 });
+    expect(result.events).toEqual([]);
     const review = baseTask({ reviewHistory: [{ id: 'r1', decision: 'pass' }] });
     const [reviewEvent] = new UnifiedTaskTimeline().buildReviewEvents(review);
     expect(reviewEvent.at).not.toBe(review.updated);
@@ -212,6 +207,11 @@ describe('filter taxonomy (§3.6)', () => {
     expect(classify('stream', 'system', 'report.promoted')).toBe('handover');
     expect(classify('stream', 'system', 'task.transitioned')).toBe('system');
     expect(classify('stream', 'legacy', 'status')).toBe('system');
+    // Owner ruling E462 (design section 6.7): the wake receipt and the trigger outcome the board writes.
+    expect(classify('stream', 'system', 'connector.wake')).toBe('system');
+    expect(classify('stream', 'system', 'connector.trigger')).toBe('system');
+    // An agent cannot write `system` provenance; its own entry of that type is not classified as one.
+    expect(classify('stream', 'reported', 'connector.trigger')).toBeNull();
   });
 
   test('report events reach Handovers & reports from EVERY stream provenance (§3.6 row: report created/linked/auto-promoted)', () => {
@@ -269,7 +269,7 @@ describe('redaction (§3.6)', () => {
 describe('additive compatibility with the live modal (§8 C1)', () => {
   test('every event keeps the legacy consumer fields with legacy types', () => {
     const task = baseTask({
-      sessionRefs: ['sess-1'],
+
       reviewHistory: [{ id: 'r1', decision: 'pass', completedAt: '2026-08-11T00:00:00.000Z', triggeredBy: 'system' }],
     });
     const result = unifiedTaskTimeline.merge(task, [streamRow()], [

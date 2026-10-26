@@ -1,10 +1,13 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, ScrollText, Pencil, History, X } from 'lucide-react';
 import { authenticatedFetch } from '../utils/auth';
+import { useWebSocket } from '../hooks/useWebSocket';
 import { renderMarkdownSafe } from '../utils/renderMarkdown';
 import './CharterPage.css';
 import { formatDateTimeLong } from '../utils/dateFormat';
+import { useStepUpRetry } from '../components/access/useStepUpRetry';
+import { readStepUpChallenge } from '../utils/stepUpChallenge';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -39,6 +42,7 @@ function formatDate(dateStr: string): string {
 
 export function CharterPage() {
   const { id } = useParams<{ id: string }>();
+  const { subscribe, connected } = useWebSocket();
   const [charter, setCharter] = useState<Charter | null>(null);
   const [projectName, setProjectName] = useState<string>('');
   const [loading, setLoading] = useState(true);
@@ -48,57 +52,76 @@ export function CharterPage() {
   const [versions, setVersions] = useState<CharterVersionMeta[] | null>(null);
   const [showVersions, setShowVersions] = useState(false);
   const [viewedVersion, setViewedVersion] = useState<{ version: number; content: string } | null>(null);
+  const loadGeneration = useRef(0);
 
   const [showEdit, setShowEdit] = useState(false);
   const [editContent, setEditContent] = useState('');
   const [saving, setSaving] = useState(false);
+  // LENSES-c gate (i) (card b5c83682): the step-up a Group owner's approval asks for.
+  const { askForToken, retryDialog } = useStepUpRetry('Confirm it is you to approve this Charter as an owner of the group that owns the project.');
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     if (!id) return;
+    const generation = ++loadGeneration.current;
     setLoading(true);
     setError(null);
     setAbsent(false);
-    authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter`)
-      .then(async res => {
+    void (async () => {
+      try {
+        const res = await authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter`);
         const data = await res.json().catch(() => null);
-        if (res.status === 404 && data?.code === 'CHARTER_NOT_FOUND') {
-          setAbsent(true);
-          setCharter(null);
-          return;
-        }
-        if (!res.ok) throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
-        setCharter(data.charter);
-      })
-      .catch(err => setError(err.message || 'Failed to load the Charter'))
-      .finally(() => setLoading(false));
-
-    authenticatedFetch(`${API_BASE_URL}/projects/${id}`)
-      .then(res => res.json())
-      .then(data => setProjectName(data.project?.name || ''))
-      .catch(() => setProjectName(''));
+        const absent = res.status === 404 && data?.code === 'CHARTER_NOT_FOUND';
+        if (!res.ok && !absent) throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
+        const projectRes = await authenticatedFetch(`${API_BASE_URL}/projects/${id}`);
+        const projectData = await projectRes.json().catch(() => null);
+        if (!projectRes.ok || !projectData?.success) throw new Error('Project access could not be verified');
+        if (generation !== loadGeneration.current) return;
+        setAbsent(absent);
+        setCharter(absent ? null : data.charter);
+        setProjectName(projectData.project?.name || '');
+        if (absent) { setVersions(null); setViewedVersion(null); setShowVersions(false); }
+      } catch (err) {
+        if (generation !== loadGeneration.current) return;
+        setCharter(null); setProjectName(''); setVersions(null); setViewedVersion(null);
+        setShowVersions(false); setShowEdit(false); setEditContent('');
+        setError(err instanceof Error ? err.message : 'Failed to load the Charter');
+      } finally {
+        if (generation === loadGeneration.current) setLoading(false);
+      }
+    })();
   }, [id]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onChange = () => { setShowEdit(false); load(); };
+    const unsubscribe = subscribe('project.authority_changed', onChange);
+    if (typeof window === 'undefined') return;
+    window.addEventListener('focus', onChange);
+    return () => { unsubscribe(); window.removeEventListener('focus', onChange); };
+  }, [subscribe, load]);
+  useEffect(() => { if (connected) load(); }, [connected, load]);
 
   const loadVersions = () => {
     if (!id) return;
+    const generation = loadGeneration.current;
     setShowVersions(v => !v);
     if (versions) return;
     authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter/versions`)
-      .then(res => res.json())
-      .then(data => setVersions(data.versions || []))
-      .catch(() => setVersions([]));
+      .then(async res => { if (!res.ok) throw new Error('Version read denied'); return res.json(); })
+      .then(data => { if (generation === loadGeneration.current) setVersions(data.versions || []); })
+      .catch(() => { if (generation === loadGeneration.current) setVersions([]); });
   };
 
   const viewVersion = (version: number) => {
     if (!id) return;
+    const generation = loadGeneration.current;
     authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter/versions/${version}`)
-      .then(res => res.json())
+      .then(async res => { if (!res.ok) throw new Error('Version read denied'); return res.json(); })
       .then(data => {
-        if (data.version) setViewedVersion({ version: data.version.version, content: data.version.content });
+        if (generation === loadGeneration.current && data.version) setViewedVersion({ version: data.version.version, content: data.version.content });
       })
-      .catch(() => setViewedVersion(null));
+      .catch(() => { if (generation === loadGeneration.current) setViewedVersion(null); });
   };
 
   const openEdit = () => {
@@ -114,18 +137,31 @@ export function CharterPage() {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (charter) headers['If-Match'] = charter.revision;
-      const res = await authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter`, {
-        method: 'PUT',
+      const send = (stepUpToken?: string) => authenticatedFetch(`${API_BASE_URL}/projects/${id}/charter/approve`, {
+        method: 'POST',
         headers,
-        body: JSON.stringify({ content: editContent }),
+        body: JSON.stringify(stepUpToken === undefined ? { content: editContent } : { content: editContent, stepUpToken }),
       });
-      const data = await res.json().catch(() => null);
+      let res = await send();
+      let data = await res.json().catch(() => null);
+      // LENSES-c gate (i) (card b5c83682): an owner of the Group that owns this
+      // project approves with a step-up. The board asks for it with the SU-14
+      // challenge for (charter.approve, this project); the person confirms it
+      // is them once and the approval is sent once more. Administrators and a
+      // person owner are never asked.
+      const challenge = readStepUpChallenge(res.status, data);
+      if (challenge && challenge.action === 'charter.approve' && challenge.targetId.toLowerCase() === id.toLowerCase()) {
+        const token = await askForToken(challenge);
+        if (!token) return;
+        res = await send(token);
+        data = await res.json().catch(() => null);
+      }
       if (!res.ok) {
         if (res.status === 412) {
           throw new Error('The Charter changed since it was loaded — close, review the new version, and retry.');
         }
         if (res.status === 403) {
-          throw new Error('Charter writes are owner-plane; this credential cannot write it.');
+          throw new Error('Sign in as this project’s owner or an authorized project administrator to approve the Charter.');
         }
         throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
       }
@@ -246,12 +282,13 @@ export function CharterPage() {
             <div className="form-actions">
               <button type="button" className="btn-cancel" onClick={() => setShowEdit(false)} disabled={saving}>Cancel</button>
               <button type="button" className="btn-save" onClick={handleSave} disabled={saving || editContent.trim().length === 0}>
-                {saving ? 'Saving…' : 'Save'}
+                {saving ? 'Approving…' : 'Approve Charter'}
               </button>
             </div>
           </div>
         </div>
       )}
+      {retryDialog}
     </div>
   );
 }

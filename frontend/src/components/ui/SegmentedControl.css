@@ -63,3 +63,45 @@
     min-width: 44px;
   }
 }
+
+/* E461: on a narrow screen the control never grows past its column. Options
+   that do not fit scroll INSIDE the control (the page never scrolls
+   sideways) and keep their natural width. At 768 px and wider the control is
+   the plain recipe above, unchanged: a scrolling box repaints the border and
+   the text, and a row that fits needs none of this. The two fades are the
+   "more this way" affordance: the lower pair is a soft edge shadow that shows
+   only where content is hidden, the upper pair (attached to the content)
+   covers it again at the ends, so nothing shows when everything fits. The
+   cover is solid for at least the shadow's width and the four fade layers are
+   clipped to the padding box, so the semi-transparent border is never lit;
+   the fifth, empty layer keeps the well colour under the border (the clip of
+   the bottom layer is the clip of the colour). */
+@media (max-width: 768px) {
+  .segmented-control {
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    background-image:
+      linear-gradient(to right, var(--bg-app) 50%, transparent),
+      linear-gradient(to left, var(--bg-app) 50%, transparent),
+      linear-gradient(to right, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent),
+      linear-gradient(to left, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent),
+      none;
+    background-position: left center, right center, left center, right center, 0 0;
+    background-repeat: no-repeat;
+    background-size: 24px 100%, 24px 100%, 12px 100%, 12px 100%, auto;
+    background-attachment: local, local, scroll, scroll, scroll;
+    background-clip: padding-box, padding-box, padding-box, padding-box, border-box;
+  }
+
+  .segmented-control::-webkit-scrollbar {
+    display: none;
+  }
+
+  .segmented-option {
+    flex: 0 0 auto;
+  }
+}

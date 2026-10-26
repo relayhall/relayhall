@@ -1,3 +1,4 @@
+import { assignedClaimEligibleSql, assignedClaimPrincipalSql } from './AssignedClaimAuthority';
 import { pool } from '../db/connection';
 import {
   AuthorizationAction,
@@ -72,11 +73,19 @@ export function mapResource(type: GrantResourceType, row: Record<string, unknown
       ? String(row.project_id) : null;
     return {
       ...base,
+      accountOwnerPrincipalId: (row.account_owner_principal_id as string | null) ?? (row.project_owner_principal_id as string | null) ?? null,
+      projectId: (row.project_id as string | null) ?? null,
+      assignedClaimEligible: row.assigned_claim_eligible === true,
+      assignedClaimPrincipalId: (row.assigned_claim_principal_id as string | null) ?? null,
       ownerPrincipalId: (row.owner_principal_id as string | null) ?? null,
       claimantPrincipalId: (row.owner_principal_id as string | null) ?? null,
       creatorPrincipalId: (row.creator_principal_id as string | null) ?? null,
       shepherdPrincipalId: (row.shepherd_principal_id as string | null) ?? null,
       verifierPrincipalId: (row.verifier_principal_id as string | null) ?? null,
+      verificationNone: row.verification_none === true || row.verification_none === 'true',
+      // Section 6.8: present only when the row carries the arm's own SQL answer.
+      ...(typeof row.verifier_guarded === 'boolean' ? { verifierGuarded: row.verifier_guarded } : {}),
+      ...(Array.isArray(row.verifier_agent_ids) ? { verifierAgentPrincipalIds: (row.verifier_agent_ids as unknown[]).map(String) } : {}),
       visibility: (row.visibility as AuthorizationResource['visibility']) ?? 'private',
       // 117 / packet 16896595 decision 2: the inherited arm walks
       // Task -> Phase -> Project. An ORPHAN Task (`project_id IS NULL`) has no
@@ -114,12 +123,29 @@ export function mapResource(type: GrantResourceType, row: Record<string, unknown
   if (type === 'report') {
     return {
       ...base,
+      accountOwnerPrincipalId: (row.account_owner_principal_id as string | null) ?? null,
       ownerPrincipalId: (row.author_principal_id as string | null) ?? null,
       creatorPrincipalId: (row.author_principal_id as string | null) ?? null,
       visibility: (row.visibility as AuthorizationResource['visibility']) ?? 'default',
     };
   }
+  if (type === 'skill') {
+    // AZ-A12 M-c (migration 162; card d67e6990): the owner arm reads the
+    // Skill owner, a person Account or a Group principal; NULL owns nothing.
+    return { ...base, ownerPrincipalId: (row.owner_principal_id as string | null) ?? null };
+  }
   return base;
+}
+
+/** The selector question's shape: the shipped resource shape with the
+ * VISIBILITY arms alone removed (see `selectorCoveredIds`). */
+function selectorShape(resource: AuthorizationSqlResource): AuthorizationSqlResource {
+  const {
+    visibility: _visibility,
+    inheritedVisibility: _inheritedVisibility,
+    ...selectorResource
+  } = resource;
+  return selectorResource;
 }
 
 export class AuthorizationRepository {
@@ -132,12 +158,14 @@ export class AuthorizationRepository {
         // Both joins are on PRIMARY KEYs, so neither can multiply a row, and
         // both are LEFT so an orphan Task still resolves (and is then decided
         // by the anchor, not by disappearing from the result).
-        text = `SELECT t.id, t.owner_principal_id, t.creator_principal_id, t.visibility,
+        text = `SELECT ${assignedClaimEligibleSql("t")} AS assigned_claim_eligible, ${assignedClaimPrincipalSql("t")} AS assigned_claim_principal_id, t.id, t.owner_principal_id, t.creator_principal_id, t.visibility,
+                       t.account_owner_principal_id, p.owner_principal_id AS project_owner_principal_id,
                        t.project_id, t.restricted_access,
                        ph.restricted_access AS phase_restricted_access,
                        p.visibility AS project_visibility, p.status AS project_status,
                        to_jsonb(t)->>'shepherd_principal_id' AS shepherd_principal_id,
-                       to_jsonb(t)->>'verifier_principal_id' AS verifier_principal_id
+                       to_jsonb(t)->>'verifier_principal_id' AS verifier_principal_id,
+                       to_jsonb(t)->>'verification_none' AS verification_none
                   FROM tasks t
                   LEFT JOIN phases ph ON ph.id = t.phase_id
                   LEFT JOIN projects p ON p.id = t.project_id
@@ -158,12 +186,12 @@ export class AuthorizationRepository {
         params = [identifier];
         break;
       case 'report':
-        text = `SELECT id, author_principal_id, visibility FROM reports
+        text = `SELECT id, author_principal_id, account_owner_principal_id, visibility FROM reports
                  WHERE id::text LIKE $1 || '%' ORDER BY id LIMIT 2`;
         params = [identifier];
         break;
       case 'skill':
-        text = `SELECT id FROM skills WHERE id::text = $1 OR name = $1 ORDER BY id LIMIT 2`;
+        text = `SELECT id, owner_principal_id FROM skills WHERE id::text = $1 OR name = $1 ORDER BY id LIMIT 2`;
         params = [identifier];
         break;
       case 'personality':
@@ -198,9 +226,13 @@ export class AuthorizationRepository {
           from: 'tasks t LEFT JOIN phases ph ON ph.id = t.phase_id'
             + ' LEFT JOIN projects p ON p.id = t.project_id',
           resource: {
+            assignedClaimEligible: assignedClaimEligibleSql('t'), assignedClaimPrincipal: assignedClaimPrincipalSql('t'),
             type, id: 't.id', owner: 't.owner_principal_id', claimant: 't.owner_principal_id',
+            accountOwner: 'COALESCE(t.account_owner_principal_id, p.owner_principal_id)',
             creator: 't.creator_principal_id', visibility: 't.visibility',
             shepherd: 't.shepherd_principal_id', verifier: 't.verifier_principal_id',
+            // Section 6.8 (E462 S4b): `none`, and the column that arms the chain guard on `verify`.
+            verificationNone: 't.verification_none',
             inheritedVisibility: 'p.visibility',
             // RH-AZ.PROJ-b: the project-bounded selector form reads THIS
             // column. It is the Task's OWN `project_id`, the same coordinate
@@ -210,6 +242,10 @@ export class AuthorizationRepository {
             project: 't.project_id',
             restrictedAccess: '(t.restricted_access OR COALESCE(ph.restricted_access, FALSE))',
             inheritanceAnchor: "t.project_id IS NOT NULL AND p.status = 'active'",
+            // AZ-A12 clause 7(b) (card ee81ee0f): the Project's owner, read
+            // only by the Group-owner inherited path (a Group value alone
+            // confers anything; a person value here confers nothing, N1).
+            projectOwner: 'p.owner_principal_id',
           },
         };
       case 'project':
@@ -233,16 +269,48 @@ export class AuthorizationRepository {
         };
       case 'report':
         return {
-          from: 'reports r',
+          from: `reports r LEFT JOIN tasks evidence_task ON evidence_task.id=r.source_task_id
+            AND r.origin='task-report' AND r.deleted_at IS NULL
+            AND EXISTS (SELECT 1 FROM task_references evidence_ref WHERE evidence_ref.task_id=r.source_task_id
+              AND evidence_ref.kind='report' AND evidence_ref.target_id=r.id AND evidence_ref.created_by_principal_id=r.author_principal_id)
+            LEFT JOIN LATERAL (
+              WITH RECURSIVE role_chain AS (
+                SELECT p.id,p.kind,p.parent_principal_id,p.id AS role_id,ARRAY[p.id] AS path,0 AS depth,
+                  (p.status='active' AND (p.parent_principal_id IS NULL OR EXISTS (
+                    SELECT 1 FROM principal_credentials c WHERE c.principal_id=p.id AND c.revoked_at IS NULL
+                      AND (c.expires_at IS NULL OR c.expires_at>NOW()) AND (c.grace_until IS NULL OR c.grace_until>NOW())))) AS alive
+                FROM task_references tr JOIN tasks et ON et.id=tr.task_id
+                CROSS JOIN LATERAL unnest(ARRAY[et.creator_principal_id,et.owner_principal_id,et.shepherd_principal_id,et.verifier_principal_id]) role(principal_id)
+                JOIN principals p ON p.id=role.principal_id
+                WHERE tr.kind='report' AND tr.target_id=r.id AND tr.created_by_principal_id=r.author_principal_id
+                  AND r.deleted_at IS NULL AND r.author_principal_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM task_native_reviews nr WHERE nr.verdict->>'reportId'=r.id::text)
+                  AND NOT EXISTS (SELECT 1 FROM task_native_executions ne WHERE ne.report_id=r.id)
+                UNION ALL
+                SELECT p.id,p.kind,p.parent_principal_id,rc.role_id,rc.path||p.id,rc.depth+1,
+                  rc.alive AND p.status='active' AND (p.parent_principal_id IS NULL OR EXISTS (
+                    SELECT 1 FROM principal_credentials c WHERE c.principal_id=p.id AND c.revoked_at IS NULL
+                      AND (c.expires_at IS NULL OR c.expires_at>NOW()) AND (c.grace_until IS NULL OR c.grace_until>NOW())))
+                FROM role_chain rc JOIN principals p ON p.id=rc.parent_principal_id
+                WHERE rc.depth<3 AND NOT (p.id=ANY(rc.path))
+              )
+              SELECT ARRAY_AGG(DISTINCT audience.id) AS readers FROM role_chain rc
+                CROSS JOIN LATERAL unnest(ARRAY[rc.role_id,rc.id]) audience(id)
+                WHERE rc.parent_principal_id IS NULL AND rc.kind='human' AND rc.alive
+            ) evidence_audience ON TRUE`,
           resource: {
             type, id: 'r.id', owner: 'r.author_principal_id', creator: 'r.author_principal_id',
+            accountOwner: 'r.account_owner_principal_id',
+            taskEvidenceReaders: ['evidence_task.owner_principal_id', 'evidence_task.shepherd_principal_id', 'evidence_task.verifier_principal_id'],
+            taskEvidenceAudience: 'evidence_audience.readers',
             visibility: 'r.visibility',
           },
         };
       case 'blueprint':
         return { from: 'blueprints b', resource: { type, id: 'b.id', owner: 'b.created_by_principal_id', visibility: "'shared'" } };
       case 'skill':
-        return { from: 'skills s', resource: { type, id: 's.id', visibility: "'shared'" } };
+        // AZ-A12 clause 15 M-c: the skill shape declares its owner column.
+        return { from: 'skills s', resource: { type, id: 's.id', owner: 's.owner_principal_id', visibility: "'shared'" } };
       case 'personality':
         return { from: 'personalities pe', resource: { type, id: 'pe.id', visibility: "'shared'" } };
       case 'service':
@@ -363,11 +431,7 @@ export class AuthorizationRepository {
     const uniqueIds = [...new Set(ids.map(String))];
     const { from, resource } = this.sqlResource(type);
     // The SHIPPED predicate, with the VISIBILITY arms alone removed.
-    const {
-      visibility: _visibility,
-      inheritedVisibility: _inheritedVisibility,
-      ...selectorResource
-    } = resource;
+    const selectorResource = selectorShape(resource);
     const condition = authorizationService.sqlCondition(actor, action, selectorResource, 2, {
       withoutAdministratorArm: true,
     });
@@ -379,6 +443,55 @@ export class AuthorizationRepository {
       [uniqueIds, ...condition.params],
     );
     return new Set(result.rows.map((row) => String(row.id)));
+  }
+
+  /**
+   * `authorizedIds` (or, with `selector`, `selectorCoveredIds`) for SEVERAL
+   * actions in ONE statement: per action, the ids of `ids` the actor is
+   * admitted to.
+   *
+   * Owner rulings E407 item 2 and E413 (the grant writer and the bulk revoke)
+   * ask the engine every action a grant's verb confers, for a grantee and its
+   * reach, before and after a grant. Each column is the text `sqlCondition`
+   * rendered for that action over the SAME shape and FROM `authorizedIds`
+   * filters, aggregated with bool_or over each id as `AccessExplorerService`
+   * does: the same predicate, never a copy. `grantsBulkRevokeLive.test.ts`
+   * pins its parity with `authorizedIds` and `selectorCoveredIds` action by
+   * action.
+   */
+  async authorizedIdsByAction(
+    actor: AuthorizationActor,
+    type: GrantResourceType,
+    ids: string[],
+    actions: readonly AuthorizationAction[],
+    queryable: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> } = pool,
+    options: { selector?: boolean } = {},
+  ): Promise<Map<AuthorizationAction, Set<string>>> {
+    const answer = new Map<AuthorizationAction, Set<string>>(actions.map((action) => [action, new Set<string>()]));
+    if (ids.length === 0 || actions.length === 0) return answer;
+    const uniqueIds = [...new Set(ids.map(String))];
+    const { from, resource } = this.sqlResource(type);
+    const shape = options.selector ? selectorShape(resource) : resource;
+    const params: unknown[] = [uniqueIds];
+    const columns = actions.map((action, index) => {
+      const condition = authorizationService.sqlCondition(actor, action, shape, params.length + 1,
+        options.selector ? { withoutAdministratorArm: true } : {});
+      params.push(...condition.params);
+      return `bool_or(${condition.sql}) AS a${index}`;
+    });
+    const result = await queryable.query(
+      `SELECT ${resource.id}::text AS id, ${columns.join(', ')}
+         FROM ${from}
+        WHERE ${resource.id}::text = ANY($1::text[])
+        GROUP BY ${resource.id}`,
+      params,
+    );
+    for (const row of result.rows) {
+      actions.forEach((action, index) => {
+        if (row[`a${index}`] === true) answer.get(action)!.add(String(row.id));
+      });
+    }
+    return answer;
   }
 
   /**
@@ -401,6 +514,17 @@ export class AuthorizationRepository {
    * The extra query runs ONLY on a refusal of a non-read action, on a request
    * already bound for a 4xx, and it is the SAME predicate - never a copy.
    */
+  /** Owner administration is resource-bounded. It never grants an admin
+   * scope to a session, connector, list or another account's object. */
+  async isAccountOwned(type: GrantResourceType, identifier: string, accountId: string): Promise<boolean> {
+    if (!['task','project','phase','report'].includes(type)) return false;
+    const resource = await this.resolve(type, identifier);
+    if (!resource) return false;
+    const owner = type === 'task' || type === 'report'
+      ? resource.accountOwnerPrincipalId : resource.ownerPrincipalId;
+    return owner === accountId;
+  }
+
   async authorizePoint(
     actor: AuthorizationActor,
     type: GrantResourceType,

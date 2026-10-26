@@ -39,3 +39,33 @@ export function dodWarningForStatusChange(
   if (hasDefinitionOfDone(definitionOfDone)) return undefined;
   return 'Task moved ideas -> todo without a definitionOfDone. Add one (relayhall update <id> --definition-of-done ...) so pickup/review gates have acceptance criteria.';
 }
+
+/** Only a pure planning status write can use the bounded Shepherd exception.
+ * This classifies shape, never authority; current source state is checked under
+ * the task row lock. Same-state retries still require the full authority. */
+export function isPlanningTaskStatusPatch(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const row = value as Record<string, unknown>;
+  return Object.keys(row).length === 1 && Object.prototype.hasOwnProperty.call(row, 'status')
+    && (row.status === 'ideas' || row.status === 'todo');
+}
+
+/** Shape only: the manager rechecks actual human authority under the Task lock. */
+export function isTaskArchivePatch(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const row = value as Record<string, unknown>;
+  return row.status === 'archived' && Object.keys(row).every(key => key === 'status' || key === 'archiveReason')
+    && (row.archiveReason === undefined || typeof row.archiveReason === 'string');
+}
+
+/** Shape-only classification for whole-Task approval. Mixed payloads retain
+ * ordinary write authorization and cannot use the bounded Verifier path. */
+export function isTaskCompletionPatch(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row);
+  return keys.length === 1 && keys[0] === 'status' && row.status === 'completed';
+}

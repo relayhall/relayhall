@@ -1,107 +1,102 @@
-import React, { useState, useEffect } from 'react';
-import { AlertTriangle, Archive, ArrowRight, CheckCircle2, ClipboardList, Clock, Plus } from 'lucide-react';
-import { authenticatedFetch } from '../../utils/auth';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { ClipboardList } from 'lucide-react';
+import { Button } from '../Button';
+import { useRelayHallConfig } from '../../contexts/RelayHallConfigContext';
+import { formatDateTime } from '../../utils/dateFormat';
+import { isIntentionalAbort } from '../../utils/fetchAbort';
+import { TimelineIcon } from '../notifications/NotificationIcon';
+import { timeAgo } from '../notifications/notifications';
+import {
+  NO_TIMELINE_FILTERS, fetchTimelinePage, mergeTimeline, timelineActor, timelineFailure, timelineLink,
+  timelineSubject, timelineWhat, type TimelineFailure, type TimelineItem,
+} from '../notifications/timeline';
 import './ActivityFeed.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+/** How many rows the widget shows (design section 4.6: "the newest 8 Timeline rows"). */
+export const ACTIVITY_ROWS = 8;
 
-interface ActivityEvent {
-  type: string;
-  taskId: string;
-  taskTitle: string;
-  oldValue?: string;
-  newValue?: string;
-  timestamp: string;
-  note?: string;
-}
+type FeedState =
+  | { status: 'loading' }
+  | { status: 'error'; failure: TimelineFailure }
+  | { status: 'ready'; items: TimelineItem[] };
 
-const timeAgo = (dateStr: string): string => {
-  const d = new Date(dateStr);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const mins = Math.floor(diffMs / 60000);
-  const hours = Math.floor(mins / 60);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return `${days}d ago`;
-  if (hours > 0) return `${hours}h ago`;
-  if (mins > 0) return `${mins}m ago`;
-  return 'Just now';
-};
-
-const getEventIcon = (type: string, newValue?: string) => {
-  if (type === 'status_change') {
-    if (newValue === 'completed') return <CheckCircle2 size={16} className="activity-icon-completed" />;
-    if (newValue === 'stuck') return <AlertTriangle size={16} className="activity-icon-stuck" />;
-    if (newValue === 'archived') return <Archive size={16} className="activity-icon-archived" />;
-    return <ArrowRight size={16} className="activity-icon-moved" />;
-  }
-  if (type === 'created') return <Plus size={16} className="activity-icon-created" />;
-  return <Clock size={16} className="activity-icon-default" />;
-};
-
-const getEventDescription = (event: ActivityEvent): string => {
-  if (event.type === 'status_change') {
-    return `moved to ${event.newValue}`;
-  }
-  if (event.type === 'created') return 'created';
-  if (event.type === 'subtask_completed') return 'subtask completed';
-  if (event.type === 'priority_change') return `priority → ${event.newValue}`;
-  return event.type.replace(/_/g, ' ');
-};
-
+/**
+ * THE DASHBOARD ACTIVITY WIDGET (Notifications and Timeline design section
+ * 4.6; card 5854f0d6, Slice B; owner ruling E394, choice C11).
+ *
+ * The newest eight Timeline rows you can see, read from
+ * `GET /notifications/timeline` with the Timeline's own defaults (every type,
+ * access changes hidden, everything you can see), and a link to the full
+ * Timeline. It replaces the widget that read `GET /dashboard/activity` and
+ * never rendered. A page of the Timeline may hold more rows than asked for
+ * (approval and skill-decision rows ride beside the feed's page), so the rows
+ * are sorted by time and cut to eight here.
+ *
+ * Honest states: a failed read (and the route's 503 TIMELINE_READ_TIMEOUT)
+ * says so with Retry; an empty Timeline says it is empty.
+ */
 export const ActivityFeed: React.FC = () => {
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [available, setAvailable] = useState(true);
+  const { config } = useRelayHallConfig();
+  const [state, setState] = useState<FeedState>({ status: 'loading' });
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
 
   useEffect(() => {
-    fetchActivity();
-  }, []);
+    const controller = new AbortController();
+    setState({ status: 'loading' });
+    fetchTimelinePage(NO_TIMELINE_FILTERS, { limit: ACTIVITY_ROWS }, controller.signal)
+      .then((page) => setState({ status: 'ready', items: mergeTimeline([], page.items).items.slice(0, ACTIVITY_ROWS) }))
+      .catch((caught) => {
+        if (!isIntentionalAbort(caught, controller.signal)) setState({ status: 'error', failure: timelineFailure(caught) });
+      });
+    return () => controller.abort();
+  }, [attempt]);
 
-  const fetchActivity = async () => {
-    try {
-      const response = await authenticatedFetch(`${API_BASE_URL}/dashboard/activity?limit=8`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success && data.events) {
-          setEvents(data.events);
-          setLoaded(true);
-          return;
-        }
-      }
-      // Endpoint not available yet — hide widget
-      setAvailable(false);
-    } catch {
-      setAvailable(false);
-    } finally {
-      setLoaded(true);
-    }
-  };
-
-  // Don't render if endpoint not available
-  if (!available || (!loaded)) return null;
-  if (events.length === 0 && loaded) return null;
+  const boardName = config.displayName || 'RelayHall';
 
   return (
-    <div className="activity-feed">
+    <section className="activity-feed" aria-labelledby="dashboard-activity-heading">
       <div className="activity-feed-header">
-        <h2><ClipboardList size={16} aria-hidden="true" /> Activity Feed</h2>
+        <h2 id="dashboard-activity-heading"><ClipboardList size={16} aria-hidden="true" /> Activity</h2>
+        <Link className="activity-feed-all" to="/action-center?tab=timeline">Open the Timeline</Link>
       </div>
 
-      <div className="activity-feed-timeline">
-        {events.map((event, idx) => (
-          <div key={idx} className="activity-feed-item">
-            <div className="activity-feed-dot">
-              {getEventIcon(event.type, event.newValue)}
-            </div>
-            <div className="activity-feed-content">
-              <span className="activity-feed-time">{timeAgo(event.timestamp)}</span>
-              <span className="activity-feed-task">{event.taskTitle}</span>
-              <span className="activity-feed-desc">{getEventDescription(event)}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
+      {state.status === 'loading' && <p className="activity-feed-quiet" role="status">Loading recent activity…</p>}
+      {state.status === 'error' && (
+        <div className="activity-feed-failed" role="alert">
+          <span>
+            {state.failure === 'timeout' ? 'Recent activity took too long to read.' : 'Couldn’t load recent activity.'}
+          </span>
+          <Button variant="secondary" size="compact" onClick={retry}>Retry</Button>
+        </div>
+      )}
+      {state.status === 'ready' && state.items.length === 0 && (
+        <p className="activity-feed-quiet">Nothing has happened that you can see yet.</p>
+      )}
+      {state.status === 'ready' && state.items.length > 0 && (
+        <ol className="activity-feed-timeline">
+          {state.items.map((item) => {
+            const link = timelineLink(item);
+            const subject = timelineSubject(item);
+            const actor = timelineActor(item, boardName);
+            return (
+              <li key={item.key} className="activity-feed-item">
+                <span className="activity-feed-dot" aria-hidden="true"><TimelineIcon kind={item.kind} /></span>
+                <div className="activity-feed-content">
+                  <time className="activity-feed-time" dateTime={item.at} title={formatDateTime(item.at, item.at)}>{timeAgo(item.at)}</time>
+                  {link
+                    ? <Link className="activity-feed-task" to={link}>{subject}</Link>
+                    : <span className="activity-feed-task">{subject}</span>}
+                  <span className="activity-feed-desc">
+                    {item.label}: {timelineWhat(item)}{actor ? `, by ${actor}` : ''}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
   );
 };

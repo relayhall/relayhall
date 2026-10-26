@@ -13,8 +13,8 @@
  * nothing — and each one must redden a DIFFERENT assertion from its neighbours.
  *
  * Run it:  cd backend && npx tsx scripts/first-run-mutation-drill.ts
- * Every file it touches is restored, including on failure. Developer tool, not
- * a CI step: never point it at a tree with uncommitted work you care about.
+ * Every file it touches is restored, including on failure. The full tier runs it in a throwaway checkout (job drill_controls, machinery queue 9b761f09);
+ * locally, never point it at a tree with uncommitted work you care about.
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';
@@ -43,6 +43,10 @@ const SERVICE = 'src/services/FirstRunService.ts';
 const CONFIG = 'src/config/relayhall.ts';
 const SERVICE_ROUTE = 'src/routes/services.ts';
 const PRINCIPAL_SERVICE = 'src/services/PrincipalService.ts';
+// The role act's checks and its ledger row moved out of the route into this
+// service (the change-request decision applies the same act); M3-M7 are
+// anchored here by name since machinery queue 9b761f09.
+const ROLE_SERVICE = 'src/services/PrincipalRoleService.ts';
 
 export const MUTATIONS: Mutation[] = [
   {
@@ -60,8 +64,10 @@ export const MUTATIONS: Mutation[] = [
     id: 'M2',
     reintroduces: 'the classification admits the rh_ bearer arm as well',
     file: SEAM,
-    find: "  return authMethod === 'session' || authMethod === 'dashboard_jwt';",
-    replace: "  return authMethod === 'session' || authMethod === 'dashboard_jwt' || authMethod === 'principal_api_key';",
+    // The stored-session kind became its own predicate; the login-kind
+    // classification is the line that names the dashboard JWT beside it.
+    find: "  return isStoredLoginSessionKind(authMethod) || authMethod === 'dashboard_jwt';",
+    replace: "  return isStoredLoginSessionKind(authMethod) || authMethod === 'dashboard_jwt' || authMethod === 'principal_api_key';",
     expects: [
       'admits exactly the two doors a PERSON comes through',
       'refuses every machine credential, not only the rh_ one',
@@ -72,14 +78,14 @@ export const MUTATIONS: Mutation[] = [
   {
     id: 'M3',
     reintroduces: 'the non-escalation ceiling is dropped — an operator mints an admin',
-    file: ROUTE,
+    file: ROLE_SERVICE,
     // NOT `if (false && ...)`: TypeScript treats the block as unreachable and
-    // RESETS the narrowing of `session` inside it, so the file stops compiling
-    // and the run measures nothing. Handing the ceiling a fixed `admin` issuer
-    // keeps every type intact and reintroduces exactly the defect — an
-    // operator bounded by somebody else's authority.
-    find: '    if (!canAssignRole(session.issuerRole, requestedRole)) {',
-    replace: "    if (!canAssignRole('admin', requestedRole)) {",
+    // RESETS the narrowing inside it, so the file stops compiling and the run
+    // measures nothing. Handing the ceiling a fixed `admin` issuer keeps every
+    // type intact and reintroduces exactly the defect — an operator bounded
+    // by somebody else's authority.
+    find: '  if (!canAssignRole(issuer.issuerRole, role)) {',
+    replace: "  if (!canAssignRole('admin', role)) {",
     expects: [
       'an OPERATOR cannot mint an admin',
       'an OPERATOR cannot mint an orchestrator either',
@@ -88,39 +94,39 @@ export const MUTATIONS: Mutation[] = [
   {
     id: 'M4',
     reintroduces: 'the self-row refusal never fires — an administrator promotes themselves',
-    file: ROUTE,
-    find: '    if (req.principal?.id && req.principal.id === target.id) {',
-    replace: '    if (req.principal?.id && req.principal.id === target.handle) {',
+    file: ROLE_SERVICE,
+    find: '  if (issuer.principalId && issuer.principalId.toLowerCase() === target.id.toLowerCase()) {',
+    replace: '  if (issuer.principalId && issuer.principalId.toLowerCase() === target.handle.toLowerCase()) {',
     expects: ['an administrator cannot change their OWN row'],
   },
   {
     id: 'M5',
     reintroduces: 'the break-glass identity loses its fixed role — the R11 lockout by another verb',
-    file: ROUTE,
+    file: ROLE_SERVICE,
     // Same reachability rule as M3. The configured handle is lowercased by
     // `localAdministratorHandle`, so an upper-cased comparison never matches
     // and the guard is inert — while every identifier stays used and every
     // narrowing survives.
-    find: '    if (target.handle === localAdministratorHandle()) {',
-    replace: '    if (target.handle === localAdministratorHandle().toUpperCase()) {',
+    find: '  if (target.handle === localAdministratorHandle()) {',
+    replace: '  if (target.handle === localAdministratorHandle().toUpperCase()) {',
     expects: ['the break-glass local administrator keeps its role'],
   },
   {
     id: 'M6',
     reintroduces: 'an elevated role lands on a legacy SERVICE row — every rh_ key it holds derives root',
-    file: ROUTE,
+    file: ROLE_SERVICE,
     // The defect precisely: the PARENT test kept, the KIND test dropped. That
     // is the half migration 096's CHECK does not carry, so a legacy parentless
     // service row — the shape that holds `rh_` keys — becomes promotable.
-    find: '    if (ELEVATED_ROLES.has(requestedRole) && (target.kind !== \'human\' || target.parentPrincipalId !== null)) {',
-    replace: '    if (ELEVATED_ROLES.has(requestedRole) && (target.parentPrincipalId !== null)) {',
+    find: '  if (ELEVATED_ROLES.has(role) && (target.kind !== \'human\' || target.parentPrincipalId !== null)) {',
+    replace: '  if (ELEVATED_ROLES.has(role) && (target.parentPrincipalId !== null)) {',
     expects: ['a legacy SERVICE row cannot be promoted to admin'],
   },
   {
     id: 'M7',
     reintroduces: 'the audit records the AFTER role as the before one — the ledger stops being a diff',
-    file: ROUTE,
-    find: '        before: previousRole,',
+    file: ROLE_SERVICE,
+    find: '        before: prepared.previousRole,',
     replace: '        before: updated.role,',
     expects: ['a successful change records actor, target, before, after and the seam'],
   },
@@ -204,12 +210,13 @@ export const MUTATIONS: Mutation[] = [
   {
     id: 'M17',
     reintroduces: 'review verdict 2c284891 B2 — the role act leaves its transaction again',
-    file: ROUTE,
+    file: ROLE_SERVICE,
     // The audit row goes back to its own connection: the UPDATE still commits,
     // the ledger row can fail on its own, and the caller is told the act failed
-    // while it happened.
-    find: '      }, client);\n      await client.query(\'COMMIT\');',
-    replace: '      });\n      await client.query(\'COMMIT\');',
+    // while it happened. The act's ledger write lives in the role service's
+    // `apply` since the change-request decision shares it.
+    find: '    }, client);\n    return { updated, previousRole: prepared.previousRole };',
+    replace: '    });\n    return { updated, previousRole: prepared.previousRole };',
     expects: [
       'the UPDATE and the audit row go down ONE connection, inside one transaction',
       'neither write escapes to the pool',

@@ -57,6 +57,123 @@
   gap: var(--space-3);
 }
 
+/* E466: the controls of the header are one box on a wide screen and TWO things on
+   a phone, the line that scrolls sideways (view switch, Search, More) and New
+   task beside it. The wrapper has no box of its own on a wide screen, so its
+   controls are the header actions' own flex items, exactly as before. */
+.tasks-page-header-scroll {
+  display: contents;
+}
+
+/* E464: on a phone the view switch, Search and more stay on ONE line that
+   scrolls sideways inside itself (the E461 tab row pattern) instead of
+   wrapping. E466: New task, the primary action, is NOT part of that line: it
+   stands beside it at the end of the row, so the edge fade can never cut it
+   (it used to sit about 7 px under the fade at 375 px until the row was
+   scrolled). Wider screens keep the rule above untouched. The block padding of
+   the scrolling line (cancelled by the matching negative margin) keeps the
+   focus ring from being clipped by the scroller. */
+@media (max-width: 768px) {
+  .tasks-page-header-actions {
+    flex-wrap: nowrap;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .tasks-page-header-actions > * {
+    flex: 0 0 auto;
+  }
+
+  /* After the rule above and of equal weight: the line may shrink to what is left beside New task. */
+  .tasks-page-header-scroll {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: inherit;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    scroll-padding-inline: var(--space-2);
+    padding-block: var(--space-2);
+    margin-block: calc(-1 * var(--space-2));
+    /* The same edge fades as the segmented control: shown only where content is hidden.
+       The fade layers are clipped to the padding box, as the Map toolbar's are. */
+    background-image:
+      linear-gradient(to right, var(--bg-surface) 50%, transparent),
+      linear-gradient(to left, var(--bg-surface) 50%, transparent),
+      linear-gradient(to right, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent),
+      linear-gradient(to left, color-mix(in srgb, var(--text-primary) 40%, transparent), transparent);
+    background-position: left center, right center, left center, right center;
+    background-repeat: no-repeat;
+    background-size: 24px 100%, 24px 100%, 12px 100%, 12px 100%;
+    background-attachment: local, local, scroll, scroll;
+    background-clip: padding-box, padding-box, padding-box, padding-box;
+  }
+
+  .tasks-page-header-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tasks-page-header-scroll > * {
+    flex: 0 0 auto;
+  }
+
+  /* The touch floor (44 px) for every control of the header, up to 768 px: the
+     global rules of the buttons, the icon buttons and the segmented control
+     stop at 767 px, and the compact buttons stop at 36 px. */
+  .tasks-page-header-actions .btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .tasks-page-header-actions .icon-btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .tasks-page-header-actions .search-toggle-btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* E469: Search is icon-only on a phone, so nothing in the line sits under its
+     edge fade at rest (it was 11 px too wide at 375 px). The word stays in the
+     markup as part of the accessible name, hidden visually the way .sr-only
+     hides it (never display:none, which would drop the name); the title and
+     the long-press label (ui/LabelTip) show it. Wider than 768 px it is
+     unchanged. */
+  .tasks-page-header-actions .search-toggle-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .tasks-page-header-actions .segmented-option {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* The More menu must not be clipped by the scrolling row. A fixed box with
+     no top keeps its place in the flow (just under the button) and ignores the
+     row's clip; it is pinned to the right edge of the screen. */
+  .tasks-toolbar-overflow .tasks-overflow-menu {
+    position: fixed;
+    top: auto;
+    right: var(--space-3);
+    margin-top: var(--space-1);
+  }
+}
+
 /* ========================================
    TASKS TOOLBAR (986be411 §2)
    Search first (DOM and tab order), actions after.
@@ -541,9 +658,17 @@
     max-width: 100% !important;
   }
 
+  /* The fixed hamburger (44px @ left:16px) sits beside the TITLE only: the room
+     it needs (76px with the gap, extra to offset the negative page margin) is
+     the title's own left padding, so a header actions row that wraps under the
+     title may use the full width (E469: at 320 px the scrolling line is 24 px
+     wider than the 232 px the indent left it, which put More under the fade). */
   .tasks-page-header {
     padding: var(--space-3);
-    padding-left: 76px; /* Space for fixed hamburger (44px @ left:16px) + gap; extra to offset negative page margin */
+  }
+
+  .tasks-page-header-title {
+    padding-left: calc(76px - var(--space-3));
   }
 
   .tasks-page-header-title h1 {
@@ -586,3 +711,9 @@
   height: 100vh;
   color: var(--text-tertiary);
 }
+
+.archive-results { margin: 0.75rem 0; padding: 0.75rem; border: 1px solid var(--border-default); border-radius: 8px; min-width: 0; }
+.archive-results summary { cursor: pointer; }
+.archive-results-body { max-height: 24rem; overflow: auto; overflow-wrap: anywhere; }
+.archive-results-scroll { max-height: 18rem; overflow: auto; overflow-wrap: anywhere; margin-top: 0.5rem; }
+.archive-results-scroll li { margin-bottom: 0.5rem; }

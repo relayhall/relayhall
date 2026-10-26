@@ -50,7 +50,13 @@ describe('AuthorizationService', () => {
     expect(service.authorizeResource(actor(), 'shepherd', task({ shepherdPrincipalId: principalId })).basis).toBe('shepherd');
     expect(service.authorizeResource(actor(), 'release', task({ shepherdPrincipalId: principalId })).basis).toBe('shepherd');
     expect(service.authorizeResource(actor(), 'write', task({ shepherdPrincipalId: principalId })).allowed).toBe(false);
-    expect(service.authorizeResource(actor(), 'verify', task({ verifierPrincipalId: principalId })).basis).toBe('verifier');
+    // Owner ruling E462 S4b (design section 6.8): `verify` through the exact-
+    // Verifier arm is decided in memory only when the chain guard is known to
+    // pass; otherwise (absent or guarded) the SQL predicate decides.
+    expect(service.authorizeResource(actor(), 'verify', task({ verifierPrincipalId: principalId, verifierGuarded: false })).basis).toBe('verifier');
+    expect(service.authorizeResource(actor(), 'verify', task({ verifierPrincipalId: principalId })).allowed).toBe(false);
+    expect(service.authorizeResource(actor(), 'verify', task({ verifierPrincipalId: principalId, verifierGuarded: true })).allowed).toBe(false);
+    expect(service.authorizeResource(actor(), 'read', task({ verifierPrincipalId: principalId, verifierGuarded: true })).basis).toBe('verifier');
     expect(service.authorizeResource(actor(), 'finish', task({ verifierPrincipalId: principalId })).allowed).toBe(false);
   });
 
@@ -153,10 +159,16 @@ describe('AuthorizationService', () => {
           resourceType: 'task', resourceId: task().id, verb,
         }]).allowed);
       const sql = service.sqlCondition(actor(), action, { type: 'task', id: 't.id' });
-      const sqlVerbs = sql.params.filter((value) => ['read', 'write', 'use', 'invoke', 'admin'].includes(String(value)));
+      // AZ-A10 also binds a verb ARRAY for role grants. String(['admin'])
+      // is 'admin', so the old scalar oracle counted that array twice.
+      const sqlVerbs = sql.params.filter((value) => typeof value === 'string'
+        && ['read', 'write', 'use', 'invoke', 'admin'].includes(value));
       // Since AZ-S2 the profile arm mirrors the grant arm verb-for-verb:
       // each allowed verb binds once for grants and once for profiles.
       expect(sqlVerbs).toEqual(pureAllowed.flatMap((verb) => [verb, verb]));
+      const roleVerbs = sql.params.filter(Array.isArray).find(value => value.every((verb: unknown) =>
+        typeof verb === 'string' && ['read','write','use','invoke','admin'].includes(verb)));
+      expect(roleVerbs ?? []).toEqual(pureAllowed);
     }
   });
 

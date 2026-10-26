@@ -170,6 +170,11 @@ export class CanonicalRuntimeSignalService {
   constructor(private readonly pool: Pool = defaultPool) {}
 
   async listTaskSignals(taskId: string, now = new Date()): Promise<CanonicalRuntimeSignal[]> {
+    return this.listTaskSignalsForTasks([taskId], now);
+  }
+
+  async listTaskSignalsForTasks(taskIds: string[], now = new Date()): Promise<CanonicalRuntimeSignal[]> {
+    if (taskIds.length === 0) return [];
     const result = await this.pool.query<RuntimeSignalRow>(
       `SELECT l.task_id, l.attempt_id, l.attempt_number, a.harness, l.link_state,
               l.linked_at, a.ended_at,
@@ -210,9 +215,9 @@ export class CanonicalRuntimeSignalService {
             WHERE o.task_id=l.task_id AND o.attempt_id=l.attempt_id AND o.ownership_kind='writer'
             ORDER BY o.acquired_at DESC, o.ownership_id DESC LIMIT 1
          ) lease ON TRUE
-        WHERE l.task_id=$1 AND l.link_state NOT IN ('released','superseded')
+        WHERE l.task_id=ANY($1::uuid[]) AND l.link_state NOT IN ('released','superseded')
         ORDER BY l.attempt_number DESC, l.linked_at DESC`,
-      [taskId, now],
+      [taskIds, now],
     );
 
     return result.rows.map(row => classifyCanonicalRuntimeSignal({

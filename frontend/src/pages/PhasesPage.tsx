@@ -1,9 +1,12 @@
+import { ContextPreview, ContextPreviewTrigger, ContextPreviewPanel } from '../components/BriefContextPreview';
 import { useMyPrincipal } from '../hooks/usePrincipals';
 import { BlueprintCapture } from '../components/blueprints/BlueprintCapture';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Compass, Plus, Pencil, Archive, ArchiveRestore, Copy, Trash2 } from 'lucide-react';
 import { authenticatedFetch } from '../utils/auth';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { DefaultVerifierField, canSetDefaultVerifier } from '../components/projects/DefaultVerifierField';
 import './PhasesPage.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
@@ -28,6 +31,8 @@ export interface Phase {
   goal: string | null;
   status: PhaseStatus;
   position: number;
+  /** Card 41e24358: the Verifier new cards landing here inherit; null = the Project's. */
+  defaultVerifierPrincipalId?: string | null;
   revision: string;
   createdAt: string;
   updatedAt: string;
@@ -53,10 +58,14 @@ const EMPTY_DRAFT: DraftState = { name: '', goal: '', status: 'todo', position: 
 
 export function PhasesPage() {
   const { id } = useParams<{ id: string }>();
-  const { scopes } = useMyPrincipal();
+  const { subscribe, connected } = useWebSocket();
+  const { me, scopes } = useMyPrincipal();
+  // Card 41e24358: who owns the Project decides who may set a Phase default.
+  const [projectOwnerPrincipalId, setProjectOwnerPrincipalId] = useState<string | null>(null);
   const canCapture = scopes?.some(scope => ['root','*','blueprints:write'].includes(scope));
   const [capturePhase, setCapturePhase] = useState<Phase | null>(null);
   const [phases, setPhases] = useState<Phase[]>([]);
+  const loadGeneration = useRef(0);
   const [projectName, setProjectName] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -73,28 +82,42 @@ export function PhasesPage() {
 
   const load = useCallback(() => {
     if (!id) return;
+    const generation = ++loadGeneration.current;
     setLoading(true);
     setError(null);
     const query = includeArchived ? '?includeArchived=true' : '';
-    authenticatedFetch(`${API_BASE_URL}/projects/${id}/phases${query}`)
-      .then(async res => {
+    void (async () => {
+      try {
+        const res = await authenticatedFetch(`${API_BASE_URL}/projects/${id}/phases${query}`);
         const data = await res.json().catch(() => null);
         if (!res.ok) throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
+        const projectRes = await authenticatedFetch(`${API_BASE_URL}/projects/${id}`);
+        const projectData = await projectRes.json().catch(() => null);
+        if (!projectRes.ok || !projectData?.success) throw new Error('Project access could not be verified');
+        if (generation !== loadGeneration.current) return;
         setPhases(data?.phases ?? []);
-      })
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load phases'))
-      .finally(() => setLoading(false));
+        setProjectName(projectData.project?.name ?? '');
+        setProjectOwnerPrincipalId(projectData.project?.ownerPrincipalId ?? null);
+      } catch (err) {
+        if (generation !== loadGeneration.current) return;
+        setPhases([]); setProjectName('');
+        setEditing(null); setCreating(false); setConfirmDelete(null); setCapturePhase(null);
+        setError(err instanceof Error ? err.message : 'Failed to load phases');
+      } finally {
+        if (generation === loadGeneration.current) setLoading(false);
+      }
+    })();
   }, [id, includeArchived]);
 
   useEffect(() => { load(); }, [load]);
-
   useEffect(() => {
-    if (!id) return;
-    authenticatedFetch(`${API_BASE_URL}/projects/${id}`)
-      .then(res => res.json())
-      .then(data => setProjectName(data?.project?.name ?? ''))
-      .catch(() => setProjectName(''));
-  }, [id]);
+    const unsubscribe = subscribe('project.authority_changed', load);
+    const onFocus = () => load();
+    if (typeof window === 'undefined') return;
+    window.addEventListener('focus', onFocus);
+    return () => { unsubscribe(); window.removeEventListener('focus', onFocus); };
+  }, [subscribe, load]);
+  useEffect(() => { if (connected) load(); }, [connected, load]);
 
   // Defaults are materialised into the draft when the form OPENS and when the
   // edited phase changes — never shown-but-not-submitted (review 66c78a1d F3).
@@ -314,6 +337,24 @@ export function PhasesPage() {
               />
             </div>
           </div>
+          {editing && id && (
+            <DefaultVerifierField
+              target="phases"
+              objectId={editing.id}
+              projectId={id}
+              revision={editing.revision}
+              value={editing.defaultVerifierPrincipalId}
+              canEdit={editing.status !== 'archived' && canSetDefaultVerifier(me, scopes, projectOwnerPrincipalId)}
+              emptyLabel={`Inherit from Project (${projectName || 'its default'})`}
+              onSaved={saved => {
+                const next = { ...editing, revision: saved.revision, defaultVerifierPrincipalId: saved.defaultVerifierPrincipalId };
+                setEditing(next);
+                setPhases(current => current.map(phase => (phase.id === next.id ? next : phase)));
+              }}
+              onConflict={() => setSaveError('The phase changed since it was loaded; reload and retry')}
+              onMessage={setNotice}
+            />
+          )}
           {saveError && <div className="phases-error">{saveError}</div>}
           <div className="form-actions">
             <button type="button" className="phases-action-btn" onClick={closeForm} disabled={saving}>Cancel</button>
@@ -341,7 +382,8 @@ export function PhasesPage() {
       {!loading && phases.length > 0 && (
         <ul className="phases-list">
           {phases.map(phase => (
-            <li key={phase.id} className={`phases-row phases-row-${phase.status}`}>
+            <ContextPreview key={phase.id} kind="phase" elementId={phase.id} elementName={phase.name}>
+            <li className={`phases-row phases-row-${phase.status}`}>
               <div className="phases-row-main">
                 <span className="phases-position">#{phase.position}</span>
                 <span className="phases-name">{phase.name}</span>
@@ -349,6 +391,7 @@ export function PhasesPage() {
               </div>
               {phase.goal && <p className="phases-goal">{phase.goal}</p>}
               <div className="phases-row-actions">
+                <ContextPreviewTrigger className="phases-action-btn" />
                 {canCapture && <button type="button" className="phases-action-btn" onClick={() => setCapturePhase(phase)}>Save as Blueprint</button>}
                 <button type="button" className="phases-action-btn" onClick={() => openEdit(phase)}>
                   <Pencil size={16} /> Edit
@@ -387,7 +430,9 @@ export function PhasesPage() {
                   </button>
                 )}
               </div>
+              <ContextPreviewPanel />
             </li>
+            </ContextPreview>
           ))}
         </ul>
       )}

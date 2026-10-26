@@ -7,9 +7,9 @@
  *
  *   "a `services:write` credential setting/changing any §4.2 field refused;
  *    setting an endpoint while the descriptor has no `knowledgeSource` block
- *    OR an empty compartment list refused at set time (sol R1-3); registering
+ *    OR an empty compartment list refused at set time (review R1-3); registering
  *    an external source without a core-credential arrangement refused in BOTH
- *    claims modes (sol R1-2); a descriptor publish changes routing only via
+ *    claims modes (review R1-2); a descriptor publish changes routing only via
  *    declared classes."
  *
  * BD-1, verbatim from §9: "§11.11 mutation-drills the reserved arm itself (a
@@ -177,7 +177,7 @@ describe('item 6 clause 1 — a services:write credential cannot set any §4.2 f
     expect(requiredScopeFor('POST', '/services')).toBe('services:write');
   });
 
-  it('accepts the seven fields on the owner-plane seat ONLY', () => {
+  it('accepts the knowledge fields (seven of §4.2, plus the RB-11 write endpoint) on the owner-plane seat ONLY', () => {
     const routeSource = readShippedSource('routes/services.ts');
     // The owner-plane call spreads the registry's own declaration; the
     // agent-plane calls list their keys literally and name none of ours.
@@ -187,7 +187,10 @@ describe('item 6 clause 1 — a services:write credential cannot set any §4.2 f
       // than through the spread — a second occurrence would be a second seat.
       expect(routeSource.split(`'${field}'`).length - 1).toBe(0);
     }
-    expect(KNOWLEDGE_OWNER_PLANE_FIELDS).toHaveLength(7);
+    // Seven §4.2 fields, plus `knowledgeWriteEndpoint` (RB-11 Governor v0,
+    // card b796067e, D-8) on the same seat and under the same root ceiling.
+    expect(KNOWLEDGE_OWNER_PLANE_FIELDS).toHaveLength(8);
+    expect(KNOWLEDGE_OWNER_PLANE_FIELDS).toContain('knowledgeWriteEndpoint');
   });
 
   it('MUTATION: with the owner-plane scope rule removed, the seat falls to services:write', () => {
@@ -238,7 +241,7 @@ describe('item 6 clauses 2 and 3 — no half-configured state can exist', () => 
     expect(error.code).toBe('KNOWLEDGE_DESCRIPTOR_BLOCK_REQUIRED');
   });
 
-  it('refuses an EMPTY compartment list in the descriptor validator itself (sol R1-3)', () => {
+  it('refuses an EMPTY compartment list in the descriptor validator itself (review R1-3)', () => {
     expect(() => validateDescriptor({ options: [], knowledgeSource: { classes: KNOWLEDGE_BLOCK.classes, compartments: [] } }))
       .toThrow(DescriptorError);
     // …and admits the canonical single-compartment declaration §4.3 names.

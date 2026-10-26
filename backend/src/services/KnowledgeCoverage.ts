@@ -15,6 +15,21 @@
  *      `answered`;
  *   4. `skipped` is DISJOINT from `consulted`.
  *
+ * Card 40e0e542 (owner ruling E127 (5), selector amendment v1.2) adds the
+ * scope the answer covered, so every answer states what was searched:
+ *
+ *   5. `searchedCategories` is a MODIFIER of `consulted` — one entry per id, ⊆
+ *      consulted — naming the categories each source was asked to search
+ *      (`all` when no category filter was sent);
+ *   6. `archive.included` is the caller's opt-in, and when it is false no
+ *      entry may name a category its source declares as archive, nor be
+ *      `all` for a source that declares one. The record cannot say "archive
+ *      excluded" about a search that reached the archive.
+ *   7. `archive.declaredBy` is within `consulted`: the consulted sources that
+ *      declare archive categories (the L3 review's rider). The scope sentence
+ *      reads it, so it can say when there was no archive to exclude, and when
+ *      every source holding one refused the opt-in.
+ *
  * Acceptance item 9 drills all four across a run touching every outcome. A
  * record assembled field by field in the executor can satisfy them on the
  * paths the drills walk and break on the next one added; a record that can
@@ -53,7 +68,21 @@ export interface KnowledgeUnavailableEntry {
 export interface KnowledgeSkippedEntry {
   id: string;
   /** The only skip reason v1 has: §5.5's class arm. */
-  reason: 'kinds';
+  reason: 'kinds' | 'categories' | 'unsupported-selector';
+  selector?: 'categories' | 'protocol';
+}
+
+/** Card 40e0e542: what one consulted source was asked to search. */
+export interface KnowledgeSearchedCategoriesEntry {
+  id: string;
+  categories: string[] | 'all';
+}
+
+/** Card 40e0e542: whether the caller opted in to the declared archive categories. */
+export interface KnowledgeArchiveScope {
+  included: boolean;
+  /** Invariant 7: the CONSULTED source ids that declare archive categories. */
+  declaredBy: string[];
 }
 
 export interface KnowledgeCoverage {
@@ -66,6 +95,12 @@ export interface KnowledgeCoverage {
   truncatedResults: string[];
   invalidResults: string[];
   skipped: KnowledgeSkippedEntry[];
+  /** v2: answered sources whose answer is partial; `deadlineFired` names the budget behind `deadline` (card 3e0ae06e). */
+  partialSources?: { id: string; reasons: string[]; deadlineFired?: 'caller_deadline' | 'source_deadline' }[];
+  /** Card 40e0e542: invariant 5, a modifier of `consulted`. */
+  searchedCategories: KnowledgeSearchedCategoriesEntry[];
+  /** Card 40e0e542: invariant 6. */
+  archive: KnowledgeArchiveScope;
 }
 
 /** Raised only by a caller misuse this class refuses to encode. */
@@ -77,6 +112,18 @@ export class KnowledgeCoverageError extends Error {
 }
 
 export class KnowledgeCoverageBuilder {
+  /**
+   * Card 40e0e542: the caller's archive opt-in is fixed when the record is
+   * opened, so no writer can change the scope the answer states afterwards.
+   */
+  constructor(options: { archiveIncluded?: boolean } = {}) {
+    this.archiveIncluded = options.archiveIncluded === true;
+  }
+
+  private readonly archiveIncluded: boolean;
+
+  private readonly searched = new Map<string, { categories: string[] | 'all'; archive: string[] }>();
+
   private readonly outcomes = new Map<string, KnowledgeCoverageOutcome>();
 
   private readonly unavailable = new Map<string, KnowledgeUnavailableEntry>();
@@ -85,7 +132,12 @@ export class KnowledgeCoverageBuilder {
 
   private readonly invalid = new Set<string>();
 
-  private readonly skippedReasons = new Map<string, 'kinds'>();
+  private readonly skippedReasons = new Map<string, KnowledgeSkippedEntry>();
+  private readonly partial = new Map<string, { reasons: string[]; deadlineFired?: 'caller_deadline' | 'source_deadline' }>();
+  markPartial(id: string, reasons: string[], deadlineFired?: 'caller_deadline' | 'source_deadline'): void {
+    this.requireAnswered(id, 'partialSources');
+    this.partial.set(id, { reasons, ...(deadlineFired ? { deadlineFired } : {}) });
+  }
 
   /**
    * Record the FINAL outcome for one consulted source.
@@ -139,11 +191,30 @@ export class KnowledgeCoverageBuilder {
    * Skipped is DISJOINT from consulted — the source was never dialed, so it
    * has no outcome and must not appear in the partition.
    */
-  markSkipped(id: string): void {
+  markSkipped(id: string, reason: KnowledgeSkippedEntry['reason'] = 'kinds', selector?: KnowledgeSkippedEntry['selector']): void {
     if (this.outcomes.has(id)) {
       throw new KnowledgeCoverageError(`source ${id} was consulted and cannot also be skipped`);
     }
-    this.skippedReasons.set(id, 'kinds');
+    this.skippedReasons.set(id, { id, reason, ...(selector ? { selector } : {}) });
+  }
+
+  /**
+   * Invariant 5: the categories one CONSULTED source was asked to search, and
+   * the archive categories it declares (kept for invariant 6, never emitted).
+   * Only a consulted id, once, and never an empty list.
+   */
+  markSearchedCategories(id: string, categories: readonly string[] | 'all', declaredArchive: readonly string[] = []): void {
+    if (!this.outcomes.has(id)) {
+      throw new KnowledgeCoverageError(`searchedCategories is a modifier of consulted; source ${id} is not consulted`);
+    }
+    if (this.searched.has(id)) throw new KnowledgeCoverageError(`source ${id} already names its searched categories`);
+    if (categories !== 'all' && categories.length === 0) {
+      throw new KnowledgeCoverageError(`source ${id} cannot be consulted over no categories`);
+    }
+    this.searched.set(id, {
+      categories: categories === 'all' ? 'all' : [...new Set(categories)].sort(),
+      archive: [...declaredArchive],
+    });
   }
 
   /** Was this source already recorded? The executor asks before re-recording. */
@@ -182,7 +253,13 @@ export class KnowledgeCoverageBuilder {
       refusedByPolicy: bucket('refusedByPolicy'),
       truncatedResults: [...this.truncated],
       invalidResults: [...this.invalid],
-      skipped: [...this.skippedReasons.entries()].map(([id, reason]) => ({ id, reason })),
+      skipped: [...this.skippedReasons.values()],
+      ...(this.partial.size ? { partialSources: [...this.partial].map(([id, entry]) => ({ id, ...entry })) } : {}),
+      searchedCategories: [...this.searched].map(([id, entry]) => ({ id, categories: entry.categories })),
+      archive: {
+        included: this.archiveIncluded,
+        declaredBy: [...this.searched].filter(([, entry]) => entry.archive.length > 0).map(([id]) => id),
+      },
     };
 
     const partitionTotal = coverage.answered.length + coverage.timedOut.length
@@ -201,6 +278,16 @@ export class KnowledgeCoverageBuilder {
     const consultedSet = new Set(consulted);
     for (const entry of coverage.skipped) {
       if (consultedSet.has(entry.id)) throw new KnowledgeCoverageError('skipped intersects consulted');
+    }
+    for (const [id, entry] of this.searched) {
+      if (!consultedSet.has(id)) throw new KnowledgeCoverageError('searchedCategories is not a subset of consulted');
+      if (!this.archiveIncluded && entry.archive.length > 0
+        && (entry.categories === 'all' || entry.categories.some((category) => entry.archive.includes(category)))) {
+        throw new KnowledgeCoverageError('the archive is excluded but a searched scope reaches an archive category');
+      }
+    }
+    for (const id of coverage.archive.declaredBy) {
+      if (!consultedSet.has(id)) throw new KnowledgeCoverageError('archive.declaredBy is not a subset of consulted');
     }
     return coverage;
   }

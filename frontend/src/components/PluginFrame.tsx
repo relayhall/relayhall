@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { AlertTriangle, RefreshCw, Loader2 } from 'lucide-react';
 import { usePlugins } from '../contexts/PluginContext';
 import { attachOrbStatusForwarder } from '../utils/orbStatus';
+import { attachPluginBridge, trustedPluginMessage } from '../utils/pluginBridge';
 import './PluginFrame.css';
 import { useBrowserSession } from '../utils/browserSession';
 
@@ -12,7 +13,21 @@ interface PluginFrameProps {
   proxyPath: string;
   /** API base URL */
   apiBase: string;
+  /**
+   * WHICH SURFACE THIS FRAME IS. Required, and deliberately not defaulted: the
+   * host reserves space for its own floating mobile chrome on the frame that IS
+   * the route's page, and that reservation is a hole in the page anywhere else.
+   * A new call site that has not decided does not compile.
+   */
+  surface: PluginFrameSurface;
 }
+
+/**
+ * `route` — this frame is the whole page behind a plugin's route (App.tsx).
+ * `embedded` — this frame sits inside a page the host lays out, such as the
+ * plugin settings hub, which reserves nothing because nothing floats over it.
+ */
+export type PluginFrameSurface = 'route' | 'embedded';
 
 /**
  * PluginFrame renders a plugin's UI in an iframe
@@ -22,8 +37,13 @@ interface PluginFrameProps {
  * 
  * The backend proxies this request to the plugin's container.
  */
-export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps) {
+export function PluginFrame({ pluginName, proxyPath, apiBase, surface }: PluginFrameProps) {
   const { plugins } = usePlugins();
+  // The modifier carries the mobile-chrome band (PluginFrame.css). Only the
+  // route surface opts in; the shared class carries no geometry of its own.
+  const containerClass = surface === 'route'
+    ? 'plugin-frame-container plugin-frame-container--route'
+    : 'plugin-frame-container';
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [, setIframeHeight] = useState<number | null>(null);
@@ -35,9 +55,8 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
   const isHealthy = plugin?.healthy ?? false;
 
   // Build the iframe URL
-  // Remove 'claw-' prefix for cleaner URLs (matches backend proxy pattern)
-  const shortName = pluginName.replace(/^claw-/, '');
-  const iframeSrc = `${apiBase}/plugins/${shortName}${proxyPath}`;
+  // Consume the host-compiled namespace; the client must not normalize names.
+  const iframeSrc = `${apiBase}${plugin?.api_base ?? ""}${proxyPath}`;
 
   // Reset loading/error state when URL changes
   useEffect(() => {
@@ -46,7 +65,7 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
     setIframeHeight(null);
   }, [iframeSrc]);
 
-  // Live status feed for the orb plugin only (other plugins get neither the
+  // Live status feed for the identity-widget (orb) plugin only (other plugins get neither the
   // messages nor the re-renders — the bus bypasses the memoized route tree).
   // Keyed off the iframe element itself via a callback ref: the unhealthy and
   // error branches unmount the iframe, so an effect keyed on props alone would
@@ -56,10 +75,12 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
     iframeRef.current = node;
     orbForwarderRef.current?.();
     orbForwarderRef.current = null;
-    if (node && pluginName === 'nim-orb') {
+    if (node && plugin?.schema_version === 'rh.plugin/1') {
+      orbForwarderRef.current = attachPluginBridge(node,pluginName,apiBase);
+    } else if (node && pluginName === 'nim-orb') {
       orbForwarderRef.current = attachOrbStatusForwarder(node);
     }
-  }, [pluginName]);
+  }, [pluginName,plugin?.schema_version,apiBase]);
 
   useEffect(() => () => {
     orbForwarderRef.current?.();
@@ -73,7 +94,7 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
   useEffect(() => {
     // postMessage listener (kept for any plugin that sends it)
     const msgHandler = (e: MessageEvent) => {
-      if (e.data?.type === 'iframeResize' && typeof e.data.height === 'number') {
+      if (iframeRef.current && trustedPluginMessage(e,iframeRef.current) && e.data?.type === 'iframeResize' && Number.isFinite(e.data.height) && e.data.height >= 48 && e.data.height <= 4096) {
         setIframeHeight(h => Math.max(h ?? 0, e.data.height));
       }
     };
@@ -131,7 +152,7 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
   // Show unhealthy warning
   if (!isHealthy && plugin) {
     return (
-      <div className="plugin-frame-container">
+      <div className={containerClass}>
         <div className="plugin-frame-error">
           <AlertTriangle size={48} className="error-icon" />
           <h2>Plugin unavailable</h2>
@@ -153,7 +174,7 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
   // The proxy rejects the iframe without the capability cookie, so wait for it.
   if (!browserSessionReady) {
     return (
-      <div className="plugin-frame-container">
+      <div className={containerClass}>
         <div className="plugin-frame-loading">
           <div className="plugin-frame-spinner" />
         </div>
@@ -162,7 +183,7 @@ export function PluginFrame({ pluginName, proxyPath, apiBase }: PluginFrameProps
   }
 
   return (
-    <div className="plugin-frame-container">
+    <div className={containerClass}>
       {/* Loading overlay */}
       {loading && (
         <div className="plugin-frame-loading">

@@ -19,7 +19,16 @@ jest.mock('../services/GrantService', () => {
   };
 });
 
+// Card ff410dc4 (E407 item 1): the list read goes through the paged list
+// service; its query parser stays the real one, so these route mechanics
+// still see the real validation.
+jest.mock('../services/GrantListService', () => {
+  const actual = jest.requireActual('../services/GrantListService');
+  return { ...actual, grantListService: { page: jest.fn() } };
+});
+
 import { grantService } from '../services/GrantService';
+import { grantListService } from '../services/GrantListService';
 import grantsRouter from '../routes/grants';
 
 let server: http.Server;
@@ -66,10 +75,20 @@ describe('scope posture (§2.9: grant mutation out of the agent plane)', () => {
 
 describe('route mechanics', () => {
   it('GET lists and passes filters through', async () => {
-    (grantService.list as jest.Mock).mockResolvedValue([]);
-    const { status } = await call('GET', '/grants?granteeId=x&resourceType=task');
+    (grantListService.page as jest.Mock).mockResolvedValue({ grants: [], pagination: {} });
+    const granteeId = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f';
+    const { status } = await call('GET', `/grants?granteeId=${granteeId}&resourceType=task`);
     expect(status).toBe(200);
-    expect(grantService.list).toHaveBeenCalledWith({ granteeId: 'x', resourceType: 'task' });
+    expect(grantListService.page).toHaveBeenCalledWith(expect.objectContaining({
+      granteeId, resourceType: 'task', limit: null, made: 'all', sort: 'created',
+    }));
+  });
+
+  it('GET refuses a malformed filter before any read (card ff410dc4)', async () => {
+    const { status, text } = await call('GET', '/grants?granteeId=x');
+    expect(status).toBe(400);
+    expect(text).toContain('INVALID_QUERY_VALUE');
+    expect(grantListService.page).not.toHaveBeenCalled();
   });
 
   it('GET rejects unknown query params', async () => {
@@ -95,7 +114,7 @@ describe('route mechanics', () => {
 
   it('an unexpected error logs a fixed-text category only, never the raw value', async () => {
     const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    (grantService.list as jest.Mock).mockRejectedValue(new Error('rh_live_SECRETMARKER.abc leaked cause'));
+    (grantListService.page as jest.Mock).mockRejectedValue(new Error('rh_live_SECRETMARKER.abc leaked cause'));
     const { status, text } = await call('GET', '/grants');
     expect(status).toBe(500);
     expect(text).toContain('INTERNAL_ERROR');

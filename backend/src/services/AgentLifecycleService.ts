@@ -16,7 +16,7 @@
 // itself still succeeds — the lease is the task plane) but leaves a
 // durable audit row, so the runway shortening is visible.
 //
-// AUTO-REVOKE (AZ-29, sol B6): fires on the ENUMERATED terminal states —
+// AUTO-REVOKE (AZ-29, review B6): fires on the ENUMERATED terminal states —
 // `completed` and `archived` ONLY (never review, never stuck; `skipped`
 // is Subtask-only and cannot reach this logic). Review-rejection rework
 // continues on the same Agent while its lease and max-age live. The sweep
@@ -29,6 +29,7 @@ import { auditService, type AuditActor } from './AuditService';
 import { auditChainFor } from '../utils/auditChain';
 import { logCaughtWarning } from '../utils/secretSafeLog';
 import { invalidateApprovalsForCredentials } from '../utils/approvalInvalidation';
+import { accessVehicleService } from './AccessVehicleService';
 
 export const AGENT_DEFAULT_MAX_AGE_HOURS = 24;
 
@@ -77,7 +78,10 @@ export class AgentLifecycleService {
       // AZ-29: re-up to NOW() + max-age (the metadata fixed at mint) —
       // never shortening an already-later expiry, never reviving a
       // revoked or already-expired credential.
-      const extended = await pool.query(
+      const client = await pool.connect();
+      try {
+      await client.query('BEGIN');
+      const extended = await client.query(
         `UPDATE principal_credentials c
             SET expires_at = GREATEST(
                   c.expires_at,
@@ -90,7 +94,11 @@ export class AgentLifecycleService {
           RETURNING c.id, c.expires_at`,
         [actingPrincipalId, AGENT_DEFAULT_MAX_AGE_HOURS],
       );
-      if (extended.rows.length === 0) return { extended: false, blockedReason: null };
+      if (extended.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return { extended: false, blockedReason: null };
+      }
+      await accessVehicleService.syncAgentRoleExpiry(client, actingPrincipalId, actor);
       await auditService.record({
         action: 'credential.extend', actor,
         resourceType: 'principal', resourceId: actingPrincipalId,
@@ -98,10 +106,15 @@ export class AgentLifecycleService {
           taskId,
           credentialIds: extended.rows.map((r) => String(r.id)),
           newExpiry: new Date(extended.rows[0].expires_at).toISOString(),
-          chain: await auditChainFor(pool, actingPrincipalId),
+          chain: await auditChainFor(client, actingPrincipalId),
         },
-      }).catch(() => undefined);
+      }, client);
+      await client.query('COMMIT');
       return { extended: true, blockedReason: null };
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally { client.release(); }
     } catch (e) {
       logCaughtWarning('[AgentLifecycle] lease-extension pass failed:', e);
       return { extended: false, blockedReason: null };

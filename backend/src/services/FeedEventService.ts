@@ -22,6 +22,10 @@ import { pool as defaultPool } from '../db/connection';
 import { authorizationService, AuthorizationActor } from './AuthorizationService';
 import { authorizationRepository } from './AuthorizationRepository';
 import type { GrantResourceType } from './GrantService';
+import { groupOwnerCondition } from '../utils/groupOwnerCondition';
+
+/** A recorded owner value the Group-owner basis may test (the column is a uuid; a legacy text value never is a Group). */
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type FeedObjectType = 'task' | 'phase' | 'project' | 'report' | 'skill' | 'personality';
 
@@ -64,6 +68,24 @@ export interface FeedEvent {
   projectId: string | null;
   ownerPrincipalId: string | null;
   payload: Record<string, unknown>;
+}
+
+/**
+ * Who acted, as a writer that has a request (or a TaskActor) knows it. Card
+ * 5854f0d6 (Notifications and Timeline design section 4.3): every emit the
+ * Timeline shows passes the acting principal where the writer has one, so the
+ * person filter finds the row.
+ */
+export interface FeedActorRef {
+  principalId?: string | null;
+  handle?: string | null;
+}
+
+/** The feed's actor columns for `actor`: a value that is not a principal UUID
+ * records NULL (the column is a foreign key), never a guess from a handle. */
+export function feedActorFields(actor?: FeedActorRef | null): { actorPrincipalId: string | null; actorHandle: string | null } {
+  const id = actor?.principalId && UUID_SHAPE.test(actor.principalId) ? actor.principalId : null;
+  return { actorPrincipalId: id, actorHandle: actor?.handle ?? null };
 }
 
 const DOTTED = /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/;
@@ -273,6 +295,22 @@ export class FeedEventService {
         );
       }
     }
+    // AZ-A12 clause 13 (card a9b1e69c): where the recorded owner is a GROUP,
+    // the owner basis resolves through active membership, using the clause-6
+    // USE-tier fragment (an active Group principal, an active member Account)
+    // — never a second copy of it. Without this a Group owner reaches nobody.
+    const groupOwnerAllowed = new Set<string>();
+    const recordedOwners = [...new Set(residue.map((row) => row.owner_principal_id).filter(Boolean).map(String))]
+      .filter((id) => UUID_TEXT.test(id) && id !== String(actor.principalId));
+    if (recordedOwners.length > 0 && actor.principalId) {
+      const members = await this.pool.query(
+        `SELECT recorded.owner_id::text AS owner_id FROM unnest($1::uuid[]) AS recorded(owner_id)
+          WHERE ${groupOwnerCondition({ owner: 'recorded.owner_id', account: '$2', tier: 'use' })}`,
+        [recordedOwners, actor.principalId],
+      );
+      for (const row of members.rows) groupOwnerAllowed.add(String(row.owner_id));
+    }
+
     const residueProjects = [...new Set(residue
       .filter((row) => PROJECT_INHERITING_TYPES.has(String(row.object_type)))
       .map((row) => row.project_id).filter(Boolean).map(String))];
@@ -290,6 +328,7 @@ export class FeedEventService {
       if (row.globally_visible === true && actor.authenticated) return true;
       if (actor.principalId && row.owner_principal_id
         && String(row.owner_principal_id) === String(actor.principalId)) return true;
+      if (row.owner_principal_id && groupOwnerAllowed.has(String(row.owner_principal_id))) return true;
       if (PROJECT_INHERITING_TYPES.has(String(row.object_type))
         && row.project_id && projectAllowed.has(String(row.project_id))) return true;
       return grantAllowed.has(key) || grantAllowed.has(`${row.object_type}:*`);

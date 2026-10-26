@@ -31,7 +31,32 @@ export interface PluginRoute {
 /**
  * Plugin info as returned by GET /api/plugins
  */
+export interface PluginSettingsEntry {
+  id: string;
+  label: string;
+  scope: 'personal' | 'deployment';
+  path: string;
+  capability: string;
+  /**
+   * Whether the current Account cannot change this entry through the host
+   * proxy, computed by the server per request; absent in older registry
+   * responses (unknown, not read-only).
+   */
+  readOnly?: boolean;
+}
+
 export interface PluginInfo {
+  /** Current caller proxy-write description; absent in older registry responses. */
+  hostProxyAccess?: { writeCapable: boolean };
+  settings?: PluginSettingsEntry[];
+  schema_version?: 'rh.plugin/1';
+  capabilities?: string[];
+  /**
+   * `grow` is the E438(1) opt-in: only `true` lets the widget take its reported content height (host ceiling 1600 px).
+   * `frame` is the E458 opt-in: exactly `'section'` draws the widget as a sidebar section (a folding heading and the
+   * frame under it, no box); absence or any other value keeps the boxed block.
+   */
+  sidebar_widget?: {path:string;height:number;grow?:boolean;frame?:'section'};
   /** Plugin name (e.g., "claw-journal") */
   name: string;
   /** Semantic version (e.g., "1.0.0") */

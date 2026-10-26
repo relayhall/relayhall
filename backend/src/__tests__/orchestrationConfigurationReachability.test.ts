@@ -60,14 +60,14 @@ describe('GET /health/orchestration handler', () => {
 
   it('does not re-read the environment: a value set after configure() is not what it answers', () => {
     taskOrchestrationService.configure({ maxActiveGlobal: 2, maxActivePerProject: 2, leaseTtlSeconds: 900 });
-    const before = process.env.CLAWBEAT_MAX_ACTIVE_GLOBAL;
-    process.env.CLAWBEAT_MAX_ACTIVE_GLOBAL = '40';
+    const before = process.env.RELAYHALL_MAX_ACTIVE_GLOBAL;
+    process.env.RELAYHALL_MAX_ACTIVE_GLOBAL = '40';
     try {
       const res = fakeRes();
       orchestrationConfigurationHandler({} as any, res);
       expect(res.body.orchestration.maxActiveGlobal).toBe(2);
     } finally {
-      if (before === undefined) delete process.env.CLAWBEAT_MAX_ACTIVE_GLOBAL; else process.env.CLAWBEAT_MAX_ACTIVE_GLOBAL = before;
+      if (before === undefined) delete process.env.RELAYHALL_MAX_ACTIVE_GLOBAL; else process.env.RELAYHALL_MAX_ACTIVE_GLOBAL = before;
     }
   });
 });
@@ -162,8 +162,8 @@ describe('boot-check probe - spawned server (integration)', () => {
     // the same moment (card 7e66a6c2).
     await withPinnedBootCheckRecorder(async (pinned) => {
       const env: Record<string, string> = { ...BOOT_ENV };
-      if (global !== 'unlimited') env.CLAWBEAT_MAX_ACTIVE_GLOBAL = String(global);
-      if (perProject !== 'unlimited') env.CLAWBEAT_MAX_ACTIVE_PER_PROJECT = String(perProject);
+      if (global !== 'unlimited') env.RELAYHALL_MAX_ACTIVE_GLOBAL = String(global);
+      if (perProject !== 'unlimited') env.RELAYHALL_MAX_ACTIVE_PER_PROJECT = String(perProject);
       const result = await runServer(env);
       expect(result.code).toBe(0);
       expect(result.stdout).toContain('BOOT CHECK OK');
@@ -184,6 +184,20 @@ describe('boot-check probe - spawned server (integration)', () => {
     expect(answer.body.orchestration.maxActiveGlobal).toBe('unlimited');
     expect(answer.body.orchestration.maxActivePerProject).toBe('unlimited');
     expect(answer.body.orchestration.claimSurface).toBe('always-on');
+  });
+
+  it('the former variable names still reach the process, and the boot says so once', async () => {
+    // Deployments written before the rename keep working: the same bound is
+    // handed under the former names and the live endpoint must answer it.
+    const result = await runServer({ ...BOOT_ENV, CLAWBEAT_MAX_ACTIVE_GLOBAL: '6', CLAWBEAT_MAX_ACTIVE_PER_PROJECT: '2' });
+    expect(result.code).toBe(0);
+    const answer = probeLine(result.stdout);
+    expect(answer.body.orchestration.maxActiveGlobal).toBe(6);
+    expect(answer.body.orchestration.maxActivePerProject).toBe(2);
+    const notices = `${result.stdout}\n${result.stderr}`.split('\n').filter((line) => line.includes('[config] deprecated environment variable name'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('CLAWBEAT_MAX_ACTIVE_GLOBAL');
+    expect(notices[0]).toContain('CLAWBEAT_MAX_ACTIVE_PER_PROJECT');
   });
 
   it('a probe path outside the set fails the gate before bind (exit 1, no BOOT CHECK OK)', async () => {

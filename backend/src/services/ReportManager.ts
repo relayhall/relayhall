@@ -1,11 +1,38 @@
+import { resourceAccountControl } from './AccountControlService';
+import type { TaskActor } from './TaskHistoryService';
+import { ForbiddenFault } from '../utils/httpErrors';
+import { auditService } from './AuditService';
 import { blueprintProvenanceOf, type BlueprintProvenanceFields } from '../utils/blueprintProvenance';
 import type { CreationTransaction } from '../db/creationTransaction';
 // ReportManager.ts - PostgreSQL-backed report/notes management
 import crypto from 'crypto';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { pool as defaultPool } from '../db/connection';
 import { normalizeReportHandover, ReportHandover } from '../types/ReportHandover';
-import { feedEventService } from './FeedEventService';
+import { feedEventService, feedActorFields, type FeedActorRef } from './FeedEventService';
+import { creationFeedActor, creationTransactionOf, type CreationWriter } from '../db/creationWriter';
+
+/** One Report as the bounded Task Report context sees it: metadata, no body. */
+export interface ReportContextRow {
+  id: string;
+  title: string;
+  status: 'active' | 'archived';
+  summary: string | null;
+  pinned: boolean;
+  origin: string;
+  auto_promoted: boolean;
+  source_task_id: string | null;
+  source_outpost_visibility_tier: string | null;
+  author_principal_id: string | null;
+  has_handover: boolean;
+  /** sha256 of the body (never the body); a summary carries it only for the
+   * Task's own progress Reports. */
+  content_hash: string | null;
+  /** Fixed-width UTC creation instant with microseconds: the ordering key. */
+  created_key: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
 
 export interface Report extends BlueprintProvenanceFields {
   id: string;
@@ -270,7 +297,15 @@ export class ReportManager {
   /**
    * List reports with pagination, filtering, and search
    */
-  async list(opts: ReportListOptions = {}): Promise<ReportListResult> {
+  async list(
+    opts: ReportListOptions = {},
+    narrowVisibility?: (rows: Array<{
+      id: string;
+      auto_promoted: boolean;
+      source_task_id: string | null;
+      source_outpost_visibility_tier: string | null;
+    }>) => Promise<Array<{ id: string }>>,
+  ): Promise<ReportListResult> {
     const limit = Math.min(Math.max(opts.limit || 10, 1), 100);
     const offset = Math.max(opts.offset || 0, 0);
 
@@ -357,6 +392,23 @@ export class ReportManager {
       paramIndex++;
     }
 
+    // Narrow lightweight candidates before COUNT/LIMIT/OFFSET. Filtering a
+    // source page afterwards strands readable rows beyond hidden candidates
+    // and makes totals describe only one page. Use the caller's shared rule,
+    // including source-Task and outpost restrictions, without restating it.
+    if (narrowVisibility) {
+      const candidateWhere = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const candidates = await this.pool.query(
+        `SELECT r.id, r.auto_promoted, r.source_task_id, r.source_outpost_visibility_tier
+         FROM reports r ${candidateWhere}`,
+        params,
+      );
+      const visible = await narrowVisibility(candidates.rows);
+      conditions.push(`r.id = ANY($${paramIndex}::uuid[])`);
+      params.push(visible.map(row => row.id));
+      paramIndex++;
+    }
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     // Explicit sort (updated_at|created_at) with a stable id tiebreak; the
@@ -367,7 +419,7 @@ export class ReportManager {
     const sortDirection = opts.order === 'asc' ? 'ASC' : 'DESC';
     const orderClause = sortColumn
       ? `ORDER BY ${sortColumn} ${sortDirection}, r.id ${sortDirection}`
-      : 'ORDER BY r.pinned DESC, r.created_at DESC';
+      : 'ORDER BY r.pinned DESC, r.created_at DESC, r.id DESC';
 
     // Get total count
     const countResult = await this.pool.query(
@@ -496,7 +548,11 @@ export class ReportManager {
    * Create a new report
    * Auto-generates summary from first 500 chars of content if not provided
    */
-  async create(data: ReportCreateData, transaction?: CreationTransaction): Promise<Report> {
+  async create(data: ReportCreateData, writer: CreationWriter): Promise<Report> {
+    // Card 5854f0d6, round 2: `writer` is REQUIRED - the composing creation
+    // transaction, or the acting principal - so report.created always records
+    // who wrote it.
+    const transaction: CreationTransaction | undefined = creationTransactionOf(writer);
     if (transaction && data.author_principal_id !== transaction.actor.principalId) throw new Error('Creation actor mismatch');
     // Auto-generate summary if not provided
     const summary = data.summary || this.generateSummary(data.content);
@@ -541,8 +597,7 @@ export class ReportManager {
       createdId = result.rows[0].id;
       await feedEventService.emit(client, {
         name: 'report.created',
-        actorPrincipalId: transaction?.actor.principalId ?? null,
-        actorHandle: transaction?.actor.handle ?? null,
+        ...creationFeedActor(writer),
         objectType: 'report',
         objectId: createdId,
         projectId: result.rows[0]?.project_id ?? null,
@@ -566,12 +621,21 @@ export class ReportManager {
   /**
    * Update an existing report (partial update)
    */
-  async update(id: string, data: ReportUpdateData): Promise<Report | null> {
+  /**
+   * `outer` (T2 S5, card 9ce0b0b0): the open transaction of a change-request
+   * decision applying an approved report.visibility; its owner commits or
+   * rolls back. Absent, this method opens and commits its own.
+   */
+  async update(id: string, data: ReportUpdateData, actor?: FeedActorRef, outer?: PoolClient): Promise<Report | null> {
     // Check if report exists
-    const existing = await this.getById(id);
+    const existing = await this.getById(id, {}, outer ?? this.pool);
     if (!existing) {
       return null;
     }
+
+    // Task-owned progress evidence must pass the current claimant/lifecycle/CAS gate.
+    // Generic Report WRITE (including a past author's) cannot bypass revocation or finish.
+    if (existing.origin === 'task-report' && existing.source_task_id) throw new Error('TASK_REPORT_ROUTE_REQUIRED');
 
     // Archived reports are read-only (§4.4); unarchive first.
     if (existing.status === 'archived') {
@@ -613,10 +677,10 @@ export class ReportManager {
     params.push(id);
     // RH-P3.C1: same-transaction feed emission, riding the status-qualified
     // atomic gate below.
-    const client = await this.pool.connect();
+    const client = outer ?? await this.pool.connect();
     let result;
     try {
-      await client.query('BEGIN');
+      if (!outer) await client.query('BEGIN');
       result = await client.query(
         `UPDATE reports SET ${fields.join(', ')}
          WHERE id = $${paramIndex} AND deleted_at IS NULL AND status = 'active'
@@ -628,17 +692,19 @@ export class ReportManager {
           name: 'report.updated',
           objectType: 'report',
           objectId: id,
+          // Card 5854f0d6 (design section 4.3): the acting principal.
+          ...feedActorFields(actor),
           projectId: result.rows[0]?.project_id ?? null,
           ownerPrincipalId: this.ownerPrincipalId(result.rows[0]),
           payload: {},
         });
       }
-      await client.query('COMMIT');
+      if (!outer) await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK');
+      if (!outer) await client.query('ROLLBACK');
       throw error;
     } finally {
-      client.release();
+      if (!outer) client.release();
     }
 
     // The earlier read provides the existing API's missing/archived response,
@@ -646,14 +712,14 @@ export class ReportManager {
     // The status-qualified UPDATE is the atomic gate. Re-read only to classify
     // a zero-row result without turning an archived row into a 404.
     if (result.rowCount === 0) {
-      const current = await this.getById(id);
+      const current = await this.getById(id, {}, outer ?? this.pool);
       if (current?.status === 'archived') {
         throw new Error('REPORT_ARCHIVED');
       }
       return current;
     }
 
-    const updated = await this.getById(id);
+    const updated = await this.getById(id, {}, outer ?? this.pool);
     console.log('[ReportManager] Updated report:', id);
     return updated;
   }
@@ -662,7 +728,7 @@ export class ReportManager {
    * Archive: finished and filed (§4.4). Read-only while archived, excluded
    * from default lists, still readable and linkable. Reversible.
    */
-  async archive(id: string): Promise<Report | null> {
+  async archive(id: string, actor?: FeedActorRef): Promise<Report | null> {
     // RH-P3.C1 (round 1, F2): archival changes what every consumer sees, so
     // it announces itself like any other lifecycle write, same transaction.
     const client = await this.pool.connect();
@@ -682,6 +748,7 @@ export class ReportManager {
         name: 'report.updated',
         objectType: 'report',
         objectId: id,
+        ...feedActorFields(actor),
         projectId: result.rows[0]?.project_id ?? null,
         ownerPrincipalId: this.ownerPrincipalId(result.rows[0]),
         payload: { status: 'archived' },
@@ -700,7 +767,7 @@ export class ReportManager {
   /**
    * Unarchive: return an archived report to active.
    */
-  async unarchive(id: string): Promise<Report | null> {
+  async unarchive(id: string, actor?: FeedActorRef): Promise<Report | null> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -718,6 +785,7 @@ export class ReportManager {
         name: 'report.updated',
         objectType: 'report',
         objectId: id,
+        ...feedActorFields(actor),
         projectId: result.rows[0]?.project_id ?? null,
         ownerPrincipalId: this.ownerPrincipalId(result.rows[0]),
         payload: { status: 'active' },
@@ -777,10 +845,24 @@ export class ReportManager {
    * dashboard_user identity (?hard=true escape hatch). Works on tombstoned
    * rows too, so soft-deleted reports can still be purged.
    */
-  async hardDelete(id: string): Promise<boolean> {
+  async hardDelete(id: string, actor?: TaskActor): Promise<boolean> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      if (actor) {
+        const locked = await client.query('SELECT id FROM reports WHERE id=$1 FOR UPDATE', [id]);
+        if (!locked.rows.length) { await client.query('ROLLBACK'); return false; }
+        const accountId = await resourceAccountControl(client, 'report', id, actor);
+        if (!accountId && actor.handle !== 'dashboard_user') {
+          throw new ForbiddenFault('Hard delete requires account owner or authorized Main control', 'HARD_DELETE_FORBIDDEN');
+        }
+        await auditService.record({ action: 'report.hard_delete',
+          actor: { principalId: actor.principalId, handle: actor.handle,
+            authMethod: actor.authMethod ?? 'unknown', credentialId: actor.credentialId ?? null },
+          resourceType: 'report', resourceId: id,
+          metadata: { accountPrincipalId: accountId, basis: accountId ? 'account-owner-control' : 'legacy-dashboard' },
+        }, client);
+      }
       const result = await client.query(
         'DELETE FROM reports WHERE id = $1 RETURNING project_id, author_principal_id, deleted_at',
         [id]
@@ -851,6 +933,56 @@ export class ReportManager {
       content: String(row.content ?? ''),
       content_hash: row.content_hash ?? null,
       handover: normalizeReportHandover(row.handover),
+    }));
+  }
+
+  /**
+   * Card 50b5e9c4 slice 3 — the bounded Report context's metadata read.
+   *
+   * Everything the context needs to order, narrow, page and summarise a
+   * Task's Reports, and nothing it would have to throw away: no `content`.
+   * The context authorizes the id set first and reads metadata only for the
+   * ids the caller may read, so a body is never fetched just to be dropped.
+   *
+   * `created_key` is the ordering key at full microsecond precision, rendered
+   * as fixed-width UTC text so it compares correctly as a string. A cursor
+   * built from a millisecond `Date` would skip rows created inside the same
+   * millisecond; this one cannot.
+   */
+  async getContextRows(ids: string[]): Promise<ReportContextRow[]> {
+    if (ids.length === 0) return [];
+    const result = await this.pool.query(
+      `SELECT id::text AS id, title, status, summary, COALESCE(pinned, FALSE) AS pinned, origin,
+              COALESCE(auto_promoted, FALSE) AS auto_promoted, source_task_id::text AS source_task_id,
+              source_outpost_visibility_tier, author_principal_id::text AS author_principal_id,
+              (handover IS NOT NULL) AS has_handover, content_hash,
+              to_char(COALESCE(created_at, 'epoch'::timestamptz) AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_key,
+              created_at, updated_at
+         FROM reports
+        WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+      [ids],
+    );
+    const iso = (value: unknown): string | null => {
+      if (value instanceof Date) return value.toISOString();
+      return typeof value === 'string' && value ? value : null;
+    };
+    return result.rows.map((row: any) => ({
+      id: String(row.id),
+      title: String(row.title ?? ''),
+      status: row.status === 'archived' ? 'archived' : 'active',
+      summary: row.summary ?? null,
+      pinned: row.pinned === true,
+      origin: String(row.origin ?? 'api'),
+      auto_promoted: row.auto_promoted === true,
+      source_task_id: row.source_task_id || null,
+      source_outpost_visibility_tier: row.source_outpost_visibility_tier || null,
+      author_principal_id: row.author_principal_id || null,
+      has_handover: row.has_handover === true,
+      content_hash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : null,
+      created_key: String(row.created_key),
+      created_at: iso(row.created_at),
+      updated_at: iso(row.updated_at),
     }));
   }
 

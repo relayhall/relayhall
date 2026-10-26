@@ -1,3 +1,16 @@
 {
-  "plugins": []
+  "plugins": [
+    {
+      "name": "example-plugin",
+      "source": "./plugins/example-plugin",
+      "enabled": false,
+      "access": {
+        "default": ["view"],
+        "accounts": {
+          "00000000-0000-4000-8000-000000000000": ["view", "generate"]
+        },
+        "assertion_key_env": "EXAMPLE_PLUGIN_ASSERTION_KEY"
+      }
+    }
+  ]
 }

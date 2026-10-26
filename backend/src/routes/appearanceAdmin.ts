@@ -12,6 +12,7 @@ import {
 } from '../services/AppearanceService';
 import { resolveIssuerAuthority } from '../utils/credentialAuthority';
 import { resolveActorRole } from '../utils/taskAutomationRole';
+import { isFullUuid, refuseMalformedPathId } from '../middleware/validate';
 
 const router = Router();
 const MAX_UPLOAD_BYTES = 512 * 1024;
@@ -222,6 +223,12 @@ router.get('/asset-history/:kind', async (req: AuthRequest, res: Response) => {
 
 router.get('/asset-versions/:id', async (req: AuthRequest, res: Response) => {
   if (!requireRoot(req, res)) return;
+  // Card bc847bd0: appearance_assets.id is a uuid column; a malformed id
+  // reached the read and answered 500.
+  if (!isFullUuid(req.params.id)) {
+    refuseMalformedPathId(res, 'INVALID_APPEARANCE_ASSET_ID', 'appearance asset');
+    return;
+  }
   try {
     const asset = await appearanceService.getAssetByIdForRoot(req.params.id);
     if (!asset) {

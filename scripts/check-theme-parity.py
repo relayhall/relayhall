@@ -8,7 +8,7 @@ that have no compiler between them:
   2. frontend/src/utils/theme.ts            — BUILT_IN_THEMES (the engine)
   3. backend/src/services/pluginTheme.ts    — BUILT_IN_THEMES (the published
                                               plugin stylesheet)
-  4. backend/src/migrations/080_…​.sql       — the stored value space
+  4. backend/src/migrations/080_….sql       — the stored value space
 
 Drift between any two is silent and user-visible: a Theme a principal can
 select but no stylesheet binds renders as unstyled dark; a Theme the CSS

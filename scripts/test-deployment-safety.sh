@@ -5,6 +5,11 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
+# setup.sh asks the real Compose what it would pass to the backend before it
+# generates a key set (scripts/test-first-install.py covers that path), so
+# the mock below hands `compose config` to the real CLI; it needs no daemon.
+REAL_DOCKER=$(command -v docker) || { echo 'the docker CLI (with compose) is required' >&2; exit 1; }
+export REAL_DOCKER
 
 cat > "$TMP/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
@@ -15,6 +20,7 @@ if [ "${1:-}" = "run" ]; then
   printf '%s\n' '$2b$10$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuuuu'
   exit 0
 fi
+if [ "${1:-}" = "compose" ] && [ "${2:-}" = "config" ]; then exec "$REAL_DOCKER" "$@"; fi
 if [ "${1:-}" = "compose" ] && [ "${2:-}" = "ps" ]; then echo 'fake-db-id'; exit 0; fi
 if [ "${1:-}" = "compose" ] && { [ "${2:-}" = "stop" ] || [ "${2:-}" = "start" ]; }; then
   if [ -n "${MOCK_DOCKER_LOG:-}" ]; then printf '%s\n' "$2" >> "$MOCK_DOCKER_LOG"; fi
@@ -43,11 +49,12 @@ chmod 755 "$TMP/bin/docker"
 
 SETUP="$TMP/setup"
 mkdir -p "$SETUP"
-cp "$ROOT/setup.sh" "$ROOT/.env.example" "$ROOT/relayhall.config.example.json" "$SETUP/"
+cp "$ROOT/setup.sh" "$ROOT/.env.example" "$ROOT/relayhall.config.example.json"   "$ROOT/docker-compose.yml" "$ROOT/relayhall.plugins.json" "$SETUP/"
 (
   cd "$SETUP"
   printf '\n\n%s\n%s\n' 'test-password-only' '58084' | PATH="$TMP/bin:$PATH" ./setup.sh >/dev/null
   [ "$(stat -c '%a' .env)" = 600 ]
+  [ "$(stat -c '%a' relayhall.keys.env)" = 600 ]
   [ "$(stat -c '%a' data)" = 700 ]
   [ "$(stat -c '%a' backups)" = 700 ]
 )
@@ -71,6 +78,27 @@ env = dict(line.split("=", 1) for line in pathlib.Path(sys.argv[2]).read_text().
 assert env.get("RELAYHALL_SESSIONS") == "on", "fresh setup must enable named Account login"
 PYSESSIONS
 echo 'fresh_account_session_carriage=pass'
+
+# The OTLP/gRPC receiver (card dac2ca71 slice 2): OFF by default and
+# empty-safe in the base file, so a fresh install binds no extra host port;
+# the opt-in overlay turns it on at container port 4317 and publishes it on
+# loopback unless the operator names another interface.
+python3 - "$ROOT/docker-compose.yml" "$ROOT/docker-compose.otlp-grpc.yml" "$SETUP/.env" <<'PYOTLPGRPC'
+import pathlib, sys, yaml
+base = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())["services"]["relayhall-backend"]
+overlay = yaml.safe_load(pathlib.Path(sys.argv[2]).read_text())["services"]["relayhall-backend"]
+assert base["environment"].get("RELAYHALL_OTLP_GRPC_PORT") == "${RELAYHALL_OTLP_GRPC_PORT:-}", (
+    "the base Compose file must forward the OTLP/gRPC port empty-safe (empty = no listener)")
+assert not any("4317" in str(port) for port in base.get("ports", [])), (
+    "the base Compose file must not publish the OTLP/gRPC port: a fresh install binds no extra host port")
+assert overlay["environment"] == {"RELAYHALL_OTLP_GRPC_PORT": "4317"}, "the overlay turns the receiver on at 4317"
+assert overlay["ports"] == ["${OTLP_GRPC_BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_HOST_PORT:-4317}:4317"], (
+    "the overlay publishes container port 4317 on loopback by default")
+env = dict(line.split("=", 1) for line in pathlib.Path(sys.argv[3]).read_text().splitlines()
+           if line and not line.startswith("#") and "=" in line)
+assert env.get("RELAYHALL_OTLP_GRPC_PORT", "") == "", "fresh setup must leave the OTLP/gRPC receiver off"
+PYOTLPGRPC
+echo 'otlp_grpc_receiver_opt_in=pass'
 
 BACKUP_ROOT="$TMP/backup"
 mkdir -p "$BACKUP_ROOT"

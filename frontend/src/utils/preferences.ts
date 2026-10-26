@@ -10,6 +10,7 @@ import {
   DEFAULT_PREFERENCES,
   isThemePreference,
   isReducedMotionPreference,
+  isMapReportsMode,
 } from './theme';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
@@ -23,6 +24,8 @@ export function toPreferences(payload: unknown): PrincipalPreferences {
     reducedMotion: isReducedMotionPreference(source.reducedMotion)
       ? source.reducedMotion
       : 'system',
+    // A server that predates migration 165 sends no field: the Map's default.
+    mapReportsMode: isMapReportsMode(source.mapReportsMode) ? source.mapReportsMode : 'collapsed',
   };
 }
 

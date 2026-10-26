@@ -115,13 +115,79 @@ const MEMBER_REGISTER: RegisterEntry[] = [
   },
   {
     file: 'services/DirectoryCarriageService.ts',
-    classes: ['derivation'],
+    classes: ['derivation', 'disclosure'],
     why: 'RH-LENSES-a: the provider-removal path reads which Accounts still hold source=directory '
       + "membership in the provider's bound Groups, so a deployment that ran directory sync BEFORE "
       + 'migration 127 -- and therefore has membership whose carriage was never recorded -- is '
       + 'recomputed too, instead of leaving authority residue no directory can correct. It reaches '
       + 'no decision about a caller and appears in no predicate. It writes NOTHING here: every '
-      + 'derived-membership write goes through GroupService.applyAccountDirectorySnapshot.',
+      + 'derived-membership write goes through GroupService.applyAccountDirectorySnapshot. '
+      + 'LENSES-c c1-A (card 46cfbd1d; design delta C.9): ONE disclosure read, the steward catalog '
+      + "row -- the active members of the Groups a caller live-stewards scope which catalog rows and "
+      + 'COUNTS that caller is shown. It is pinned line by line in SEAM_DISCLOSURE_READS below.',
+  },
+  {
+    file: 'services/GroupStewardService.ts',
+    classes: ['authorization', 'disclosure'],
+    why: 'LENSES-c c1-A (card 46cfbd1d; design delta C.3): GET /groups/:id/stewards names the first '
+      + "reason a steward row is inert, and not_a_member is read here. It writes NOTHING here; every "
+      + 'authority read of a steward row is the shared fragment. LENSES-c c1-B (card b5c83682): gate (iii) '
+      + "reads the appointee's own member row FOR SHARE (a manager is appointed only from the active members, "
+      + "C.4 step 4), and the manager lens counts each stewarded Group's active members (C.8). Neither "
+      + 'admits anybody to anything by itself.',
+  },
+  {
+    file: 'services/ChangeRequestService.ts',
+    classes: ['authorization'],
+    why: 'card 502fb19e (E325 section 5.5): the change decide refuses SELF_DECISION_REFUSED when the decider, or a '
+      + 'principal under its Account, is a member of the Group grantee or subject by ANY source. It can only refuse a '
+      + 'decision, never admit one, and writes NOTHING here.',
+  },
+  {
+    file: 'utils/liveStewardCondition.ts',
+    classes: ['authorization', 'disclosure', 'comment'],
+    why: 'LENSES-c c1-A (card 46cfbd1d; design delta C.2): THE shared fragment. A Group role row is '
+      + 'live only while its holder is a member of the Group by any source, so the fragment joins '
+      + 'group_members. It names no carriage table; R-3(ii) holds it to that.',
+  },
+  {
+    file: 'services/GroupOwnerStewardTransfer.ts',
+    classes: ['authorization', 'disclosure'],
+    why: 'LENSES-c c1-B (card b5c83682; design delta C.6): the steward transfer out of a Group moves an object '
+      + "only to an ACTIVE MEMBER of that Group, so it reads the target's member row FOR SHARE (a refusal, "
+      + 'TARGET_NOT_A_GROUP_MEMBER, never an admission on its own); and its audit row records the active member '
+      + 'count, as clause 9(f) does. It writes nothing here and names no carriage table.',
+  },
+  {
+    file: 'services/GroupOwnershipTransfer.ts',
+    classes: ['disclosure'],
+    why: 'AZ-A12 build 3 (card 311229fd; clause 9(f)): the transfer act records the active member '
+      + 'count of the Group gaining (else losing) ownership in its own audit row. One SELECT; it '
+      + 'decides nothing, writes nothing and names no carriage table.',
+  },
+  {
+    file: 'services/ProjectOwnershipService.ts',
+    classes: ['disclosure'],
+    why: 'AZ-A12 build 5 (card a9b1e69c; clause 13): the owner-change socket hint fans out to the '
+      + 'active members of a Group that owned or now owns the Project. One SELECT after commit; the '
+      + 'hint carries no object id and confers nothing, it writes nothing and names no carriage table.',
+  },
+  {
+    file: 'services/AccessExplorerService.ts',
+    classes: ['disclosure'],
+    why: 'AZ-A12 build 6 (card 1e56dbef; clause 12): the Access Explorer read model lists a Group\'s members and '
+      + 'their sources (directory data under principals:read, design 4d961e37 section 5.3), counts them, nominates '
+      + 'the members of an owning or granted Group for the evaluator, and reads one member\'s membership for SR-3. '
+      + 'Every verdict and tier is the evaluator or its shared fragments; it decides nothing, writes nothing and '
+      + 'names no carriage table.',
+  },
+  {
+    file: 'utils/groupOwnerCondition.ts',
+    classes: ['authorization', 'comment'],
+    why: 'AZ-A12 build 2 (card ee81ee0f; clauses 6-8): THE shared Group-owner fragment. A Group-owned '
+      + "object's use tier is read at use from the acting Account's membership of the owning Group by "
+      + 'any source, so the fragment joins group_members; the edit tier composes liveStewardCondition. '
+      + 'It writes nothing and names no carriage table.',
   },
   {
     file: 'services/HomeGroupService.ts',
@@ -203,6 +269,25 @@ const MEMBER_REGISTER: RegisterEntry[] = [
 ];
 
 const MEMBER_PATTERN = /group_members/;
+
+/**
+ * LENSES-c c1-A (card 46cfbd1d; design delta C.9, v5 §5.3's steward row):
+ * the seam's ONLY deciding read of group_members, by exact trimmed line. The
+ * steward catalog row is, by design, the one place where membership scopes a
+ * catalog DISCLOSURE: a steward sees the references carried by active members
+ * of the Groups it live-stewards, as counts. It confers nothing and feeds no
+ * authorization predicate. Because the seam is THE file in which the
+ * reference store and group_members meet (CARRIAGE_REGISTER), R-3(ii) exempts
+ * it BY THESE LINES: any other group_members line in the seam that is not a
+ * comment or the registered derivation read reddens.
+ */
+const SEAM_DISCLOSURE_READS = [
+  'JOIN group_members member ON member.group_id = live_role.group_id',
+];
+/** The seam's derivation read (provider removal), unchanged since LENSES-a. */
+const SEAM_DERIVATION_READS = [
+  'FROM group_members gm',
+];
 
 /** The files whose group_members occurrences are a read that decides something
  *  about a CALLER. None of them may know the carriage tables exist. */
@@ -291,10 +376,20 @@ describe('prohibition 1: the reference store is not a second authority store', (
     // authority without anybody writing that sentence down.
     const deciders = MEMBER_REGISTER
       .filter((entry) => entry.classes.some((c) => DECIDING_CLASSES.includes(c)))
-      .map((entry) => entry.file);
+      .map((entry) => entry.file)
+      // The seam is exempted BY LINE, below, and by nothing else.
+      .filter((file) => file !== 'services/DirectoryCarriageService.ts');
     expect(deciders.length).toBeGreaterThan(0);
     const leaked = occurrences.filter((o) => deciders.includes(o.file));
     expect(leaked.map((o) => `${o.file}:${o.line}  ${o.text}`)).toEqual([]);
+  });
+
+  it('R-3(ii), the seam: its only non-comment group_members lines are the registered derivation and steward-catalog reads', () => {
+    const seamMemberLines = census(MEMBER_PATTERN)
+      .filter((o) => o.file === 'services/DirectoryCarriageService.ts' && !o.text.startsWith('*'))
+      .map((o) => o.text)
+      .sort();
+    expect(seamMemberLines).toEqual([...SEAM_DERIVATION_READS, ...SEAM_DISCLOSURE_READS].sort());
   });
 
   it('migration 127 refuses a foreign key to groups — the structural half', () => {
@@ -430,7 +525,7 @@ describe('R-3 sink-anchored directory write census', () => {
   it('R-3: every discovered write has an exact value-scoped exemption', () => {
     const actual = directoryWriteSinks(SRC).map(({ file, owner, sql }) => [file, owner, sql]);
     expect(actual.sort()).toEqual([...DIRECTORY_WRITE_REGISTER].sort());
-    // This is the sole dynamic protected-table statement. Enumerate its
+    // This is the Group metadata dynamic SET statement. Enumerate its
     // expression producers too, so the sink cannot hide a new binding SET.
     const source = ts.createSourceFile('GroupService.ts',
       fs.readFileSync(path.join(SRC, 'services/GroupService.ts'), 'utf8'), ts.ScriptTarget.Latest, true);
@@ -454,7 +549,7 @@ describe('R-3 sink-anchored directory write census', () => {
     ]);
   });
 
-  it('the one dynamic table token is drawn from a closed literal list', () => {
+  it('the Blueprint dynamic table token is drawn from a closed literal list', () => {
     // `DIRECTORY_WRITE_REGISTER` admits `UPDATE ${table} SET ...` on the
     // strength of where `table` comes from, so that is MEASURED here rather
     // than taken on the register's word: the loop's subject is an inline array
@@ -482,4 +577,45 @@ describe('R-3 sink-anchored directory write census', () => {
     visit(source);
     expect(tokens).toEqual(['phases', 'tasks', 'reports']);
   });
+
+  // This exemption is about one SQL VALUE plus its local token producer, never
+  // the whole service or method. NOWAIT and the no-op write preserve the MVCC
+  // fence; a new binding SET still fails the exact sink register above.
+  function assertReferenceFence(text: string): void {
+    const source = ts.createSourceFile('AccessVehicleService.ts', text, ts.ScriptTarget.Latest, true);
+    let method: ts.MethodDeclaration | undefined;
+    function visit(node: ts.Node): void {
+      if (ts.isMethodDeclaration(node) && node.name.getText() === 'versionReferenceTarget') method = node;
+      ts.forEachChild(node, visit);
+    }
+    visit(source);
+    expect(method).toBeDefined();
+    const statements = method!.body!.statements;
+    expect(statements).toHaveLength(4);
+    expect(statements[0].getText()).toBe("const table = kind === 'grant' ? 'grants' : 'access_profile_assignments';");
+    expect(statements[1].getText()).toBe('const locked = await this.referenceQuery(client, `SELECT id FROM ${table} WHERE id=$1 FOR UPDATE NOWAIT`, [id]);');
+    expect(statements[2].getText()).toBe("if (!locked.rows.length) throw err(409, 'ASSIGNMENT_REFERENCE_BUSY', 'Assignment target changed; roll back and retry the transaction');");
+    expect(statements[3].getText()).toBe('await this.referenceQuery(client, `UPDATE ${table} SET id=id WHERE id=$1`, [id]);');
+  }
+  const referenceSource = fs.readFileSync(path.join(SRC, 'services/AccessVehicleService.ts'), 'utf8');
+  it('the reference version fence has a closed non-directory mapping and exact no-op SQL', () => {
+    assertReferenceFence(referenceSource);
+  });
+  it.each([
+    ["? 'grants' :", "? 'groups' :"],
+    ["'access_profile_assignments';", "'group_members';"],
+    ["kind === 'grant' ? 'grants' : 'access_profile_assignments'", 'kind'],
+    ['SET id=id WHERE id=$1', 'SET identity_provider_id=$2 WHERE id=$1'],
+    ['${table} WHERE id=$1 FOR UPDATE NOWAIT', '${table} WHERE id=$1 FOR UPDATE'],
+    ['if (!locked.rows.length)', 'if (false)'],
+  ])('rejects reference fence drift %s', (before, after) => {
+    expect(referenceSource).toContain(before);
+    expect(() => assertReferenceFence(referenceSource.replace(before, after))).toThrow();
+  });
+  it('the new exact register row grants no exemption to a different owner or SQL value', () => {
+    const row = DIRECTORY_WRITE_REGISTER.find(([file]) => file === 'services/AccessVehicleService.ts')!;
+    expect(DIRECTORY_WRITE_REGISTER).not.toContainEqual([row[0], 'anotherMethod', row[2]]);
+    expect(DIRECTORY_WRITE_REGISTER).not.toContainEqual([row[0], row[1], 'UPDATE ${table} SET identity_provider_id=$2 WHERE id=$1']);
+  });
+
 });

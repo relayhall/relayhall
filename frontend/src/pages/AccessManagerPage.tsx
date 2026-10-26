@@ -1,18 +1,34 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AuthorityPreviewTable, type AuthorityPreviewData } from '../components/AuthorityPreviewTable';
 import { useSearchParams } from 'react-router-dom';
 import { Fingerprint,
-  AlertTriangle, BadgeCheck, Eye, FileKey2, Inbox, KeyRound, Loader2,
-  RefreshCw, ScrollText, ShieldCheck, Stamp, XCircle,
+  AlertTriangle, Eye, FileKey2, KeyRound, Loader2,
+  RefreshCw, ScrollText, ShieldCheck, Stamp,
 } from 'lucide-react';
 import { Button } from '../components/Button';
 import { Select } from '../components/ui/Select';
 import { ConfirmationModal } from '../components/ConfirmationModal';
 import { StepUpDialog } from '../components/access/StepUpDialog';
+import { STEP_UP_RETRY_DESCRIPTION, useStepUpRetry } from '../components/access/useStepUpRetry';
+import { sendWithStepUpRetry, type StepUpChallenge } from '../utils/stepUpChallenge';
 import { SetPasswordPanel } from '../components/access/SetPasswordPanel';
+import { SharedWritersPanel } from '../components/access/SharedWritersPanel';
+import { useRelayHallConfig } from '../contexts/RelayHallConfigContext';
+import { GroupStewardsPanel } from '../components/access/GroupStewardsPanel';
+import { principalLabel, readJson, ruleSummary, type ProfileRule, type StepUpRequest } from '../components/access/accessShared';
+import { CeilingRulesField } from '../components/access/CeilingRulesField';
+import { ceilingRuleProblems, rowsToRules, type CeilingRuleRow } from '../components/access/ceilingRules';
+import { ApprovalsQueue } from '../components/approvals/ApprovalsQueue';
 import { useMyPrincipal, usePrincipals } from '../hooks/usePrincipals';
 import type { Principal } from '../types/task';
 import { authenticatedFetch } from '../utils/auth';
+import { formatInstantForDateTimeLocal } from '../utils/dateFormat';
 import { assignableBy, mayChangeRoles } from '../utils/administratorSession';
+import { useRoleCatalogue } from '../hooks/useRoleCatalogue';
+import { RoleCatalogueList, RoleSelectionExplanation } from '../components/access/RoleExplanation';
+import {
+  isRoleChangeTarget, roleChangeNotice, RoleChangeConfirmation, ROLE_CHANGE_STEP_UP_DESCRIPTION, sendRoleChange,
+} from '../components/access/roleChange';
 import './AccessManagerPage.css';
 
 /**
@@ -31,30 +47,6 @@ import { AGENT_WORKING_SCOPES } from '../types/connections';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
-interface ProfileRule {
-  resourceType: string;
-  selectorForm: 'exact' | 'all-of-type' | 'all-except' | 'all-in-project';
-  selectorIds: string[];
-  verbs: string[];
-}
-
-interface ApprovalItem {
-  id: string;
-  status: 'pending' | 'approved' | 'denied' | 'collected' | 'lapsed';
-  requesterPrincipalId: string;
-  requesterHandle: string | null;
-  targetTaskId: string;
-  targetTaskTitle: string | null;
-  requestedScopes: string[];
-  requestedRules: ProfileRule[];
-  approvedScopes: string[] | null;
-  lapseReason: string | null;
-  denialReason: string | null;
-  requestedAt: string;
-  pendingExpiresAt: string;
-  collectExpiresAt: string | null;
-}
-
 interface WarrantItem {
   id: string;
   name: string;
@@ -63,6 +55,15 @@ interface WarrantItem {
   status: 'active' | 'suspended' | 'revoked' | 'expired';
   ceilingProfileName: string | null;
   ceilingProfileVersionNumber: number | null;
+  /** The pinned version's profile and id (`WarrantService` mapWarrant). The
+   * detail panel reads the pinned rules through them; optional because older
+   * fixtures and payloads may omit them, and an absent pin reads nothing. */
+  ceilingProfileId?: string | null;
+  ceilingProfileVersionId?: string | null;
+  /** Inline rules on the warrant row itself. Every warrant created since
+   * AZ-A3 stores NULL here and pins a profile version instead
+   * (`WarrantService.create` inserts `ceiling_rules` as NULL), so this is
+   * non-null only for rows written before that. */
   ceilingRules: ProfileRule[] | null;
   ceilingScopes: string[] | null;
   expiresAt: string | null;
@@ -84,42 +85,6 @@ interface MintedIdentity {
   createdAt: string;
 }
 
-interface StepUpRequest {
-  action: string;
-  targetId: string;
-  description: string;
-  onToken: (token: string) => void;
-}
-
-function principalLabel(principal?: Principal): string {
-  if (!principal) return 'Unknown identity';
-  return principal.displayName ? `${principal.displayName} (${principal.handle})` : principal.handle;
-}
-
-/** One rule in words. EXHAUSTIVE over the ratified forms, and the fallback
- * describes what it does not recognise rather than mislabelling it: a form
- * added to the backend and not yet to this page must read as unknown, never as
- * `exact`, which is what the old trailing `:` branch made it. */
-function ruleSummary(rule: ProfileRule): string {
-  const count = rule.selectorIds.length;
-  let selector: string;
-  if (rule.selectorForm === 'all-of-type') selector = 'every';
-  else if (rule.selectorForm === 'all-except') selector = `all except ${count}`;
-  else if (rule.selectorForm === 'exact') selector = `${count} exact`;
-  else if (rule.selectorForm === 'all-in-project') {
-    selector = `every (in ${count} ${count === 1 ? 'project' : 'projects'})`;
-  } else selector = `${count} id(s) by an unrecognised selector (${String(rule.selectorForm)})`;
-  return `${rule.verbs.join('/')} on ${selector} ${rule.resourceType}`;
-}
-
-async function readJson(response: Response): Promise<any> {
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.success === false) {
-    throw new Error(data.message || data.error || `Request failed (${response.status})`);
-  }
-  return data;
-}
-
 /**
  * THE ROLE CONTROL (owner ruling `60307311` §1.2).
  *
@@ -132,23 +97,26 @@ async function readJson(response: Response): Promise<any> {
  * list excludes the identities the route refuses outright, so the common
  * refusals are unreachable rather than merely explained.
  *
- * There is no step-up here, unlike the mint and reveal panels beside it. The
- * act is bounded by non-escalation and cannot exceed the authority the session
- * already holds, which is precisely the condition §7.6 reserves step-up for
- * the absence of.
+ * The server asks for no step-up here, unlike the mint and reveal panels
+ * beside it. The act is bounded by non-escalation and cannot exceed the
+ * authority the session already holds, which is precisely the condition §7.6
+ * reserves step-up for the absence of; should the route ever answer with the
+ * step-up challenge, the shared act (`roleChange.tsx`) asks once through the
+ * existing dialog. There IS a confirmation (card a2d1e317): it names the
+ * Account, the role it carries now and the role it will carry, and shows the
+ * new role's catalogue entry, so the person reads what they are giving before
+ * the request is sent.
+ *
+ * Card caea70ef: the same act is offered on an identity's own detail page
+ * (Identities → open a row). This panel stays the bulk view, and both call
+ * the targets rule, the request and the confirmation in `roleChange.tsx`.
+ *
+ * EVERY ROLE EXPLANATION here comes from the board's role catalogue
+ * (`GET /principals/roles`, rendered by `RoleExplanation`). There is no local
+ * copy of what a role means: the list this panel used to carry was the second
+ * hand-written list card a2d1e317 removes.
  */
-// Explanatory copy only. assignableBy and the server remain the authority.
-const ROLE_GUIDANCE: Record<string, string> = {
-  admin: 'Full administration and credential management. Can assign every role.',
-  operator: 'Administers product objects and can assign roles except admin and orchestrator. No root-only settings or credential issuance.',
-  editor: 'Working access to permitted objects. Has the same permission ceiling as user; ownership, grants and Task assignments decide access.',
-  user: 'Everyday working access to permitted objects. Has the same permission ceiling as editor.',
-  viewer: 'Read-only access to permitted objects. Cannot edit those objects.',
-  orchestrator: 'Elevated automation role with root-level scope. Can assign roles except admin and orchestrator.',
-  reviewer: 'Working access for reviewing evidence. Task verification still follows Verifier assignments and workflow rules.',
-  qa: 'Working access for quality checks. Shares the reviewer permission ceiling; Task verification still follows Verifier assignments and workflow rules.',
-  agent: 'Working access for automation. Task assignments, credential scopes and delegation limits still apply.',
-};
+const ROLE_DOCS_URL = 'https://github.com/relayhall/relayhall/blob/main/docs/roles.md';
 
 const RolePanel: React.FC<{
   principals: Principal[];
@@ -160,6 +128,9 @@ const RolePanel: React.FC<{
   const [principalId, setPrincipalId] = useState('');
   const [role, setRole] = useState('');
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const catalogue = useRoleCatalogue();
+  const { askForToken, retryDialog } = useStepUpRetry(ROLE_CHANGE_STEP_UP_DESCRIPTION);
 
   const roles = useMemo(() => assignableBy(issuerRole), [issuerRole]);
 
@@ -171,26 +142,25 @@ const RolePanel: React.FC<{
    * the deployment always has a way back in.
    */
   const targets = useMemo(
-    () => principals.filter((p) => p.id !== ownPrincipalId
-      && p.handle !== 'system'
-      && p.handle !== 'dashboard_user'),
+    () => principals.filter((p) => isRoleChangeTarget(p, ownPrincipalId)),
     [principals, ownPrincipalId],
   );
 
   const selected = targets.find((p) => p.id === principalId);
 
-  const submit = async (event: React.FormEvent) => {
+  const submit = (event: React.FormEvent) => {
     event.preventDefault();
+    if (!principalId || !role) return;
+    setConfirming(true);
+  };
+
+  const changeRole = async () => {
+    setConfirming(false);
     if (!principalId || !role) return;
     setBusy(true);
     try {
-      const response = await authenticatedFetch(`${API_BASE}/principals/${principalId}/role`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role }),
-      });
-      const data = await readJson(response);
-      surface('notice', data.note || `${data.principal?.handle} now carries the role ${data.principal?.role}.`);
+      const data = await sendRoleChange(principalId, role, askForToken);
+      surface('notice', roleChangeNotice(data));
       setRole('');
       onChanged?.();
     } catch (err) {
@@ -204,8 +174,7 @@ const RolePanel: React.FC<{
     <section className="axm-section" aria-labelledby="axm-roles-heading">
       <div className="axm-section-head">
         <h2 id="axm-roles-heading"><Fingerprint aria-hidden="true" /> Roles</h2>
-        <a href="https://github.com/relayhall/relayhall/blob/main/docs/authorization.md#account-roles"
-          target="_blank" rel="noopener noreferrer">
+        <a href={ROLE_DOCS_URL} target="_blank" rel="noopener noreferrer">
           Role guide on GitHub
         </a>
       </div>
@@ -217,13 +186,9 @@ const RolePanel: React.FC<{
         not listed: the route refuses both by name.
       </p>
       <details className="axm-role-guide">
-        <summary>Compare all nine roles</summary>
+        <summary>Compare every role</summary>
         <p>Roles limit possible actions; object access also depends on ownership, grants, Task assignments and credential scopes.</p>
-        <dl>
-          {Object.entries(ROLE_GUIDANCE).map(([value, description]) => (
-            <div key={value}><dt>{value}</dt><dd>{description}</dd></div>
-          ))}
-        </dl>
+        <RoleCatalogueList catalogue={catalogue} />
       </details>
       <form className="axm-editor" onSubmit={submit} aria-label="Change a role">
         <div className="axm-editor-grid">
@@ -261,9 +226,13 @@ const RolePanel: React.FC<{
                 <option key={value} value={value}>{value}</option>
               ))}
             </Select>
-            <p id="axm-role-description" className="axm-muted" aria-live="polite">
-              {ROLE_GUIDANCE[role] || 'Choose a role to see what it permits, or compare all nine roles above.'}
-            </p>
+            <div id="axm-role-description" aria-live="polite">
+              <RoleSelectionExplanation
+                catalogue={catalogue}
+                role={role}
+                emptyText="Choose a role to see what it may reach, or compare every role above."
+              />
+            </div>
           </div>
         </div>
         <div className="axm-decide-actions">
@@ -281,6 +250,16 @@ const RolePanel: React.FC<{
           </Button>
         </div>
       </form>
+      {confirming && selected && (
+        <RoleChangeConfirmation
+          principal={selected}
+          role={role}
+          catalogue={catalogue}
+          onConfirm={changeRole}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+      {retryDialog}
     </section>
   );
 };
@@ -288,6 +267,7 @@ const RolePanel: React.FC<{
 export const AccessManagerPage: React.FC = () => {
   const { me, scopes, loading: authorityLoading } = useMyPrincipal();
   const { principals, reload: reloadPrincipals } = usePrincipals();
+  const { config } = useRelayHallConfig();
   const [searchParams] = useSearchParams();
   const deepLinkApprovalId = searchParams.get('approval');
   const [stepUp, setStepUp] = useState<StepUpRequest | null>(null);
@@ -302,6 +282,12 @@ export const AccessManagerPage: React.FC = () => {
   const isRoot = Array.isArray(scopes)
     ? scopes.includes('root')
     : me?.role === 'admin' || me?.role === 'orchestrator';
+
+  // LENSES-c c1-A: the Group roles read rides principals:read, as GET /groups
+  // does; root also appoints and removes there. A session holding neither
+  // would only be refused, so the sub-panel is not mounted for it.
+  const canReadGroupRoles = isRoot
+    || (Array.isArray(scopes) && (scopes.includes('principals:read') || scopes.includes('principals:admin')));
 
   const principalById = useMemo(() => new Map(principals.map((p) => [p.id, p])), [principals]);
 
@@ -331,7 +317,12 @@ export const AccessManagerPage: React.FC = () => {
       {error && <div className="axm-error" role="alert">{error}</div>}
       {notice && <div className="axm-notice" role="status">{notice}</div>}
 
+      {/* The queue is a shared component since card b1e3b16d (lane L1): the
+          approvals hub mounts the same one. This mount is the Access manager
+          panel, unchanged — its own filter, the published deep link
+          expanding the item in place — plus one link into the hub. */}
       <ApprovalsQueue
+        mount="access-manager"
         principalById={principalById}
         deepLinkApprovalId={deepLinkApprovalId}
         requestStepUp={setStepUp}
@@ -369,10 +360,27 @@ export const AccessManagerPage: React.FC = () => {
           surface={surface}
         />
       )}
+      {/* Card 549cc51f (E298, E299): the shared-area writer list. Offered to
+          the same administrator sessions as the two panels above; the panel
+          asks the board for the administration view and renders nothing when
+          the board refuses it, and every change is a root or administrator
+          login-session act with a step-up, decided by the route. */}
+      {mayChangeRoles(me?.role ?? null, scopes) && (
+        <SharedWritersPanel
+          principals={principals}
+          requestStepUp={setStepUp}
+          surface={surface}
+          auditTrailAvailable={config.features.auditLog}
+        />
+      )}
       {isRoot && <InventoryPanel principals={principals} surface={surface} />}
       <RevealPanel principals={principals} requestStepUp={setStepUp} surface={surface} />
       {isRoot && <IdentityProviders surface={surface} />}
       {isRoot && <GroupDirectoryBindings surface={surface} />}
+      {/* LENSES-c c1-A (card 46cfbd1d): the Group roles sub-panel. Every
+          reader sees role, holder and the live/inert flag; appoint and remove
+          are offered to a root session only, as the server allows. */}
+      {canReadGroupRoles && <GroupStewardsPanel isRoot={isRoot} principals={principals} surface={surface} />}
       {isRoot && <RemediationQueues surface={surface} />}
 
       {stepUp && (
@@ -381,229 +389,10 @@ export const AccessManagerPage: React.FC = () => {
           targetId={stepUp.targetId}
           description={stepUp.description}
           onToken={(token) => { const request = stepUp; setStepUp(null); request.onToken(token); }}
-          onCancel={() => setStepUp(null)}
+          onCancel={() => { const request = stepUp; setStepUp(null); request.onCancel?.(); }}
         />
       )}
     </div>
-  );
-};
-
-/* ── Approvals (§6.1): the edit-before-approve queue ──────────────────── */
-
-const ApprovalsQueue: React.FC<{
-  principalById: Map<string, Principal>;
-  deepLinkApprovalId: string | null;
-  requestStepUp: (request: StepUpRequest) => void;
-  surface: (kind: 'notice' | 'error', message: string) => void;
-}> = ({ principalById, deepLinkApprovalId, requestStepUp, surface }) => {
-  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
-  const [statusFilter, setStatusFilter] = useState<'pending' | 'all'>('pending');
-  const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [expandedId, setExpandedId] = useState<string | null>(deepLinkApprovalId);
-  const [editedScopes, setEditedScopes] = useState<Record<string, string[]>>({});
-  const [editedRuleDrops, setEditedRuleDrops] = useState<Record<string, number[]>>({});
-  const [denyReason, setDenyReason] = useState('');
-  const deepLinkRef = useRef<HTMLLIElement>(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const query = statusFilter === 'pending' ? '?status=pending' : '';
-      const data = await readJson(await authenticatedFetch(`${API_BASE}/approvals${query}`));
-      setApprovals(Array.isArray(data.approvals) ? data.approvals : []);
-    } catch (caught) {
-      surface('error', caught instanceof Error ? caught.message : 'Could not load approvals');
-    } finally {
-      setLoading(false);
-    }
-  }, [statusFilter, surface]);
-
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => {
-    if (deepLinkApprovalId && typeof deepLinkRef.current?.scrollIntoView === 'function') {
-      deepLinkRef.current.scrollIntoView({ block: 'center' });
-    }
-  }, [deepLinkApprovalId, approvals.length]);
-
-  const decide = (approval: ApprovalItem, decision: 'approve' | 'deny') => {
-    requestStepUp({
-      action: 'approval.decide',
-      targetId: approval.id,
-      description: decision === 'approve'
-        ? `Approve the agent-mint request from ${approval.requesterHandle ?? approval.requesterPrincipalId} for task “${approval.targetTaskTitle ?? approval.targetTaskId}”.`
-        : `Deny the agent-mint request from ${approval.requesterHandle ?? approval.requesterPrincipalId}.`,
-      onToken: async (stepUpToken) => {
-        setBusyId(approval.id);
-        try {
-          const body: Record<string, unknown> = { stepUpToken };
-          if (decision === 'approve') {
-            const scopesEdit = editedScopes[approval.id];
-            if (scopesEdit && scopesEdit.length !== approval.requestedScopes.length) body.editedScopes = scopesEdit;
-            const drops = editedRuleDrops[approval.id] ?? [];
-            if (drops.length > 0) {
-              body.editedRules = approval.requestedRules.filter((_, index) => !drops.includes(index));
-            }
-          } else if (denyReason.trim()) {
-            body.reason = denyReason.trim();
-          }
-          await readJson(await authenticatedFetch(`${API_BASE}/approvals/${approval.id}/${decision}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-          }));
-          surface('notice', decision === 'approve'
-            ? 'Approved. The requesting connector collects the credential with the same key it requested with; the authorization lapses unused after 24 hours.'
-            : 'Denied and recorded in the audit ledger.');
-          setDenyReason('');
-          await load();
-        } catch (caught) {
-          surface('error', caught instanceof Error ? caught.message : `Could not ${decision} the approval`);
-        } finally {
-          setBusyId(null);
-        }
-      },
-    });
-  };
-
-  const toggleScope = (approval: ApprovalItem, scope: string) => {
-    setEditedScopes((current) => {
-      const present = current[approval.id] ?? approval.requestedScopes;
-      const next = present.includes(scope) ? present.filter((s) => s !== scope) : [...present, scope];
-      return { ...current, [approval.id]: next };
-    });
-  };
-
-  const toggleRule = (approval: ApprovalItem, index: number) => {
-    setEditedRuleDrops((current) => {
-      const drops = current[approval.id] ?? [];
-      const next = drops.includes(index) ? drops.filter((i) => i !== index) : [...drops, index];
-      return { ...current, [approval.id]: next };
-    });
-  };
-
-  return (
-    <section className="axm-section" aria-labelledby="axm-approvals-heading">
-      <div className="axm-section-head">
-        <h2 id="axm-approvals-heading"><Inbox aria-hidden="true" /> Pending approvals</h2>
-        <div className="axm-section-tools">
-          <label className="axm-filter">
-            Show
-            <Select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as 'pending' | 'all')}>
-              <option value="pending">pending only</option>
-              <option value="all">every state</option>
-            </Select>
-          </label>
-          <Button variant="secondary" size="compact" icon={<RefreshCw size={16} />} onClick={() => load()} ariaLabel="Refresh approvals">Refresh</Button>
-        </div>
-      </div>
-      <p className="axm-section-intro">
-        A connector&rsquo;s agent-mint request becomes a pending item here. The decision happens only on this
-        authenticated surface after step-up — the notification deep link carries no authority. You may edit
-        the requested authority <em>down</em> before approving; the approval is a single-use authorization the
-        requesting credential collects within 24 hours.
-      </p>
-      {loading ? (
-        <div className="axm-state"><Loader2 className="axm-spin" aria-hidden="true" /> Loading approvals…</div>
-      ) : approvals.length === 0 ? (
-        <div className="axm-empty">No {statusFilter === 'pending' ? 'pending ' : ''}approvals.</div>
-      ) : (
-        <ul className="axm-list">
-          {approvals.map((approval) => {
-            const expanded = expandedId === approval.id;
-            const keptScopes = editedScopes[approval.id] ?? approval.requestedScopes;
-            const drops = editedRuleDrops[approval.id] ?? [];
-            const requester = principalById.get(approval.requesterPrincipalId);
-            return (
-              <li key={approval.id} ref={approval.id === deepLinkApprovalId ? deepLinkRef : undefined}
-                  className={`axm-item ${approval.id === deepLinkApprovalId ? 'axm-item--linked' : ''}`}>
-                <div className="axm-item-row">
-                  <span className={`axm-status axm-status--${approval.status}`}>{approval.status}</span>
-                  <span className="axm-item-title">
-                    <strong>{approval.requesterHandle ?? principalLabel(requester)}</strong>
-                    <small>wants an agent on “{approval.targetTaskTitle ?? approval.targetTaskId}”</small>
-                  </span>
-                  <span className="axm-item-meta">{new Date(approval.requestedAt).toLocaleString()}</span>
-                  <Button
-                    variant="secondary" size="compact"
-                    ariaExpanded={expanded}
-                    onClick={() => setExpandedId(expanded ? null : approval.id)}
-                  >
-                    {expanded ? 'Hide' : 'Review'}
-                  </Button>
-                </div>
-                {expanded && (
-                  <div className="axm-item-detail">
-                    <h3>Requested scopes {approval.status === 'pending' && <small>(untick to narrow before approving)</small>}</h3>
-                    <div className="axm-chipset">
-                      {approval.requestedScopes.map((scope) => (
-                        approval.status === 'pending' ? (
-                          <label key={scope} className={`axm-scope ${keptScopes.includes(scope) ? '' : 'axm-scope--dropped'}`}>
-                            <input
-                              type="checkbox"
-                              checked={keptScopes.includes(scope)}
-                              onChange={() => toggleScope(approval, scope)}
-                            /> {scope}
-                          </label>
-                        ) : <span key={scope} className="axm-scope">{scope}</span>
-                      ))}
-                    </div>
-                    <h3>Requested object rules</h3>
-                    {approval.requestedRules.length === 0 ? (
-                      <p className="axm-muted">None — the agent works purely through its bound-task role.</p>
-                    ) : (
-                      <div className="axm-chipset">
-                        {approval.requestedRules.map((rule, index) => (
-                          approval.status === 'pending' ? (
-                            <label key={index} className={`axm-scope ${drops.includes(index) ? 'axm-scope--dropped' : ''}`}>
-                              <input
-                                type="checkbox"
-                                checked={!drops.includes(index)}
-                                onChange={() => toggleRule(approval, index)}
-                              /> {ruleSummary(rule)}
-                            </label>
-                          ) : <span key={index} className="axm-scope">{ruleSummary(rule)}</span>
-                        ))}
-                      </div>
-                    )}
-                    {approval.lapseReason && <p className="axm-muted">Lapsed: {approval.lapseReason}</p>}
-                    {approval.denialReason && <p className="axm-muted">Denied: {approval.denialReason}</p>}
-                    {approval.status === 'pending' && (
-                      <div className="axm-decide">
-                        <div className="form-group axm-deny-reason">
-                          <label htmlFor={`deny-reason-${approval.id}`}>Denial reason <span className="axm-muted">optional</span></label>
-                          <input
-                            id={`deny-reason-${approval.id}`}
-                            className="form-input"
-                            type="text"
-                            value={denyReason}
-                            onChange={(event) => setDenyReason(event.target.value)}
-                          />
-                        </div>
-                        <div className="axm-decide-actions">
-                          <Button
-                            variant="danger" size="compact" icon={<XCircle size={16} />}
-                            disabled={busyId !== null}
-                            onClick={() => decide(approval, 'deny')}
-                          >
-                            {busyId === approval.id ? 'Working…' : 'Deny'}
-                          </Button>
-                          <Button
-                            variant="success" size="compact" icon={<BadgeCheck size={16} />}
-                            disabled={busyId !== null || keptScopes.length === 0}
-                            onClick={() => decide(approval, 'approve')}
-                          >
-                            {busyId === approval.id ? 'Working…' : (keptScopes.length !== approval.requestedScopes.length || drops.length > 0 ? 'Approve narrowed' : 'Approve')}
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </section>
   );
 };
 
@@ -626,6 +415,7 @@ const MintAgentPanel: React.FC<{
     handle: string;
     secretOnce: string;
     bootstrapLine: string;
+    bootstrapPrompt: string;
     cliEnv: string[];
     mcpGeneric: string;
     mcpClaudeCode: string;
@@ -667,6 +457,7 @@ const MintAgentPanel: React.FC<{
             handle: String(data.pack?.handle ?? ''),
             secretOnce: String(data.pack?.secretOnce ?? ''),
             bootstrapLine: String(onboarding.bootstrapLine ?? ''),
+            bootstrapPrompt: String(onboarding.bootstrapPrompt ?? ''),
             cliEnv: Array.isArray(onboarding.cliEnv) ? onboarding.cliEnv : [],
             mcpGeneric: JSON.stringify(mcp.generic ?? {}, null, 2),
             mcpClaudeCode: JSON.stringify(mcp.claudeCode ?? {}, null, 2),
@@ -744,6 +535,12 @@ const MintAgentPanel: React.FC<{
           <pre className="axm-pack-pre">{minted.mcpCodex}</pre>
           <h4>MCP config — generic stdio</h4>
           <pre className="axm-pack-pre">{minted.mcpGeneric}</pre>
+          {minted.bootstrapPrompt && (
+            <>
+              <h4>Bootstrap prompt <span className="axm-muted">(no credential inside; paste it into a fresh session)</span></h4>
+              <pre className="axm-pack-pre">{minted.bootstrapPrompt}</pre>
+            </>
+          )}
           <h4>Effective-access preview</h4>
           <code>GET {minted.previewPath}</code>
           <h4>Compiled Brief</h4>
@@ -931,6 +728,85 @@ const EMPTY_WARRANT_DRAFT = {
   transportPin: 'any',
 };
 
+/**
+ * THE PINNED CEILING RULES a warrant's details list (card 785e1eed, lane P2-F).
+ *
+ * An entry is a STATE, for the reason `DependentCount` is: an empty list must
+ * never stand in for "not read yet" or "could not be read", because a ceiling
+ * that reads as having no rules reads as having no authority.
+ *
+ * Where the rules come from: a warrant written before AZ-A3 carries them
+ * inline (`ceilingRules`); every later warrant stores NULL there and pins a
+ * profile VERSION, whose rules `GET /access-profiles/:id/versions` returns
+ * (principals:read, the same authority the form's profile list already
+ * needs). The pinned version is found by its id, never by "the latest": a
+ * republished profile never widens a standing warrant, so its newest version
+ * is not the warrant's ceiling.
+ */
+type PinnedRules =
+  | { state: 'reading' }
+  | { state: 'read'; rules: ProfileRule[] }
+  | { state: 'unreadable'; reason: string }
+  | { state: 'unpinned' };
+
+function normalisedRules(rules: unknown[]): ProfileRule[] {
+  return rules.filter((rule): rule is Record<string, unknown> => typeof rule === 'object' && rule !== null)
+    .map((rule) => ({
+      resourceType: String(rule.resourceType ?? ''),
+      selectorForm: rule.selectorForm as ProfileRule['selectorForm'],
+      selectorIds: Array.isArray(rule.selectorIds) ? rule.selectorIds.map(String) : [],
+      verbs: Array.isArray(rule.verbs) ? rule.verbs.map(String) : [],
+    }));
+}
+
+function initialPinnedRules(warrant: WarrantItem | undefined): PinnedRules {
+  if (!warrant) return { state: 'unpinned' };
+  if (Array.isArray(warrant.ceilingRules) && warrant.ceilingRules.length > 0) {
+    return { state: 'read', rules: normalisedRules(warrant.ceilingRules) };
+  }
+  if (warrant.ceilingProfileId && warrant.ceilingProfileVersionId) return { state: 'reading' };
+  return { state: 'unpinned' };
+}
+
+function pinnedVersionRules(data: unknown, versionId: string): PinnedRules {
+  const versions = (data as { versions?: unknown } | null)?.versions;
+  if (!Array.isArray(versions)) return { state: 'unreadable', reason: 'the profile history came back without a version list' };
+  const pinned = versions.find((version) => (version as { id?: unknown } | null)?.id === versionId) as { rules?: unknown } | undefined;
+  if (!pinned) return { state: 'unreadable', reason: 'the pinned version is not in the profile history' };
+  if (!Array.isArray(pinned.rules)) return { state: 'unreadable', reason: 'the pinned version came back without its rules' };
+  return { state: 'read', rules: normalisedRules(pinned.rules) };
+}
+
+const PinnedRulesList: React.FC<{ pinned: PinnedRules }> = ({ pinned }) => {
+  if (pinned.state === 'unpinned') return null;
+  if (pinned.state === 'reading') return <p className="axm-muted" role="status">Reading the pinned rules…</p>;
+  if (pinned.state === 'unreadable') {
+    return <p className="axm-muted" role="status">The pinned rules could not be read: {pinned.reason}</p>;
+  }
+  if (pinned.rules.length === 0) return <p className="axm-muted">The pinned version carries no object rules.</p>;
+  return (
+    <ul className="axm-minted" aria-label="Pinned ceiling rules">
+      {pinned.rules.map((rule, index) => (
+        <li key={`${rule.resourceType}-${index}`}>
+          {ruleSummary(rule)}
+          {rule.selectorIds.length > 0 && ' · '}
+          {rule.selectorIds.map((id, at) => (
+            <React.Fragment key={id}>{at > 0 && ' '}<code>{id.slice(0, 8)}</code></React.Fragment>
+          ))}
+        </li>
+      ))}
+    </ul>
+  );
+};
+
+/** A non-2xx answer from `POST /warrants`, kept whole: the form shows it verbatim. */
+interface WarrantRefusal {
+  status: number;
+  code: string | null;
+  message: string;
+  errorId: string | null;
+}
+
 const WarrantRegistry: React.FC<{
   principals: Principal[];
   principalById: Map<string, Principal>;
@@ -940,10 +816,34 @@ const WarrantRegistry: React.FC<{
   const [warrants, setWarrants] = useState<WarrantItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [mintedFailure, setMintedFailure] = useState<Record<string, string>>({});
   const [minted, setMinted] = useState<Record<string, MintedIdentity[]>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [editWarrant, setEditWarrant] = useState<WarrantItem | null>(null);
+  const [editLifetime, setEditLifetime] = useState<'keep' | 'until-task'>('until-task');
+  const [editTask, setEditTask] = useState('');
+  const [editRevert, setEditRevert] = useState('');
+  const [narrowAgents, setNarrowAgents] = useState(false);
+  const [editWarning, setEditWarning] = useState<{ count: DependentCount; proceed: () => void } | null>(null);
+  // Card 72b8fb97 (SU-33): the second ask when a warrant act answers the
+  // step-up challenge, through the page's one dialog, for exactly the
+  // challenge's binding; null when the person cancels.
+  const askAgain = (challenge: StepUpChallenge) => new Promise<string | null>((resolve) => requestStepUp({
+    action: challenge.action, targetId: challenge.targetId, description: STEP_UP_RETRY_DESCRIPTION,
+    onToken: resolve, onCancel: () => resolve(null),
+  }));
+
   const [draft, setDraft] = useState({ ...EMPTY_WARRANT_DRAFT });
+  // Lane P2-F: the ceiling-rules field. The rows live here, beside the draft,
+  // because this component owns the exclusion with the profile selector and
+  // the submit; `rulesAttempted` turns the problem list on after a refused
+  // submit and keeps it live while the rows are fixed.
+  const [ruleRows, setRuleRows] = useState<CeilingRuleRow[]>([]);
+  const [rulesAttempted, setRulesAttempted] = useState(false);
+  const [refusal, setRefusal] = useState<WarrantRefusal | null>(null);
+  const [pinned, setPinned] = useState<Record<string, PinnedRules>>({});
+  const ruleProblems = rulesAttempted && ruleRows.length > 0 ? ceilingRuleProblems(ruleRows) : null;
   const [profiles, setProfiles] = useState<Array<{ id: string; name: string; publishedVersionNumber: number | null }>>([]);
   // RH-P3.AZ-S7 (ruling 7440b579 R4/R5): the dependent-task warning a
   // revoke must show first, and the assignments each warrant carries.
@@ -982,11 +882,17 @@ const WarrantRegistry: React.FC<{
   const expand = async (warrantId: string) => {
     if (expandedId === warrantId) { setExpandedId(null); return; }
     setExpandedId(warrantId);
+    setMintedFailure(current => { const next = { ...current }; delete next[warrantId]; return next; });
     // Installed in the SAME commit as `expandedId`, before either request is
     // even issued: the panel renders as soon as the id is set, and it must
     // have a state to render (review `99ba9444` B2 — the first expansion
     // transiently claimed a revoke unassigns nothing).
     setCarried((current) => ({ ...current, [warrantId]: COUNTING }));
+    // Lane P2-F: the pinned rules get their state in the same commit, for the
+    // same reason - the panel renders as soon as the id is set.
+    const warrant = warrants.find((item) => item.id === warrantId);
+    const pinnedStart = initialPinnedRules(warrant);
+    setPinned((current) => ({ ...current, [warrantId]: pinnedStart }));
     // ONE TOKEN PER EXPANSION. Collapse-and-re-expand, or two expansions
     // racing, could otherwise let an older response overwrite a newer one for
     // the same warrant (round 1, non-blocking observation). A result is
@@ -1003,6 +909,14 @@ const WarrantRegistry: React.FC<{
     // unrelated read. Both requests are in flight before the first `await`.
     const detail = (async () => readJson(await authenticatedFetch(`${API_BASE}/warrants/${warrantId}`)))();
     const linkage = (async () => readJson(await authenticatedFetch(`${API_BASE}/warrants/${warrantId}/linkage`)))();
+    // A THIRD read and a third failure domain, started with the other two:
+    // the pinned version's rules, only when the row pins a version and does
+    // not carry its rules inline.
+    const pinnedProfileId = warrant?.ceilingProfileId ?? null;
+    const pinnedVersionId = warrant?.ceilingProfileVersionId ?? null;
+    const versions = pinnedStart.state === 'reading' && pinnedProfileId && pinnedVersionId
+      ? (async () => readJson(await authenticatedFetch(`${API_BASE}/access-profiles/${pinnedProfileId}/versions`)))()
+      : null;
 
     // And each one SETTLES on its own. Starting both is not enough: awaiting
     // them in sequence would still hold the count behind the other read, which
@@ -1014,6 +928,7 @@ const WarrantRegistry: React.FC<{
         setMinted((current) => ({ ...current, [warrantId]: Array.isArray(data.mintedIdentities) ? data.mintedIdentities : [] }));
       },
       (caught) => {
+        if (stillCurrent()) setMintedFailure(current => ({ ...current, [warrantId]: caught instanceof Error ? caught.message : 'Could not load the warrant' }));
         surface('error', caught instanceof Error ? caught.message : 'Could not load the warrant');
       },
     );
@@ -1033,7 +948,23 @@ const WarrantRegistry: React.FC<{
         }
       },
     );
-    await Promise.allSettled([applyDetail, applyLinkage]);
+    // Its failure is shown in the panel it belongs to and nowhere else: a
+    // session without principals:read cannot read profile history, and that
+    // is a fact about this list, not an error about the page.
+    const applyPinned = versions && pinnedVersionId
+      ? versions.then(
+        (data) => {
+          if (!stillCurrent()) return;
+          setPinned((current) => ({ ...current, [warrantId]: pinnedVersionRules(data, pinnedVersionId) }));
+        },
+        (caught) => {
+          if (!stillCurrent()) return;
+          const reason = caught instanceof Error ? caught.message : 'the profile history could not be read';
+          setPinned((current) => ({ ...current, [warrantId]: { state: 'unreadable', reason } }));
+        },
+      )
+      : Promise.resolve();
+    await Promise.allSettled([applyDetail, applyLinkage, applyPinned]);
   };
 
   /** R4: revocation WARNS with the enumerated list of dependent
@@ -1102,13 +1033,123 @@ const WarrantRegistry: React.FC<{
     });
   };
 
+  const revokeMintedAgent = async (identity: MintedIdentity, warrantId: string) => {
+    if (!window.confirm(`Revoke every live credential for Agent ${identity.handle}? Its identity and history stay.`)) return;
+    setBusyId(identity.principalId);
+    try {
+      const listed = await readJson(await authenticatedFetch(`${API_BASE}/principals/${identity.principalId}/credentials`));
+      if (!Array.isArray(listed.credentials)) throw new Error('Agent credentials could not be read');
+      for (const credential of listed.credentials) {
+        if (credential.revokedAt || (credential.expiresAt && Date.parse(credential.expiresAt) <= Date.now())) continue;
+        await readJson(await authenticatedFetch(`${API_BASE}/credentials/${credential.id}/revoke`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'Agent credential revoked from warrant registry' }) }));
+      }
+      const refreshed = await readJson(await authenticatedFetch(`${API_BASE}/warrants/${warrantId}`));
+      setMinted(current => ({ ...current, [warrantId]: Array.isArray(refreshed.mintedIdentities) ? refreshed.mintedIdentities : [] }));
+      surface('notice', 'Agent credentials revoked; identity and history preserved.'); await load();
+    } catch (caught) { surface('error', caught instanceof Error ? caught.message : 'Could not revoke Agent credentials. Refresh to see any completed revocations.'); }
+    finally { setBusyId(null); }
+  };
+
+  const editFields = (): Record<string, unknown> => {
+    if (!editWarrant) return {};
+    const fields: Record<string, unknown> = {};
+    const originalExpiry = formatInstantForDateTimeLocal(editWarrant.expiresAt ?? '').slice(0, 16);
+    const expiry = draft.expiresAt === originalExpiry ? editWarrant.expiresAt : draft.expiresAt ? new Date(draft.expiresAt).toISOString() : null;
+    const scopes = draft.ceilingScopes.trim() ? draft.ceilingScopes.split(',').map(value => value.trim()).filter(Boolean) : null;
+    if (JSON.stringify(scopes) !== JSON.stringify(editWarrant.ceilingScopes)) fields.ceilingScopes = scopes;
+    if (expiry !== editWarrant.expiresAt) fields.expiresAt = expiry;
+    if (draft.transportPin !== editWarrant.transportPin) fields.transportPin = draft.transportPin;
+    for (const key of ['maxConcurrent', 'maxTotal'] as const) {
+      const value = draft[key] ? Number(draft[key]) : null;
+      if (value !== editWarrant[key]) fields[key] = value;
+    }
+    if (ruleRows.length) fields.ceilingRules = rowsToRules(ruleRows);
+    else if (draft.ceilingProfileId) fields.ceilingProfileId = draft.ceilingProfileId;
+    return fields;
+  };
+  const fieldsNow = editWarrant ? editFields() : {};
+  const ceilingChanged = 'ceilingRules' in fieldsNow || 'ceilingProfileId' in fieldsNow;
+  // Profile containment is proved by the server. Until read and proven locally,
+  // a changed ceiling receives conservative widening confirmation.
+  const knownPinned = editWarrant ? pinned[editWarrant.id] ?? initialPinnedRules(editWarrant) : { state: 'unpinned' as const };
+  const rulesNarrow = ruleRows.length > 0 && knownPinned.state === 'read' && rowsToRules(ruleRows).every(rule => rule.verbs.every(verb => knownPinned.rules.some(source => {
+    if (source.resourceType !== rule.resourceType || !source.verbs.includes(verb)) return false;
+    const ids = rule.selectorIds ?? [];
+    if (source.selectorForm === 'all-of-type') return true;
+    if (source.selectorForm === 'all-except') return rule.selectorForm === 'exact' ? ids.every(id => !source.selectorIds.includes(id)) : rule.selectorForm === 'all-except' && source.selectorIds.every(id => ids.includes(id));
+    if (source.selectorForm === 'all-in-project') return rule.selectorForm === 'all-in-project' && ids.every(id => source.selectorIds.includes(id));
+    return source.selectorForm === rule.selectorForm && ids.every(id => source.selectorIds.includes(id));
+  })));
+  const editWidens = editWarrant !== null && ((ceilingChanged && !rulesNarrow)
+    || ('ceilingScopes' in fieldsNow && editWarrant.ceilingScopes !== null && (fieldsNow.ceilingScopes === null || (fieldsNow.ceilingScopes as string[]).some(scope => !editWarrant.ceilingScopes!.includes(scope))))
+    || (['maxConcurrent', 'maxTotal'] as const).some(key => key in fieldsNow && editWarrant[key] !== null && (fieldsNow[key] === null || Number(fieldsNow[key]) > editWarrant[key]!))
+    || ('expiresAt' in fieldsNow && editWarrant.expiresAt !== null && (fieldsNow.expiresAt === null || Date.parse(String(fieldsNow.expiresAt)) > Date.parse(editWarrant.expiresAt)))
+    || ('transportPin' in fieldsNow && editWarrant.transportPin !== 'any'));
+  const saveWarrantEdit = async () => {
+    if (!editWarrant || busyId !== null) return;
+    setRulesAttempted(true);
+    if (ruleRows.length && ceilingRuleProblems(ruleRows).length) return;
+    if (editWidens && editLifetime === 'until-task' && !editTask.trim() && !editRevert) return;
+    const warrant = editWarrant;
+    const fields = editFields();
+    if (!Object.keys(fields).length) { surface('notice', 'No authority fields changed.'); return; }
+    const apply = async (acknowledgeDependents: boolean, stepUpToken?: string) => {
+      setBusyId(warrant.id);
+      try {
+        const bodyWith = (token: string | undefined) => ({ ...fields, acknowledgeDependents, ...(!editWidens && narrowAgents ? { narrowAgents: true } : {}), ...(token ? { stepUpToken: token, lifetime: editLifetime === 'keep' ? { choice: 'keep' } : { choice: 'until-task', ...(editTask.trim() ? { taskId: editTask.trim() } : {}), ...(editRevert ? { revertAt: new Date(editRevert).toISOString() } : {}) } } : {}) });
+        const send = (token: string | undefined) => authenticatedFetch(`${API_BASE}/warrants/${warrant.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyWith(token)) });
+        // Card 72b8fb97 (SU-33): a widening whose token no longer counts is
+        // answered with the challenge for (warrant.edit, id); the SAME edit
+        // is sent ONE more time with the token the person confirms.
+        const sent = stepUpToken
+          ? await sendWithStepUpRetry(send, stepUpToken, { action: 'warrant.edit', targetId: warrant.id }, askAgain)
+          : await (async () => { const response = await send(undefined); return { response, body: await response.json() }; })();
+        const response = sent.response;
+        const data = (sent.body ?? {}) as Record<string, any>;
+        if (!response.ok || !data.success) throw new Error(`${data.code ? `${data.code}: ` : ''}${data.message || data.error || 'Could not edit the warrant'}`);
+        surface('notice', `Warrant edit applied (${data.edit?.direction || 'saved'}). ${data.edit?.narrowedAgents?.length || 0} Agents narrowed; ${data.edit?.revokedAgents?.length || 0} revoked. The record and provenance stay.`);
+        setEditWarrant(null); setCreating(false); setRuleRows([]); await load(); const refreshed = await readJson(await authenticatedFetch(`${API_BASE}/warrants/${warrant.id}`)); setMinted(current => ({ ...current, [warrant.id]: Array.isArray(refreshed.mintedIdentities) ? refreshed.mintedIdentities : [] })); setExpandedId(warrant.id);
+      } catch (caught) { surface('error', caught instanceof Error ? caught.message : 'Could not edit the warrant'); }
+      finally { setBusyId(null); }
+    };
+    const proceed = (acknowledge: boolean) => {
+      if (editWidens) requestStepUp({ action: 'warrant.edit', targetId: warrant.id, description: `Confirm the edit to “${warrant.name}” with lifetime ${editLifetime === 'keep' ? 'keep' : 'until this task ends'}.`, onToken: token => apply(acknowledge, token) });
+      else void apply(acknowledge);
+    };
+    if (!ceilingChanged) { proceed(false); return; }
+    setEditWarning({ count: COUNTING, proceed: () => {} });
+    try {
+      const data = await readJson(await authenticatedFetch(`${API_BASE}/warrants/${warrant.id}/dependent-tasks`));
+      setEditWarning({ count: dependentTasksCount(data), proceed: () => { setEditWarning(null); proceed(true); } });
+    } catch (caught) { setEditWarning({ count: { state: 'uncounted', reason: caught instanceof Error ? caught.message : 'Could not read riding tasks' }, proceed: () => {} }); }
+  };
+
   const create = (event: React.FormEvent) => {
     event.preventDefault();
+    if (editWarrant) { void saveWarrantEdit(); return; }
     if (!draft.holderPrincipalId || !draft.name.trim() || !draft.anchorId.trim()) return;
+    setRefusal(null);
+    // EXACTLY ONE CEILING FORM (AZ-31a; `WarrantService.prepareCreate`
+    // refuses both and neither). The form cannot hold both - each control
+    // disables the other - so the rules, when there are any, ARE the ceiling,
+    // and the profile is sent only when there are none. Neither is the
+    // existing behaviour: the profile selector is then `required`.
+    let ceilingRules: ReturnType<typeof rowsToRules> | null = null;
+    if (ruleRows.length > 0) {
+      const problems = ceilingRuleProblems(ruleRows);
+      setRulesAttempted(true);
+      // Refused here, before step-up: a rule the server would refuse is not
+      // worth a password, and the token would be burned by the refusal.
+      if (problems.length > 0) return;
+      ceilingRules = rowsToRules(ruleRows);
+    }
+    const ceilingWords = ceilingRules
+      ? ` Its ceiling is the ${ceilingRules.length === 1 ? 'rule' : `${ceilingRules.length} rules`} you entered, published as this warrant's own Access profile.`
+      : '';
     requestStepUp({
       action: 'warrant.create',
       targetId: draft.holderPrincipalId,
-      description: `Create the standing warrant “${draft.name.trim()}” for ${principalLabel(principalById.get(draft.holderPrincipalId))} — its holder may then mint agents inside the anchor scope without per-spawn approval.`,
+      description: `Create the standing warrant “${draft.name.trim()}” for ${principalLabel(principalById.get(draft.holderPrincipalId))} — its holder may then mint agents inside the anchor scope without per-spawn approval.${ceilingWords}`,
       onToken: async (stepUpToken) => {
         setBusyId('create');
         try {
@@ -1119,16 +1160,54 @@ const WarrantRegistry: React.FC<{
             anchors: [{ anchorType: draft.anchorType, anchorId: draft.anchorId.trim() }],
             transportPin: draft.transportPin,
           };
-          if (draft.ceilingProfileId) body.ceilingProfileId = draft.ceilingProfileId;
+          if (ceilingRules) body.ceilingRules = ceilingRules;
+          else if (draft.ceilingProfileId) body.ceilingProfileId = draft.ceilingProfileId;
           if (draft.ceilingScopes.trim()) body.ceilingScopes = draft.ceilingScopes.split(',').map((s) => s.trim()).filter(Boolean);
           if (draft.expiresAt) body.expiresAt = new Date(draft.expiresAt).toISOString();
           if (draft.maxConcurrent) body.maxConcurrent = Number(draft.maxConcurrent);
           if (draft.maxTotal) body.maxTotal = Number(draft.maxTotal);
-          await readJson(await authenticatedFetch(`${API_BASE}/warrants`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-          }));
-          surface('notice', 'Warrant created and recorded with its pinned ceiling.');
+          // Card 72b8fb97 (SU-33): a token that no longer counts when the
+          // create arrives is answered with the challenge for
+          // (warrant.create, holder); the SAME create is sent ONE more time
+          // with the token the person confirms.
+          const sent = await sendWithStepUpRetry(
+            (token) => authenticatedFetch(`${API_BASE}/warrants`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, stepUpToken: token }),
+            }),
+            stepUpToken,
+            { action: 'warrant.create', targetId: draft.holderPrincipalId },
+            askAgain,
+          );
+          const response = sent.response;
+          // A REFUSAL IS SHOWN AS SENT. A 4xx is the server's answer about
+          // this form's input - the rules, the anchor, the holder, the
+          // step-up - so it renders verbatim inside the form, next to what
+          // it is about, rather than paraphrased at the top of the page. A
+          // 5xx renders there too, with its error id: a rule refusal raised by
+          // AccessProfileService (`validateRules` and the selector checks)
+          // reaches this route as a 500 WARRANT_CREATE_FAILED, because
+          // `sendWarrantError` in routes/warrants.ts maps WarrantError and
+          // StepUpError only - and the person at the form needs it either way.
+          if (!response.ok) {
+            const refused = sent.body as Record<string, unknown> | null;
+            setRefusal({
+              status: response.status,
+              code: typeof refused?.code === 'string' ? refused.code : null,
+              message: typeof refused?.message === 'string' ? refused.message
+                : typeof refused?.error === 'string' ? refused.error
+                  : `The server answered HTTP ${response.status} without a message.`,
+              errorId: typeof refused?.errorId === 'string' ? refused.errorId : null,
+            });
+            return;
+          }
+          const created = (sent.body ?? {}) as { success?: boolean; message?: string; error?: string };
+          if (created.success === false) throw new Error(created.message || created.error || `Request failed (${response.status})`);
+          surface('notice', ceilingRules
+            ? 'Warrant created: its ceiling rules were published as its own Access profile and that version is pinned.'
+            : 'Warrant created and recorded with its pinned ceiling.');
           setDraft({ ...EMPTY_WARRANT_DRAFT });
+          setRuleRows([]);
+          setRulesAttempted(false);
           setCreating(false);
           await load();
         } catch (caught) {
@@ -1146,34 +1225,35 @@ const WarrantRegistry: React.FC<{
         <h2 id="axm-warrants-heading"><ScrollText aria-hidden="true" /> Warrant registry</h2>
         <div className="axm-section-tools">
           <Button variant="secondary" size="compact" icon={<RefreshCw size={16} />} onClick={() => load()} ariaLabel="Refresh warrants">Refresh</Button>
-          <Button variant="primary" size="compact" icon={<Stamp size={16} />} onClick={() => setCreating((c) => !c)} ariaExpanded={creating}>
+          <Button variant="primary" size="compact" icon={<Stamp size={16} />} onClick={() => { if (editWarrant) { setEditWarrant(null); setDraft({ ...EMPTY_WARRANT_DRAFT }); setRuleRows([]); } setCreating((c) => !c); }} ariaExpanded={creating}>
             {creating ? 'Close form' : 'New warrant'}
           </Button>
         </div>
       </div>
       <p className="axm-section-intro">
         A warrant is the standing exception to per-mint approval: one holder, an anchor scope, a pinned
-        authority ceiling and a mandatory expiry. A profile-backed ceiling pins the version published at
-        creation — republishing the profile never widens a standing warrant. Suspended warrants resume
-        only through the re-approval act.
+        authority ceiling and a mandatory expiry. The ceiling is a published Access profile, or rules
+        entered with the warrant, which are published as its own profile in the same act; either way the
+        version published at creation is pinned — republishing a profile never widens a standing warrant.
+        Suspended warrants resume only through the re-approval act.
       </p>
       {creating && (
-        <form className="axm-editor" onSubmit={create} aria-label="Create a warrant">
+        <form className="axm-editor" onSubmit={create} aria-label={editWarrant ? "Edit a warrant" : "Create a warrant"}>
           <div className="axm-editor-grid">
             <div className="form-group">
               <label htmlFor="axm-w-name">Name</label>
-              <input id="axm-w-name" className="form-input" type="text" required maxLength={120} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+              <input id="axm-w-name" disabled={Boolean(editWarrant)} className="form-input" type="text" required maxLength={120} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
             </div>
             <div className="form-group">
               <label htmlFor="axm-w-holder">Holder (connector or service account)</label>
-              <Select id="axm-w-holder" required value={draft.holderPrincipalId} onChange={(event) => setDraft({ ...draft, holderPrincipalId: event.target.value })}>
+              <Select id="axm-w-holder" disabled={Boolean(editWarrant)} required value={draft.holderPrincipalId} onChange={(event) => setDraft({ ...draft, holderPrincipalId: event.target.value })}>
                 <option value="">Choose a holder…</option>
                 {holders.map((holder) => <option key={holder.id} value={holder.id}>{principalLabel(holder)}</option>)}
               </Select>
             </div>
             <div className="form-group">
               <label htmlFor="axm-w-anchor-type">Anchor</label>
-              <Select id="axm-w-anchor-type" value={draft.anchorType} onChange={(event) => setDraft({ ...draft, anchorType: event.target.value })}>
+              <Select id="axm-w-anchor-type" disabled={Boolean(editWarrant)} value={draft.anchorType} onChange={(event) => setDraft({ ...draft, anchorType: event.target.value })}>
                 <option value="task">task</option>
                 <option value="phase">phase</option>
                 <option value="project">project</option>
@@ -1181,24 +1261,48 @@ const WarrantRegistry: React.FC<{
             </div>
             <div className="form-group">
               <label htmlFor="axm-w-anchor-id">Anchor id</label>
-              <input id="axm-w-anchor-id" className="form-input" type="text" required pattern="[0-9a-fA-F\-]{36}" value={draft.anchorId} onChange={(event) => setDraft({ ...draft, anchorId: event.target.value })} />
+              <input id="axm-w-anchor-id" disabled={Boolean(editWarrant)} className="form-input" type="text" required pattern="[0-9a-fA-F\-]{36}" value={draft.anchorId} onChange={(event) => setDraft({ ...draft, anchorId: event.target.value })} />
             </div>
-            <div className="form-group">
+            {/* THE CEILING, ONE OF TWO FORMS (lane P2-F). The profile selector
+                and the rules field below exclude each other: rules disable the
+                selector, a chosen profile disables the rules. With neither, the
+                selector is required, exactly as before the rules existed. */}
+            <div className="form-group axm-editor-wide">
               <label htmlFor="axm-w-profile">Ceiling profile (pins the published version)</label>
-              <Select id="axm-w-profile" required value={draft.ceilingProfileId} onChange={(event) => setDraft({ ...draft, ceilingProfileId: event.target.value })}>
-                <option value="">Choose a published profile…</option>
+              <Select
+                id="axm-w-profile"
+                required={!editWarrant && ruleRows.length === 0}
+                disabled={ruleRows.length > 0}
+                aria-describedby={ruleRows.length > 0 ? 'axm-w-profile-hint' : undefined}
+                value={ruleRows.length > 0 ? '' : draft.ceilingProfileId}
+                onChange={(event) => setDraft({ ...draft, ceilingProfileId: event.target.value })}
+              >
+                <option value="">{editWarrant ? "Keep pinned ceiling" : "Choose a published profile…"}</option>
+                {editWarrant?.ceilingProfileId && !profiles.some(profile => profile.id === editWarrant.ceilingProfileId) && <option value={editWarrant.ceilingProfileId}>{editWarrant.ceilingProfileName} (current pin)</option>}
                 {profiles.filter((profile) => profile.publishedVersionNumber !== null).map((profile) => (
                   <option key={profile.id} value={profile.id}>{profile.name} (v{profile.publishedVersionNumber})</option>
                 ))}
               </Select>
+              {ruleRows.length > 0 && (
+                <p id="axm-w-profile-hint" className="axm-muted">
+                  Off while ceiling rules are entered below. Remove every rule to choose a profile instead.
+                </p>
+              )}
             </div>
+            <CeilingRulesField
+              idPrefix="axm-w-rules"
+              rows={ruleRows}
+              onRowsChange={(rows) => { setRuleRows(rows); setRefusal(null); }}
+              disabled={Boolean(draft.ceilingProfileId)}
+              problems={ruleProblems}
+            />
             <div className="form-group">
               <label htmlFor="axm-w-scopes">Scope ceiling <span className="axm-muted">optional, comma-separated</span></label>
               <input id="axm-w-scopes" className="form-input" type="text" placeholder="tasks:read, tasks:write, reports:write" value={draft.ceilingScopes} onChange={(event) => setDraft({ ...draft, ceilingScopes: event.target.value })} />
             </div>
             <div className="form-group">
               <label htmlFor="axm-w-expiry">Expiry {draft.anchorType === 'task' ? <span className="axm-muted">optional for a single task (task-terminal)</span> : <span className="axm-muted">required</span>}</label>
-              <input id="axm-w-expiry" className="form-input" type="datetime-local" required={draft.anchorType !== 'task'} value={draft.expiresAt} onChange={(event) => setDraft({ ...draft, expiresAt: event.target.value })} />
+              <input id="axm-w-expiry" className="form-input" type="datetime-local" required={draft.anchorType !== 'task' && !editWarrant} value={draft.expiresAt} onChange={(event) => setDraft({ ...draft, expiresAt: event.target.value })} />
             </div>
             <div className="form-group">
               <label htmlFor="axm-w-transport">Transport pin</label>
@@ -1217,9 +1321,28 @@ const WarrantRegistry: React.FC<{
               <input id="axm-w-max-total" className="form-input" type="number" min={1} value={draft.maxTotal} onChange={(event) => setDraft({ ...draft, maxTotal: event.target.value })} />
             </div>
           </div>
+          {editWarrant && <>
+            <h3>Edit {editWarrant.name}</h3>
+            {editWidens ? <>
+              <p>This change may widen authority and needs confirmation with a lifetime.</p>
+              <label htmlFor="warrant-edit-lifetime">Lifetime for this edit</label><Select id="warrant-edit-lifetime" value={editLifetime} onChange={event => setEditLifetime(event.target.value as typeof editLifetime)}><option value="until-task">Until this task ends</option><option value="keep">Keep (until narrowed)</option></Select>
+              {editLifetime === 'until-task' && <><label htmlFor="warrant-edit-task">Related task ID</label><input id="warrant-edit-task" pattern="[0-9a-fA-F-]{36}" value={editTask} onChange={event => setEditTask(event.target.value)} /><label htmlFor="warrant-edit-revert">Revert at (required without a task)</label><input id="warrant-edit-revert" type="datetime-local" required={!editTask.trim()} value={editRevert} onChange={event => setEditRevert(event.target.value)} /></>}
+            </> : <label><input type="checkbox" checked={narrowAgents} onChange={event => setNarrowAgents(event.target.checked)} /> Narrow all live minted Agents to this ceiling (incompatible Agents are revoked)</label>}
+            <Button type="button" onClick={() => { setEditWarrant(null); setCreating(false); setRuleRows([]); }}>Cancel edit</Button>
+          </>}
+          {refusal && (
+            <div className="axm-error" role="alert">
+              <strong>
+                {refusal.status < 500 ? 'The server refused this warrant' : 'The server could not create this warrant'}
+                {' '}(HTTP {refusal.status}{refusal.code ? `, ${refusal.code}` : ''}):
+              </strong>{' '}
+              {refusal.message}
+              {refusal.errorId && <> (error id <code>{refusal.errorId}</code>)</>}
+            </div>
+          )}
           <div className="axm-decide-actions">
-            <Button type="submit" variant="primary" size="compact" disabled={busyId === 'create'}>
-              {busyId === 'create' ? 'Creating…' : 'Create warrant'}
+            <Button type="submit" variant="primary" size="compact" disabled={busyId !== null}>
+              {busyId ? 'Working…' : editWarrant ? 'Save warrant edit' : 'Create warrant'}
             </Button>
           </div>
         </form>
@@ -1253,6 +1376,10 @@ const WarrantRegistry: React.FC<{
                     </span>
                   )}
                   <span className="axm-item-meta">{warrant.expiresAt ? `expires ${new Date(warrant.expiresAt).toLocaleString()}` : 'task-terminal expiry'}</span>
+                  {(warrant.status === 'active' || warrant.status === 'suspended') && <Button variant="secondary" size="compact" disabled={busyId !== null} onClick={() => {
+                    setEditWarrant(warrant); if (expandedId !== warrant.id) void expand(warrant.id); setCreating(true); setRuleRows([]); setRulesAttempted(false); setRefusal(null); setNarrowAgents(false); setEditLifetime('until-task'); setEditTask(warrant.anchors.length === 1 && warrant.anchors[0].anchorType === 'task' ? warrant.anchors[0].anchorId : ''); setEditRevert('');
+                    setDraft({ ...EMPTY_WARRANT_DRAFT, name: warrant.name, holderPrincipalId: warrant.holderPrincipalId, anchorType: warrant.anchors[0]?.anchorType || 'task', anchorId: warrant.anchors[0]?.anchorId || '', ceilingProfileId: '', ceilingScopes: warrant.ceilingScopes?.join(', ') || '', transportPin: warrant.transportPin, maxConcurrent: warrant.maxConcurrent === null ? '' : String(warrant.maxConcurrent), maxTotal: warrant.maxTotal === null ? '' : String(warrant.maxTotal), expiresAt: formatInstantForDateTimeLocal(warrant.expiresAt ?? '').slice(0, 16) });
+                  }}>Edit</Button>}
                   <Button variant="secondary" size="compact" ariaExpanded={expanded} onClick={() => expand(warrant.id)}>
                     {expanded ? 'Hide' : 'Details'}
                   </Button>
@@ -1267,6 +1394,7 @@ const WarrantRegistry: React.FC<{
                     </div>
                     <h3>Ceiling</h3>
                     <p className="axm-muted">Profile “{warrant.ceilingProfileName}” pinned at v{warrant.ceilingProfileVersionNumber} (republish never widens this warrant).</p>
+                    <PinnedRulesList pinned={pinned[warrant.id] ?? initialPinnedRules(warrant)} />
                     {warrant.ceilingScopes && (
                       <div className="axm-chipset">
                         {warrant.ceilingScopes.map((scope) => <span key={scope} className="axm-scope">{scope}</span>)}
@@ -1292,7 +1420,7 @@ const WarrantRegistry: React.FC<{
                       </ul>
                     )}
                     <h3>Identities minted under this warrant</h3>
-                    {(minted[warrant.id] ?? []).length === 0 ? (
+                    {mintedFailure[warrant.id] ? <p role="status">Live Agents could not be read: {mintedFailure[warrant.id]}</p> : !minted[warrant.id] ? <p role="status">Reading minted Agents…</p> : minted[warrant.id].length === 0 ? (
                       <p className="axm-muted">None yet.</p>
                     ) : (
                       <ul className="axm-minted">
@@ -1301,6 +1429,7 @@ const WarrantRegistry: React.FC<{
                             <code>{identity.handle}</code> — {identity.live ? 'live' : identity.status}
                             {identity.boundTaskId && ` · task ${identity.boundTaskId.slice(0, 8)}`}
                             {' · '}{new Date(identity.createdAt).toLocaleString()}
+                            {identity.live && <Button variant="danger" size="compact" disabled={busyId !== null} onClick={() => void revokeMintedAgent(identity, warrant.id)}>Revoke Agent credentials</Button>}
                           </li>
                         ))}
                       </ul>
@@ -1322,6 +1451,7 @@ const WarrantRegistry: React.FC<{
           })}
         </ul>
       )}
+      {editWarning && <ConfirmationModal danger title="Edit warrant ceiling?" confirmLabel="Acknowledge riding tasks and continue" confirmDisabled={!acknowledgementReady(editWarning.count)} message={<><p>Changing this ceiling releases tasks riding the warrant. Current assignments must be acknowledged first.</p><p role="status">{unassignmentSentence(editWarning.count)}</p>{editWarning.count.state === 'counted' && <ul>{editWarning.count.tasks.map(task => <li key={task.id}>{task.title} ({task.status})</li>)}</ul>}</>} onConfirm={editWarning.proceed} onCancel={() => setEditWarning(null)} />}
       {revokeTarget && (
         <ConfirmationModal
           danger
@@ -1368,28 +1498,36 @@ const WarrantRegistry: React.FC<{
 
 /* ── Inventory (§9.5): who holds what, from which source ──────────────── */
 
-const InventoryPanel: React.FC<{
+export const InventoryPanel: React.FC<{
   principals: Principal[];
   surface: (kind: 'notice' | 'error', message: string) => void;
 }> = ({ principals, surface }) => {
   const [principalId, setPrincipalId] = useState('');
-  const [access, setAccess] = useState<{ grants: any[]; profiles: any[] } | null>(null);
+  const [access, setAccess] = useState<(AuthorityPreviewData & { grants: any[]; profiles: any[]; credentials?: Array<{id: string; live: boolean; transport: string}>; nextCursor?: string | null; credentialsTruncated?: boolean }) | null>(null);
+  const [resourceType, setResourceType] = useState('task');
+  const [credentialId, setCredentialId] = useState('');
+  const [credentialDraft, setCredentialDraft] = useState('');
+  const requestVersion = useRef(0);
   const [loading, setLoading] = useState(false);
 
-  const inspect = useCallback(async (id: string) => {
+  const inspect = useCallback(async (id: string, type = resourceType, credential = credentialId, after?: string) => {
+    const version = ++requestVersion.current;
     setPrincipalId(id);
     setAccess(null);
-    if (!id) return;
+    if (!id) { setLoading(false); return; }
     setLoading(true);
     try {
-      const data = await readJson(await authenticatedFetch(`${API_BASE}/access-profiles/what-if?principalId=${id}`));
-      setAccess(data.access ?? { grants: [], profiles: [] });
+      const query = new URLSearchParams({ principalId: id, resourceType: type, limit: '20' });
+      if (credential) query.set('credentialId', credential);
+      if (after) query.set('after', after);
+      const data = await readJson(await authenticatedFetch(`${API_BASE}/access-profiles/what-if?${query}`));
+      if (version === requestVersion.current) setAccess(data.access ?? { grants: [], profiles: [] });
     } catch (caught) {
-      surface('error', caught instanceof Error ? caught.message : 'Could not compute the inventory');
+      if (version === requestVersion.current) surface('error', caught instanceof Error ? caught.message : 'Could not compute the inventory');
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
-  }, [surface]);
+  }, [surface, resourceType, credentialId]);
 
   return (
     <section className="axm-section" aria-labelledby="axm-inventory-heading">
@@ -1397,23 +1535,42 @@ const InventoryPanel: React.FC<{
         <h2 id="axm-inventory-heading"><FileKey2 aria-hidden="true" /> Granted-access inventory</h2>
       </div>
       <p className="axm-section-intro">
-        The live evaluator&rsquo;s own tables, per identity: direct grants, group grants, and published
-        profile rules reached directly or through group membership. Delegated identities are additionally
-        capped by their chain — this view shows the sources, the chain caps what survives.
+        Inspect current permissions and the sources that allow them. Choose one credential for a
+        connector or agent. Stored grants and profile rules are listed separately below.
       </p>
       <label className="axm-filter axm-filter--wide">
         Identity
-        <Select value={principalId} onChange={(event) => inspect(event.target.value)} aria-label="Identity to inspect">
+        <Select value={principalId} onChange={(event) => { setCredentialId(''); setCredentialDraft(''); inspect(event.target.value, resourceType, ''); }} aria-label="Identity to inspect">
           <option value="">Choose an identity…</option>
           {principals.map((principal) => (
             <option key={principal.id} value={principal.id}>{principalLabel(principal)} · {principal.kind}</option>
           ))}
         </Select>
       </label>
+      <label>Object type <Select aria-label="Preview object type" value={resourceType} onChange={event => {
+        setResourceType(event.target.value); inspect(principalId, event.target.value);
+      }}>{['task','phase','project','report','skill','personality','service'].map(type => <option key={type} value={type}>{type}</option>)}</Select></label>
+      {access?.credentials && access.credentials.length > 0 && <label>Credential <Select aria-label="Preview credential" value={credentialId} onChange={event => {
+        setCredentialId(event.target.value); setCredentialDraft(event.target.value); inspect(principalId, resourceType, event.target.value);
+      }}><option value="">Choose a credential…</option>{credentialId && !access.credentials.some(key => key.id === credentialId) && <option value={credentialId}>{credentialId} · selected by ID</option>}{access.credentials.map(credential => <option key={credential.id} value={credential.id}>{credential.id.slice(0, 8)} · {credential.transport} · {credential.live ? 'active' : 'inactive'}</option>)}</Select></label>}
+      {access?.credentialsTruncated && <p role="status">Only the first 50 credentials are listed, including inactive history. Enter an exact credential ID to inspect another credential for this identity.</p>}
+      {principalId && <form onSubmit={event => {
+        event.preventDefault();
+        const exact = credentialDraft.trim().toLowerCase();
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(exact)) {
+          surface('error', 'Enter an exact credential UUID.'); return;
+        }
+        setCredentialId(exact); inspect(principalId, resourceType, exact);
+      }}>
+        <label>Exact credential ID <input aria-label="Exact preview credential ID" value={credentialDraft} maxLength={36}
+          onChange={event => setCredentialDraft(event.target.value)} /></label>
+        <Button type="submit">Inspect credential</Button>
+      </form>}
       {loading && <div className="axm-state"><Loader2 className="axm-spin" aria-hidden="true" /> Computing…</div>}
+      {access && !loading && <><AuthorityPreviewTable access={access} />{access.hasMore && access.nextCursor && <Button onClick={() => inspect(principalId, resourceType, credentialId, access.nextCursor!)}>Next objects</Button>}</>}
       {access && !loading && (
         (access.grants.length === 0 && access.profiles.length === 0) ? (
-          <div className="axm-empty">No object-authority sources. Role arms, task roles and visibility may still apply.</div>
+          <div className="axm-empty">No stored grants or profile rules for this identity.</div>
         ) : (
           <div className="axm-table" role="table" aria-label="Object authority sources">
             <div className="axm-trow axm-trow--head" role="row">
@@ -1819,6 +1976,27 @@ interface IdentityProviderRow {
   scimClientPrincipalId?: string | null;
   /** SSO-R8 (W4): hours of push silence before the AZ-30 alarm; null = claim-sync semantics. */
   scimHeartbeatIntervalHours?: number | null;
+  /**
+   * Card 7a99d63e (SU-17): how a step-up asks this Identity provider for a
+   * fresh sign-in, or null for the default request (prompt=login, max_age=0).
+   */
+  stepUpPolicy?: StepUpPolicy | null;
+}
+
+/** Card 7a99d63e: the step-up policy fields this release accepts. */
+interface StepUpPolicy {
+  sso_step_up?: 'enabled' | 'disabled';
+  prompt_login?: boolean;
+  max_age?: number | null;
+}
+
+/** The step-up request a policy sends, in the words of the parameters. */
+function stepUpRequestSummary(policy: StepUpPolicy | null | undefined): string {
+  if (policy?.sso_step_up === 'disabled') return 'step-up by single sign-on off';
+  const promptLogin = policy?.prompt_login ?? true;
+  const maxAge = policy && 'max_age' in policy ? policy.max_age ?? null : 0;
+  const parts = [promptLogin ? 'prompt=login' : null, maxAge === null ? null : `max_age=${maxAge}`].filter(Boolean);
+  return `step-up asks ${parts.join(' and ')}`;
 }
 
 /** SSO-R4 — one Group admitting a federated login at this Identity provider. */
@@ -1854,6 +2032,17 @@ const IdentityProviders: React.FC<{
    * states of their own, and the editor asserts nothing until it knows.
    */
   const [gateLoad, setGateLoad] = useState<Record<string, 'loading' | 'loaded' | 'failed'>>({});
+  /**
+   * Card 7a99d63e (SU-31 a): the root-only step-up editor. Two fields, the
+   * two standard knobs a step-up request carries; the server's validator
+   * (`validateStepUpPolicy`) decides, and its named refusal is shown as is.
+   * Any check here is a convenience only.
+   */
+  const [stepUpOpenFor, setStepUpOpenFor] = useState<string | null>(null);
+  const [stepUpPromptLogin, setStepUpPromptLogin] = useState(true);
+  const [stepUpMaxAge, setStepUpMaxAge] = useState('0');
+  const [stepUpBusy, setStepUpBusy] = useState(false);
+  const [stepUpRefusal, setStepUpRefusal] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1946,6 +2135,55 @@ const IdentityProviders: React.FC<{
     }
   }, [surface]);
 
+  const openStepUp = useCallback((provider: IdentityProviderRow) => {
+    const opening = stepUpOpenFor !== provider.id;
+    setStepUpOpenFor(opening ? provider.id : null);
+    setStepUpRefusal(null);
+    if (!opening) return;
+    const policy = provider.stepUpPolicy ?? null;
+    setStepUpPromptLogin(policy?.prompt_login ?? true);
+    const maxAge = policy && 'max_age' in policy ? policy.max_age ?? null : 0;
+    setStepUpMaxAge(maxAge === null ? '' : String(maxAge));
+  }, [stepUpOpenFor]);
+
+  /** PATCH the policy (or null for the default request) and show the board's answer. */
+  const saveStepUp = useCallback(async (provider: IdentityProviderRow, policy: StepUpPolicy | null) => {
+    setStepUpBusy(true);
+    setStepUpRefusal(null);
+    try {
+      const response = await authenticatedFetch(`${API_BASE}/identity-providers/${provider.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stepUpPolicy: policy }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const code = typeof data?.code === 'string' ? data.code : `HTTP ${response.status}`;
+        const message = typeof data?.message === 'string' ? data.message : 'The step-up policy was not saved.';
+        setStepUpRefusal(`${code}: ${message}`);
+        return;
+      }
+      surface('notice', policy === null
+        ? `${provider.name}: step-ups use the default request again (prompt=login and max_age=0).`
+        : `${provider.name}: ${stepUpRequestSummary(data?.identityProvider?.stepUpPolicy ?? policy)}.`);
+      await load();
+    } catch {
+      setStepUpRefusal('The step-up policy could not be saved. Nothing has changed.');
+    } finally {
+      setStepUpBusy(false);
+    }
+  }, [load, surface]);
+
+  const submitStepUp = useCallback((provider: IdentityProviderRow) => {
+    const raw = stepUpMaxAge.trim();
+    if (raw !== '' && !/^\d+$/.test(raw)) {
+      setStepUpRefusal('Enter a whole number of seconds, or leave the field empty to send no max_age.');
+      return;
+    }
+    const policy: StepUpPolicy = { ...(provider.stepUpPolicy ?? {}), prompt_login: stepUpPromptLogin, max_age: raw === '' ? null : Number(raw) };
+    void saveStepUp(provider, policy);
+  }, [saveStepUp, stepUpMaxAge, stepUpPromptLogin]);
+
   const removeLoginGroup = useCallback(async (providerId: string, groupId: string) => {
     setGateBusy(true);
     try {
@@ -2011,6 +2249,7 @@ const IdentityProviders: React.FC<{
                   {typeof provider.scimHeartbeatIntervalHours === 'number' && (
                     <span className="axm-badge">directory push expected every {provider.scimHeartbeatIntervalHours} h</span>
                   )}
+                  {provider.stepUpPolicy && <span className="axm-badge">{stepUpRequestSummary(provider.stepUpPolicy)}</span>}
                 </span>
                 <span role="cell">
                   {providerHealth ? (
@@ -2036,6 +2275,15 @@ const IdentityProviders: React.FC<{
                     onClick={() => openGate(provider.id)}
                   >
                     Allowed groups
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="compact"
+                    ariaExpanded={stepUpOpenFor === provider.id}
+                    ariaLabel={`Step-up for ${provider.name}`}
+                    onClick={() => openStepUp(provider)}
+                  >
+                    Step-up
                   </Button>
                 </span>
               </div>
@@ -2118,6 +2366,63 @@ const IdentityProviders: React.FC<{
                       </select>
                     </>
                   )}
+                </span>
+              </div>
+            );
+          })()}
+          {stepUpOpenFor !== null && (() => {
+            const provider = providers.find((row) => row.id === stepUpOpenFor);
+            if (!provider) return null;
+            return (
+              <div className="axm-trow axm-trow--detail" role="row">
+                <span role="cell">
+                  <h3>How a step-up asks {provider.name}</h3>
+                  <p className="axm-section-intro">
+                    Approvals and other protected acts ask the identity provider to confirm it is
+                    you again. These two standard settings choose the question; the answer is judged
+                    the same way whatever is asked, so a sign-in older than the request is always
+                    refused. Leave the defaults (prompt=login, maximum age 0) unless the provider
+                    keeps reusing an earlier sign-in; a provider that ignores a maximum age of 0
+                    often honours one of 30 seconds without prompt=login.
+                  </p>
+                  <form onSubmit={(event) => { event.preventDefault(); submitStepUp(provider); }}>
+                    <label className="axm-inline-label">
+                      <input
+                        type="checkbox"
+                        checked={stepUpPromptLogin}
+                        disabled={stepUpBusy}
+                        onChange={(event) => setStepUpPromptLogin(event.target.checked)}
+                      />
+                      Ask with prompt=login
+                    </label>
+                    <div className="form-group">
+                      <label htmlFor="axm-step-up-max-age">
+                        Maximum sign-in age (seconds) <span className="axm-muted">empty, 0, or 10 to 300</span>
+                      </label>
+                      <input
+                        id="axm-step-up-max-age"
+                        className="form-input"
+                        type="text"
+                        inputMode="numeric"
+                        value={stepUpMaxAge}
+                        disabled={stepUpBusy}
+                        onChange={(event) => setStepUpMaxAge(event.target.value)}
+                      />
+                    </div>
+                    {stepUpRefusal && <p className="axm-warn" role="alert">{stepUpRefusal}</p>}
+                    <Button type="submit" variant="primary" size="compact" disabled={stepUpBusy}>
+                      {stepUpBusy ? 'Saving…' : 'Save step-up settings'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="compact"
+                      disabled={stepUpBusy || !provider.stepUpPolicy}
+                      onClick={() => { void saveStepUp(provider, null); }}
+                    >
+                      Use the default request
+                    </Button>
+                  </form>
                 </span>
               </div>
             );

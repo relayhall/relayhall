@@ -35,7 +35,6 @@ export const TASK_DETAIL_SECTION_REGISTRY: readonly TaskDetailSectionDescriptor[
   // Constraints fields are canonical, so they are first-class sections.
   section('dod', 'content', 12),
   section('constraints', 'content', 14),
-  section('agent-instructions', 'content', 20),
   section('notes', 'content', 30),
   section('verifier-settings', 'content', 40),
   section('subtasks', 'content', 50),

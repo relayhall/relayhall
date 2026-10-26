@@ -12,10 +12,13 @@ import {
 import type { OnboardingPack } from '../../types/connections';
 import {
   DEFAULT_SERVICE_TRANSPORT, IDENTITY_KINDS, PURPOSE_MAX_LENGTH,
-  PURPOSE_REQUIRED_MESSAGE, ROLE_CHOICES, SERVICE_TRANSPORTS,
-  defaultRoleFor, handleIsUsable, principalRefusalMessage,
+  PURPOSE_REQUIRED_MESSAGE, SERVICE_TRANSPORTS,
+  defaultRoleFor, handleIsUsable, principalRefusalMessage, rolesOfferedFor,
 } from '../../types/identities';
 import type { IdentityKind } from '../../types/identities';
+import { useRoleCatalogue } from '../../hooks/useRoleCatalogue';
+import { assignableBy } from '../../utils/administratorSession';
+import { RoleSelectionExplanation } from '../access/RoleExplanation';
 import { BootstrapPane } from '../connections/BootstrapPane';
 import { ConnectAgentWizard } from '../connections/ConnectAgentWizard';
 import { ScopeNarrowing } from '../connections/ScopeNarrowing';
@@ -79,8 +82,10 @@ interface CreatedIdentity {
 export const CreateIdentityWizard: React.FC<CreateIdentityWizardProps> = ({
   initialKind, lockKind = false, onCreated, onClose,
 }) => {
-  const { scopes, delegableScopes, loading: principalLoading } = useMyPrincipal();
+  const { me, scopes, delegableScopes, loading: principalLoading } = useMyPrincipal();
   const [kind, setKind] = useState<IdentityKind | null>(initialKind ?? null);
+  // Only the Human and Service arms show a role selector.
+  const catalogue = useRoleCatalogue(kind === 'human' || kind === 'service');
   const [step, setStep] = useState<Step>(lockKind || initialKind ? 2 : 1);
 
   const [handle, setHandle] = useState('');
@@ -104,6 +109,19 @@ export const CreateIdentityWizard: React.FC<CreateIdentityWizardProps> = ({
    */
   const [created, setCreated] = useState<CreatedIdentity | null>(null);
   const [pack, setPack] = useState<OnboardingPack | null>(null);
+
+  /**
+   * The role selector's options (card a2d1e317): the catalogue's roles meant
+   * for this kind that this session may assign. Until the catalogue answers,
+   * or when it cannot, the only offer is the kind's default working role, so
+   * the form never offers a role it cannot explain.
+   */
+  const roleOptions = useMemo(() => {
+    if (!kind || kind === 'agent') return [];
+    if (catalogue.state !== 'ready') return [defaultRoleFor(kind)];
+    const offered = rolesOfferedFor(kind, catalogue.roles, assignableBy(me?.role ?? null)).map((entry) => entry.role);
+    return offered.includes(defaultRoleFor(kind)) ? offered : [defaultRoleFor(kind), ...offered];
+  }, [kind, catalogue, me?.role]);
 
   const sessionHoldsRoot = useMemo(() => holdsRoot(scopes), [scopes]);
   const available = useMemo(
@@ -320,16 +338,21 @@ export const CreateIdentityWizard: React.FC<CreateIdentityWizardProps> = ({
               id="identity-role"
               className="form-select"
               value={role}
+              aria-describedby="identity-role-explanation"
               onChange={(event) => setRole(event.target.value)}
             >
-              {ROLE_CHOICES.map((choice) => (
-                <option key={choice.value} value={choice.value}>{choice.label}</option>
+              {roleOptions.map((value) => (
+                <option key={value} value={value}>{value}</option>
               ))}
             </select>
           </label>
-          <p className="conn-note">
-            {ROLE_CHOICES.find((choice) => choice.value === role)?.line}
-          </p>
+          <div className="conn-note" id="identity-role-explanation" aria-live="polite">
+            <RoleSelectionExplanation
+              catalogue={catalogue}
+              role={role}
+              emptyText="Choose a role to see what it may reach."
+            />
+          </div>
 
           {kind === 'service' && (
             <>
@@ -461,6 +484,8 @@ export const CreateIdentityWizard: React.FC<CreateIdentityWizardProps> = ({
               mcpConfig={pack.mcpConfig}
               cliEnv={pack.cliEnv}
               bootstrapLine={pack.bootstrapLine}
+              bootstrapPrompt={pack.bootstrapPrompt}
+              configurationGuidance={pack.configurationGuidance}
               boardEndpoint={pack.boardEndpoint}
               transport={transport}
               initialTab={transport === 'api' ? 'cli' : 'generic'}

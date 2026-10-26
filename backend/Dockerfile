@@ -1,4 +1,6 @@
-FROM node:22-bookworm-slim AS builder
+# Node is an exact patched release pinned by digest (CVE-2026-111497);
+# scripts/check-node-base-images.py refuses a floating or older Node image.
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS builder
 
 WORKDIR /app
 
@@ -20,7 +22,7 @@ COPY . .
 RUN npm run build
 
 # Production image
-FROM node:22-bookworm-slim
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 
 # Minimal runtime support. Core does not mount harness environments or run
 # workspace/image tooling.
@@ -54,16 +56,22 @@ ENV PGID=1002
 # Immutable release provenance: baked into the image at build time so runtime
 # verification never depends on mounted git metadata. Args are supplied by the
 # exact-main deploy wrapper; defaults make ad-hoc builds self-identify as such.
+# The release version (docs/build-identity.md) is supplied by the release
+# tooling as 1.0.0-beta.<N>; empty marks an unreleased build. It is recorded in
+# the manifest only - the server reads that file, never its environment. The
+# writer fails the build on a malformed version, and JSON.stringify keeps any
+# argument value from breaking the document.
 ARG RELEASE_SHA=unknown
 ARG RELEASE_DIRTY=unknown
 ARG RELEASE_BUILD_CONTEXT=unknown
 ARG RELEASE_BUILT_AT=unknown
+ARG RELAYHALL_RELEASE_VERSION=
 LABEL org.opencontainers.image.revision=$RELEASE_SHA
 LABEL org.opencontainers.image.source="https://github.com/relayhall/relayhall"
+LABEL org.opencontainers.image.version=$RELAYHALL_RELEASE_VERSION
 LABEL org.relayhall.dirty=$RELEASE_DIRTY
 LABEL org.relayhall.build-context=$RELEASE_BUILD_CONTEXT
-RUN printf '{"service":"relayhall-backend","sha":"%s","dirty":"%s","buildContext":"%s","builtAt":"%s"}\n' \
-    "$RELEASE_SHA" "$RELEASE_DIRTY" "$RELEASE_BUILD_CONTEXT" "$RELEASE_BUILT_AT" > /release-manifest.json
+RUN node /app/scripts/write-release-manifest.cjs relayhall-backend /app/package.json /release-manifest.json
 
 # Expose port
 EXPOSE 3001

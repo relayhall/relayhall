@@ -6,12 +6,15 @@ Index of the documentation in this directory. Start with the main [README](../RE
 - [getting-started.md](getting-started.md) — 5-minute setup guide
 - [going-further.md](going-further.md) — wiring RelayHall into your own infrastructure (starter-pack guide)
 - [mount-points.md](mount-points.md) — volume mounts the stack needs
+- [connector-onboarding.md](connector-onboarding.md) — the bootstrap prompt, the registry onboarding Skill and the local connection skill installer
 
 ## API
 - [api.md](api.md) — API usage notes; the machine-readable spec is served at `GET /openapi.json`
+- [cli.md](cli.md) — the `relayhall` CLI: every verb mapped to its REST route and MCP tool, retry keys and refusal codes
 - [report-handover.md](report-handover.md) — the optional structured handover object a Report may carry
 
 ## Features
+- [build-identity.md](build-identity.md) — what About shows about the deployed frontend and backend builds, and the `RELAYHALL_RELEASE_VERSION` build argument a release sets
 - [observability.md](observability.md) — the reporter model (F11): why Sessions/Stats are empty-state, the ingest contract, pipeline health
 - [personalities.md](personalities.md) — Personality instruction templates for agent tasks
 - [execution-profiles.md](execution-profiles.md) — task execution modes and access profiles
@@ -21,6 +24,7 @@ Index of the documentation in this directory. Start with the main [README](../RE
 - [skills.md](skills.md) — the Skills registry: instruction entries served to agents, and how Skills differ from Phase-2 Tools
 - [charter.md](charter.md) — the Charter: a project's authority index, included in every compiled Brief
 - [services.md](services.md) — the Service registry: registered external systems, Connectors, and versioned capability descriptors
+- [knowledge-search.md](knowledge-search.md) — the Knowledge page: scoped search over the sources you may read, why each result matched, the side-panel reader and incomplete answers
 - [grants.md](grants.md) — object-level grants: (grantee, resource, verb) authority, owner-plane management
 - [authorization.md](authorization.md) — the shared authorization predicate, evaluation order, Task roles, and route coverage
 - [phases.md](phases.md) — the Phase object: grouping tasks under one outcome, the goal property, and the phase brief
@@ -30,6 +34,7 @@ Index of the documentation in this directory. Start with the main [README](../RE
 - [harness-support.md](harness-support.md) — the A/B/C support tiers: what each class of client can do today
 - [oauth.md](oauth.md) — the OAuth 2.1 authorization server: the Tier-B front door, Client ID Metadata Documents, and what an access token actually is
 - [Principals](principals.md) — clean-install identity provenance and lifecycle
+- [roles.md](roles.md) — every Account role: purpose, scope ceiling, who it is meant for and who assigns it (generated from the role catalogue)
 - [task-elements.md](task-elements.md) — what the Task core carries and what is composed around it
 - [lifecycle-policy-contract.md](lifecycle-policy-contract.md) — the evaluator contract: what RelayHall owns and what an installed evaluator owns
 - [terminology.md](terminology.md) — where the working vocabulary is decided while RelayHall is being built
@@ -46,7 +51,6 @@ Index of the documentation in this directory. Start with the main [README](../RE
 - [design-system.md](design-system.md) — the design contract the appearance gates enforce
 - [publishing.md](publishing.md) — the two-repository model and how a public release is cut
 - [third-party-licenses.md](third-party-licenses.md) — licences for third-party assets shipped in the tree
-- [design-history/](design-history/) — superseded design records, kept for provenance
 
 ## Assets
 

@@ -1,3 +1,5 @@
+import * as measurementPlaneModel from './mapPlaneModel';
+import * as measurementRecords from './mapMeasurements';
 // @vitest-environment jsdom
 //
 // RH-UI A7a — what the Map ACTUALLY RENDERS at each detail band.
@@ -14,21 +16,24 @@
 // record there.
 
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { authenticatedFetch } from '../../utils/auth';
+import { ThemeProvider } from '../../contexts/ThemeContext';
+import { preferencesCacheKey } from '../../utils/theme';
 import type { Task } from '../../types/task';
 import { TaskCard } from '../tasks/TaskCard';
 import graphTaskFixture from './__fixtures__/graph.task.json';
 import { MapView } from './MapView';
 import { CHAIN_DIM, EDGE_DENSITY_THRESHOLD, planeStateClass } from './MapView';
+import { planeDetailBand, PLANE_METRICS } from "./mapPlaneModel";
 import { DETAIL_MATRIX, DETAIL_THRESHOLDS } from './useMapData';
 
-const VIEW_STORAGE_KEY = 'relayhall_map_view';
+const VIEW_STORAGE_KEY = 'relayhall_map_view_v2';
 
 /**
  * The plane suite's estate, hoisted so the round-1 repair tests can share it:
@@ -79,9 +84,22 @@ function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={client}>
-      <MemoryRouter>{children}</MemoryRouter>
+      {/* Signed out: the provider reads the boot cache and fetches nothing. */}
+      <MemoryRouter><ThemeProvider authenticated={false}>{children}</ThemeProvider></MemoryRouter>
     </QueryClientProvider>
   );
+}
+
+/**
+ * Card 742fae98: the Map's Reports display defaults to Collapsed (one
+ * "Reports · N" node per task). Suites about INDIVIDUAL Report pills choose
+ * Expanded through the principal's preference, as a reader would, via the
+ * provider's boot cache. Call it after any localStorage.clear().
+ */
+function expandReports() {
+  localStorage.setItem(preferencesCacheKey(), JSON.stringify({
+    theme: null, reducedMotion: 'system', mapReportsMode: 'expanded', deploymentTheme: null,
+  }));
 }
 
 /**
@@ -112,6 +130,8 @@ async function renderMapAtScale(scale: number, organization = 'horizontal') {
 
 beforeEach(() => {
   sessionStorage.clear();
+  // The Reports display defaults to Collapsed in every test that does not choose.
+  localStorage.removeItem(preferencesCacheKey());
   fetchMock.mockReset();
   fetchMock.mockImplementation(async () => ({
     ok: true,
@@ -122,11 +142,35 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+test.each(['horizontal', 'vertical', 'organic'])('%s pan and zoom keep the SVG raster surface bounded to the viewport', async organization => {
+  const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
+    const width = this.classList.contains('map-canvas') ? 1200 : 0;
+    const height = this.classList.contains('map-canvas') ? 800 : 0;
+    return { x: 0, y: 0, left: 0, top: 0, right: width, bottom: height, width, height, toJSON: () => ({}) };
+  });
+  try {
+    await renderMapAtScale(0.05, organization);
+    const canvas = screen.getByRole('application', { name: 'Task map canvas' });
+    for (const deltaY of [-800, 1600, -800]) {
+      fireEvent.wheel(canvas, { deltaY, clientX: 600, clientY: 400 });
+      fireEvent.keyDown(canvas, { key: 'ArrowRight' });
+      const svg = document.querySelector<SVGElement>('.map-edges')!;
+      expect(svg.getAttribute('width')).toBe('1200');
+      expect(svg.getAttribute('height')).toBe('800');
+      expect(svg.style.overflow).toBe('hidden');
+      expect(svg.querySelectorAll('[data-project-ground], .map-hull').length).toBeGreaterThan(0);
+      const view = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
+      expect(svg.querySelector('g')!.getAttribute('transform')).toBe(`translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})`);
+      expect(parseFloat(document.querySelector<HTMLElement>('.map-plane')!.style.width)).toBe(0);
+    }
+  } finally { rect.mockRestore(); }
+});
+
 // A scale comfortably inside each band, derived from the thresholds rather
 // than hard-coded, so retuning the thresholds cannot silently retarget these.
 const BAND_SCALE = {
   far: DETAIL_THRESHOLDS.overview / 2,
-  overview: (DETAIL_THRESHOLDS.overview + DETAIL_THRESHOLDS.mid) / 2,
+  overview: 0.72, // task ink owns the new readable simplified band
   mid: (DETAIL_THRESHOLDS.mid + DETAIL_THRESHOLDS.close) / 2,
   close: DETAIL_THRESHOLDS.close + 0.4,
 } as const;
@@ -215,22 +259,31 @@ describe('§4 density collapse for cross-lane edges', () => {
     }
     const lanes = [...byLane.values()].filter(list => list.length > 0);
     const edges: any[] = [];
-    // Alternate cross-lane and same-lane so both classes are present.
-    for (let i = 0; edges.length < edgeCount; i += 1) {
-      const a = lanes[i % lanes.length];
-      const b = lanes[(i + 1) % lanes.length];
-      const from = a[i % a.length];
-      const crossTo = b[(i + 1) % b.length];
-      const sameTo = a[(i + 1) % a.length];
-      if (from && crossTo && from.id !== crossTo.id) {
-        edges.push({ from: from.id, to: crossTo.id, kind: 'dependency' });
+    // DISTINCT relationships only (card cae8dfe1, absorbed 01282f30). This
+    // generator used to repeat pairs: 50 and 80 rows held 22 relationships,
+    // and the Map drew every repeat under a shared React key. The Map now
+    // draws one edge per (kind, from, to), so the density contract is stated
+    // over distinct relationships, the thing a reader can see. Each pair is
+    // enumerated once, later task depending on earlier (so no cycle is
+    // invented), cross-lane and same-lane interleaved so both classes are
+    // present, in the fixture's own order (deterministic).
+    const laneOf = new Map<string, number>();
+    lanes.forEach((list, index) => list.forEach((node: any) => laneOf.set(node.id, index)));
+    const ordered = lanes.flat();
+    const cross: any[] = [];
+    const same: any[] = [];
+    for (const [later, from] of ordered.entries()) {
+      for (const to of ordered.slice(0, later)) {
+        (laneOf.get(from.id) === laneOf.get(to.id) ? same : cross)
+          .push({ from: from.id, to: to.id, kind: 'dependency' });
       }
-      if (edges.length < edgeCount && from && sameTo && from.id !== sameTo.id) {
-        edges.push({ from: from.id, to: sameTo.id, kind: 'dependency' });
-      }
-      if (i > edgeCount * 4) break;
     }
-    return { ...graphTaskFixture, edges: edges.slice(0, edgeCount) };
+    for (let i = 0; edges.length < edgeCount && (i < cross.length || i < same.length); i += 1) {
+      if (i < cross.length) edges.push(cross[i]);
+      if (edges.length < edgeCount && i < same.length) edges.push(same[i]);
+    }
+    expect(edges, 'the dense fixture must reach its count with distinct relationships').toHaveLength(edgeCount);
+    return { ...graphTaskFixture, edges };
   };
 
   const renderDense = async (edgeCount: number) => {
@@ -256,11 +309,11 @@ describe('§4 density collapse for cross-lane edges', () => {
     expect(renderedEdges().length).toBe(EDGE_DENSITY_THRESHOLD - 10);
   });
 
-  test('ABOVE the threshold non-selected cross-lane edges collapse', async () => {
+  test('ABOVE the old threshold all visible cross-lane edges remain drawn', async () => {
     const count = EDGE_DENSITY_THRESHOLD + 20;
     await renderDense(count);
     const drawn = renderedEdges().length;
-    expect(drawn).toBeLessThan(count);
+    expect(drawn).toBe(count);
     // Same-lane edges are untouched: the collapse is cross-lane only.
     const graph = denseGraph(count);
     const sameLane = graph.edges.filter((e: any) => laneOfTile(e.from) === laneOfTile(e.to));
@@ -268,7 +321,7 @@ describe('§4 density collapse for cross-lane edges', () => {
     expect(drawn).toBeGreaterThanOrEqual(sameLane.length);
   });
 
-  test('a collapsed cross-lane edge comes back on HOVER (§4 hover/selection-only)', async () => {
+  test('hover emphasizes a cross-lane edge without changing visible membership', async () => {
     const count = EDGE_DENSITY_THRESHOLD + 20;
     await renderDense(count);
     const collapsed = renderedEdges().length;
@@ -286,7 +339,8 @@ describe('§4 density collapse for cross-lane edges', () => {
     await waitFor(() => {
       // Its collapsed cross-lane edges come back, and only its own: the
       // disclosure is scoped to the tile the reader is pointing at.
-      expect(renderedEdges().length).toBeGreaterThan(collapsed);
+      expect(renderedEdges().length).toBe(collapsed);
+      expect(document.querySelectorAll('.map-edge--hovered').length).toBeGreaterThan(0);
     });
     // The collapsed baseline itself is pinned by the test above, which renders
     // with no hover and no selection. Asserting the return-to-baseline HERE
@@ -534,6 +588,7 @@ describe('MapView — the transformed plane owns every pannable element', () => 
 describe('MapView — a Report is openable at the task altitude (A2 via B4)', () => {
   test('the pill is a named control that opens its Report', async () => {
     const opened: string[] = [];
+    expandReports();
     // The recorded graph fixture carries no Reports (see SHAPE.json), so they
     // are attached here in the serializer's own row shape - {id, taskId,
     // title} exactly as backend queryLinkedReports returns.
@@ -755,7 +810,7 @@ describe('MapView — hover must not replace an explicit aggregate selection (ro
     expect(button).toBeVisible();
     return button.closest('.map-container:not(.map-container--shape)') as HTMLElement;
   };
-  const drawn = () => document.querySelectorAll('.map-edge--aggregate').length;
+  const drawn = () => document.querySelectorAll('.map-edge[data-edge-from]').length;
 
   test('the selected chain stays lit and fully drawn while a disconnected node is hovered, and hover-only disclosure returns once the selection clears', async () => {
     fetchMock.mockImplementation(async () => ({
@@ -771,7 +826,7 @@ describe('MapView — hover must not replace an explicit aggregate selection (ro
     expect(CHAIN).toBeGreaterThan(EDGE_DENSITY_THRESHOLD);
     // Baseline: everything is cross-lane and nothing is selected, so the §4
     // collapse leaves fewer edges than one chain owns.
-    expect(drawn()).toBeLessThan(CHAIN);
+    expect(drawn()).toBeGreaterThanOrEqual(CHAIN);
 
     const a0 = aggregateOf(/select phase A0 of project alpha/i);
     const b0 = aggregateOf(/select phase B0 of project gamma/i);
@@ -870,7 +925,7 @@ describe('MapView — round 10 rendered findings', () => {
     expect(button).toBeVisible();
     return button.closest('.map-container:not(.map-container--shape)') as HTMLElement;
   };
-  const drawn = () => document.querySelectorAll('.map-edge--aggregate').length;
+  const drawn = () => document.querySelectorAll('.map-edge[data-edge-from]').length;
 
   test('B1: a selection removed by an ordinary filter refresh stops outranking hover', async () => {
     serve(graphOf(chainA(), chainB()), 'g-r10-full');
@@ -1142,16 +1197,17 @@ describe('MapView — all six aggregate facts render together (round 15 B1)', ()
 
 
 describe('MapView — the organization switcher (A7b slice 2, §2)', () => {
-  test('the switcher lists all four §2 organizations; organic waits honestly', async () => {
+  test('the switcher exposes only the owner-approved Horizontal and Vertical views', async () => {
     await renderMapAtScale(1);
     const group = screen.getByRole('radiogroup', { name: 'Map organization' });
     expect(group).toBeInTheDocument();
-    const radios = screen.getAllByRole('radio');
-    expect(radios.length).toBe(3);
+    // Scoped to the organization group: the toolbar also carries the Reports
+    // display switch (card 742fae98), whose two radios are not organizations.
+    const radios = within(group).getAllByRole('radio');
+    expect(radios.length).toBe(2);
     expect(screen.queryByRole('radio', { name: 'Radial' })).not.toBeInTheDocument();
-    // Every organization ships now — nothing is disabled any more.
-    const organic = screen.getByRole('radio', { name: 'Organic' });
-    expect(organic).toBeEnabled();
+    // Organic remains model-tested but is deferred from the product UI.
+    expect(screen.queryByRole('radio', { name: 'Organic' })).not.toBeInTheDocument();
     expect(screen.getByRole('radio', { name: 'Horizontal' })).toBeChecked();
   });
 
@@ -1174,92 +1230,19 @@ describe('MapView — the organization switcher (A7b slice 2, §2)', () => {
     expect(document.querySelectorAll('.map-tile').length).toBeGreaterThan(0);
   });
 
-  test('the merged Organic organization draws its §3 bounds hulls in the underlay', async () => {
-    await renderMapAtScale(1);
-    expect(document.querySelectorAll('.map-hull').length).toBe(0);
-    fireEvent.click(screen.getByRole('radio', { name: 'Organic' }));
-    await waitFor(() => {
-      expect(document.querySelectorAll('.map-hull').length).toBeGreaterThan(0);
-    });
-    const view = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
-    expect(view.organization).toBe('organic');
-    // One hull per band, and the pipeline band rectangles are gone.
-    expect(document.querySelectorAll('.map-band').length).toBe(0);
-  });
-
-  test('a persisted radial view migrates to Organic', async () => {
+  test.each(['radial', 'organic'])('a persisted %s view falls back to Horizontal without resetting camera', async organization => {
     sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({
-      scale: 1, offsetX: 0, offsetY: 0, organization: 'radial',
+      scale: 1, offsetX: 30, offsetY: 40, organization,
     }));
     render(<MapView query={{}} onOpenTask={() => {}} />, { wrapper });
-    await waitFor(() => expect(document.querySelectorAll('.map-hull').length).toBeGreaterThan(0));
-    expect(screen.getByRole('radio', { name: 'Organic' })).toBeChecked();
-    expect(screen.queryByRole('radio', { name: 'Radial' })).not.toBeInTheDocument();
-  });
-});
-
-
-describe('MapView — band containers FOLLOW the morph (review a649f5f7 B2)', () => {
-  test('switching into Organic mounts travelling containers that actually travel', async () => {
-    await renderMapAtScale(1);
-    fireEvent.click(screen.getByRole('radio', { name: 'Organic' }));
-    // The overlay is present while the morph runs…
-    await waitFor(() => {
-      expect(document.querySelectorAll('.map-hull--morph').length).toBeGreaterThan(0);
-    });
-    const first = document.querySelector('.map-hull--morph')!.getAttribute('d');
-    // …and its geometry CHANGES between frames — hidden-then-revealed
-    // containers (the rejected behavior) have no frames to change in.
-    await waitFor(() => {
-      const current = document.querySelector('.map-hull--morph')?.getAttribute('d');
-      expect(current === null || current !== first).toBe(true);
-    }, { timeout: 1500 });
-    // At arrival the overlay unmounts and the static hulls stand.
-    await waitFor(() => {
-      expect(document.querySelectorAll('.map-hull--morph').length).toBe(0);
-      expect(document.querySelectorAll('.map-hull').length).toBeGreaterThan(0);
-    }, { timeout: 2500 });
-  });
-
-  test('the switch keeps the reader: same altitude, same scale, membership landing', async () => {
-    await renderMapAtScale(1);
-    const before = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
-    fireEvent.click(screen.getByRole('radio', { name: 'Organic' }));
-    await waitFor(() => {
-      const view = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
-      expect(view.organization).toBe('organic');
-      // Live QA caught the first cut fitting the new plane: the fitted
-      // overview was not task-readable and settle turned the switch into a
-      // zoom-out. The reader's scale is now preserved outright.
-      expect(view.scale).toBe(before.scale ?? 1);
-    });
-  });
-});
-
-
-describe('MapView — the organic organization ships (A7b slice 3)', () => {
-  test('switching to organic renders its hulls and persists', async () => {
-    await renderMapAtScale(1);
-    fireEvent.click(screen.getByRole('radio', { name: 'Organic' }));
-    await waitFor(() => {
-      expect(document.querySelectorAll('.map-hull').length).toBeGreaterThan(0);
-    }, { timeout: 3000 });
+    await waitFor(() => expect(screen.getByRole('radio', { name: 'Horizontal' })).toBeChecked());
+    await waitFor(() => expect(document.querySelectorAll('.map-tile').length).toBeGreaterThan(0));
     const view = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
-    expect(view.organization).toBe('organic');
-    expect(document.querySelectorAll('.map-tile').length).toBeGreaterThan(0);
-    expect(document.querySelectorAll('.map-band').length).toBe(0);
-  });
-
-  test('a persisted organic view restores directly', async () => {
-    sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({
-      scale: 1, offsetX: 0, offsetY: 0, organization: 'organic',
-    }));
-    render(<MapView query={{}} onOpenTask={() => {}} />, { wrapper });
-    await waitFor(() => expect(document.querySelectorAll('.map-hull').length).toBeGreaterThan(0));
-    expect(screen.getByRole('radio', { name: 'Organic' })).toBeChecked();
+    expect(view).toMatchObject({ organization: 'horizontal', scale: 1, offsetX: 30, offsetY: 40 });
+    expect(document.querySelectorAll('.map-hull')).toHaveLength(0);
+    expect(screen.queryByRole('radio', { name: 'Organic' })).not.toBeInTheDocument();
   });
 });
-
 
 /* ======================================================================
  * THE CONTINUOUS PLANE, AS RENDERED — amendment §2/§5-A3, card 03acc0b2.
@@ -1289,7 +1272,7 @@ describe('MapView — the continuous plane (amendment §2/§5-A3)', () => {
    * that and from the ratified endpoints rather than guessed.
    */
   const READING = 1;            // 170px of tile on screen: the tiles carry it
-  const PHASE_OWNS = 0.28;      // ~48px of tile: the phase container takes over
+  const PHASE_OWNS = 0.64;      // 109px: phase owns the widened cross-fade
   const PROJECT_OWNS = 0.2;     // the narrow project's phases hand over in turn
 
   beforeEach(() => {
@@ -1347,14 +1330,16 @@ describe('MapView — the continuous plane (amendment §2/§5-A3)', () => {
     expect(document.querySelectorAll('.map-container--phase').length).toBeGreaterThan(0);
   });
 
-  test('exactly ONE layer is reachable at a time', async () => {
+  test('simplified tasks remain keyboard-reachable alongside phase controls', async () => {
     await renderPlaneAt(PHASE_OWNS);
-    // Tiles have become shapes: aria-hidden, and holding no control at all.
+    // Simplified tasks are now inspectable controls, as requested by the owner.
     const tiles = [...document.querySelectorAll('.map-tile')];
     expect(tiles.length).toBeGreaterThan(0);
     for (const tile of tiles) {
       expect(tile.classList.contains('map-tile--shape')).toBe(true);
-      expect(tile.getAttribute('aria-hidden')).toBe('true');
+      expect(tile.getAttribute('aria-hidden')).not.toBe('true');
+      expect(tile.getAttribute('role')).toBe('button');
+      expect(tile.getAttribute('tabindex')).toBe('0');
       expect(tile.querySelectorAll('button, a, input, [tabindex]').length).toBe(0);
     }
     // The container that took over IS reachable, and says which one it is.
@@ -1400,9 +1385,11 @@ describe('MapView — the continuous plane (amendment §2/§5-A3)', () => {
         // The card is drawn at its designed CSS size (the plane's inverse
         // scale rides it back out), so "it fits" is a statement about the
         // region measured in CSS pixels on screen.
-        expect(parseFloat((card as HTMLElement).style.width)).toBeLessThanOrEqual(parseFloat(region.style.width) * scale);
-        expect(parseFloat((card as HTMLElement).style.width)).toBeGreaterThan(0);
-        expect(parseFloat((card as HTMLElement).style.maxHeight)).toBeLessThanOrEqual(parseFloat(region.style.height) * scale);
+        const style = (card as HTMLElement).style;
+        const factor = Number(style.transform.match(/scale\(([^)]+)\)/)?.[1] ?? 1);
+        expect(parseFloat(style.width) * factor).toBeLessThanOrEqual(parseFloat(region.style.width));
+        expect(parseFloat(style.width)).toBeGreaterThan(0);
+        expect(parseFloat(style.maxHeight) * factor).toBeLessThanOrEqual(192);
       }
       cleanup();
     }
@@ -1451,7 +1438,7 @@ describe('MapView — the continuous plane (amendment §2/§5-A3)', () => {
     await waitFor(() => expect(document.querySelectorAll('.map-tile').length).toBeGreaterThan(0));
     expect(document.querySelectorAll('.map-container').length).toBe(0);
     expect(document.querySelectorAll('.map-tile--shape').length).toBe(0);
-    for (const option of ['Horizontal', 'Vertical', 'Organic']) {
+    for (const option of ['Horizontal', 'Vertical']) {
       expect(screen.getByRole('radio', { name: option })).toBeInTheDocument();
     }
   });
@@ -1468,18 +1455,15 @@ describe('MapView — the continuous plane (amendment §2/§5-A3)', () => {
     }
   });
 
-  test('clause 6: the anchors are written where a later session can find them', async () => {
-    localStorage.removeItem('relayhall_map_plane_anchors');
+  test('E386: no layout record is written for a later session', async () => {
+    localStorage.removeItem('relayhall_map_plane_anchors_v2');
+    const writes = vi.spyOn(Storage.prototype, 'setItem');
     await renderPlaneAt(READING);
-    // The write is debounced (see MapView): the record is large enough that
-    // stringifying it on every measurement pass would be felt.
-    await waitFor(() => expect(
-      localStorage.getItem('relayhall_map_plane_anchors')).not.toBeNull(),
-    { timeout: 4000 });
-    const stored = JSON.parse(localStorage.getItem('relayhall_map_plane_anchors')!);
-    expect(stored.version).toBe(1);
-    expect(Object.keys(stored.slots).length).toBe(bigGraph.nodes.length);
-    expect(stored.laneOrder.length).toBeGreaterThan(0);
+    // Longer than the retired 750 ms debounce: nothing is written, ever.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 1200)); });
+    expect(localStorage.getItem('relayhall_map_plane_anchors_v2')).toBeNull();
+    expect(writes.mock.calls.filter(([key]) => String(key).startsWith('relayhall_map_plane'))).toEqual([]);
+    writes.mockRestore();
   });
 });
 
@@ -1572,7 +1556,7 @@ describe('MapView — round-1 repairs', () => {
     expect(Number(dimmed.style.opacity)).toBeCloseTo(CHAIN_DIM.node, 6);
   });
 
-  test.each([0.28, 0.2])('§4 multiplies every container fade at scale %s', async scale => {
+  test.each([0.26, 0.2])('§4 multiplies every container fade at scale %s', async scale => {
     fetchMock.mockImplementation(async () => ({
       ok: true, status: 200, headers: new Headers({ ETag: '"g-dim-alt"' }),
       json: async () => planeBigGraph,
@@ -1619,7 +1603,7 @@ describe('MapView — round-1 repairs', () => {
 describe('continuous-plane attention across mixed layers', () => {
   test('selecting a phase dims unrelated task shapes by their actual fade', async () => {
     fetchMock.mockImplementation(async () => ({ ok:true,status:200,headers:new Headers({ETag:'"mixed-attention"'}),json:async()=>planeBigGraph }) as unknown as Response);
-    sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({scale:0.28,offsetX:0,offsetY:0,organization:'horizontal',altitude:'task'}));
+    sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({scale:0.64,offsetX:0,offsetY:0,organization:'horizontal',altitude:'task'}));
     render(<MapView query={{}} onOpenTask={()=>{}} onOpenReport={()=>{}} />, {wrapper});
     const select = await screen.findByRole('button',{name:'Select phase Wide of project Wide Project'});
     const before=new Map([...document.querySelectorAll<HTMLElement>('.map-tile--shape')].map(el=>[el.dataset.task!,Number(el.style.opacity)]));
@@ -1629,7 +1613,8 @@ describe('continuous-plane attention across mixed layers', () => {
     const lit=[...document.querySelectorAll<HTMLElement>('.map-tile--shape.map-tile--lit')];
     const dimmed=[...document.querySelectorAll<HTMLElement>('.map-tile--shape.map-tile--dimmed')];
     expect(lit.length).toBeGreaterThan(0);
-    expect(dimmed.some(el=>before.get(el.dataset.task!)!>0 && before.get(el.dataset.task!)!<1)).toBe(true);
+    expect(dimmed.length).toBeGreaterThan(0);
+    expect(dimmed.every(el=>before.get(el.dataset.task!)===1)).toBe(true);
     for(const el of lit){expect(el.dataset.task!.startsWith('wide-')).toBe(true);expect(Number(el.style.opacity)).toBeCloseTo(before.get(el.dataset.task!)!,6);}
     for(const el of dimmed){expect(el.dataset.task!.startsWith('wide-')).toBe(false);expect(Number(el.style.opacity)).toBeCloseTo(before.get(el.dataset.task!)!*CHAIN_DIM.node,6);}
   });
@@ -1726,7 +1711,7 @@ describe('painted phase and Project furniture shares chain attention', () => {
 
 
 describe('RH-UI.17i fitted continuous camera', () => {
-  test('all three organization commits retain selection and fit atomically; every input shares the resized floor', async () => {
+  test('both organization commits retain selection and fit atomically; every input can zoom beyond fit and Fit restores the overview', async () => {
     let viewport={width:1200,height:1200};
     const rect=vi.spyOn(HTMLElement.prototype,'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
       const {width,height}=this.classList.contains('map-canvas') ? viewport : {width:0,height:0};
@@ -1741,16 +1726,16 @@ describe('RH-UI.17i fitted continuous camera', () => {
     const persisted=vi.spyOn(Storage.prototype,'setItem');
     const expected=()=>{
       const plane=document.querySelector<HTMLElement>('.map-plane')!;
-      const w=parseFloat(plane.style.width),h=parseFloat(plane.style.height);
-      const scale=Math.min(2.5,Math.max(0.05,Math.min(viewport.width*.8/w,viewport.height*.8/h)));
-      return {scale,offsetX:(viewport.width-w*scale)/2,offsetY:(viewport.height-h*scale)/2};
+      const [x,y,w,h]=plane.dataset.fitBounds!.split(',').map(Number);
+      const scale=Math.min(2.5,Math.max(0.0001,Math.min(viewport.width*.8/w,viewport.height*.8/h)));
+      return {scale,offsetX:(viewport.width-w*scale)/2-x*scale,offsetY:(viewport.height-h*scale)/2-y*scale};
     };
     const saved=()=>JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
     try {
       await renderMapAtScale(1);
       const opener=document.querySelector('.task-card-map-open')!;
       fireEvent.focus(opener);
-      for(const organization of ['Vertical','Organic','Horizontal']) {
+      for(const organization of ['Vertical','Horizontal']) {
         persisted.mockClear();
         fireEvent.click(screen.getByRole('radio',{name:organization}));
         await waitFor(()=>expect(saved().organization).toBe(organization.toLowerCase()));
@@ -1769,16 +1754,24 @@ describe('RH-UI.17i fitted continuous camera', () => {
           expect(parseFloat(chip.style.top)).toBeGreaterThanOrEqual(0);
         }
       }
+      const beforeZoom = saved();
+      const centre = { x: viewport.width / 2, y: viewport.height / 2 };
+      fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+      const afterZoom = saved();
+      expect((centre.x - afterZoom.offsetX) / afterZoom.scale)
+        .toBeCloseTo((centre.x - beforeZoom.offsetX) / beforeZoom.scale, 6);
+      expect((centre.y - afterZoom.offsetY) / afterZoom.scale)
+        .toBeCloseTo((centre.y - beforeZoom.offsetY) / beforeZoom.scale, 6);
       const canvas=document.querySelector('.map-canvas')!;
       fireEvent.wheel(canvas,{deltaY:100000,clientX:400,clientY:300});
-      expect(saved().scale).toBeCloseTo(expected().scale,6);
+      expect(saved().scale).toBeLessThan(expected().scale);
       fireEvent.click(screen.getByRole('button',{name:'Zoom out'}));
       fireEvent.keyDown(canvas,{key:'-'});
-      expect(saved().scale).toBeCloseTo(expected().scale,6);
+      expect(saved().scale).toBeLessThan(expected().scale);
       viewport={width:900,height:500};
       fireEvent(window,new Event('resize'));
       fireEvent.wheel(canvas,{deltaY:100000,clientX:400,clientY:300});
-      await waitFor(()=>expect(saved().scale).toBeCloseTo(expected().scale,6));
+      await waitFor(()=>expect(saved().scale).toBeLessThan(expected().scale));
       fireEvent.click(screen.getByRole('button',{name:'Fit view'}));
       await waitFor(()=>expect(saved().offsetX).toBeCloseTo(expected().offsetX,6));
     } finally { persisted.mockRestore();rect.mockRestore();width.mockRestore();height.mockRestore(); }
@@ -1803,18 +1796,18 @@ test('an organization chosen while a restored Map is loading fits the arriving g
   try {
     render(<MapView query={{}} onOpenTask={()=>{}} />, {wrapper});
     await waitFor(()=>expect(screen.getByText('Loading the Map…')).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('radio',{name:'Organic'}));
+    fireEvent.click(screen.getByRole('radio',{name:'Vertical'}));
     release({ok:true,status:200,headers:new Headers(),json:async()=>graphTaskFixture} as Response);
     await waitFor(()=>expect(screen.queryByText('Loading the Map…')).not.toBeInTheDocument());
     await waitFor(()=> {
       const plane=document.querySelector<HTMLElement>('.map-plane')!;
-      const width=parseFloat(plane.style.width),height=parseFloat(plane.style.height);
+      const [x,y,width,height]=plane.dataset.fitBounds!.split(',').map(Number);
       const scale=Math.min(2.5,Math.max(.05,Math.min(960/width,640/height)));
       const view=JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
-      expect(view.organization).toBe('organic');
+      expect(view.organization).toBe('vertical');
       expect(view.scale).toBeCloseTo(scale,6);
-      expect(view.offsetX).toBeCloseTo((1200-width*scale)/2,6);
-      expect(view.offsetY).toBeCloseTo((800-height*scale)/2,6);
+      expect(view.offsetX).toBeCloseTo((1200-width*scale)/2-x*scale,6);
+      expect(view.offsetY).toBeCloseTo((800-height*scale)/2-y*scale,6);
     });
   } finally {rect.mockRestore();measuredWidth.mockRestore();measuredHeight.mockRestore();}
 });
@@ -1844,4 +1837,416 @@ describe('continuous caption ownership through the cross-fade', () => {
       expect(identities.size).toBeGreaterThan(0);
     }
   });
+});
+
+
+test('Fit on a narrow canvas retains sparse phase controls beside a long dependency chain', async () => {
+  const template = (graphTaskFixture as any).nodes[0];
+  const phases = Array.from({ length: 10 }, (_, index) => ({
+    id: `narrow-${index}`, name: `Narrow Stage ${index}`, projectId: 'narrow', position: index,
+  }));
+  const nodes = phases.flatMap((phase, phaseIndex) => Array.from({ length: phaseIndex === 0 ? 40 : 3 }, (_, index) => ({
+    ...template, id: `${phase.id}-${index}`, title: `Task ${phase.id}-${index}`,
+    project: 'Narrow Project', phaseId: phase.id, status: 'todo',
+  })));
+  const edges = Array.from({ length: 39 }, (_, index) => ({
+    from: `narrow-0-${index}`, to: `narrow-0-${index + 1}`, kind: 'dependency',
+  }));
+  fetchMock.mockImplementation(async () => ({ ok: true, status: 200,
+    headers: new Headers(), json: async () => ({ ...graphTaskFixture, nodes, phases, edges }),
+  }) as unknown as Response);
+  const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+    .mockImplementation(function(this: HTMLElement) {
+      const width = this.classList.contains('map-canvas') ? 768 : 0;
+      const height = this.classList.contains('map-canvas') ? 600 : 0;
+      return { x: 0, y: 0, left: 0, top: 0, right: width, bottom: height,
+        width, height, toJSON: () => ({}) };
+    });
+  try {
+    await renderMapAtScale(0.13, 'horizontal');
+    fireEvent.click(screen.getByRole('button', { name: 'Fit view' }));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /^Select phase Narrow/ })).toHaveLength(10));
+    const scale = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!).scale;
+    // Card 31454392: the nine sparse phases now wrap onto a second shelf
+    // under the chain, so this Fit rose from 0.059 to 0.076. The chain phase
+    // alone still spans the narrow canvas; the case stays a far-out Fit.
+    expect(scale).toBeLessThan(0.08);
+    expect(document.querySelectorAll('.map-overview-caption')).toHaveLength(0);
+    const phase = screen.getByRole('button', { name: 'Select phase Narrow Stage 9 of project Narrow Project' });
+    fireEvent.click(phase);
+    expect(phase).toHaveAttribute('aria-pressed', 'true');
+  } finally { rect.mockRestore(); }
+});
+
+test('a fitted tall project retains named phase selection beside narrow regions', async () => {
+  const template = (graphTaskFixture as any).nodes[0];
+  const phases = Array.from({ length: 5 }, (_, index) => ({
+    id: `helios-${index}`, name: `Helios Stage ${index}`, projectId: 'helios', position: index,
+  }));
+  const nodes = phases.flatMap(phase => Array.from({ length: 3 }, (_, index) => ({
+    ...template, id: `${phase.id}-${index}`, title: `Task ${phase.id}-${index}`,
+    project: 'Helios Platform Migration', phaseId: phase.id, status: 'todo',
+  })));
+  fetchMock.mockImplementation(async () => ({ ok: true, status: 200,
+    headers: new Headers(), json: async () => ({ ...graphTaskFixture, nodes, phases, edges: [] }),
+  }) as unknown as Response);
+  const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+    .mockImplementation(function(this: HTMLElement) {
+      const width = this.classList.contains('map-canvas') ? 1442 : 0;
+      const height = this.classList.contains('map-canvas') ? 667 : 0;
+      return { x: 0, y: 0, left: 0, top: 0, right: width, bottom: height,
+        width, height, toJSON: () => ({}) };
+    });
+  try {
+    await renderMapAtScale(0.13, 'vertical');
+    fireEvent.click(screen.getByRole('button', { name: 'Fit view' }));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /^Select phase Helios/ })).toHaveLength(5));
+    expect(document.querySelectorAll('.map-overview-caption')).toHaveLength(0);
+    const fittedScale = JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!).scale;
+    for (let step = 0; step < 3; step++) {
+      fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+    }
+    expect(JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!).scale).toBeGreaterThan(fittedScale);
+    expect(screen.getAllByRole('button', { name: /^Select phase Helios/ })).toHaveLength(5);
+    fireEvent.click(screen.getByRole('button', { name: 'Fit view' }));
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!).scale)
+      .toBeCloseTo(fittedScale));
+    const ground = [...document.querySelectorAll<HTMLElement>('.map-container')]
+      .map(element => [element.style.left, element.style.top, element.style.width, element.style.height]);
+    const label = screen.getByRole('button', {
+      name: 'Select phase Helios Stage 0 of project Helios Platform Migration',
+    });
+    expect(label.closest('.map-container-card,.map-band-chip')).toHaveTextContent('Helios Platform Migration');
+    fireEvent.click(label);
+    expect(label).toHaveAttribute('aria-pressed', 'true');
+    expect([...document.querySelectorAll<HTMLElement>('.map-container')]
+      .map(element => [element.style.left, element.style.top, element.style.width, element.style.height]))
+      .toEqual(ground);
+    fireEvent.click(screen.getByRole('button', { name: /show as list/i }));
+    expect(document.querySelectorAll('.map-tree button')).toHaveLength(15);
+  } finally { rect.mockRestore(); }
+});
+
+// Wiring evidence only: jsdom is not a painted-readability gate.
+test.each(["horizontal", "vertical", "organic"])("%s titles share the camera scale through detail thresholds", async organization => {
+  for (const scale of [0.79, 0.8, 192 / 170 - 0.001, 192 / 170 + 0.001, 2]) {
+    await renderMapAtScale(scale, organization);
+    const plane = document.querySelector<HTMLElement>(".map-plane")!;
+    expect(plane.dataset.planeLod).toBe(planeDetailBand(PLANE_METRICS.tileCellW * scale));
+    expect(Number(plane.style.getPropertyValue("--map-plane-inverse-scale"))).toBeCloseTo(1 / scale);
+    expect(plane.querySelectorAll(".task-card-title-compact").length).toBeGreaterThan(0);
+    cleanup();
+    sessionStorage.clear();
+  }
+});
+
+// R1 maintained rendered proof: jsdom world coordinates, not painted browser QA.
+test.each([
+  ["horizontal", 0], ["horizontal", 1], ["vertical", 0], ["vertical", 1],
+] as const)("%s filtered-rank return retains actual flow (%i Reports/task)", async (organization, reportCount) => {
+  localStorage.clear();
+  sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({ scale: 1.5, offsetX: 0, offsetY: 0, organization }));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const original = Array.from({ length: 9 }, (_, i) => "a" + i);
+  const make = (active: string[], chain: string[], intermediates = false) => {
+    const ids = [...active, ...chain, "c"];
+    return { success: true, lod: "task",
+      nodes: ids.map(id => ({ ...graphTaskFixture.nodes[0], id, title: id, status: "todo", priority: "normal",
+        project: "R1", phaseId: "r1-phase", updated: "2026-10-03T00:00:00Z" })),
+      phases: [{ id: "r1-phase", name: "Return", projectId: "R1", position: 0, goal: null }],
+      edges: intermediates ? [
+        { from: "b", to: "a0", kind: "dependency" }, { from: "intermediate", to: "b", kind: "dependency" },
+        { from: "c", to: "intermediate", kind: "dependency" },
+      ] : [{ from: "b", to: "a0", kind: "dependency" }, { from: "c", to: "b", kind: "dependency" }],
+      reports: reportCount ? ids.map(id => ({ id: "report-" + id, taskId: id, title: "Evidence" })) : [],
+    };
+  };
+  fetchMock.mockImplementation(async () => ({ ok: true, status: 200, headers: new Headers({ ETag: "r1-proof" }),
+    json: async () => make(original, ["b"]) }) as unknown as Response);
+  try {
+    render(<QueryClientProvider client={client}><MemoryRouter><MapView query={{}} onOpenTask={() => {}} /></MemoryRouter></QueryClientProvider>);
+    await waitFor(() => expect(document.querySelectorAll("[data-task]")).toHaveLength(11));
+    const boxes = () => Object.fromEntries([...document.querySelectorAll<HTMLElement>("[data-task]")]
+      .map(e => [e.dataset.task!, [parseFloat(e.style.left), parseFloat(e.style.top)]]));
+    const axis = organization === "horizontal" ? 0 : 1;
+    // Source-declared task reservation. jsdom cannot measure painted CSS boxes.
+    const extent = organization === "horizontal" ? PLANE_METRICS.tileCellW : PLANE_METRICS.tileCellH;
+    const change = async (active: string[], chain: string[], intermediates = false) => {
+      const before = boxes(), graph = make(active, chain, intermediates);
+      client.setQueriesData({ queryKey: ["map-graph", "{}"], type: 'active' }, graph);
+      await waitFor(() => expect(document.querySelectorAll("[data-task]")).toHaveLength(graph.nodes.length));
+      const after = boxes();
+      // E386: hiding work closes the holes it leaves, and a new dependency
+      // into existing work may re-flow its phase; a step that only ADDS
+      // independent work moves nothing already placed.
+      const ids = new Set(graph.nodes.map(node => node.id));
+      const removes = Object.keys(before).some(id => !ids.has(id));
+      const linksIn = graph.edges.some(edge => ids.has(edge.from) && ids.has(edge.to)
+        && (edge.from in before) !== (edge.to in before));
+      if (!removes && !linksIn) {
+        for (const [id, position] of Object.entries(before)) if (after[id]) expect(after[id], id).toEqual(position);
+      }
+      for (const edge of graph.edges) {
+        if (after[edge.from] && after[edge.to]) {
+          expect(after[edge.to][axis] + extent, edge.to + " -> " + edge.from).toBeLessThan(after[edge.from][axis]);
+        }
+      }
+      expect(document.querySelectorAll(".map-report-pill")).toHaveLength(graph.nodes.length * reportCount);
+      const tasks = Object.values(after);
+      for (let i = 0; i < tasks.length; i += 1) for (let j = i + 1; j < tasks.length; j += 1) {
+        const a = tasks[i], b = tasks[j];
+        expect(a[0] < b[0] + PLANE_METRICS.tileCellW && b[0] < a[0] + PLANE_METRICS.tileCellW
+          && a[1] < b[1] + PLANE_METRICS.tileCellH && b[1] < a[1] + PLANE_METRICS.tileCellH).toBe(false);
+      }
+      return after;
+    };
+    await change(original, []);
+    await change([...original, ...Array.from({ length: 9 }, (_, i) => "new" + i)], []);
+    const survivors = ["a0", "new7", "new8"];
+    await change(survivors, []);
+    const exact = await change(survivors, ["b"]);
+    expect(exact.b[axis] + extent).toBeLessThan(exact.c[axis]);
+    await change(survivors, ["b", "intermediate"], true);
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      await change(survivors, [], true);
+      const arrivals = Array.from({ length: 19 }, (_, i) => "cycle-" + cycle + "-" + i);
+      await change([...survivors, ...arrivals], [], true);
+      await change([...survivors, arrivals[8], arrivals[9]], [], true);
+      await change([...survivors, arrivals[8], arrivals[9]], ["b", "intermediate"], true);
+      await change(survivors, ["b", "intermediate"], true);
+    }
+    const beforeZoom = boxes(), canvas = screen.getByRole("application", { name: "Task map canvas" });
+    for (const deltaY of [-300, 600, -300]) {
+      fireEvent.wheel(canvas, { deltaY, clientX: 0, clientY: 0 });
+      expect(boxes()).toEqual(beforeZoom);
+    }
+  } finally { client.clear(); }
+});
+
+
+test.each(['zoom', 'wheel', 'pan'])('reader %s cancels an earlier Fit correction when a later extent arrives', async action => {
+  localStorage.clear();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
+    const width = this.classList.contains('map-canvas') ? 1200 : 0;
+    const height = this.classList.contains('map-canvas') ? 800 : 0;
+    return {x:0,y:0,left:0,top:0,right:width,bottom:height,width,height,toJSON:()=>({})};
+  });
+  const w = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(170);
+  const h = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(123);
+  fetchMock.mockImplementation(async()=>({ok:true,status:200,headers:new Headers(),json:async()=>planeBigGraph}) as Response);
+  const read = () => JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
+  try {
+    sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({scale:0.05,offsetX:0,offsetY:0,organization:'horizontal'}));
+    render(<QueryClientProvider client={client}><MemoryRouter><MapView query={{}} onOpenTask={()=>{}} /></MemoryRouter></QueryClientProvider>);
+    await waitFor(()=>expect(document.querySelectorAll('.map-lane-header').length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole('button',{name:'Fit view'}));
+    await waitFor(()=>expect(read().scale).not.toBe(0.05));
+    const fitted=read();
+    if(action==='zoom')fireEvent.click(screen.getByRole('button',{name:'Zoom out'}));
+    else if(action==='wheel')fireEvent.wheel(screen.getByRole('application',{name:'Task map canvas'}),{deltaY:120,clientX:600,clientY:400});
+    else fireEvent.keyDown(screen.getByRole('application',{name:'Task map canvas'}),{key:'ArrowRight'});
+    const owned=read();expect(owned).not.toEqual(fitted);
+    const changed={...planeBigGraph,nodes:[...planeBigGraph.nodes,...Array.from({length:50},(_,i)=>({
+      ...planeBigGraph.nodes[0],id:'late-'+i,title:'Late '+i,project:'Late project',phaseId:null,status:'todo'
+    }))]};
+    client.setQueriesData({ queryKey: ['map-graph','{}'], type: 'active' },changed);
+    await waitFor(()=>expect(document.querySelector('.map-plane')?.textContent).toContain('Late project'));
+    expect(read()).toEqual(owned);
+    fireEvent.click(screen.getByRole('button',{name:'Fit view'}));
+    await waitFor(()=>expect(read()).not.toEqual(owned));
+  } finally { client.clear(); rect.mockRestore(); w.mockRestore(); h.mockRestore(); }
+});
+
+
+test.each(['horizontal', 'vertical', 'organic', 'radial'])('%s continuous captions keep their DOM without unused measurement reads', async organization => {
+  localStorage.clear();
+  // E386: no stored record is read, so no migration read needs isolating.
+  let chipWidth = 12, reads = 0;
+  const width = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockImplementation(function(this: HTMLElement) {
+    if (this.classList.contains('map-band-chip') || this.classList.contains('map-lane-header')) { reads++; return chipWidth; }
+    return 0;
+  });
+  const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function(this: HTMLElement) {
+    if (this.classList.contains('map-band-chip') || this.classList.contains('map-lane-header')) { reads++; return 100; }
+    return 0;
+  });
+  const layout = vi.spyOn(measurementPlaneModel, 'layoutContinuousPlane');
+  try {
+    await renderMapAtScale(0.55, organization);
+    expect(document.querySelectorAll('.map-band-chip,.map-lane-header').length).toBeGreaterThan(0);
+    expect(reads).toBe(0);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    // Allow the existing post-migration basis to settle before the resize gesture.
+    fireEvent.keyDown(screen.getByRole('application', { name: 'Task map canvas' }), { key: 'ArrowRight' });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    const before = layout.mock.calls.length;
+    const earlierReads = reads;
+    chipWidth = 23;
+    fireEvent.wheel(screen.getByRole('application', { name: 'Task map canvas' }), { deltaY: -120, clientX: 200, clientY: 200 });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    expect(reads).toBe(earlierReads);
+    expect(layout.mock.calls.length).toBe(before);
+  } finally { layout.mockRestore(); width.mockRestore(); height.mockRestore(); }
+});
+
+test('continuous measurement retains task, report and card sizes while passive captions stay unread', async () => {
+  localStorage.clear();
+  expandReports();
+  const firstTask = graphTaskFixture.nodes[0].id;
+  fetchMock.mockImplementation(async () => ({ ok: true, status: 200, headers: new Headers(),
+    json: async () => ({ ...graphTaskFixture,
+      reports: [{ id: 'measured-report', taskId: firstTask, title: 'Measured report' }],
+    }),
+  }) as Response);
+  const counts = { task: 0, report: 0, card: 0, passive: 0 };
+  const dimension = (element: HTMLElement, axis: 'w' | 'h') => {
+    if (element.matches('.map-band-chip,.map-lane-header')) { counts.passive++; return 90; }
+    if (element.matches('.map-tile')) { counts.task++; return axis === 'w' ? 180 : 110; }
+    if (element.matches('.map-report-pill')) { counts.report++; return axis === 'w' ? 130 : 40; }
+    if (element.matches('.map-container-card')) { counts.card++; return axis === 'w' ? 300 : 160; }
+    return 0;
+  };
+  const width = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockImplementation(function(this: HTMLElement) { return dimension(this, 'w'); });
+  const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function(this: HTMLElement) { return dimension(this, 'h'); });
+  const records = vi.spyOn(measurementRecords, 'recordMapMeasurements');
+  const layout = vi.spyOn(measurementPlaneModel, 'layoutContinuousPlane');
+  try {
+    await renderMapAtScale(0.55);
+    await waitFor(() => expect(counts.card).toBeGreaterThan(0));
+    const canvas = screen.getByRole('application', { name: 'Task map canvas' });
+    fireEvent.wheel(canvas, { deltaY: -Math.log(1.5 / 0.55) / Math.log(1.0015), clientX: 0, clientY: 0 });
+    await waitFor(() => expect(counts.report).toBeGreaterThan(0));
+    expect(counts.task).toBeGreaterThan(0);
+    expect(counts.passive).toBe(0);
+    expect(layout.mock.calls.some(([, sizes]) =>
+      sizes[firstTask]?.w === 180 && sizes[firstTask]?.h === 110
+      && sizes[`pill:measured-report:${firstTask}`]?.w === 130
+      && sizes[`pill:measured-report:${firstTask}`]?.h === 40)).toBe(true);
+    expect(records.mock.results.some(result => result.type === 'return'
+      && Object.entries(result.value.sizes).some(([id, box]) => id.startsWith('card:')
+        && (box as { w: number; h: number }).w === 300
+        && (box as { w: number; h: number }).h === 160))).toBe(true);
+  } finally { records.mockRestore(); layout.mockRestore(); width.mockRestore(); height.mockRestore(); }
+});
+
+test('viewport card culling preserves grounds, focused ink and camera return', async () => {
+  const rect=vi.spyOn(HTMLElement.prototype,'getBoundingClientRect').mockImplementation(function(this:HTMLElement){
+    const width=this.classList.contains('map-canvas')?1200:0,height=this.classList.contains('map-canvas')?800:0;
+    return {x:0,y:0,left:0,top:0,right:width,bottom:height,width,height,toJSON:()=>({})};
+  });
+  const width=vi.spyOn(HTMLElement.prototype,'offsetWidth','get').mockReturnValue(300);
+  const height=vi.spyOn(HTMLElement.prototype,'offsetHeight','get').mockReturnValue(160);
+  try {
+    await renderMapAtScale(0.28,'horizontal');
+    await waitFor(()=>expect(document.querySelector('.map-container-card button')).not.toBeNull());
+    const button=document.querySelector<HTMLButtonElement>('.map-container-card button')!;
+    const canvas=screen.getByRole('application',{name:'Task map canvas'});
+    const geometry=()=>[...document.querySelectorAll<HTMLElement>('.map-container')].map(e=>[e.style.left,e.style.top,e.style.width,e.style.height].join('|'));
+    const before=geometry();const camera=JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!);
+    act(()=>button.focus());
+    act(()=>{for(let i=0;i<40;i++)fireEvent.keyDown(canvas,{key:'ArrowRight',shiftKey:true});});
+    expect(button).toHaveFocus();expect(geometry()).toEqual(before);
+    expect(document.querySelectorAll('.map-container-card')).toHaveLength(1);
+    act(()=>{for(let i=0;i<40;i++)fireEvent.keyDown(canvas,{key:'ArrowLeft',shiftKey:true});});
+    expect(button).toHaveFocus();expect(geometry()).toEqual(before);
+    expect(JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!)).toEqual(camera);
+    expect(document.querySelectorAll('.map-container-card').length).toBeGreaterThan(0);
+  } finally {rect.mockRestore();width.mockRestore();height.mockRestore();}
+});
+
+
+test('owner preview: simplified tasks reveal details on hover and open on keyboard', async () => {
+  const open = vi.fn();
+  sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({scale:0.12,offsetX:0,offsetY:0,organization:'horizontal'}));
+  render(<MapView query={{}} onOpenTask={open}/>,{wrapper});
+  await waitFor(()=>expect(document.querySelector('.map-tile--shape')).not.toBeNull());
+  const shape=document.querySelector('.map-tile--shape') as HTMLElement;
+  expect(shape.getAttribute('aria-hidden')).toBeNull();
+  fireEvent.pointerEnter(shape);
+  expect(await screen.findByRole('tooltip')).toHaveTextContent('Click task to open details');
+  fireEvent.keyDown(shape,{key:'Enter'});
+  expect(open).toHaveBeenCalledWith(shape.dataset.task);
+  fireEvent.pointerLeave(shape);
+  expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+});
+
+// Card 2b6f21f6 (C) — owner screenshots 07 vs 08: panning into the ground a
+// Task's Reports stand on showed nothing until the Task card itself came on
+// screen, because a pill was culled by its TASK's box rather than its own.
+// One Task with a tall Report grid: the camera frames the top of the grid and
+// leaves the Task more than the cull margin below the viewport.
+describe('card 2b6f21f6 (C): a Report inside the viewport renders while its Task is off-screen', () => {
+  test('pills are culled by their own box, not by their Task card', async () => {
+    localStorage.clear();
+    expandReports();
+    const template = (graphTaskFixture as any).nodes[0];
+    const taskId = 'cull-task';
+    const reports = Array.from({ length: 120 }, (_, index) => ({
+      id: `cull-report-${String(index).padStart(3, '0')}`, taskId, title: `Cull evidence ${index}`,
+    }));
+    const graph = {
+      ...(graphTaskFixture as any),
+      nodes: [{ ...template, id: taskId, title: 'Task with a tall Report grid', status: 'todo',
+        agent: null, project: 'Cull project', phaseId: 'cull-phase' }],
+      edges: [],
+      phases: [{ id: 'cull-phase', name: 'Cull phase', goal: null, projectId: 'cull', position: 0 }],
+      reports,
+    };
+    fetchMock.mockImplementation(async () => ({
+      ok: true, status: 200, headers: new Headers({ ETag: '"g-cull"' }), json: async () => graph,
+    }) as unknown as Response);
+    // Where the plane puts them: geometry is declared, so measurement cannot move it.
+    const planned = measurementPlaneModel.layoutContinuousPlane(graph, {}, 'horizontal',
+      structuredClone(measurementPlaneModel.EMPTY_PLANE_ANCHORS));
+    const tile = planned.elements.find((e: any) => e.kind === 'tile' && e.id === taskId)!;
+    const pills = planned.elements.filter((e: any) => e.kind === 'pill');
+    expect(pills).toHaveLength(reports.length);
+    const top = Math.min(...pills.map(pill => pill.y));
+    const scale = BAND_SCALE.close;
+    const viewport = { width: 1200, height: 800 };
+    const camera = { offsetX: 100 - tile.x * scale, offsetY: 40 - top * scale };
+    // Not vacuous: the Task card is past the cull margin, and Report cells are on screen.
+    expect(tile.y * scale + camera.offsetY).toBeGreaterThan(viewport.height + 240);
+    expect(pills.some(pill => pill.y * scale + camera.offsetY < viewport.height)).toBe(true);
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
+      const width = this.classList.contains('map-canvas') ? viewport.width : 0;
+      const height = this.classList.contains('map-canvas') ? viewport.height : 0;
+      return { x: 0, y: 0, left: 0, top: 0, right: width, bottom: height, width, height, toJSON: () => ({}) };
+    });
+    try {
+      sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({
+        scale, ...camera, organization: 'horizontal', altitude: 'task',
+      }));
+      render(<MapView query={{}} onOpenTask={() => {}} onOpenReport={() => {}} />, { wrapper });
+      await waitFor(() => expect(document.querySelector('[data-project-ground="Cull project"]')).not.toBeNull());
+      // The camera was restored, not refitted, so the geometry above holds.
+      expect(JSON.parse(sessionStorage.getItem(VIEW_STORAGE_KEY)!)).toMatchObject({ scale, ...camera });
+      expect(document.querySelector(`[data-task="${taskId}"]`)).toBeNull();
+      await waitFor(() => expect(document.querySelectorAll('.map-report-pill').length).toBeGreaterThan(0));
+      const drawn = document.querySelectorAll<HTMLElement>('.map-report-pill');
+      // Still CULLED: the cells far below the viewport stay out of the DOM.
+      expect(drawn.length).toBeLessThan(reports.length);
+      for (const pill of drawn) {
+        const screenY = parseFloat(pill.style.top) * scale + camera.offsetY;
+        expect(screenY).toBeLessThanOrEqual(viewport.height + 240);
+      }
+      const opener = drawn[0].querySelector('button');
+      expect(opener?.getAttribute('aria-label')).toMatch(/^Open linked Report: Cull evidence/);
+    } finally { rect.mockRestore(); }
+  });
+});
+
+// Card 2b6f21f6 (A), superseded by E386: the archived toggle reaches the
+// layout only through what is SHOWN. There is no display flag; the plane fits
+// the graph it is given (MapView.fitToShown.test.tsx proves the rectangles).
+test.each([false, true])('E386: includeArchived=%s lays the plane out from the graph alone, with no display flag', async includeArchived => {
+  localStorage.clear();
+  const layout = vi.spyOn(measurementPlaneModel, 'layoutContinuousPlane');
+  try {
+    sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify({ scale: 0.55, offsetX: 0, offsetY: 0, organization: 'horizontal' }));
+    render(<MapView query={{ includeArchived }} onOpenTask={() => {}} />, { wrapper });
+    await waitFor(() => expect(layout).toHaveBeenCalled());
+    for (const call of layout.mock.calls) expect(call).toHaveLength(4);
+  } finally { layout.mockRestore(); }
 });

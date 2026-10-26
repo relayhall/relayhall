@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_FILES: set[str] = set()  # CHANGELOG.md was excluded while it carried
 # predecessor release history; it was reset to a RelayHall-native changelog
 # (RH-P1.6a) and is now gated like every other Markdown file.
-EXCLUDED_PARTS = {".git", "node_modules", "dist", "coverage", "design-history", ".pytest_cache"}
+EXCLUDED_PARTS = {".git", "node_modules", "dist", "coverage", ".pytest_cache"}
 # A7: the compiled working context is a Brief. Defined ONCE and used by both
 # the Markdown pass and the runtime pass, so a word cannot be retired in prose
 # and legal in code. Punctuation-tolerant and clause-bounded; the auxiliary
@@ -236,6 +236,19 @@ RUNTIME_EXCLUDED_PARTS = {"migrations", "__tests__", "fixtures", "node_modules",
 RUNTIME_SUFFIXES = {".ts", ".tsx", ".py", ".css", ".sh", ""}
 
 
+# Exact negative-target literals are security constraints, not branding. Keep
+# this exception restricted to both complete declarations at their source path;
+# comments, defaults, extra literals and other files remain subject to the gate.
+DB_DENIAL_DECLARATIONS = {
+    "export const REFUSED_DB_NAMES: readonly string[] = ['clawboard', 'clawboard_dev'];",
+    "export const REFUSED_DB_HOSTS: readonly string[] = ['clawboard-db', 'clawboard-dev-db'];",
+}
+
+
+def is_db_denial_declaration(relative: str, line: str) -> bool:
+    return relative == "backend/src/db/connection.ts" and line in DB_DENIAL_DECLARATIONS
+
+
 def check_runtime_sources(failures: list[str]) -> None:
     """Owner-reachable runtime/API/UI surfaces must not regress to retired
     vocabulary (review 90d8abd9 finding 2). Historical migrations, tests and
@@ -257,6 +270,8 @@ def check_runtime_sources(failures: list[str]) -> None:
             except (UnicodeDecodeError, OSError):
                 continue
             for number, line in enumerate(text.splitlines(), 1):
+                if is_db_denial_declaration(relative.as_posix(), line):
+                    continue
                 for pattern, advice in RUNTIME_RETIRED:
                     if pattern.search(line):
                         failures.append(f"{relative}:{number}: {advice}: {line.strip()}")

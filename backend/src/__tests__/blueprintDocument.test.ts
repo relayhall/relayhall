@@ -16,6 +16,32 @@ function fixture(): BlueprintDocument {
     reports: [], dependencies: [{ task: 'after', dependsOn: 'announce' }] };
 }
 describe('portable Blueprint documents', () => {
+  test.each([1, 10])('accepts maxRetries at the Task boundary %s', maxRetries => {
+    const d = fixture(); d.tasks[0].defaults = { maxRetries };
+    expect(validateBlueprintDocument(d, config).tasks[0].defaults.maxRetries).toBe(maxRetries);
+  });
+  test.each([0, 11, 100, -1, 1.5, '3', null])('refuses maxRetries outside the Task integer range: %s', maxRetries => {
+    const d = fixture(); d.tasks[0].defaults = { maxRetries };
+    expect(() => validateBlueprintDocument(d, config)).toThrow(expect.objectContaining({
+      status: 422, code: 'BLUEPRINT_DOCUMENT_REFUSED', field: 'maxRetries', message: expect.stringContaining('1..10'),
+    }));
+  });
+  test.each([[1, 10], [1, 1], [10, 10]])('accepts a retry placeholder bounded to %s..%s', (min, max) => {
+    const d = fixture();
+    d.parameters.push({ key: 'retry_limit', label: 'Retries', promptText: 'How many retries?', type: 'integer', required: true, constraints: { min, max } });
+    d.tasks[0].defaults = { maxRetries: '{{retry_limit}}' };
+    const validated = validateBlueprintDocument(d, config);
+    expect(substituteBlueprint(validated, { retry_limit: min }).tasks[0].defaults.maxRetries).toBe(min);
+    expect(substituteBlueprint(validated, { retry_limit: max }).tasks[0].defaults.maxRetries).toBe(max);
+  });
+  test.each([[0, 10], [1, 11], [0, 100]])('refuses a retry placeholder spanning %s..%s', (min, max) => {
+    const d = fixture();
+    d.parameters.push({ key: 'retry_limit', label: 'Retries', promptText: 'How many retries?', type: 'integer', required: true, constraints: { min, max } });
+    d.tasks[0].defaults = { maxRetries: '{{retry_limit}}' };
+    expect(() => validateBlueprintDocument(d, config)).toThrow(expect.objectContaining({
+      status: 422, code: 'BLUEPRINT_DOCUMENT_REFUSED', field: 'maxRetries', message: expect.stringContaining('1..10'),
+    }));
+  });
   test('D22 credential-shaped unknown keys and values are screened before schema errors without echo', () => {
     const d = validateBlueprintDocument(fixture(), config); const secret = 'rh_live_abcdefghijklmnopqrstuvwxyz';
     for (const values of [{ [secret]: 'ordinary' }, { unknown: secret }]) {

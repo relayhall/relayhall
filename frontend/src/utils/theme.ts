@@ -45,6 +45,15 @@ export const REDUCED_MOTION_VALUES = ['system', 'reduce', 'no-preference'] as co
 export type ReducedMotionPreference = (typeof REDUCED_MOTION_VALUES)[number];
 
 /**
+ * How the Map draws a task's Reports (card 742fae98): ONE "Reports · N" node
+ * per task (`collapsed`, the default) or every Report node inside a report area
+ * (`expanded`). A per-principal display choice, stored on the same row as the
+ * Theme; migration 165's CHECK holds the same two values.
+ */
+export const MAP_REPORTS_MODE_VALUES = ['collapsed', 'expanded'] as const;
+export type MapReportsMode = (typeof MAP_REPORTS_MODE_VALUES)[number];
+
+/**
  * A principal's stored preferences. `theme: null` means "no preference of my
  * own" — the resolution chain falls through to the deployment default. That
  * absence is a real state and is why the column is nullable rather than
@@ -53,11 +62,13 @@ export type ReducedMotionPreference = (typeof REDUCED_MOTION_VALUES)[number];
 export interface PrincipalPreferences {
   theme: ThemePreference | null;
   reducedMotion: ReducedMotionPreference;
+  mapReportsMode: MapReportsMode;
 }
 
 export const DEFAULT_PREFERENCES: PrincipalPreferences = {
   theme: null,
   reducedMotion: 'system',
+  mapReportsMode: 'collapsed',
 };
 
 /** Display labels (sentence case, vocabulary §6). */
@@ -88,6 +99,10 @@ export function isThemePreference(value: unknown): value is ThemePreference {
 
 export function isReducedMotionPreference(value: unknown): value is ReducedMotionPreference {
   return typeof value === 'string' && (REDUCED_MOTION_VALUES as readonly string[]).includes(value);
+}
+
+export function isMapReportsMode(value: unknown): value is MapReportsMode {
+  return typeof value === 'string' && (MAP_REPORTS_MODE_VALUES as readonly string[]).includes(value);
 }
 
 /** `system` resolves through prefers-color-scheme to one of the two Themes. */
@@ -207,6 +222,7 @@ export function readCachedPreferences(): CachedPreferences {
       reducedMotion: isReducedMotionPreference(parsed.reducedMotion)
         ? parsed.reducedMotion
         : 'system',
+      mapReportsMode: isMapReportsMode(parsed.mapReportsMode) ? parsed.mapReportsMode : 'collapsed',
       deploymentTheme: isBuiltInTheme(parsed.deploymentTheme) ? parsed.deploymentTheme : null,
     };
   } catch {

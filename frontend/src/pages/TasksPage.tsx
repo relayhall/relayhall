@@ -1,3 +1,5 @@
+import { describeBulkArchiveFailures, bulkArchiveOutcome, bulkArchiveReason, bulkArchiveOutcomeLabel, copyBulkArchiveOutcomes, type BulkArchiveOutcome } from '../utils/bulkArchiveFailure';
+import { activityApplies, useTaskActivity } from '../hooks/useTaskActivity';
 import { authenticatedFetch } from '../utils/auth';
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
@@ -5,10 +7,18 @@ import { Archive, Brain, Eye, LayoutGrid, Map as MapIcon, MoreHorizontal, Plus, 
 import { Task, TaskPriority, TaskStatus, SubtaskStatus, SubtaskTransitionDetails } from '../types/task';
 import { TaskColumn } from '../components/tasks/TaskColumn';
 import { FilterBar, TaskFilters } from '../components/tasks/FilterBar';
+import {
+  describeClearedPhases,
+  reconcilePhaseFilter,
+  usePhaseFilterCatalog,
+  type PhaseFilterOption,
+} from '../components/tasks/phaseFilterScope';
 import { Button } from '../components/Button';
 import { SegmentedControl } from '../components/ui/SegmentedControl';
 import { MapView } from '../components/map/MapView';
 import { IconButton } from '../components/ui/IconButton';
+import { useFocusScrollsRow } from '../components/ui/scrollRow';
+import { useLabelTips } from '../components/ui/LabelTip';
 import { ConfirmationModal } from '../components/ConfirmationModal';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useToast } from '../hooks/useToast';
@@ -107,6 +117,7 @@ export const resolveTaskDeepLinkId = (
 };
 
 const EMPTY_FILTERS: TaskFilters = { searchQuery: '', priorities: [], tags: [], projects: [], phases: [], statuses: [] };
+const NO_PHASE_OPTIONS: PhaseFilterOption[] = [];
 
 const loadFiltersFromStorage = (urlTag?: string | null): TaskFilters => {
   if (urlTag) {
@@ -161,11 +172,12 @@ export const parseFiltersFromParams = (
     mine: params.get('mine') === 'true',
     owner: params.get('assignee') || null,
     unassigned: params.get('unassigned') === 'true',
+    verifierUnusable: params.get('verifierUnusable') === 'true',
   };
   const hasAny = Boolean(
     filters.searchQuery || filters.priorities.length || filters.tags.length
     || filters.projects.length || filters.phases.length || filters.statuses.length
-    || filters.mine || filters.owner || filters.unassigned
+    || filters.mine || filters.owner || filters.unassigned || filters.verifierUnusable
   );
   return { filters, hasAny };
 };
@@ -206,6 +218,8 @@ export const TasksPage: React.FC = () => {
     return next;
   }, []);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [loadedBoardGeneration, setLoadedBoardGeneration] = useState<number | null>(null);
+  const [boardError, setBoardError] = useState(false);
   const [draggedTask, setDraggedTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<ColumnKey>>(new Set(['ideas', 'archived']));
   const [mobileActiveTab, setMobileActiveTab] = useState<ColumnKey>('todo');
@@ -225,9 +239,15 @@ export const TasksPage: React.FC = () => {
     const fromUrl = parseFiltersFromParams(searchParams);
     const initial = fromUrl.hasAny ? fromUrl.filters : loadFiltersFromStorage(searchParams.get('tag'));
     return !!(initial.searchQuery || initial.priorities.length || initial.tags.length || initial.projects.length
-      || initial.phases.length || initial.statuses.length || initial.mine || initial.owner || initial.unassigned);
+      || initial.phases.length || initial.statuses.length || initial.mine || initial.owner || initial.unassigned
+      || initial.verifierUnusable);
   });
   const [filterOptions, setFilterOptions] = useState<FilterOptions>({ tags: [], projects: [] });
+  // The Phases the filter bar offers and the Project directory that scopes
+  // them (card 096fda30): one catalog, so the list the bar shows and the rule
+  // that clears an out-of-scope selection cannot disagree.
+  const phaseCatalog = usePhaseFilterCatalog();
+  const [phaseScopeNotice, setPhaseScopeNotice] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(() =>
     searchParams.get('archived') === 'true' || searchParams.get('focus') === 'archived');
   const selectedView = resolveTaskView(searchParams.get('view'));
@@ -235,6 +255,15 @@ export const TasksPage: React.FC = () => {
   const searchToggleRef = useRef<HTMLButtonElement>(null);
   const overflowTriggerRef = useRef<HTMLButtonElement>(null);
   const overflowMenuRef = useRef<HTMLDivElement>(null);
+  // The header controls and the board's status tabs are one line that scrolls
+  // sideways on a phone (E464); a control that takes focus is brought into view.
+  const [headerActionsRow, setHeaderActionsRow] = useState<HTMLDivElement | null>(null);
+  const [mobileTabsRow, setMobileTabsRow] = useState<HTMLDivElement | null>(null);
+  useFocusScrollsRow(headerActionsRow);
+  // E469: a visible label for the header's icon-only buttons on a phone (long press, hover, focus).
+  const [headerActions, setHeaderActions] = useState<HTMLDivElement | null>(null);
+  const labelTip = useLabelTips(headerActions);
+  useFocusScrollsRow(mobileTabsRow);
 
   // Identity/attribution (card 60558599). Both degrade to empty: the board
   // must render exactly as it did pre-identity when the substrate is absent.
@@ -308,7 +337,8 @@ export const TasksPage: React.FC = () => {
     filters.statuses.length +
     (filters.mine ? 1 : 0) +
     (filters.owner ? 1 : 0) +
-    (filters.unassigned ? 1 : 0);
+    (filters.unassigned ? 1 : 0) +
+    (filters.verifierUnusable ? 1 : 0);
 
   const boardQueryKey = useMemo(() => JSON.stringify({
     showArchived,
@@ -321,8 +351,19 @@ export const TasksPage: React.FC = () => {
     mine: filters.mine,
     owner: filters.owner,
     unassigned: filters.unassigned,
+    verifierUnusable: filters.verifierUnusable,
   }), [showArchived, filters.searchQuery, filters.priorities, filters.tags, filters.projects,
-       filters.phases, filters.statuses, filters.mine, filters.owner, filters.unassigned]);
+       filters.phases, filters.statuses, filters.mine, filters.owner, filters.unassigned, filters.verifierUnusable]);
+
+  // A changed scope invalidates rows immediately, before the fetching effect.
+  // Keep the filter shell mounted; only a response for this generation can
+  // expose task actions again (including an A -> B -> A filter sequence).
+  const boardScopeRef = useRef({ key: boardQueryKey, generation: 0 });
+  if (boardScopeRef.current.key !== boardQueryKey) {
+    boardScopeRef.current = { key: boardQueryKey, generation: boardScopeRef.current.generation + 1 };
+  }
+  const boardGeneration = boardScopeRef.current.generation;
+  const boardScopePending = loadedBoardGeneration !== boardGeneration;
 
   const fetchBoardRef = useRef<((offsetOverrides?: Partial<Record<ColumnKey, number>>, statusesSubset?: ColumnKey[]) => Promise<void>) | null>(null);
   // The reconnect reconcile's delta anchor: the last instant the loaded board
@@ -365,16 +406,24 @@ export const TasksPage: React.FC = () => {
     if (filters.mine) params.set('mine', 'true');
     if (filters.owner) params.set('owner', filters.owner);
     if (filters.unassigned) params.set('unassigned', 'true');
+    // Card 41e24358: server-side, decided by the usable-Verifier predicate.
+    if (filters.verifierUnusable) params.set('verifierUnusable', 'true');
 
     statuses.forEach((status) => {
       const offset = offsetOverrides?.[status] ?? 0;
       params.set(`offset_${status}`, String(offset));
     });
 
+    const generation = boardGeneration;
+    if (generation !== boardScopeRef.current.generation) return;
+    setBoardError(false);
     try {
       const response = await authenticatedFetch(`${API_BASE_URL}/tasks/board?${params.toString()}`);
       const data = await response.json();
+      if (generation !== boardScopeRef.current.generation) return;
+      if (!response.ok || !data.success) throw new Error('Board request failed');
       if (data.success) {
+        setLoadedBoardGeneration(generation);
         lastSyncRef.current = new Date().toISOString();
         commitBoard(prev => {
           const next = { ...prev };
@@ -393,15 +442,20 @@ export const TasksPage: React.FC = () => {
         });
       }
     } catch (error) {
+      if (generation !== boardScopeRef.current.generation) return;
+      setBoardError(true);
       if (!isIntentionalAbort(error)) console.error('Failed to fetch board:', error);
     } finally {
-      setInitialLoading(false);
+      if (generation === boardScopeRef.current.generation) setInitialLoading(false);
     }
-  }, [commitBoard, fetchedColumns, filters, showArchived]);
+  }, [commitBoard, fetchedColumns, filters, showArchived, boardQueryKey, boardGeneration]);
 
   const loadMoreColumn = useCallback(async (column: ColumnKey) => {
     // Read the live snapshot, not a render-time closure: a load-more fired
     // from a scroll handler must see rows a WS patch just added.
+    const generation = boardGeneration;
+    if (generation !== boardScopeRef.current.generation) return;
+    if (boardScopePending || boardError) return;
     const current = boardDataRef.current[column];
     if (current.loading || !current.hasMore) return;
 
@@ -427,10 +481,13 @@ export const TasksPage: React.FC = () => {
     if (filters.mine) params.set('mine', 'true');
     if (filters.owner) params.set('owner', filters.owner);
     if (filters.unassigned) params.set('unassigned', 'true');
+    // Card 41e24358: server-side, decided by the usable-Verifier predicate.
+    if (filters.verifierUnusable) params.set('verifierUnusable', 'true');
 
     try {
       const response = await authenticatedFetch(`${API_BASE_URL}/tasks/board?${params.toString()}`);
       const data = await response.json();
+      if (generation !== boardScopeRef.current.generation) return;
       if (data.success) {
         const incoming = data.columns?.[column];
         commitBoard(prev => ({
@@ -452,13 +509,14 @@ export const TasksPage: React.FC = () => {
         }));
       }
     } catch (error) {
+      if (generation !== boardScopeRef.current.generation) return;
       if (!isIntentionalAbort(error)) console.error(`Failed to load more tasks for ${column}:`, error);
       commitBoard(prev => ({
         ...prev,
         [column]: { ...prev[column], loading: false },
       }));
     }
-  }, [commitBoard, filters, showArchived]);
+  }, [commitBoard, filters, showArchived, boardScopePending, boardError, boardGeneration]);
 
   const refreshBoard = useCallback(async (showInitialLoader = false) => {
     if (showInitialLoader) setInitialLoading(true);
@@ -486,7 +544,6 @@ export const TasksPage: React.FC = () => {
   }, [fetchFilterOptions]);
 
   useEffect(() => {
-    setInitialLoading(true);
     fetchBoardRef.current?.();
   }, [boardQueryKey]);
 
@@ -558,6 +615,9 @@ export const TasksPage: React.FC = () => {
       if (!ownerPrincipal || task.ownerPrincipalId !== ownerPrincipal.id) return false;
     }
     if (filters.unassigned && task.ownerPrincipalId) return false;
+    // Card 41e24358: the predicate is the server's; a row that says it is
+    // usable leaves, anything else stays until the next server read.
+    if (filters.verifierUnusable && task.verifierUsability?.usable === true) return false;
     return true;
   }, [filters, myPrincipal, principals]);
 
@@ -649,13 +709,9 @@ export const TasksPage: React.FC = () => {
 
   const handleTaskUpdated = useCallback((msg: { task: Task }) => {
     const task = msg.task;
-    if (task.needsReview && task.completedBy) {
-      if (task.status === 'completed') success(`Agent completed: ${task.title}`, 7000);
-      else if (task.status === 'stuck') warning(`Agent encountered issues: ${task.title}`, 7000);
-    }
     if (task?.id) applyTaskPatch(task, 'updated');
     else scheduleBoardRefresh();
-  }, [applyTaskPatch, scheduleBoardRefresh, success, warning]);
+  }, [applyTaskPatch, scheduleBoardRefresh]);
 
   const handleTaskRemoved = useCallback(() => {
     scheduleBoardRefresh();
@@ -739,6 +795,7 @@ export const TasksPage: React.FC = () => {
       writeParam('assignee', filters.owner || '');
       writeParam('mine', filters.mine ? 'true' : '');
       writeParam('unassigned', filters.unassigned ? 'true' : '');
+      writeParam('verifierUnusable', filters.verifierUnusable ? 'true' : '');
       writeParam('archived', showArchived ? 'true' : '');
       prev.delete('tag');
       return prev;
@@ -753,9 +810,32 @@ export const TasksPage: React.FC = () => {
     setFilters(prev => ({ ...prev, tags: [tag] }));
   }, []);
 
+  // A Phase the selected Projects exclude can only narrow the board to
+  // nothing (card 096fda30, owner E67). A change from the filter bar is
+  // reconciled HERE, before it reaches state, so no board fetch ever goes out
+  // with the contradiction; the clearing is said, not done silently.
   const handleFiltersChange = useCallback((newFilters: TaskFilters) => {
-    setFilters(newFilters);
-  }, []);
+    const { filters: reconciled, removed } = reconcilePhaseFilter(newFilters, phaseCatalog);
+    setFilters(reconciled);
+    if (removed.length > 0) {
+      setPhaseScopeNotice(describeClearedPhases(removed));
+    } else if (reconciled.projects.join(',') !== filters.projects.join(',')
+      || reconciled.phases.join(',') !== filters.phases.join(',')) {
+      setPhaseScopeNotice(null);
+    }
+  }, [phaseCatalog, filters.projects, filters.phases]);
+
+  // The same rule for what arrives WITHOUT a filter-bar change: a link or
+  // stored filter state carrying a Phase outside its Projects, and a catalog
+  // that lands after the filters it governs. A no-op once consistent.
+  useEffect(() => {
+    const { filters: reconciled, removed } = reconcilePhaseFilter(filters, phaseCatalog);
+    if (removed.length === 0) return;
+    setFilters(reconciled);
+    setPhaseScopeNotice(describeClearedPhases(removed));
+  }, [filters, phaseCatalog]);
+
+  const dismissPhaseScopeNotice = useCallback(() => setPhaseScopeNotice(null), []);
 
   // The 1500 ms collapse-on-clear timer that used to live here retires with
   // A1 (986be411 §2.1): clearing filters clears VALUES; it never unmounts or
@@ -1188,7 +1268,7 @@ export const TasksPage: React.FC = () => {
   // Bulk archive-completed of the FILTERED SCOPE (design 986be411 §4, E3):
   // the id set comes from the server-side IDs-only scope read — NEVER the
   // loaded column window (the 6-item ceiling this replaces, d8507677 §7).
-  const [bulkArchive, setBulkArchive] = useState<{ ids: string[]; total: number; scope: string } | null>(null);
+  const [bulkArchive, setBulkArchive] = useState<{ ids: string[]; total: number; scope: string; generation: number } | null>(null);
   const [bulkProgress, setBulkProgress] = useState<string | null>(null);
   // Client batch UNDER the server cap of 200: one oversized request sat
   // behind the proxy long enough to be aborted mid-flight in live QA (120
@@ -1207,6 +1287,7 @@ export const TasksPage: React.FC = () => {
     if (filters.mine) parts.push('assigned to me');
     if (filters.owner) parts.push(`assignee ${filters.owner}`);
     if (filters.unassigned) parts.push('unassigned');
+    if (filters.verifierUnusable) parts.push('without a usable Verifier');
     return parts.length ? `Filtered view: ${parts.join(' · ')}` : 'No filters active — every completed task on the board.';
   }, [filters]);
 
@@ -1222,13 +1303,18 @@ export const TasksPage: React.FC = () => {
     if (filters.mine) params.set('mine', 'true');
     if (filters.owner) params.set('owner', filters.owner);
     if (filters.unassigned) params.set('unassigned', 'true');
+    // Card 41e24358: server-side, decided by the usable-Verifier predicate.
+    if (filters.verifierUnusable) params.set('verifierUnusable', 'true');
     return params.toString();
   }, [filters]);
 
   const handleArchiveCompleted = async () => {
+    if (boardScopePending || boardError) return;
+    const generation = boardGeneration;
     try {
       const response = await authenticatedFetch(`${API_BASE_URL}/tasks/ids?${buildCompletedScopeParams()}`);
       const data = await response.json().catch(() => ({}));
+      if (generation !== boardScopeRef.current.generation) return;
       if (!response.ok || !data.success) {
         warning(data.error || 'The archive scope could not be read');
         return;
@@ -1237,7 +1323,7 @@ export const TasksPage: React.FC = () => {
         warning('No completed tasks to archive in the current view');
         return;
       }
-      setBulkArchive({ ids: data.ids, total: data.total, scope: describeFilterScope() });
+      setBulkArchive({ ids: data.ids, total: data.total, scope: describeFilterScope(), generation });
     } catch (error) {
       console.error('Failed to read the archive scope:', error);
       warning('The archive scope could not be read');
@@ -1246,11 +1332,26 @@ export const TasksPage: React.FC = () => {
 
   // Batches above the server cap are the client's job; per-Task failures are
   // surfaced honestly (the old console-only catch retires).
+  const [archiveResults, setArchiveResults] = useState<{ sequence: number; scope: string; outcomes: BulkArchiveOutcome[] } | null>(null);
+  const archiveResultSequence = useRef(0);
+  const [archiveCopyStatus, setArchiveCopyStatus] = useState('');
+  const copyArchiveResults = async () => {
+    const result = archiveResults;
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(copyBulkArchiveOutcomes(result.outcomes));
+      if (archiveResultSequence.current === result.sequence) setArchiveCopyStatus('Results copied');
+    } catch {
+      if (archiveResultSequence.current === result.sequence) setArchiveCopyStatus('Could not copy results. Select and copy the details below.');
+    }
+  };
+
   const runBulkArchive = async () => {
     const scope = bulkArchive;
-    if (!scope) return;
+    if (!scope || scope.generation !== boardScopeRef.current.generation || boardScopePending || boardError) return;
+    const outcomes: BulkArchiveOutcome[] = [];
     let archived = 0;
-    const failures: Array<{ id: string; code: string; error?: string }> = [];
+    const failures: Array<{ id: string; code: string; error?: string; errorId?: string }> = [];
     for (let index = 0; index < scope.ids.length; index += BULK_ARCHIVE_BATCH) {
       const batch = scope.ids.slice(index, index + BULK_ARCHIVE_BATCH);
       setBulkProgress(`Archiving ${Math.min(index + batch.length, scope.ids.length)} of ${scope.ids.length}…`);
@@ -1262,28 +1363,44 @@ export const TasksPage: React.FC = () => {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data.success) {
-          batch.forEach(id => failures.push({ id, code: 'REQUEST_FAILED', error: data.error }));
+          batch.forEach(id => { const row = bulkArchiveOutcome(id, { code: data.code ?? 'REQUEST_FAILED', errorId: data.errorId }); outcomes.push(row); failures.push({ id, code: row.code, errorId: row.references[0] }); });
           continue;
         }
-        for (const result of data.results as Array<{ id: string; archived: boolean; code: string; error?: string }>) {
-          if (result.archived) archived += 1;
-          else failures.push(result);
+        const results = Array.isArray(data.results) ? data.results : [];
+        for (const id of batch) {
+          const matches = results.filter((row: unknown) => row !== null && typeof row === 'object' && (row as { id?: unknown }).id === id);
+          const row = bulkArchiveOutcome(id, matches.length === 1 ? matches[0] : { code: 'REQUEST_FAILED' }, matches.map((row: { errorId?: unknown }) => row.errorId));
+          outcomes.push(row);
+          if (row.archived) archived += 1;
+          else failures.push({ id, code: row.code, errorId: row.references[0] });
         }
       } catch (error) {
         console.error('Bulk archive batch failed:', error);
-        batch.forEach(id => failures.push({ id, code: 'REQUEST_FAILED' }));
+        batch.forEach(id => { failures.push({ id, code: 'REQUEST_FAILED' }); outcomes.push(bulkArchiveOutcome(id, { code: 'REQUEST_FAILED' })); });
       }
     }
     setBulkProgress(null);
     setBulkArchive(null);
+    setArchiveCopyStatus('');
+    setArchiveResults({ sequence: ++archiveResultSequence.current, scope: scope.scope, outcomes });
     if (archived > 0) success(`Archived ${archived} completed task${archived === 1 ? '' : 's'}`);
     if (failures.length > 0) {
-      const codes = Array.from(new Set(failures.map(f => f.code))).join(', ');
-      warning(`${failures.length} task${failures.length === 1 ? '' : 's'} could not be archived (${codes})`, 10000);
+      const codes = describeBulkArchiveFailures(failures);
+      const denied = outcomes.filter(row => row.confirmed && !row.archived).length;
+      const unknown = outcomes.filter(row => !row.confirmed).length;
+      const counts = [denied ? `${denied} task${denied === 1 ? ' was' : 's were'} not archived` : '', unknown ? `${unknown} task outcome${unknown === 1 ? ' is' : 's are'} unconfirmed` : ''].filter(Boolean).join('; ');
+      warning(`${counts} (${codes}). View archive results for details.`, 10000);
     }
     revealArchivedColumn();
     await refreshBoard();
   };
+
+  // Card 30d198df (2): only In Progress cards show activity, so only their ids are read.
+  const activityTasks = selectedView === 'board'
+    ? (isMobile ? [mobileActiveTab] : visibleColumns).filter(column => !isColumnCollapsed(column))
+      .flatMap(column => boardData[column].items).filter(activityApplies)
+    : [];
+  const taskActivity = useTaskActivity(activityTasks, myPrincipal?.id ?? null);
 
   if (initialLoading) {
     return (
@@ -1298,6 +1415,29 @@ export const TasksPage: React.FC = () => {
     <div className="tasks-page-container fade-in">
       <ToastContainer toasts={toasts} />
       <div className="tasks-page-main">
+      {archiveResults && (
+        <section className="archive-results" aria-label="Archive results">
+          <details>
+            <summary>View archive results ({archiveResults.outcomes.length} task{archiveResults.outcomes.length === 1 ? '' : 's'})</summary>
+            <div className="archive-results-body">
+            <p>{archiveResults.scope}</p>
+            <Button onClick={copyArchiveResults}>Copy archive results</Button>
+            <p role="status" aria-live="polite">{archiveCopyStatus}</p>
+            <div className="archive-results-scroll" tabIndex={0}>
+              <ul>{archiveResults.outcomes.map(row => (
+                <li key={row.id}>
+                  <code>{row.id}</code>: {bulkArchiveOutcomeLabel(row)} — <code>{row.code}</code>
+                  {!row.archived && <>: {bulkArchiveReason(row.code).message}</>}
+                  {row.references.map(ref => <span key={ref}> (reference: <code>{ref}</code>)</span>)}
+                </li>
+              ))}</ul>
+            </div>
+            </div>
+          </details>
+        </section>
+      )}
+
+
         {/* Title row + toolbar merged (census A15, owner ruling in
             7fa7e605): ONE header row carries the title and every control —
             view switcher, Search, Show archived, Archive completed, New
@@ -1307,12 +1447,18 @@ export const TasksPage: React.FC = () => {
             deep links carrying restored filters open revealed. */}
         <div className="tasks-page-header">
           <div className="tasks-page-header-title">
-            <h1><Brain size={16} aria-hidden="true" /> On My Mind</h1>
+            <h1><Brain size={16} aria-hidden="true" /> Tasks</h1>
             <p>
               {visibleTaskCount} thing{visibleTaskCount !== 1 && 's'} in view{hiddenArchivedCount > 0 ? `, plus ${hiddenArchivedCount} archived` : ''}
             </p>
           </div>
-          <div className="tasks-page-header-actions">
+          {/* E466: New task, the primary action, is the last control of the
+              header actions and sits BESIDE the line that scrolls sideways on a
+              phone (.tasks-page-header-scroll), never inside it, so the row's
+              edge fade can never cut it. Wider than 768 px the scrolling line
+              is a display:contents wrapper: the header is what it always was. */}
+          <div className="tasks-page-header-actions" ref={setHeaderActions}>
+            <div className="tasks-page-header-scroll" ref={setHeaderActionsRow}>
             <SegmentedControl
               ariaLabel="Task view"
               className="tasks-view-switcher"
@@ -1325,6 +1471,7 @@ export const TasksPage: React.FC = () => {
                   ariaLabel: view.label,
                   disabled: view.disabled,
                   title: view.tooltip,
+                  labelTip: true,
                   label: (
                     <>
                       <Icon size={16} aria-hidden="true" />
@@ -1349,6 +1496,7 @@ export const TasksPage: React.FC = () => {
               aria-controls="tasks-search-panel"
               aria-label={activeFilterCount > 0 ? `Search and filter (${activeFilterCount} active)` : 'Search and filter'}
               title="Search and filter"
+              data-label-tip=""
             >
               <Search size={16} aria-hidden="true" />
               <span className="search-toggle-label">Search</span>
@@ -1374,6 +1522,7 @@ export const TasksPage: React.FC = () => {
                 </Button>
 
                 <Button
+                  disabled={boardScopePending || boardError}
                   onClick={handleArchiveCompleted}
                   variant="secondary"
                   size="compact"
@@ -1395,6 +1544,7 @@ export const TasksPage: React.FC = () => {
                   ref={overflowTriggerRef}
                   icon={<MoreHorizontal size={16} />}
                   ariaLabel="More actions"
+                  labelTip
                   ariaHaspopup="menu"
                   ariaExpanded={overflowOpen}
                   onClick={() => setOverflowOpen(previous => !previous)}
@@ -1416,6 +1566,7 @@ export const TasksPage: React.FC = () => {
                     </button>
                     <button
                       role="menuitem"
+                      disabled={boardScopePending || boardError}
                       className="tasks-overflow-item"
                       onClick={() => {
                         closeOverflow(true);
@@ -1432,6 +1583,7 @@ export const TasksPage: React.FC = () => {
                 )}
               </div>
             )}
+            </div>
 
             <Button
               onClick={() => navigate(createTaskHref())}
@@ -1439,11 +1591,14 @@ export const TasksPage: React.FC = () => {
               size="compact"
               icon={<Plus size={16} />}
               ariaLabel="Create new task"
+              labelTip
             >
               New task
             </Button>
           </div>
         </div>
+
+        {labelTip}
 
         {searchPanelOpen && (
           <div className="tasks-toolbar">
@@ -1467,6 +1622,10 @@ export const TasksPage: React.FC = () => {
                   availableProjects={filterOptions.projects}
                   availableOwners={ownerHandles}
                   canFilterMine={Boolean(myPrincipal)}
+                  availablePhases={phaseCatalog.phases ?? NO_PHASE_OPTIONS}
+                  phaseProjects={phaseCatalog.projects}
+                  phaseScopeNotice={phaseScopeNotice}
+                  onDismissPhaseScopeNotice={dismissPhaseScopeNotice}
                 />
               </div>
             </div>
@@ -1477,7 +1636,7 @@ export const TasksPage: React.FC = () => {
             the Map does not consume, so on the Map they were live controls for
             a surface that was not on screen (review b74ba787 B2). */}
         {isMobile && selectedView === 'board' && (
-          <div className="tasks-mobile-tabs">
+          <div className="tasks-mobile-tabs" ref={setMobileTabsRow}>
             {visibleColumns.map(column => {
               const count = boardData[column].total;
               return (
@@ -1494,7 +1653,11 @@ export const TasksPage: React.FC = () => {
           </div>
         )}
 
-        {selectedView === 'map' ? (
+        {selectedView === 'board' && (boardScopePending || boardError) ? (
+          <div className="page-loading" role={boardError ? 'alert' : 'status'}>
+            {boardError ? <><span>Tasks could not be loaded.</span><Button onClick={() => refreshBoard()}>Retry</Button></> : <><div className="loading-spinner" /><span>Loading tasks...</span></>}
+          </div>
+        ) : selectedView === 'map' ? (
           <MapView
             query={{
               q: filters.searchQuery || undefined,
@@ -1534,6 +1697,7 @@ export const TasksPage: React.FC = () => {
                 status={column as any}
                 title={COLUMN_LABELS[column]}
                 tasks={boardData[column].items}
+                taskActivity={taskActivity}
                 total={boardData[column].total}
                 hasMore={boardData[column].hasMore}
                 loadingMore={boardData[column].loading}
@@ -1567,7 +1731,7 @@ export const TasksPage: React.FC = () => {
         )}
       </div>
 
-      {bulkArchive && (
+      {bulkArchive && bulkArchive.generation === boardGeneration && (
         <ConfirmationModal
           title={`Archive ${bulkArchive.total} completed task${bulkArchive.total === 1 ? '' : 's'}?`}
           message={(

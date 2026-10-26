@@ -10,6 +10,9 @@ import { filterAuthorizedResources } from '../middleware/sharedAuthorization';
 
 const router = Router();
 
+// E159 write-id refusal lives in sharedAuthorization, after the root ceiling
+// and before point resolution. GET continues to accept a Personality slug.
+
 function requireManageAuthority(req: AuthRequest, res: Response): boolean {
   const authority = resolveIssuerAuthority({
     scopes: req.scopes,

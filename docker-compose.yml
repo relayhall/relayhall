@@ -41,10 +41,24 @@ services:
         RELEASE_DIRTY: ${RELEASE_DIRTY:-unknown}
         RELEASE_BUILD_CONTEXT: ${RELEASE_BUILD_CONTEXT:-unknown}
         RELEASE_BUILT_AT: ${RELEASE_BUILT_AT:-unknown}
+        RELAYHALL_RELEASE_VERSION: ${RELAYHALL_RELEASE_VERSION:-}
     restart: unless-stopped
+    # The four key sets (credential envelope, telemetry pepper, knowledge
+    # handle, knowledge assertion), which setup.sh generates once into this
+    # file; .env.example documents them. Optional and listed as an env_file on
+    # purpose: without the file the backend environment is exactly what it was,
+    # and a value supplied another way still wins (an `environment:` entry in
+    # an override, or an override's own env_file, which Compose reads after
+    # this one). Named in `environment:` below instead, an unset name would
+    # erase a value an operator's env_file supplies.
+    env_file:
+      - path: ./relayhall.keys.env
+        required: false
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       RELAYHALL_ENVIRONMENT: ${RELAYHALL_ENVIRONMENT:-production}
+      # Stable operator-provisioned UUID; unset keeps versioned coordination closed.
+      RELAYHALL_DEPLOYMENT_ID: ${RELAYHALL_DEPLOYMENT_ID:-}
       RELAYHALL_LIFECYCLE_POLICY_MODE: ${RELAYHALL_LIFECYCLE_POLICY_MODE:-off}
       RELAYHALL_LIFECYCLE_POLICY_ID: ${RELAYHALL_LIFECYCLE_POLICY_ID:-relayhall.contract-only}
       RELAYHALL_LIFECYCLE_POLICY_VERSION: ${RELAYHALL_LIFECYCLE_POLICY_VERSION:-1}
@@ -68,9 +82,21 @@ services:
       # CORS
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8082}
 
+      # Public address (optional; .env.example). The URL of the API as browsers
+      # and agents reach it, ending in /api: the onboarding pack and single
+      # sign-on name it. Empty = derived from each request, as before.
+      RELAYHALL_PUBLIC_API_URL: ${RELAYHALL_PUBLIC_API_URL:-}
+      # Proxies in front of the backend whose forwarded client address and
+      # scheme it trusts. 1 (the backend's own default) = the frontend's nginx.
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+
       # Optional read-only deployment model catalog
       LITELLM_ADMIN_API_URL: ${LITELLM_ADMIN_API_URL:-}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+
+      # Optional OTLP/gRPC receiver: empty = no listener. To publish it on the
+      # host, add docker-compose.otlp-grpc.yml (see docs/observability.md).
+      RELAYHALL_OTLP_GRPC_PORT: ${RELAYHALL_OTLP_GRPC_PORT:-}
 
       # No harness mounts and no gateway URL: the board never observes an
       # agent runtime (strategy F11) — session data arrives only through
@@ -106,11 +132,11 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
-        VITE_PUBLIC_BUILD: ${VITE_PUBLIC_BUILD:-false}
         RELEASE_SHA: ${RELEASE_SHA:-unknown}
         RELEASE_DIRTY: ${RELEASE_DIRTY:-unknown}
         RELEASE_BUILD_CONTEXT: ${RELEASE_BUILD_CONTEXT:-unknown}
         RELEASE_BUILT_AT: ${RELEASE_BUILT_AT:-unknown}
+        RELAYHALL_RELEASE_VERSION: ${RELAYHALL_RELEASE_VERSION:-}
     restart: unless-stopped
     environment:
       NODE_ENV: ${NODE_ENV:-production}
@@ -132,11 +158,11 @@ services:
   # ========================================
   # To add a plugin, create a service like this and add it to relayhall.plugins.json
   #
-  # claw-myplugin:
+  # my-plugin:
   #   build:
-  #     context: ./plugins/claw-myplugin
+  #     context: ./plugins/my-plugin
   #     dockerfile: Dockerfile
-  #   container_name: claw-myplugin
+  #   container_name: my-plugin
   #   restart: unless-stopped
   #   environment:
   #     NODE_ENV: production

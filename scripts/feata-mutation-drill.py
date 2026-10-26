@@ -5,6 +5,9 @@ Run from any directory, with the same disposable DB environment as
 test:task-write-fields. Every edited file is restored from its exact original
 bytes in finally; this never checks out, resets or discards a working tree.
 JSON assertion receipts and logs default to the ignored tmp directory.
+A run that ends the drill without a red proof (a baseline that is not green,
+no JSON, a runtime error) first prints its failed assertions and the tail of
+its log, because no CI job keeps that directory.
 """
 import argparse
 import hashlib
@@ -46,6 +49,24 @@ MUTATIONS = [
  ('drop-refusal-description','frontend','refusal keeps the typed deadline',[(INPUT,'aria-describedby={refusal ? refusalId : (value ? absoluteId : undefined)}','aria-describedby={value ? absoluteId : undefined}')]),
 ]
 
+# Card d4315f28: how much of a failing runner's evidence reaches the CI log.
+# The failed assertions carry the diagnosis; the log tail carries whatever
+# happened outside an assertion (a suite that did not load, a crash).
+FAILURE_MESSAGE_LINES = 80
+LOG_TAIL_LINES = 200
+
+# Card 696f3bb8: the budget of ONE runner invocation. The frontend baseline is
+# the Task details suite plus two small files; once that suite stopped failing
+# fast at its old 5000 ms test budget, its baseline outlived the former 600 s
+# on one core shared four ways (the card's starvation drill). Each CI job's
+# own timeout still bounds the step.
+RUN_TIMEOUT_SECONDS = 1800
+
+def clip(text, limit):
+ lines = text.splitlines()
+ if len(lines) <= limit: return text
+ return '\n'.join(lines[:limit] + [f'... ({len(lines) - limit} more lines)'])
+
 def command(group, output, selector=None):
  if group == 'backend':
   cmd=['npm','run','test:task-write-fields','--','--silent','--json','--outputFile',str(output)]
@@ -76,23 +97,57 @@ def main():
  fingerprint={rel:hashlib.sha256(data).hexdigest() for rel,data in originals.items()}
  env=os.environ.copy();env.update(RELAYHALL_DUE_ZONE_SEED='16092026',RELAYHALL_DUE_SEED='16092026')
  receipts=[]
+ def explain(label,code):
+  # Card d4315f28: print what the runner said, so a red run is diagnosable
+  # from the CI log alone. It reads only the files run() wrote, and a fault in
+  # it is printed rather than raised, so the caller's own error still follows.
+  print(f'---- {label}: runner exit {code}; its output follows ----',flush=True)
+  try:
+   result_file=out/(label+'.json')
+   try:
+    result=json.loads(result_file.read_text()) if result_file.exists() else None
+   except ValueError as error:
+    result=None;print(f'{result_file.name} is not JSON: {error}')
+   if result is None:
+    print(f'{result_file.name}: no runner JSON')
+   else:
+    for suite in result.get('testResults',[]):
+     failed=[a for a in suite.get('assertionResults',[]) if a.get('status')=='failed']
+     if suite.get('status')=='failed' and not failed and suite.get('message'):
+      print(f'SUITE FAILED {suite.get("name")}\n{clip(suite["message"],FAILURE_MESSAGE_LINES)}')
+     for a in failed:
+      print(f'FAILED {a.get("fullName")}')
+      for message in a.get('failureMessages') or []:print(clip(message,FAILURE_MESSAGE_LINES))
+   log=out/(label+'.log')
+   lines=log.read_bytes().decode('utf-8','replace').splitlines() if log.exists() else []
+   print(f'---- {log.name}: last {min(len(lines),LOG_TAIL_LINES)} of {len(lines)} lines ----')
+   for line in lines[-LOG_TAIL_LINES:]:print(line)
+  except Exception as error:
+   print(f'could not print the {label} output: {error!r}')
+  print(f'---- end of {label} output ----',flush=True)
  def run(label,group,selector=None):
   result_file=out/(label+'.json')
   if result_file.exists():result_file.unlink()
   print(f'{label}: starting',flush=True)
   with (out/(label+'.log')).open('wb') as log:
    process=subprocess.run(command(group,result_file,selector),cwd=ROOT/('backend' if group=='backend' else 'frontend'),
-                          env=env,stdout=log,stderr=subprocess.STDOUT,timeout=600)
-  if not result_file.exists():raise RuntimeError(label+': runner produced no JSON assertions')
+                          env=env,stdout=log,stderr=subprocess.STDOUT,timeout=RUN_TIMEOUT_SECONDS)
+  if not result_file.exists():
+   explain(label,process.returncode)
+   raise RuntimeError(label+': runner produced no JSON assertions')
   result=json.loads(result_file.read_text())
-  if result.get('numRuntimeErrorTestSuites',0):raise RuntimeError(label+': runtime error is not a red proof')
+  if result.get('numRuntimeErrorTestSuites',0):
+   explain(label,process.returncode)
+   raise RuntimeError(label+': runtime error is not a red proof')
   names=sorted(a['fullName'] for f in result['testResults'] for a in f.get('assertionResults',[]) if a['status']=='failed')
   passed=sum(a['status']=='passed' for f in result['testResults'] for a in f.get('assertionResults',[]))
   return process.returncode,names,passed
  try:
   for group in sorted({m[1] for m in selected}):
    code,names,passed=run('baseline-'+group,group)
-   if code or names or not passed:raise RuntimeError(group+': baseline is not green')
+   if code or names or not passed:
+    explain('baseline-'+group,code)
+    raise RuntimeError(group+': baseline is not green')
    print(f'{group}: baseline {passed} passed',flush=True)
   for name,group,selector,changes in selected:
    for rel,data in originals.items():

@@ -22,7 +22,8 @@ import {
   type KnowledgeSourceArmRow,
 } from './KnowledgeArmEvaluator';
 import { signKnowledgeAssertion } from './KnowledgeAssertionSigner';
-import { unsealKnowledgeHandle, KnowledgeHandleError } from './KnowledgeHandleSealer';
+import { validateRetrieval, KnowledgeCompartment, RetrievalStatus } from './KnowledgeV2';
+import { unsealKnowledgeHandle, sealKnowledgeHandle, KnowledgeHandlePayload, KnowledgeHandleError } from './KnowledgeHandleSealer';
 import { readBoardObject } from './KnowledgeBoardAdapter';
 import { resolveChannelCredential, channelAuthDialOptions } from './KnowledgeChannelAuth';
 import { recordKnowledgeGet } from './KnowledgeAuditService';
@@ -36,7 +37,7 @@ export type KnowledgeGetRefusal =
   // estate, so they stay distinct: an operator has to be able to tell a
   // rotated key from a forged handle from an unsupported version.
   | 'handle_malformed' | 'handle_tampered' | 'handle_key_retired' | 'handle_key_unknown'
-  | 'handle_version_unsupported'
+  | 'handle_version_unsupported' | 'invalid_continuation' | 'source_protocol_error' | 'source_unavailable' | 'source_timed_out'
   // ── ABOUT ESTATE STATE — ONE TOKEN, DELIBERATELY (§5.5, finding F1) ──
   //
   // "Sources failing (a)-(c) or excluded by (e) are undisclosed absolutely —
@@ -55,13 +56,22 @@ export type KnowledgeGetRefusal =
   | 'continuation_without_content_hash' | 'content_changed'
   | 'source_refused' | 'source_response_invalid' | 'transport';
 
+export interface KnowledgeV2Content {
+  protocol_version: 2; status: 'content'; content_base64: string; sha256: string;
+  offset: number; byteLength: number; totalBytes: number; truncated: boolean; continuation?: string;
+  provenance: { sourceId: string; compartment: KnowledgeCompartment; contentKind: string; category: string };
+  retrieval: RetrievalStatus;
+}
 export type KnowledgeGetResult =
+  | ({ ok: true } & KnowledgeV2Content)
   | { ok: true; content: string; sha256: string; compartment: string; truncated?: boolean }
   | { ok: true; notModified: true }
   | { ok: false; refused: KnowledgeGetRefusal };
 
 export interface KnowledgeGetInput {
   handle: unknown;
+  continuation?: unknown;
+  auditRef?: string;
   continueFrom?: number;
   contentHash?: string;
   ifNoneMatch?: string;
@@ -115,7 +125,7 @@ interface SourceRow extends KnowledgeSourceArmRow {
   knowledge_core_credential_ref: string | null;
 }
 
-export async function executeKnowledgeGet(
+async function executeKnowledgeGetInner(
   req: AuthRequest,
   input: KnowledgeGetInput,
   options: { issuer: string; callerGroupIds?: readonly string[]; trustAnchors?: string | string[] } ,
@@ -142,8 +152,18 @@ export async function executeKnowledgeGet(
   // sha256; mismatch → named `content_changed`." Checked here because a
   // continuation with no anchor is a splice request, and there is nothing to
   // ask a source about.
-  const continueFrom = Number(input.continueFrom ?? 0);
-  if (Number.isFinite(continueFrom) && continueFrom > 0 && !input.contentHash) {
+  let continuation: KnowledgeHandlePayload | undefined;
+  if (payload.v === 2) {
+    if (input.continueFrom !== undefined || input.contentHash !== undefined || (input.continuation !== undefined && input.ifNoneMatch !== undefined)) return refuse('invalid_continuation');
+    if (input.ifNoneMatch !== undefined && !/^[a-f0-9]{64}$/.test(input.ifNoneMatch)) return refuse('invalid_continuation');
+    if (input.continuation !== undefined) {
+      try { continuation = unsealKnowledgeHandle(input.continuation, 'continuation'); } catch { return refuse('invalid_continuation'); }
+      if (['s','dv','c','r','fh'].some(k => continuation![k as keyof KnowledgeHandlePayload] !== payload[k as keyof KnowledgeHandlePayload])) return refuse('invalid_continuation');
+    }
+  } else if (input.continuation !== undefined) return refuse('invalid_continuation');
+  const continueFrom = continuation?.next ?? Number(input.continueFrom ?? 0);
+  const contentHash = continuation?.h ?? input.contentHash;
+  if (Number.isFinite(continueFrom) && continueFrom > 0 && !contentHash) {
     return refuse('continuation_without_content_hash');
   }
 
@@ -179,6 +199,7 @@ export async function executeKnowledgeGet(
    * this function never passes a ref anywhere else, and nothing here logs one.
    */
   const auditGet = (outcome: string): Promise<void> => recordKnowledgeGet(req, {
+    ...(input.auditRef ? { auditRef: input.auditRef } : {}),
     sourceId: row.id,
     compartment: payload.c,
     rawRef: payload.r,
@@ -209,7 +230,9 @@ export async function executeKnowledgeGet(
     return conceal('the handle pins a version that does not exist');
   }
   const pinnedBlock = (pinned.rows[0].descriptor as ServiceDescriptor | null)?.knowledgeSource ?? null;
-  if (!pinnedBlock || !pinnedBlock.compartments.includes(payload.c)) {
+  if (!pinnedBlock || (payload.v === 2
+    ? pinnedBlock.protocol_version !== 2 || pinnedBlock.compartment_mode !== 'dynamic-opaque'
+    : !pinnedBlock.compartments.includes(payload.c))) {
     // A core-minted handle cannot reach here: §8.1's pin means a compartment
     // DROPPED by a later publish still validates against its own version. So
     // this is the forgery case — and it is concealed like every other
@@ -276,7 +299,7 @@ export async function executeKnowledgeGet(
     };
   }
 
-  // ── 6. THE §8.2 MODE BRANCH (sol R2-1) ──
+  // ── 6. THE §8.2 MODE BRANCH (review R2-1) ──
   //
   // `asserted` ⇒ channel + a FRESH assertion. `none` ⇒ channel, NO assertion
   // — the arm set was still re-run at core, because authority is core's
@@ -301,6 +324,7 @@ export async function executeKnowledgeGet(
   // `asserted`; `ifNoneMatch` is FORWARDED, never compared here.
   const body = JSON.stringify({
     ref: payload.r,
+    ...(payload.v === 2 ? { protocol_version: 2, compartment_id: payload.c, filter: payload.f, limitBytes: KNOWLEDGE_GET_MAX_BYTES, ...(contentHash ? { contentHash } : {}) } : {}),
     ...(continueFrom > 0 ? { continueFrom } : {}),
     ...(input.ifNoneMatch ? { ifNoneMatch: input.ifNoneMatch } : {}),
     ...(assertion ? { assertion } : {}),
@@ -324,21 +348,48 @@ export async function executeKnowledgeGet(
     headers: { 'content-type': 'application/json', ...(channel.headers ?? {}) },
     allowedNetworks: row.knowledge_allowed_networks ?? [],
     ...(channel.clientCertificate ? { clientCertificate: channel.clientCertificate } : {}),
-    maxResponseBytes: KNOWLEDGE_GET_MAX_BYTES,
+    maxResponseBytes: payload.v === 2 ? 384 * 1024 : KNOWLEDGE_GET_MAX_BYTES,
+    ...(payload.v === 2 ? { timeoutMs: 8000 } : {}),
     ...(options.trustAnchors !== undefined ? { trustAnchors: options.trustAnchors } : {}),
   });
   if (!dialed.ok) {
     await auditGet('transport');
-    return refuse('transport');
+    return refuse(payload.v === 2 ? (dialed.failure === 'timedOut' ? 'source_timed_out' : 'source_unavailable') : 'transport');
   }
 
+  if (payload.v === 2 && [401,403,404].includes(dialed.status)) { await auditGet('source_refused'); return refuse('source_refused'); }
+  if (payload.v === 2 && (dialed.status < 200 || dialed.status >= 300)) { await auditGet('transport'); return refuse('source_unavailable'); }
   // ── 7. FIELD-COMPLETE VALIDATION OF THE SOURCE'S ANSWER ──
   let answer: Record<string, unknown>;
   try {
     answer = JSON.parse(dialed.body) as Record<string, unknown>;
+    if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('Invalid response');
   } catch {
     await auditGet('source_response_invalid');
-    return refuse('source_response_invalid');
+    return refuse(payload.v === 2 ? 'source_protocol_error' : 'source_response_invalid');
+  }
+
+  if (payload.v === 2) {
+    if (dialed.status === 401 || dialed.status === 403 || dialed.status === 404) { await auditGet('source_refused'); return refuse('source_refused'); }
+    if (dialed.status < 200 || dialed.status >= 300) { await auditGet('transport'); return refuse('source_unavailable'); }
+    if (answer.protocol_version !== 2) {
+      await auditGet('source_response_invalid');
+      return refuse('source_protocol_error');
+    }
+    if (answer.status === 'notModified') {
+      if (!input.ifNoneMatch) {
+        await auditGet('source_response_invalid');
+        return refuse('source_protocol_error');
+      }
+      await auditGet('not_modified'); return { ok: true, notModified: true };
+    }
+    if (answer.status === 'refused') {
+      await auditGet('source_refused');
+      return refuse(answer.code === 'content_changed' && continuation ? 'content_changed' : 'source_refused');
+    }
+    const v2 = validateV2KnowledgeContent(answer, payload, continueFrom, contentHash, pinnedBlock.categories ?? []);
+    await auditGet(v2.ok ? 'ok' : v2.refused);
+    return v2;
   }
 
   // §8.3: ONLY the source produces `notModified`, and its contract obliges
@@ -400,4 +451,45 @@ export async function executeKnowledgeGet(
     compartment,
     ...(answer.truncated === true ? { truncated: true } : {}),
   };
+}
+
+/** Validate byte-window metadata before releasing any source byte. Partial windows
+ * cannot be full-document-hash-verified by core; the satellite owns that proof. */
+export function validateV2KnowledgeContent(answer: Record<string, unknown>, payload: KnowledgeHandlePayload, offset: number, contentHash: string | undefined, declaredCategories: readonly string[]): KnowledgeGetResult {
+  const invalid = (): KnowledgeGetResult => refuse('source_protocol_error');
+  const compartment = answer.compartment as KnowledgeCompartment | null;
+  const retrieval = validateRetrieval(answer.retrieval);
+  if (answer.status !== 'content' || typeof answer.content_base64 !== 'string' || typeof answer.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(answer.sha256)
+    || !compartment || compartment.id !== payload.c || (compartment.label !== undefined && (typeof compartment.label !== 'string' || compartment.label.length > 128))
+    || !payload.f?.kinds.includes(answer.contentKind as never) || typeof answer.category !== 'string' || !declaredCategories.includes(answer.category)
+    || (payload.f.categories !== undefined && !payload.f.categories.includes(answer.category)) || !retrieval) return invalid();
+  const bytes = Buffer.from(answer.content_base64, 'base64');
+  if (bytes.toString('base64') !== answer.content_base64 || bytes.length > KNOWLEDGE_GET_MAX_BYTES
+    || ![answer.offset, answer.byteLength, answer.totalBytes].every(n => Number.isSafeInteger(n) && Number(n) >= 0)
+    || answer.offset !== offset || answer.byteLength !== bytes.length || typeof answer.truncated !== 'boolean') return invalid();
+  const total = answer.totalBytes as number;
+  const end = offset + bytes.length;
+  if ((bytes.length === 0 && (total !== 0 || offset !== 0)) || !Number.isSafeInteger(end) || end > total || (answer.truncated ? bytes.length === 0 || end >= total : end !== total)) return invalid();
+  if (contentHash && contentHash !== answer.sha256) return refuse('content_changed');
+  if (offset === 0 && !answer.truncated && crypto.createHash('sha256').update(bytes).digest('hex') !== answer.sha256) return invalid();
+  return { ok: true, protocol_version: 2, status: 'content', content_base64: answer.content_base64, sha256: answer.sha256,
+    offset, byteLength: bytes.length, totalBytes: total, truncated: answer.truncated,
+    ...(answer.truncated ? { continuation: sealKnowledgeHandle({ s: payload.s, dv: payload.dv, c: payload.c, r: payload.r, f: payload.f, domain: 'continuation', h: answer.sha256, next: end }) } : {}),
+    provenance: { sourceId: payload.s, compartment: { id: compartment.id, ...(compartment.label ? { label: compartment.label } : {}) }, contentKind: answer.contentKind as string, category: answer.category },
+    retrieval };
+}
+
+/** V2 presentation adds a receipt while the legacy wire remains byte-compatible. */
+export async function executeKnowledgeGet(
+  req: AuthRequest, input: KnowledgeGetInput,
+  options: { issuer: string; callerGroupIds?: readonly string[]; trustAnchors?: string | string[] },
+): Promise<KnowledgeGetResult & { protocol_version?: 2; status?: string; code?: string; auditRef?: string }> {
+  let v2 = false;
+  try { v2 = unsealKnowledgeHandle(input.handle).v === 2; } catch { /* inner owns exact refusal */ }
+  const auditRef = v2 ? crypto.randomUUID() : undefined;
+  const outcome = await executeKnowledgeGetInner(req, { ...input, ...(auditRef ? { auditRef } : {}) }, options);
+  if (!v2) return outcome;
+  if (!outcome.ok) return { ...outcome, protocol_version: 2, auditRef, status: 'refused', code: outcome.refused === 'not_authorized' || outcome.refused === 'source_refused' ? 'refused' : outcome.refused };
+  if ('notModified' in outcome) return { ...outcome, protocol_version: 2, auditRef, status: 'notModified' };
+  return { ...outcome, protocol_version: 2, auditRef, status: 'content' };
 }

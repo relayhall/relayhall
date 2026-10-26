@@ -9,10 +9,13 @@
  *    file (bare `npm start`, CI, a non-Docker deploy) would otherwise be
  *    invisible to modules that read process.env at import time.
  * 2. A missing JWT_SECRET throws here, once, for every consumer. There is no
- *    fallback literal anywhere: a published constant is not a secret.
+ *    fallback literal anywhere: a published constant is not a secret, and the
+ *    one published value an operator might copy (the .env.example
+ *    placeholder) is refused the same way (config/placeholderSecrets).
  */
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import { refusePlaceholderJwtSecret } from './placeholderSecrets';
 
 dotenv.config();
 
@@ -24,6 +27,8 @@ export function getJwtSecret(): string {
     if (!secret) {
       throw new Error('FATAL: JWT_SECRET environment variable is required (no insecure fallback).');
     }
+    // The public .env.example placeholder is no secret either.
+    refusePlaceholderJwtSecret(secret);
     cachedJwtSecret = secret;
   }
   return cachedJwtSecret;

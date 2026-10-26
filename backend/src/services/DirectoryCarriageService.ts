@@ -112,6 +112,7 @@ import {
 } from './GroupService';
 import { resolveGroupBindings } from './identity/ssoGroupBinding';
 import { directoryCarriageBounds } from '../config/directoryCarriage';
+import { GROUP_STEWARD_ROLES, liveStewardRows } from '../utils/liveStewardCondition';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -338,6 +339,19 @@ export interface DirectoryGroupReferenceCatalogRow extends DirectoryGroupReferen
   boundGroupId: string | null;
   boundGroupName: string | null;
 }
+
+/**
+ * Who is reading the catalog, as the route classifies it (LENSES-c C.9):
+ * `rootSession` is "a login session holding root"; `stewardSessionPrincipalId`
+ * is the Account of a LOGIN SESSION (null for a bearer), which the service
+ * then tests for a live Group role row.
+ */
+export interface CatalogScope {
+  rootSession: boolean;
+  stewardSessionPrincipalId?: string | null;
+}
+
+export type CatalogProjection = { kind: 'root' } | { kind: 'steward'; principalId: string };
 
 /** The caller's OWN carriage — their profile's "Directory groups (N)". */
 export interface OwnCarriageRow {
@@ -851,20 +865,35 @@ export class DirectoryCarriageService {
       const description = throughGroupValidator(() => validateGroupDescription(input.description));
       let groupRow;
       try {
+        // AZ-A12 clause 2 (card 20f40e40): ONE statement allocates the id,
+        // inserts the Group principal (kind 'group', handle 'group:' || id
+        // built from the uuid) and then the bound groups row with that id.
         groupRow = await client.query(
-          `INSERT INTO groups (name, description, created_by_principal_id, identity_provider_id, external_group_ref)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id, name`,
+          `WITH group_principal AS (
+             INSERT INTO principals (id, kind, handle, display_name, status)
+             SELECT minted.id, 'group', 'group:' || minted.id::text, $1::text, 'active'
+               FROM (SELECT gen_random_uuid() AS id) minted
+             RETURNING id
+           )
+           INSERT INTO groups (id, name, description, created_by_principal_id, identity_provider_id, external_group_ref)
+           SELECT group_principal.id, $1::text, $2, $3, $4, $5 FROM group_principal
+           RETURNING id, name`,
           [name, description, actor.principalId ?? null, identityProviderId, reference.externalGroupRef],
         );
       } catch (e) {
-        if (e instanceof Error && e.message.includes('duplicate key')) {
-          if (e.message.includes('ux_groups_directory_binding')) {
-            throw err(
-              409,
-              'DIRECTORY_GROUP_REFERENCE_ALREADY_BOUND',
-              'another Group is already bound to that external group reference at this Identity provider',
-            );
-          }
+        // Each unique index is matched BY NAME: the statement also inserts a
+        // principal row, so a duplicate key alone is not a name collision.
+        const constraint = (e as { constraint?: unknown } | null)?.constraint;
+        const on = (name_: string): boolean => e instanceof Error && e.message.includes('duplicate key')
+          && (constraint === name_ || e.message.includes(name_));
+        if (on('ux_groups_directory_binding')) {
+          throw err(
+            409,
+            'DIRECTORY_GROUP_REFERENCE_ALREADY_BOUND',
+            'another Group is already bound to that external group reference at this Identity provider',
+          );
+        }
+        if (on('ux_groups_name_ci')) {
           throw err(
             409,
             'GROUP_NAME_EXISTS',
@@ -1181,23 +1210,44 @@ export class DirectoryCarriageService {
     return outcome;
   }
 
-  // ── The catalog read model (design §5.1–§5.3, narrowed by DBD-14) ───────
+  // ── The catalog read model (design §5.1–§5.3; the steward row, LENSES-c C.9) ──
 
   /**
-   * The v1 projection.
+   * THE PROJECTION, decided in one place.
    *
-   * §5.3's visibility table has three live rows; with `group_stewards`
-   * deferred to LENSES-c the STEWARD row has no subject in v1, so v1 is:
-   * **root login session -> everything; every other caller, bearer or session,
-   * -> `200` with an EMPTY LIST** (register row **DBD-14**). That is NARROWER
-   * than the design and than owner decision 5, never wider.
+   * §5.3's visibility table has three live rows, and since LENSES-c c1-A
+   * (card 46cfbd1d; design delta C.9, D-17) each has its subject:
+   *   - a ROOT LOGIN SESSION -> every row, counts over the whole store;
+   *   - a non-root LOGIN SESSION holding at least one LIVE Group role row
+   *     (owner or manager, the shared fragment) -> the STEWARD projection: the
+   *     rows carried by at least one ACTIVE member of a Group it live-stewards,
+   *     with counts and sources computed over that projected set, and no
+   *     identities at any depth (A-L35-c, A-L36);
+   *   - every other caller, bearer or session -> `200` with an EMPTY LIST.
+   * The route decides only "login session, and root?" through the one
+   * classification; a bearer never reaches the steward row because the route
+   * passes no session principal for it.
    *
    * An empty list rather than a 403: a 403 on a list discloses that the
    * surface exists and is populated.
    */
-  async listReferences(scope: { rootSession: boolean }): Promise<DirectoryGroupReferenceCatalogRow[]> {
-    if (!scope.rootSession) return [];
-    const result = await pool.query(`${CATALOG_SELECT} ORDER BY ${CATALOG_ORDER}`);
+  async catalogProjection(scope: CatalogScope): Promise<CatalogProjection | null> {
+    if (scope.rootSession) return { kind: 'root' };
+    const principalId = scope.stewardSessionPrincipalId;
+    if (!principalId || !UUID_PATTERN.test(principalId)) return null;
+    const live = await pool.query(
+      `SELECT 1 FROM (${liveStewardRows({ group: null, account: '$1', roles: '$2::text[]' })}) live_role LIMIT 1`,
+      [principalId, [...GROUP_STEWARD_ROLES]],
+    );
+    return live.rows.length > 0 ? { kind: 'steward', principalId } : null;
+  }
+
+  async listReferences(scope: CatalogScope): Promise<DirectoryGroupReferenceCatalogRow[]> {
+    const projection = await this.catalogProjection(scope);
+    if (!projection) return [];
+    const result = projection.kind === 'steward'
+      ? await pool.query(`${STEWARD_CATALOG_SELECT} ORDER BY ${CATALOG_ORDER}`, [projection.principalId, [...GROUP_STEWARD_ROLES]])
+      : await pool.query(`${CATALOG_SELECT} ORDER BY ${CATALOG_ORDER}`);
     return result.rows.map(mapCatalogRow);
   }
 
@@ -1207,12 +1257,17 @@ export class DirectoryCarriageService {
    * The caller answers `null` with the SAME 404 it answers for an id that does
    * not exist — one branch, the same words. The estate standard is FIX-C at
    * `21daf85`: *"refused in the same words, from ONE branch, so closing the
-   * bypass does not open an oracle in its place"*.
+   * bypass does not open an oracle in its place"*. A steward's reference
+   * outside its projected set is `null` here too, from the same query that
+   * finds an absent id.
    */
-  async getReference(id: string, scope: { rootSession: boolean }): Promise<DirectoryGroupReferenceCatalogRow | null> {
+  async getReference(id: string, scope: CatalogScope): Promise<DirectoryGroupReferenceCatalogRow | null> {
     if (!UUID_PATTERN.test(String(id))) return null;
-    if (!scope.rootSession) return null;
-    const result = await pool.query(`${CATALOG_SELECT} WHERE dgr.id = $1`, [id]);
+    const projection = await this.catalogProjection(scope);
+    if (!projection) return null;
+    const result = projection?.kind === 'steward'
+      ? await pool.query(`${STEWARD_CATALOG_SELECT} AND dgr.id = $3`, [projection.principalId, [...GROUP_STEWARD_ROLES], id])
+      : await pool.query(`${CATALOG_SELECT} WHERE dgr.id = $1`, [id]);
     if (result.rows.length === 0) return null;
     return mapCatalogRow(result.rows[0]);
   }
@@ -1342,6 +1397,42 @@ const CATALOG_SELECT = `
     LEFT JOIN groups g
       ON g.identity_provider_id = dgr.identity_provider_id
      AND g.external_group_ref = dgr.external_group_ref`;
+
+/**
+ * The STEWARD projection's SELECT (LENSES-c C.9): `$1` is the steward's
+ * Account, `$2` the Group roles. `projected` is the set of ACTIVE members of
+ * every Group the steward LIVE-stewards (the shared fragment decides "live");
+ * a reference appears only if one of them carries it, and its `memberCount`
+ * and `sources` are computed over that set only (A-L36), so a steward never
+ * learns how many people OUTSIDE its Groups carry a reference. Like
+ * `CATALOG_SELECT`, it names no identity at any depth (A-L35-c). It ends in a
+ * WHERE clause so a point read appends `AND dgr.id = $3`.
+ */
+const STEWARD_CATALOG_SELECT = `
+  WITH projected AS (
+    SELECT DISTINCT member.account_principal_id
+      FROM (${liveStewardRows({ group: null, account: '$1', roles: '$2::text[]' })}) live_role
+      JOIN group_members member ON member.group_id = live_role.group_id
+      JOIN principals carrier ON carrier.id = member.account_principal_id AND carrier.status = 'active'
+  )
+  SELECT dgr.id, dgr.identity_provider_id, dgr.external_group_ref, dgr.display_name,
+         dgr.scim_external_id, dgr.first_seen_at, dgr.last_seen_at, dgr.updated_at,
+         (SELECT count(DISTINCT adgr.account_principal_id)::int
+            FROM account_directory_group_references adgr
+           WHERE adgr.directory_group_reference_id = dgr.id
+             AND adgr.account_principal_id IN (SELECT account_principal_id FROM projected)) AS member_count,
+         COALESCE((SELECT array_agg(DISTINCT adgr.source ORDER BY adgr.source)
+                     FROM account_directory_group_references adgr
+                    WHERE adgr.directory_group_reference_id = dgr.id
+                      AND adgr.account_principal_id IN (SELECT account_principal_id FROM projected)), '{}') AS sources,
+         g.id AS bound_group_id, g.name AS bound_group_name
+    FROM directory_group_references dgr
+    LEFT JOIN groups g
+      ON g.identity_provider_id = dgr.identity_provider_id
+     AND g.external_group_ref = dgr.external_group_ref
+   WHERE EXISTS (SELECT 1 FROM account_directory_group_references carried
+                  WHERE carried.directory_group_reference_id = dgr.id
+                    AND carried.account_principal_id IN (SELECT account_principal_id FROM projected))`;
 
 /** Sort at READ, on (display_name NULLS LAST, ref): the provider's own order is
  *  not ours to keep, and there is no `ordinal` column to keep it in. The

@@ -29,16 +29,27 @@ export type ThemePreference = (typeof THEME_PREFERENCE_VALUES)[number];
 export const REDUCED_MOTION_VALUES = ['system', 'reduce', 'no-preference'] as const;
 export type ReducedMotionPreference = (typeof REDUCED_MOTION_VALUES)[number];
 
+/**
+ * How the Map draws a task's Reports (card 742fae98): one "Reports · N" node
+ * per task, or every Report node in a report area. A display choice of the
+ * principal's own, so it lives on this row; migration 165's CHECK holds the
+ * same two values and principalPreferences.test.ts compares them.
+ */
+export const MAP_REPORTS_MODE_VALUES = ['collapsed', 'expanded'] as const;
+export type MapReportsMode = (typeof MAP_REPORTS_MODE_VALUES)[number];
+
 export interface PrincipalPreferences {
   /** null = no preference; the chain falls through to the deployment default. */
   theme: ThemePreference | null;
   reducedMotion: ReducedMotionPreference;
+  mapReportsMode: MapReportsMode;
 }
 
 /** What a principal with no stored row has. Absence is a real answer. */
 export const DEFAULT_PREFERENCES: PrincipalPreferences = {
   theme: null,
   reducedMotion: 'system',
+  mapReportsMode: 'collapsed',
 };
 
 export class PreferencesValidationError extends Error {
@@ -56,6 +67,10 @@ function isReducedMotionPreference(value: unknown): value is ReducedMotionPrefer
   return typeof value === 'string' && (REDUCED_MOTION_VALUES as readonly string[]).includes(value);
 }
 
+function isMapReportsMode(value: unknown): value is MapReportsMode {
+  return typeof value === 'string' && (MAP_REPORTS_MODE_VALUES as readonly string[]).includes(value);
+}
+
 /**
  * A submitted patch. Both fields are optional; `theme: null` is a MEANINGFUL
  * value ("clear my preference") and is distinguished from the field being
@@ -64,6 +79,7 @@ function isReducedMotionPreference(value: unknown): value is ReducedMotionPrefer
 export interface PreferencesPatch {
   theme?: ThemePreference | null;
   reducedMotion?: ReducedMotionPreference;
+  mapReportsMode?: MapReportsMode;
 }
 
 /**
@@ -98,8 +114,16 @@ export function parsePreferencesPatch(body: unknown): PreferencesPatch {
     patch.reducedMotion = source.reducedMotion;
   }
 
+  if ('mapReportsMode' in source) {
+    if (!isMapReportsMode(source.mapReportsMode)) {
+      throw new PreferencesValidationError(
+        `mapReportsMode must be one of: ${MAP_REPORTS_MODE_VALUES.join(', ')}`);
+    }
+    patch.mapReportsMode = source.mapReportsMode;
+  }
+
   if (Object.keys(patch).length === 0) {
-    throw new PreferencesValidationError('Provide theme, reducedMotion, or both');
+    throw new PreferencesValidationError('Provide at least one of theme, reducedMotion or mapReportsMode');
   }
   return patch;
 }
@@ -107,6 +131,7 @@ export function parsePreferencesPatch(body: unknown): PreferencesPatch {
 interface PreferencesRow {
   theme: string | null;
   reduced_motion: string;
+  map_reports_mode: string;
 }
 
 /**
@@ -120,6 +145,7 @@ function toPreferences(row: PreferencesRow | undefined): PrincipalPreferences {
   return {
     theme: isThemePreference(row.theme) ? row.theme : null,
     reducedMotion: isReducedMotionPreference(row.reduced_motion) ? row.reduced_motion : 'system',
+    mapReportsMode: isMapReportsMode(row.map_reports_mode) ? row.map_reports_mode : 'collapsed',
   };
 }
 
@@ -127,7 +153,7 @@ export class PrincipalPreferencesService {
   /** The authenticated principal's own preferences; defaults when unset. */
   async get(principalId: string): Promise<PrincipalPreferences> {
     const result = await pool.query<PreferencesRow>(
-      'SELECT theme, reduced_motion FROM principal_preferences WHERE principal_id = $1',
+      'SELECT theme, reduced_motion, map_reports_mode FROM principal_preferences WHERE principal_id = $1',
       [principalId]
     );
     return toPreferences(result.rows[0]);
@@ -145,21 +171,26 @@ export class PrincipalPreferencesService {
   async save(principalId: string, patch: PreferencesPatch): Promise<PrincipalPreferences> {
     const themeGiven = 'theme' in patch;
     const motionGiven = 'reducedMotion' in patch;
+    const mapReportsGiven = 'mapReportsMode' in patch;
     const result = await pool.query<PreferencesRow>(
-      `INSERT INTO principal_preferences (principal_id, theme, reduced_motion)
-            VALUES ($1, $2, COALESCE($4, 'system'))
+      `INSERT INTO principal_preferences (principal_id, theme, reduced_motion, map_reports_mode)
+            VALUES ($1, $2, COALESCE($4, 'system'), COALESCE($6, 'collapsed'))
        ON CONFLICT (principal_id) DO UPDATE
               SET theme = CASE WHEN $3 THEN EXCLUDED.theme ELSE principal_preferences.theme END,
                   reduced_motion = CASE WHEN $5 THEN EXCLUDED.reduced_motion
                                         ELSE principal_preferences.reduced_motion END,
+                  map_reports_mode = CASE WHEN $7 THEN EXCLUDED.map_reports_mode
+                                          ELSE principal_preferences.map_reports_mode END,
                   updated_at = now()
-         RETURNING theme, reduced_motion`,
+         RETURNING theme, reduced_motion, map_reports_mode`,
       [
         principalId,
         themeGiven ? patch.theme ?? null : null,
         themeGiven,
         motionGiven ? patch.reducedMotion : null,
         motionGiven,
+        mapReportsGiven ? patch.mapReportsMode : null,
+        mapReportsGiven,
       ]
     );
     return toPreferences(result.rows[0]);

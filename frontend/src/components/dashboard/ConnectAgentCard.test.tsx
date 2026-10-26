@@ -11,7 +11,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { ConnectAgentCard } from './ConnectAgentCard';
@@ -134,7 +134,10 @@ describe('ConnectAgentCard', () => {
     await waitFor(() => {
       expect(screen.getByText('Paste this into your agent and let it configure itself.')).toBeInTheDocument();
     });
-    expect(screen.getByText(/rh_dev_ab12cd34ef56.SECRETVALUE0000000000/)).toBeInTheDocument();
+    // Claude Code is a harness template (E462 S1): the credential is in the tab's
+    // block and, once more, in the block that hands it to the installer.
+    expect(within(screen.getByTestId('tab-block')).getByText(/rh_dev_ab12cd34ef56.SECRETVALUE0000000000/)).toBeInTheDocument();
+    expect(screen.getByTestId('installer-token').textContent).toBe('rh_dev_ab12cd34ef56.SECRETVALUE0000000000');
     expect(screen.getByText(/shown once and is never stored on the board/)).toBeInTheDocument();
 
     // And only when the person is finished does the card fold away, because

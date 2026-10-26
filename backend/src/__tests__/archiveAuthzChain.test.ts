@@ -191,3 +191,18 @@ describe('hostile-exception envelopes (review f98d127b B1): no caught message re
     }
   });
 });
+
+test('route/shared adapter/real bulk/archive/update retains failure reference and concealed missing result', async () => {
+ const {TaskManagerDB}=jest.requireActual('../services/TaskManagerDB');
+ const query=jest.fn(async(..._args:any[])=>({rows:[{id:IN_GRANT_A,status:'completed',archived_at:null}]}));
+ const m=new TaskManagerDB({connect:async()=>({query,release:jest.fn()})});
+ jest.spyOn(m,'getTask').mockResolvedValue({id:IN_GRANT_A,status:'completed'});
+ jest.spyOn(m,'getAllTasks').mockResolvedValue([]);
+ // Only the singleton wiring is replaced; the actual mutation is not mocked.
+ bulkSpy.mockImplementationOnce((...args:any[])=>m.bulkArchiveCompleted(...args));
+ const {status,json}=await request('POST','/tasks/bulk-archive',{taskIds:[OUT_OF_GRANT,IN_GRANT_A]});
+ expect(status).toBe(200);expect(json.archivedCount).toBe(0);expect(json.failedCount).toBe(2);
+ expect(json.results[0]).toEqual({id:OUT_OF_GRANT,archived:false,code:'NOT_FOUND',error:'Task not found'});
+ expect(json.results[1]).toEqual({id:IN_GRANT_A,archived:false,code:'FORBIDDEN',error:'Lifecycle authority does not permit archival',errorId:expect.any(String)});
+ expect(query.mock.calls.map(c=>c[0])).toContain('ROLLBACK');
+});

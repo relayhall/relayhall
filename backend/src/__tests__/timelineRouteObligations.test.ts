@@ -2,8 +2,8 @@
  * timelineRouteObligations.test.ts — C1 route-level obligations (review
  * edf44910 F4): visibility parity with /stream, typed 400s for invalid
  * filter/cursor, degradation surfaced in the response envelope, and the
- * reports route obligations (UUID validation, authorization post-filters
- * unchanged). House idiom: structural pins over the route source, in the
+ * reports route obligations (UUID validation, authorization narrowing
+ * before pagination and again before serialization). House idiom: structural pins over the route source, in the
  * same spirit as notesAttribution.test.ts — the functional behavior is
  * pinned by the unifiedTimeline suite over the production functions.
  */
@@ -78,20 +78,23 @@ describe("GET /reports taskId route obligations", () => {
     expect(body).toContain("taskId,");
   });
 
-  it("authorization post-filters are unchanged and run AFTER the bounded query", () => {
-    // Card 72258a60 moved the three narrowings out of this handler and into
-    // `services/ReportVisibility`, because the dashboard's `reportCount` has
-    // to run the SAME three and a second copy is how two surfaces come to
-    // disagree about a row. The order obligation is therefore two claims now:
-    // the handler narrows AFTER its bounded query, and the thing it calls
-    // still composes all three, in that order.
+  it("shared authorization narrows pagination candidates and rechecks fetched content before serialization", () => {
+    // Pagination counts only visible candidates through the shared policy.
+    // Fetched full rows are checked again before serialization because their
+    // visibility/content may change after the candidate/count decision.
     const routes = read("routes/reports.ts");
     const start = routes.indexOf("router.get('/'");
     const body = routes.slice(start, routes.indexOf("\nrouter.", start + 10));
     const listIdx = body.indexOf("reportManager.list(");
-    const narrowIdx = body.indexOf("filterVisibleReports(");
+    const candidateFilter = "(rows) => filterVisibleReports(req as AuthRequest, rows)";
+    const finalFilter = "const reports = await filterVisibleReports(req as AuthRequest, result.reports)";
+    const candidateIdx = body.indexOf(candidateFilter);
+    const finalIdx = body.indexOf(finalFilter);
+    const responseIdx = body.indexOf("res.json({", listIdx);
     expect(listIdx).toBeGreaterThan(-1);
-    expect(narrowIdx).toBeGreaterThan(listIdx);
+    expect(candidateIdx).toBeGreaterThan(listIdx);
+    expect(finalIdx).toBeGreaterThan(candidateIdx);
+    expect(responseIdx).toBeGreaterThan(finalIdx);
 
     const visibility = read("services/ReportVisibility.ts");
     for (const name of ["filterAuthorizedResources", "filterTaskScopedPromotions", "filterPromotedReports"]) {
@@ -102,7 +105,11 @@ describe("GET /reports taskId route obligations", () => {
     expect(composed.indexOf("filterAuthorizedResources"))
       .toBeLessThan(composed.indexOf("filterVisiblePromotions"));
 
-    // pagination honesty is preserved
-    expect(body).toContain("hasMore: false");
+    // Forward the visible count/page decision, not a page-length total or
+    // constant hasMore. Concurrent final-row omissions can shorten this page.
+    const response = body.slice(responseIdx, body.indexOf("});", responseIdx));
+    expect(response).toContain("reports,");
+    expect(response).toContain("total: result.total");
+    expect(response).toContain("hasMore: result.hasMore");
   });
 });

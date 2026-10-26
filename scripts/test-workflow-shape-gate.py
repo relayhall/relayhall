@@ -247,7 +247,8 @@ CASES = [
 # no case is a rule nobody has measured, so the run fails rather than reporting
 # a smaller number of passes.
 RULES = {'parses', 'duplicate-keys', 'trigger', 'steps-present', 'one-action',
-         'action-value', 'known-keys', 'forge-parity', 'gate-census', 'full-tier-unconditional'}
+         'action-value', 'known-keys', 'forge-parity', 'gate-census', 'full-tier-unconditional',
+         'frontend-shards'}
 
 
 def run_checker(cwd: pathlib.Path) -> subprocess.CompletedProcess:
@@ -360,6 +361,132 @@ TREE_CASES = [
      ['names no gate'], 'gate-census'),
 ]
 
+# ---------------------------------------------------------------------------
+# Rule 10 (E473): the Frontend unit tests are sharded, and the workflow must name
+# exactly the shards the plan declares. One correct fast-tier workflow, and one
+# mutant per way the split can quietly lose a slice of the tests.
+
+SHARD_PLAN = 'scripts/frontend-test-shards.json'
+SHARD_PLAN_CONTENT = '{"schema": "frontend-test-shards/1", "shards": 3, "defaultSeconds": 1, "weights": {}}\n'
+
+SHARDED_CI = """name: CI
+on:
+  push:
+    branches: ['**']
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+  frontend:
+    name: Frontend build and tests
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx tsc --noEmit
+      - name: Prove the frontend unit-test shards cover the whole file set
+        run: python3 ../scripts/frontend-test-shard.py check
+      - run: npm run test:unit:tz
+  frontend-unit:
+    name: Frontend unit tests (shard ${{ matrix.shard }} of 3)
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Frontend unit tests (one shard of the file set)
+        run: python3 ../scripts/frontend-test-shard.py run --shard ${{ matrix.shard }}/3
+"""
+
+
+def mutated(text: str, old: str, new: str) -> str:
+    """`text` with one edit, refusing to return it unchanged: a mutation that
+    matched nothing would leave a correct workflow and make its case pass for
+    the wrong reason."""
+    if old not in text:
+        raise SystemExit(f'the mutation target {old!r} is not in the template; fix the control')
+    return text.replace(old, new, 1)
+
+
+def sharded_tree(ci: str, plan: str = SHARD_PLAN_CONTENT) -> dict:
+    return {'.github/workflows/ci.yml': ci, '.gitea/workflows/ci.yml': ci, SHARD_PLAN: plan}
+
+
+SHARD_CASES = [
+    ('a shard missing from the matrix',
+     sharded_tree(mutated(SHARDED_CI, 'shard: [1, 2, 3]', 'shard: [1, 2]')),
+     ['matrix `shard` is [1, 2]', 'never runs'], 'frontend-shards'),
+    ('a shard added to the matrix that the plan does not declare',
+     sharded_tree(mutated(SHARDED_CI, 'shard: [1, 2, 3]', 'shard: [1, 2, 3, 4]')),
+     ['matrix `shard` is [1, 2, 3, 4]'], 'frontend-shards'),
+    ('the plan declares more shards than the matrix names',
+     sharded_tree(SHARDED_CI, SHARD_PLAN_CONTENT.replace('"shards": 3', '"shards": 4')),
+     ['declares 4 shards'], 'frontend-shards'),
+    ('an exclude that drops a shard behind the declared list',
+     sharded_tree(mutated(SHARDED_CI, 'shard: [1, 2, 3]', 'shard: [1, 2, 3]\n        exclude:\n          - shard: 3')),
+     ['`include` and `exclude`'], 'frontend-shards'),
+    ('fail-fast left on, so one red shard hides the others',
+     sharded_tree(mutated(SHARDED_CI, 'fail-fast: false', 'fail-fast: true')),
+     ['fail-fast: false'], 'frontend-shards'),
+    ('the shards skipped on a different condition than the job they belong to',
+     sharded_tree(mutated(SHARDED_CI, "    if: ${{ needs.changes.outputs.frontend == 'true' }}\n    runs-on: ubuntu-latest\n    strategy:",
+                          "    if: ${{ needs.changes.outputs.cli == 'true' }}\n    runs-on: ubuntu-latest\n    strategy:")),
+     ['skipped together'], 'frontend-shards'),
+    ('the shard step cut for a different count than the plan',
+     sharded_tree(mutated(SHARDED_CI, '--shard ${{ matrix.shard }}/3', '--shard ${{ matrix.shard }}/2')),
+     ['exactly one shard step'], 'frontend-shards'),
+    ('the shard job without its shard step',
+     sharded_tree(mutated(SHARDED_CI,
+                          '      - name: Frontend unit tests (one shard of the file set)\n'
+                          '        run: python3 ../scripts/frontend-test-shard.py run --shard ${{ matrix.shard }}/3\n',
+                          '      - run: echo no tests\n')),
+     ['exactly one shard step'], 'frontend-shards'),
+    ('the serial unit-test step left in the frontend job',
+     sharded_tree(mutated(SHARDED_CI, '      - run: npm run test:unit:tz\n',
+                          '      - run: npm run test:unit\n      - run: npm run test:unit:tz\n')),
+     ['still runs `npm run test:unit` serially'], 'frontend-shards'),
+    ('the coverage proof removed from the frontend job',
+     sharded_tree(mutated(SHARDED_CI,
+                          '      - name: Prove the frontend unit-test shards cover the whole file set\n'
+                          '        run: python3 ../scripts/frontend-test-shard.py check\n', '')),
+     ['exactly once', 'the coverage proof'], 'frontend-shards'),
+    ('the shards waiting on a different job than the frontend job does',
+     sharded_tree(mutated(SHARDED_CI,
+                          "    needs: changes\n    if: ${{ needs.changes.outputs.frontend == 'true' }}\n    runs-on: ubuntu-latest\n    strategy:",
+                          "    needs: [changes, frontend]\n    if: ${{ needs.changes.outputs.frontend == 'true' }}\n    runs-on: ubuntu-latest\n    strategy:")),
+     ['skipped together', '`needs`'], 'frontend-shards'),
+    ('the shard job named for a different count than the plan',
+     sharded_tree(mutated(SHARDED_CI, 'name: Frontend unit tests (shard ${{ matrix.shard }} of 3)',
+                          'name: Frontend unit tests (shard ${{ matrix.shard }} of 4)')),
+     ['is named', 'expected'], 'frontend-shards'),
+    ('the plan file declares one shard, which is not a split',
+     sharded_tree(SHARDED_CI, SHARD_PLAN_CONTENT.replace('"shards": 3', '"shards": 1')),
+     ['it must be an integer of at least 2'], 'frontend-shards'),
+    ('the frontend job deleted outright',
+     sharded_tree(mutated(SHARDED_CI, '  frontend:\n    name: Frontend build and tests\n', '  frontend-other:\n    name: Something else\n')),
+     ["job 'frontend' is missing"], 'frontend-shards'),
+    ('continue-on-error on the shard job, so a red shard leaves the run green',
+     sharded_tree(mutated(SHARDED_CI,
+                          "    runs-on: ubuntu-latest\n    strategy:",
+                          "    runs-on: ubuntu-latest\n    continue-on-error: true\n    strategy:")),
+     ["job 'frontend-unit' sets `continue-on-error`", 'no longer gate anything'], 'frontend-shards'),
+    ('continue-on-error on the shard step, so a red shard leaves the run green',
+     sharded_tree(mutated(SHARDED_CI,
+                          "        run: python3 ../scripts/frontend-test-shard.py run --shard ${{ matrix.shard }}/3\n",
+                          "        run: python3 ../scripts/frontend-test-shard.py run --shard ${{ matrix.shard }}/3\n"
+                          "        continue-on-error: true\n")),
+     ["step 'Frontend unit tests (one shard of the file set)' sets `continue-on-error`"], 'frontend-shards'),
+    ('the shard job deleted outright',
+     sharded_tree(SHARDED_CI.split('  frontend-unit:')[0]),
+     ["job 'frontend-unit' is missing"], 'frontend-shards'),
+]
+TREE_CASES += SHARD_CASES
+
 # The non-vacuity partner for the cases above: the same shape, correct.
 TREE_VALID = {
     '.github/workflows/ci.yml': MINIMAL,
@@ -471,6 +598,27 @@ def main() -> int:
     # REAL repository is required to carry a non-empty census here. Deleting
     # `scripts/ci-gate-steps.txt` reddens this control rather than quietly
     # retiring the rule that says no gate was lost.
+    # Rule 10 is keyed on the plan file the same way, so the same fail-closed
+    # requirement applies: the real repository carries it, and a correct sharded
+    # workflow is accepted (otherwise every red above could be a checker that
+    # refuses any workflow with a matrix).
+    with tempfile.TemporaryDirectory() as raw:
+        result = sandbox_tree(root, pathlib.Path(raw), sharded_tree(SHARDED_CI))
+        if result.returncode != 0:
+            print('a WELL-FORMED sharded workflow was refused - rule 10 refuses everything:',
+                  file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            failures += 1
+        else:
+            print('well_formed_sharded_workflow_passes=pass')
+    if not (root / SHARD_PLAN).exists():
+        print(f'the REAL repository has no shard plan at {SHARD_PLAN} - rule 10 is keyed on it, '
+              'so without it the Frontend shards are not protected from losing a slice',
+              file=sys.stderr)
+        failures += 1
+    else:
+        print('real_repository_shard_plan=present')
+
     census = root / CENSUS
     listed = []
     if census.exists():

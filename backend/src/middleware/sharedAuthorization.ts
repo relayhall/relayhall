@@ -1,18 +1,58 @@
+import { pool } from '../db/connection';
+import { resourceAccountControl } from '../services/AccountControlService';
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from './auth';
 import { authorizationService, AuthorizationActor } from '../services/AuthorizationService';
-import type { AuthorizationAction } from '../services/AuthorizationService';
+import type { AuthorizationAction, AuthorizationDecision } from '../services/AuthorizationService';
 import { authorizationRepository } from '../services/AuthorizationRepository';
 import type { AuthorizationListScope } from '../services/AuthorizationRepository';
 import type { GrantResourceType } from '../services/GrantService';
 import type { AuthorizationResource } from '../services/AuthorizationService';
-import { normalizePathForScope, requiredScopeFor, ROOT_SCOPE } from '../utils/scopeMap';
+import { normalizePathForScope, requiredScopeFor, ROOT_SCOPE, scopesNamedByDenial } from '../utils/scopeMap';
 import { resolveActorRole } from '../utils/taskAutomationRole';
 import { sendApiError } from '../utils/apiErrors';
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { accessSurfaceService, type AccessLevel } from '../services/AccessSurfaceService';
 import { auditService } from '../services/AuditService';
 import { auditActorFromRequest } from '../utils/auditActor';
+import { attachSkillRefusalAudit } from '../utils/skillRefusalAudit';
+import { isTaskCompletionPatch } from '../utils/taskLifecycle';
+import { projectOwnershipService } from '../services/ProjectOwnershipService';
+import { isFullUuid, refuseMalformedPathId } from './validate';
+import { charterService } from '../services/CharterService';
+import { verifierTaskActAllowed } from '../services/ExplicitTaskActionCaps';
+
+/** Audit only the named Charter approval refusal, without changing any gate
+ * or resolving concealed Charter content. Request attribution is trusted. */
+async function auditCharterRefusal(req: AuthRequest, mountedPath: string): Promise<void> {
+  if (req.method.toUpperCase() !== 'POST') return;
+  const match = /^\/projects\/([^/]+)\/charter\/approve$/.exec(normalizePathForScope(mountedPath));
+  if (!match) return;
+  await charterService.recordRefusedApproval(isFullUuid(match[1]) ? match[1] : null, auditActorFromRequest(req));
+}
+
+/**
+ * Card 5216d735 (owner ruling E311): the `res.locals` key the point stage sets
+ * when it hands `PUT /phases/:id/default-verifier` to its handler although the
+ * point decision refused. The handler reads it and can only refuse: it is a
+ * choice of refusal, never an admission.
+ */
+export const DEFAULT_VERIFIER_POINT_REFUSED = 'defaultVerifierPointRefused';
+
+/**
+ * Whether a Phase's Project lends the actor read on the Phase for the E311
+ * refusal choice: read on the Project, unless the Phase is restricted (a
+ * restricted Phase suppresses what its Project lends, ruling 44ee41f2). The
+ * Project read is the shared predicate, never a copy.
+ */
+async function phaseReadableThroughProject(actor: AuthorizationActor, phaseId: string): Promise<boolean> {
+  const found = await pool.query(
+    'SELECT project_id::text AS project_id, restricted_access FROM phases WHERE id = $1', [phaseId]);
+  const row = found.rows[0];
+  if (!row || row.restricted_access) return false;
+  const projectId = String(row.project_id);
+  return (await authorizationRepository.authorizedIds(actor, 'project', [projectId], 'read')).has(projectId);
+}
 
 export function actorFromRequest(req: AuthRequest): AuthorizationActor {
   return {
@@ -53,7 +93,7 @@ const NON_OBJECT_SEGMENTS = new Set([
   // classifier synthesizes a Task id 'ids'/'bulk-archive' and 404s them.
   'ids', 'bulk-archive',
   // Candidate A3 scale-read collection routes (design 986be411 §5).
-  'aggregates', 'graph',
+  'aggregates', 'graph', 'activity',
 ]);
 
 export interface PointAuthorizationTarget {
@@ -213,13 +253,18 @@ export function authorizedListScope<T extends GrantResourceType>(
 
 /** Vocabulary5.3: park and Service reassignment are bounded Shepherd acts.
  * This classifies only the payload shape. Authority still uses the canonical
- * point predicate, and execution descriptor/invoke checks stay in the writer. */
+ * point predicate, and execution descriptor/invoke checks stay in the writer.
+ * AZ-A10 clause 6 / E62: the assigning act carries its own date, so
+ * `roleGrantExpiresAt` belongs to the reassignment shape — whoever may
+ * perform the reassignment may date it. It never makes a body shepherd-shaped
+ * on its own: `executionProfile` is still required. */
 export function isShepherdTaskPatch(body: unknown): boolean {
   if (!body || typeof body !== 'object' || Array.isArray(body)
     || Object.getPrototypeOf(body) !== Object.prototype) return false;
   const row = body as Record<string, unknown>; const keys = Object.keys(row);
   if (keys.length === 1 && keys[0] === 'autoStart') return row.autoStart === false;
-  return keys.includes('executionProfile') && keys.every(key => ['executionProfile', 'executionWarrantId'].includes(key))
+  return keys.includes('executionProfile')
+    && keys.every(key => ['executionProfile', 'executionWarrantId', 'roleGrantExpiresAt'].includes(key))
     && row.executionProfile !== null && typeof row.executionProfile === 'object' && !Array.isArray(row.executionProfile);
 }
 export function pointAuthorizationTarget(method: string, mountedPath: string, body?: unknown): PointAuthorizationTarget | null {
@@ -265,8 +310,26 @@ export function pointAuthorizationTarget(method: string, mountedPath: string, bo
   let action: AuthorizationAction;
   if (upperMethod === 'GET') action = 'read';
   else if (upperMethod === 'DELETE') action = 'admin';
+  else if (type === 'task' && upperMethod === 'PATCH' && segments.length === 2 && isTaskCompletionPatch(body)) action = 'verify';
+  else if (type === 'task' && tail[0] === 'native-reviews') action = 'read'; // Handler applies current Verifier/Shepherd and Service authority.
+  else if (type === 'task' && tail[0] === 'native-executions') action = 'read'; // Handler checks current implementation owner/assignment or bounded Shepherd recovery.
   else if (tail.includes('prompt') || tail.includes('brief')) action = 'read';
-  else if (routeWords.includes('reviewer') || tail.includes('approve') || tail.includes('reject')) action = 'verify';
+  else if (type === 'task' && upperMethod === 'PUT' && tail.length === 1 && tail[0] === 'account-owner') action = 'admin';
+  else if (type === 'project' && upperMethod === 'PUT'
+    && tail.length === 1 && tail[0] === 'owner') action = 'admin';
+  // Card d67e6990: the Skill owner assignment is the admin action on the Skill.
+  else if (type === 'skill' && upperMethod === 'PUT'
+    && tail.length === 1 && tail[0] === 'owner') action = 'admin';
+  // Card 41e24358 (check F2): the default Verifier is NOT the admin-action
+  // class, which would refuse the person owner at the role ceiling. The point
+  // stage asks `write` (the owner arm admits the person owner; a Phase
+  // resolves to its Project's owner) and the handler applies the real gate.
+  else if ((type === 'project' || type === 'phase') && upperMethod === 'PUT'
+    && tail.length === 1 && tail[0] === 'default-verifier') action = 'write';
+  else if (type === 'project' && upperMethod === 'POST'
+    && tail.length === 2 && tail[0] === 'charter' && tail[1] === 'approve') action = 'write';
+  else if (routeWords.includes('reviewer') || tail.includes('approve') || tail.includes('reject')
+    || type === 'task' && tail.length === 1 && tail[0] === 'success-criteria') action = 'verify';
   else if (tail.includes('roles')) action = 'shepherd';
   else if (tail.includes('access')) action = 'admin';
   else if (tail.includes('claim')) action = 'claim';
@@ -360,15 +423,29 @@ async function recordSurfaceRefusal(
 /**
  * Returns true when the request may continue to the point stage. When it
  * returns false the response has already been sent.
+ *
+ * `routeDenial` is the route ceiling's own reason (`authorizeRoute().denial`).
+ * It is optional so every caller that does not pass it keeps the bare refusal.
  */
 export async function evaluateSurfaceStage(
   req: AuthRequest,
   res: Response,
   mountedPath: string,
   required: ReturnType<typeof requiredScopeFor>,
+  routeDenial?: AuthorizationDecision['denial'],
 ): Promise<boolean> {
   const refuseUnchanged = (): boolean => {
-    sendApiError(res, 403, 'FORBIDDEN', 'This identity is not authorized for the requested operation');
+    // Same status, code and text as ever. When the ceiling refused because the
+    // credential lacks the route's scope, the scope it checked rides along as
+    // structured data (`details.requiredScopes`) so a caller - the MCP layer in
+    // particular - can name the REAL scope instead of guessing one. It is the
+    // route's own requirement, never what the credential holds, and it is
+    // absent for every other cause.
+    const requiredScopes = scopesNamedByDenial(required, routeDenial);
+    sendApiError(
+      res, 403, 'FORBIDDEN', 'This identity is not authorized for the requested operation',
+      undefined, requiredScopes ? { requiredScopes } : undefined,
+    );
     return false;
   };
 
@@ -442,27 +519,179 @@ export async function evaluateSurfaceStage(
   return refuseUnchanged();
 }
 
+/**
+ * Card bc847bd0, owner ruling E159 ("refuse names"): a Project is addressed by
+ * its id.
+ *
+ * The point stage resolves a Project by NAME as well as by id
+ * (`AuthorizationRepository.resolve`), so a Project's name in the path passed
+ * it and reached about twenty handlers that read `projects.id` as a uuid
+ * (500), and the owner paths read it before the route ceiling (503). A path
+ * Project id that is not a full UUID is refused here, BEFORE ANYTHING READS
+ * IT, with 400 INVALID_PROJECT_ID. No name is resolved to an id.
+ *
+ * Where it answers. The route ceiling and the Access-surface arm read no
+ * Project, so a caller they refuse outright keeps their refusal (403), exactly
+ * as it gets for any id. Two arms admit a caller only by READING the Project -
+ * the owner-change path and the account-owner arm - so for a caller one of
+ * them could admit, the only answer that reads nothing is the shape refusal.
+ *
+ * Returns true when the response has been sent.
+ */
+async function refuseMalformedProjectId(
+  req: AuthRequest,
+  res: Response,
+  actor: AuthorizationActor,
+  mountedPath: string,
+  required: ReturnType<typeof requiredScopeFor>,
+  ownerChange: boolean,
+): Promise<boolean> {
+  const target = pointAuthorizationTarget(req.method, mountedPath, req.body);
+  if (!target || target.type !== 'project' || isFullUuid(target.identifier)) return false;
+  const ceiling = authorizationService.authorizeRoute(actor, required);
+  const readingArm = ownerChange || (target.action === 'admin' && Boolean(req.principal?.id)
+    && authorizationService.authorizeRoute(actor, 'projects:write').allowed);
+  if (!ceiling.allowed && !readingArm) {
+    try {
+      await auditCharterRefusal(req, mountedPath);
+      if (!await evaluateSurfaceStage(req, res, mountedPath, required, ceiling.denial)) return true;
+    } catch {
+      sendApiError(res, 503, 'AUTHORIZATION_UNAVAILABLE', 'Authorization could not be evaluated');
+      return true;
+    }
+  }
+  await auditCharterRefusal(req, mountedPath);
+  refuseMalformedPathId(res, 'INVALID_PROJECT_ID', 'project',
+    'Address a Project by its id; GET /projects lists the Projects you can read, with their ids');
+  return true;
+}
+
 export async function sharedAuthorizationMiddleware(
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   const mountedPath = `${req.baseUrl || ''}${req.path}`;
+  attachSkillRefusalAudit(req, res, normalizePathForScope(mountedPath));
   const required = requiredScopeFor(req.method, mountedPath);
-  const decision = authorizationService.authorizeRoute(actorFromRequest(req), required);
-  if (!decision.allowed) {
-    // The route stage has refused. The Access-surface arm is the ONLY thing
-    // that may still admit the request, and only by substituting for the
-    // `root` sentinel on a governable surface's declared families.
+  // AZ-A10 11c: a verifier Agent's tasks:write scope buys only its own
+  // verify act. Apply before the route ceiling and before any handler runs.
+  const actingLink = req.delegationLinks?.[0];
+  if (required === 'tasks:write' && actingLink?.kind === 'agent'
+    && actingLink.boundTaskRole === 'verifier') {
+    const verdict = pointAuthorizationTarget(req.method, mountedPath, req.body);
+    if (!verifierTaskActAllowed(actingLink, verdict)) {
+      sendApiError(res, 403, 'VERIFIER_ACT_CAP',
+        'AZ-A10 clause 11c permits tasks:write only for the verify act on the bound task');
+      return;
+    }
+  }
+  const ownerChange = req.method.toUpperCase() === 'PUT'
+    && /^\/projects\/[^/]+\/owner$/.test(normalizePathForScope(mountedPath));
+  const actor = actorFromRequest(req);
+  if (await refuseMalformedProjectId(req, res, actor, mountedPath, required, ownerChange)) return;
+  // Owner writes are admin-scoped, but the early route ceiling must not
+  // turn an unreadable Project's 404 into a role-dependent 403.
+  const taskOwnerChange = req.method.toUpperCase() === 'PUT'
+    && /^\/tasks\/[^/]+\/account-owner$/.test(normalizePathForScope(mountedPath));
+  if (ownerChange || taskOwnerChange) {
     try {
-      if (!await evaluateSurfaceStage(req, res, mountedPath, required)) return;
+      const target = pointAuthorizationTarget(req.method, mountedPath, req.body);
+      const readable = target && await authorizationRepository.authorizePoint(
+        actor, target.type, target.identifier, 'read',
+      );
+      if (!readable || !readable.exists || readable.concealed || !readable.allowed) {
+        sendApiError(res, 404, 'RESOURCE_NOT_FOUND', 'Resource not found');
+        return;
+      }
     } catch {
       sendApiError(res, 503, 'AUTHORIZATION_UNAVAILABLE', 'Authorization could not be evaluated');
       return;
     }
   }
-  const actor = actorFromRequest(req);
+  // Exact-resource account control never adds estate-wide admin scopes.
+  // Card bc847bd0: the arm compares uuid columns, so an identifier that is not
+  // a full UUID cannot name an object it would admit for. It does not read
+  // then (it threw 22P02 and answered 503 on every admin-action Task, Phase,
+  // Report and Project route), and the request goes on to the route ceiling
+  // and the point stage like any other.
+  const ownerTarget = pointAuthorizationTarget(req.method, mountedPath, req.body);
+  const criteriaOwnerPath = ownerTarget?.type === 'task' && ownerTarget.action === 'verify'
+    && /^\/tasks\/[^/]+\/success-criteria\/?$/i.test(mountedPath);
+  let accountOwnedAdmin = false;
+  if ((ownerTarget?.action === 'admin' || criteriaOwnerPath) && ownerTarget && req.principal?.id && isFullUuid(ownerTarget.identifier)
+    && ['task','project','phase','report'].includes(ownerTarget.type)
+    && authorizationService.authorizeRoute(actor,
+      ({task:'tasks:write',project:'projects:write',phase:'phases:write',report:'reports:write'} as const)[ownerTarget.type as 'task'|'project'|'phase'|'report']).allowed) {
+    try {
+      const client = await pool.connect();
+      try { accountOwnedAdmin = Boolean(await resourceAccountControl(client,
+        ownerTarget.type as 'task'|'project'|'phase'|'report', ownerTarget.identifier, {
+          principalId: req.principal.id, handle: req.userId ?? '', authorization: actor,
+          authMethod: req.authMethod, credentialId: req.credentialId, sessionId: req.sessionId,
+        })); } finally { client.release(); }
+    } catch { sendApiError(res, 503, 'AUTHORIZATION_UNAVAILABLE', 'Ownership could not be evaluated'); return; }
+  }
+  const decision = authorizationService.authorizeRoute(actor, required);
+  if (!decision.allowed && !accountOwnedAdmin) {
+    if (ownerChange) {
+      try {
+        const target = pointAuthorizationTarget(req.method, mountedPath, req.body)!;
+        const access = await projectOwnershipService.access(target.identifier, {
+          authorization: actor, authMethod: req.authMethod, sessionId: req.sessionId, credentialId: req.credentialId, audit: auditActorFromRequest(req),
+        });
+        sendApiError(res, 403, access.reason ?? 'NO_PROJECT_ADMIN', 'A current human Project administrator is required');
+      } catch {
+        sendApiError(res, 503, 'AUTHORIZATION_UNAVAILABLE', 'Authorization could not be evaluated');
+      }
+      return;
+    }
+    // The route stage has refused. The Access-surface arm is the ONLY thing
+    // that may still admit the request, and only by substituting for the
+    // `root` sentinel on a governable surface's declared families.
+    try {
+      await auditCharterRefusal(req, mountedPath);
+      if (!await evaluateSurfaceStage(req, res, mountedPath, required, decision.denial)) return;
+    } catch {
+      sendApiError(res, 503, 'AUTHORIZATION_UNAVAILABLE', 'Authorization could not be evaluated');
+      return;
+    }
+  }
   req.authorizationActor = actor;
+
+  // E159: reject an invalid descriptor Version before point authorization
+  // reads the addressed Service. The route's scope ceiling has already run.
+  // Match Express's case-insensitive fixed words and non-strict trailing slash.
+  // Capture, then decode, the value without folding or trimming its bytes.
+  const descriptorVersionRoute = req.method.toUpperCase() === 'GET'
+    ? /^\/services\/[^/]+\/descriptor\/versions\/([^/]+)\/?$/i.exec(mountedPath)
+    : req.method.toUpperCase() === 'POST'
+      ? /^\/services\/[^/]+\/descriptor\/versions\/([^/]+)\/retire\/?$/i.exec(mountedPath)
+      : null;
+  if (descriptorVersionRoute) {
+    const descriptorVersion = decodeURIComponent(descriptorVersionRoute[1]);
+    if (!/^\d+$/.test(descriptorVersion) || Number(descriptorVersion) < 1 || Number(descriptorVersion) > 2147483647) {
+      sendApiError(res, 400, 'INVALID_QUERY_VALUE', 'version must be a positive integer up to 2147483647', 'version');
+      return;
+    }
+  }
+
+  // Personality writes address UUIDs, while GET deliberately accepts a slug.
+  // Refuse malformed write ids before point resolution can turn an arbitrary
+  // name into 404. Keep the handler's root ceiling ahead of that refusal.
+  const personalityWritePath = /^\/personalities\/([^/]+)\/?$/i.exec(mountedPath);
+  if (['PATCH', 'DELETE'].includes(req.method.toUpperCase()) && personalityWritePath) {
+    const personalityId = decodeURIComponent(personalityWritePath[1]);
+    if (!isFullUuid(personalityId)) {
+      if (!req.scopes?.includes('root')) {
+        res.status(403).json({ success: false, error: 'Forbidden', message: 'Credential management requires the root scope' });
+        return;
+      }
+      refuseMalformedPathId(res, 'INVALID_PERSONALITY_ID', 'personality',
+        'Address a Personality by its id; GET /personalities/{slug} returns it');
+      return;
+    }
+  }
 
   const target = pointAuthorizationTarget(req.method, mountedPath, req.body);
   if (!target) {
@@ -476,8 +705,22 @@ export async function sharedAuthorizationMiddleware(
       target.identifier,
       target.action,
     );
+    if (accountOwnedAdmin && (target.action === 'admin' || criteriaOwnerPath)) point = { ...point, allowed: true, concealed: false };
     if (!point.allowed && target.alternativeAction) {
       point = await authorizationRepository.authorizePoint(actor, target.type, target.identifier, target.alternativeAction);
+    }
+    // Card 5216d735 (owner ruling E311): on the Phase default-Verifier write a
+    // caller who can READ the Phase - read on it, or read on its Project - is
+    // answered by the handler's gate, as on the Project route (403
+    // DEFAULT_VERIFIER_REQUIRES_OWNER, audited), not concealed. The request is
+    // marked refused, so the handler can only refuse it: no caller gains an
+    // act. A caller who cannot read the Phase keeps the concealed 404 below.
+    if (!point.allowed && point.exists && req.method.toUpperCase() === 'PUT'
+      && /^\/phases\/[^/]+\/default-verifier$/.test(normalizePathForScope(mountedPath))
+      && (!point.concealed || await phaseReadableThroughProject(actor, String(point.resourceId)))) {
+      res.locals[DEFAULT_VERIFIER_POINT_REFUSED] = true;
+      next();
+      return;
     }
     // Card f9b7febe. ABSENT and UNREADABLE are ONE answer, on every verb.
     // This branch used to read `target.action === 'read'` instead of the
@@ -489,11 +732,20 @@ export async function sharedAuthorizationMiddleware(
     // resource and lacks authority for THIS act - because concealing that one
     // presents as a broken save and discloses nothing.
     if (!point.exists || point.concealed) {
+      await auditCharterRefusal(req, mountedPath);
       sendApiError(res, 404, 'RESOURCE_NOT_FOUND', 'Resource not found');
       return;
     }
     if (!point.allowed) {
-      sendApiError(res, 403, 'FORBIDDEN', 'This identity is not authorized for the requested resource');
+      await auditCharterRefusal(req, mountedPath);
+      if (ownerChange) {
+        const access = await projectOwnershipService.access(target.identifier, {
+          authorization: actor, authMethod: req.authMethod, sessionId: req.sessionId, credentialId: req.credentialId, audit: auditActorFromRequest(req),
+        });
+        sendApiError(res, 403, access.reason ?? 'NO_PROJECT_ADMIN', 'A current human Project administrator is required');
+      } else {
+        sendApiError(res, 403, 'FORBIDDEN', 'This identity is not authorized for the requested resource');
+      }
       return;
     }
     next();

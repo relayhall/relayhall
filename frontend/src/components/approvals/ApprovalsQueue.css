@@ -1,0 +1,166 @@
+/* The extracted approval queue (card b1e3b16d, lane L1). Its list, rows and
+   decide flow keep the Access manager's own `axm-*` rules, imported by the
+   component, so both mounts render one recipe. These are only what the
+   extraction added: the link into the hub, the kind chip the hub shows, and the
+   failed-read state that replaced a false "No pending approvals." */
+
+.approvals-queue-hub-link {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.approvals-queue-hub-link a {
+  color: var(--text-accent);
+}
+
+.approvals-queue-kind {
+  width: max-content;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.approvals-queue-failed {
+  min-height: 90px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  color: var(--text-error);
+  font-size: var(--text-sm);
+}
+
+/* A grant request's rows, related references and created grants (AZ-A9,
+   card 785e1eed P1-B): a plain list, one line per row. */
+.approvals-queue-rules {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+.approvals-queue-rule {
+  margin: var(--space-1) 0;
+}
+
+.approvals-queue-grant-editor {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.approvals-queue-grant-row {
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.approvals-queue-grant-row legend {
+  padding: 0 var(--space-1);
+  font-weight: 600;
+}
+
+.approvals-queue-grant-row textarea {
+  width: 100%;
+  min-height: 4rem;
+}
+
+/* A credential request's scope chip says whether the connector already holds
+   the scope or would gain it (AZ-A9 clause 7; card 785e1eed P1-B-2). */
+.approvals-queue-scope-tag {
+  margin-left: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* The requester's reason is UNTRUSTED text (AZ-A9 clause 3): fenced and
+   labelled, never styled as the board's own words. */
+.approvals-queue-untrusted {
+  border: 1px solid var(--status-warning-soft);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.approvals-queue-untrusted-label {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--status-warning-soft);
+  color: var(--text-warning);
+  font-size: var(--text-xs);
+}
+
+.approvals-queue-untrusted-text {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+}
+
+/* In-app links inside an item — the requested rows, the related task, phase
+   and project, the hub's references (card 6dc53ea0). They were bare <Link>s,
+   so the browser's default blue showed through: 1.99:1 on the dark surface.
+   Now the dashboard's token link ink (--text-accent on --bg-surface is a gated
+   pair in every Theme, docs/design-system.md), underlined so a link is not
+   told by colour alone, a heavier underline on hover, and the shared focus
+   ring on keyboard focus. Both mounts (Access manager and hub) render it. */
+.approvals-queue-link {
+  color: var(--text-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.approvals-queue-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.approvals-queue-link:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
+}
+
+.approvals-queue-link svg {
+  vertical-align: text-bottom;
+}
+
+/* T9: the hub's sections — one per Group, Shared, Private (yours, then each
+   other owner), Board-level (card b1e3b16d). */
+.approvals-queue-section {
+  margin-top: var(--space-4);
+}
+
+.approvals-queue-section-heading {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+/* T10: the hub's item facts — when, about what, who decides. */
+.approvals-queue-facts {
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+.approvals-queue-fact {
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* Whether THIS session may decide, as the server says: words, not colour
+   alone. */
+.approvals-queue-yours {
+  color: var(--text-success);
+  font-weight: 600;
+}
+
+.approvals-queue-others {
+  color: var(--text-tertiary);
+}
+
+.approvals-queue-groups-more {
+  color: var(--text-tertiary);
+}

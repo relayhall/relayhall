@@ -22,18 +22,117 @@
 }
 
 /* ========================================
+   IDENTITY BLOCK - account row + identity widget (card 89c4eb9a, scope A)
+   ======================================== */
+
+/* The account used to be a filled, rounded box on `--bg-surface` sitting on a
+   rail whose gradient STARTS at `--bg-app`: a lighter rectangle against a
+   darker rail reads as a notice ABOUT the session rather than as the session's
+   own row. It takes the rail's own background now, so nothing floats, and it
+   keeps the `position: sticky` it shipped with — the handle stays readable
+   while the rail scrolls, which is why the row is still a direct child of the
+   rail rather than wrapped. The identity block is closed by the one hairline
+   under the widget host (see `.sidebar-avatar-section`), and that single
+   separator is what makes the rail a hierarchy: identity, then plugin
+   widgets, then navigation.
+
+   Since owner ruling E21 (10 Oct 2026) the row is three things only: the
+   monogram, the handle and the bell. `space-between` keeps the bell at the
+   row's trailing edge when there is no handle to fill the middle (the
+   Settings link, which used to do that with `margin-left: auto`, now sits
+   above Logout). */
+.sidebar-account {
+  position: sticky;
+  top: 0;
+  z-index: 1001;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: 0 0 var(--space-2);
+  background: var(--bg-app);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* The avatar is a monogram, not a graphic: the identity WIDGET below already
+   carries the product's animated presence, and a second illustration in the
+   same block would compete with it. Neutral tokens only — the estate's literal
+   ratchet stands at zero and a generated hue here would be a new literal. */
+.sidebar-account-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.sidebar-account-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+/* The handle is the row's only text since E21 retired the `Signed in as`
+   caption; it ellipsises rather than wraps, and the row's tooltip carries the
+   full handle. */
+.sidebar-account-handle {
+  display: block;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ========================================
    AVATAR SECTION - Top Priority
    ======================================== */
 
+/* The body the identity disclosure controls. Hidden with `display: none`, like
+   every other widget body, so the frame stays in the document and the bridge
+   and declared height survive a collapse. */
+.sidebar-identity-host {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.sidebar-identity-host--collapsed {
+  display: none;
+}
+
+/* The identity widget host. Since card 89c4eb9a it also CLOSES the identity
+   block: the account row and the widget are one thing, and the hairline is
+   the only rule drawn in the rail. The host's own geometry is untouched — the
+   widget's height is the plugin's to declare (48..240, plugin-host-v1) and the
+   legacy circle keeps its 180/128/64px breakpoints. */
 .sidebar-avatar-section {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 0;
+  padding: 0 0 var(--space-1);
+  margin-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle, var(--border-default));
   overflow: visible;
   position: relative;
   z-index: 10;
   flex-shrink: 0;
+  min-width: 0;
 }
 
 .avatar-container {
@@ -49,18 +148,147 @@
   border-radius: 50%;
 }
 
-.avatar-placeholder {
+/* The identity host carries EITHER the legacy circular orb OR one plugin
+   identity widget. A plugin widget is a page, not a circular graphic - the
+   Orb's own `/avatar` is a `100px 1fr` grid with textual telemetry beside the
+   visual - so masking it into the circle squeezed and clipped it. That is the
+   defect this variant repairs: rectangular, full sidebar width, the declared
+   height, no mask, and no size transition to animate. */
+/* Declared STANDALONE, not as `.avatar-container.avatar-container--widget`, so
+   the rendered-class ownership gate can attribute this class: owned_classes()
+   takes the first class of a selector's first compound, which in the compound
+   form is `avatar-container` and leaves the modifier owned by nobody. It sits
+   after the base rule and overrides all six properties the base sets, so equal
+   specificity plus source order does the work the extra compound used to. Do
+   not re-compound it. */
+.avatar-container--widget {
   width: 100%;
-  height: 100%;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--bg-surface-hover) 0%, var(--bg-elevated) 50%, var(--status-info) 100%);
-  color: var(--text-on-fill);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 4px 16px var(--shadow-color);
+  height: auto;
+  border-radius: 0;
+  overflow: visible;
+  display: block;
+  transition: none;
 }
 
+/* Every OTHER plugin sidebar widget: its own labelled block below the avatar,
+   full sidebar width, its own declared height, no circular mask, no overlap. */
+/* Below navigation since the 2026-09-18 audit (defect 5), so its own rule
+   above it separates telemetry from the navigation it used to push down. */
+.sidebar-plugin-widgets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+  margin-bottom: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle, var(--border-default));
+  flex-shrink: 0;
+}
+
+.sidebar-plugin-widget {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border-subtle, var(--border-default));
+  border-radius: 10px;
+  background: var(--overlay-weak);
+  /* Keep the square iframe corners inside the rounded block border. */
+  padding: 0 6px 6px;
+}
+
+/* The label IS the disclosure control (live audit P2). It keeps the label's
+   own rank — meta type, recessive ink — because promoting it to a heading
+   would make a secondary widget compete with the account row above it. */
+.sidebar-plugin-widget-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sidebar-plugin-widget-label:hover {
+  color: var(--text-primary);
+}
+
+.sidebar-plugin-widget-label:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: -2px;
+}
+
+/* Owner ruling E458: the SECTION frame (`ui.sidebar_widget.frame: "section"`).
+   The widget loses its box (border, radius, background, inner padding), so the
+   rows gain the width the padding took, and the label becomes a heading that
+   reads as one more navigation group heading: the same inset, ink, tracking
+   and radius as `.nav-group-header` / `.nav-group-label` (size, case and the
+   gap are the label's own, which already match). Declared standalone and AFTER
+   the base rules so equal specificity plus source order decides; the flex
+   column, the gap and the full width stay the block's own. */
+.sidebar-plugin-widget--section {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 0;
+}
+
+.sidebar-plugin-widget-label--section {
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: var(--text-tertiary);
+  letter-spacing: 0.08em;
+}
+
+.sidebar-plugin-widget-label--section:hover {
+  background: var(--overlay-weak);
+  color: var(--text-tertiary);
+}
+
+.sidebar-plugin-widget-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-plugin-widget-body {
+  width: 100%;
+  min-width: 0;
+}
+
+/* Collapsed is `display: none`, not an unmount: the iframe stays in the
+   document so the bridge and the widget's DECLARED height survive. */
+.sidebar-plugin-widget-body--collapsed {
+  display: none;
+}
+
+/* Owner ruling E465: the body of a SECTION widget paints nothing, so the
+   sidebar's own background shows through the frame (the frame element is
+   transparent too, inline, with its colour scheme kept equal to its
+   document's: PluginSidebarWidget.tsx). It also takes the navigation's own
+   horizontal inset, the one the section heading and the navigation group
+   headings already use, so the heading text, the rows' text and the menu share
+   one left edge; the rows begin at 0 inside the frame, so the inset belongs
+   here. Declared standalone and AFTER the base body rule so source order
+   decides; the boxed block's body is untouched. */
+.sidebar-plugin-widget-body--section {
+  background: transparent;
+  padding: 0 10px;
+}
+
+/* The class name is emitted by the identity-widget plugin's own markup, so it
+   is a contract with that plugin and stays as it is. */
 .sidebar-avatar-section .nim-orb-webgl {
   width: 100%;
   height: 100%;
@@ -177,33 +405,50 @@
   outline-offset: 2px;
 }
 
-/* Entry point to the user config page (RH-UI.2). Quiet by design: it sits
-   with the account action rather than in the navigation groups. */
+/* Entry point to the user config page (RH-UI.2). Quiet by design. Owner ruling
+   E21 (10 Oct 2026) moved it out of the account row to sit IMMEDIATELY ABOVE
+   Logout: Settings is used less often than the rest of the rail, and in the
+   row it made the header busy. It therefore takes the sign-out control's own
+   grammar — full width, the same border, ground, padding, radius and hover —
+   so the foot of the rail reads as one quiet pair, Settings then Logout.
+   Icon AND the word, because a rail that spells out `Dashboard` and `Logout`
+   has no reason to make this one entry a glyph the reader has to recognise.
+   The word is clipped in exactly one place, the 96px compact rail, which
+   withholds every other text label too; the drawer no longer clips it, since
+   the 44px close-control gutter belongs to the account row and not to the
+   foot. Clipped, never `display: none`, so the accessible name is the same
+   single word everywhere. */
 .sidebar-preferences-link {
   width: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  border-radius: 12px;
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-glass);
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: transparent;
   color: var(--text-secondary);
   padding: 11px 14px;
-  margin-bottom: var(--space-2);
   text-decoration: none;
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 .sidebar-preferences-link:hover {
-  background: var(--bg-glass-hover);
+  background: var(--bg-surface-hover);
   border-color: var(--border-strong);
   color: var(--text-primary);
+}
+
+.sidebar-preferences-link:focus-visible {
+  outline: 2px solid var(--focus-ring-color);
+  outline-offset: 2px;
 }
 
 .sidebar-preferences-text {
   font-size: var(--text-sm);
   font-weight: 600;
+  white-space: nowrap;
 }
 
 /* Walkthrough item R18. This was the only status fill in the chrome, so the
@@ -423,9 +668,43 @@
   margin-bottom: var(--space-1);
 }
 
-.sidebar.sidebar-compact .avatar-container {
+/* The 96px rail leaves 80px of content (96 - 2 x --space-2). A 36px monogram
+   and the 36px bell side by side, with the row's gaps, need 88px and neither
+   of them may shrink — so on this rail the row STACKS. Nothing is dropped: the
+   monogram and the bell are both still here, and only the handle goes, exactly
+   as every nav label, the logout word and the health dot already do on this
+   rail. */
+.sidebar.sidebar-compact .sidebar-account {
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.sidebar.sidebar-compact .sidebar-account-text {
+  display: none !important;
+}
+
+/* The Settings link above Logout keeps the sign-out control's compact
+   geometry here: centred glyph, the same 10px side padding (see the
+   `.sidebar-logout-button` compact rules below). */
+.sidebar.sidebar-compact .sidebar-preferences-link {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+.sidebar.sidebar-compact .avatar-container:not(.avatar-container--widget) {
   width: 64px;
   height: 64px;
+}
+
+/* A labelled, text-carrying widget cannot survive the 96px rail - the same
+   reason every nav label, the logout text and the plugin health dot are
+   withheld here. The section is hidden rather than squeezed; the identity
+   widget stays, at rail width and its declared height, so nothing overflows
+   the rail or overlaps navigation. */
+.sidebar.sidebar-compact .sidebar-plugin-widgets {
+  display: none !important;
 }
 
 .sidebar.sidebar-compact .sidebar-status-meta-row,
@@ -443,9 +722,34 @@
 .sidebar.sidebar-compact .nav-group-label,
 .sidebar.sidebar-compact .nav-group-chevron,
 .sidebar.sidebar-compact .nav-label,
-.sidebar.sidebar-compact .sidebar-preferences-text,
 .sidebar.sidebar-compact .logout-text {
   display: none !important;
+}
+
+/* Clipped, not removed: these labels ARE their controls' accessible names.
+   The widget name joins them (review N1): on an icon-only rail it rendered as
+   bare text whose chevron the rule above had already taken away, so the
+   disclosure read as a caption rather than as something to press. */
+.sidebar.sidebar-compact .sidebar-preferences-text,
+.sidebar.sidebar-compact .sidebar-plugin-widget-name {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ...and the chevron comes back for this one control, because with the name
+   clipped it is the ONLY thing left to press. A navigation group on this rail
+   still has its icon; a widget block has no icon of its own. */
+.sidebar.sidebar-compact .sidebar-plugin-widget-label .nav-group-chevron {
+  display: inline-flex !important;
+}
+
+.sidebar.sidebar-compact .sidebar-plugin-widget-label {
+  justify-content: center;
+  min-height: var(--control-compact);
 }
 
 .sidebar.sidebar-compact .plugin-health-dot {
@@ -506,7 +810,7 @@
     transform: translateX(0);
   }
 
-  .avatar-container {
+  .avatar-container:not(.avatar-container--widget) {
     width: 128px;
     height: 128px;
   }
@@ -515,4 +819,155 @@
     transform: scale(0.84);
     transform-origin: center;
   }
+
+  /* DRAWER HEADER ROW (live audit 2026-09-18, P1). The menu control is
+     `position: fixed` at 14px/14px and stays there when the drawer opens —
+     that is what put the close glyph on top of the account label in
+     `ux-mobile-drawer.png`. The account row reserves that 44px square as its
+     leading gutter instead, so the drawer's first row reads close, identity,
+     bell, with no overlapping hit area and nothing moved or hidden. (Settings
+     left this row under owner ruling E21 and sits above Logout, where the
+     drawer has the full width for its word, so nothing clips it here.)
+     44px is the WCAG 2.5.5 target floor the rest of the chrome already uses. */
+  .sidebar-account {
+    padding-left: calc(44px + var(--space-2));
+    min-height: 44px;
+  }
+}
+
+/* ========================================
+   CLOSED-STATE MOBILE IDENTITY - the second cell of the floating top bar
+   (card 89c4eb9a, the P2 scope A deferred)
+   ======================================== */
+
+/* The menu control is `position: fixed` at 14px/14px, 44x44, radius 12px
+   (`.sidebar-hamburger`, above). This chip takes the SAME top edge, height,
+   radius and border, so the two are one row — control left, identity right —
+   and not a control plus a stray pill. It sits on `--bg-surface` rather than
+   the control's scrim because it carries TEXT that has to read against its
+   own background, not a glyph against the page.
+
+   CLAMPED TO THE ROOM THE CONTROL LEAVES. The width budget is the viewport
+   less the control's right edge (its 14px inset + 44px), the row gap, and
+   the chip's own 14px inset — written out term by term rather than summed,
+   so `Sidebar.geometry.test.ts` can derive it from the control's own
+   declarations and redden if the control ever moves. At 320px that leaves
+   the chip 222px and the two boxes cannot meet whatever the handle; the
+   240px ceiling keeps a long handle from swallowing a 390px row.
+
+   A PLAIN 44px HEIGHT, like the control's: this is not a control (it is not
+   on the 36/48 control scale and it does nothing when pressed), and it must
+   be no taller than the control, because the 4rem band `PluginFrame.css`
+   reserves for the host's chrome (1f8824c1) is measured against the lowest
+   edge of that chrome. */
+.sidebar-mobile-account {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 260;
+  height: 44px;
+  max-width: min(calc(100vw - 14px - 44px - var(--space-3) - 14px - 14px), 240px);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+}
+
+/* The account row's monogram (`.sidebar-account-avatar`), one step smaller:
+   28px inside the 44px cell leaves the same 8px inset the control gives its
+   glyph. Same tokens, same circle, same weight — the same identity mark in
+   the closed state as in the open drawer. */
+.sidebar-mobile-account-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* The handle at the account row's own size and weight
+   (`.sidebar-account-handle`), clipped with an ellipsis rather than wrapped
+   or hidden: the text is what a screen reader falls back to when it ignores
+   the chip's label, so it stays in the document. */
+.sidebar-mobile-account-handle {
+  display: block;
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ========================================
+   THE BELL IN THE ACCOUNT ROW (card b1e3b16d, lane L1; design T2)
+   ======================================== */
+
+/* The control kit's icon button, on a quiet glass ground (`--bg-glass`,
+   `--border-subtle`) — the ground it shared with the Settings link while that
+   link sat in this row; since owner ruling E21 the bell is the row's only
+   control. The compound selector outranks the kit's ground on specificity. */
+.sidebar-account-bell.notification-bell {
+  border-color: var(--border-subtle);
+  background: var(--bg-glass);
+}
+
+/* ========================================
+   THE BELL IN THE CLOSED STATE - inside the identity chip's footprint
+   (card b1e3b16d, lane L1; design T2)
+   ======================================== */
+
+/* The bell is the control kit's icon button (`.icon-btn`) drawn at the
+   floating bar's own geometry: the chip's right inset, the control's top edge,
+   44px height and 12px radius. The compound selector outranks the kit's
+   single-class size, border and ground on SPECIFICITY rather than on
+   stylesheet order, which the bundler does not promise. Standing alone (an
+   identity with no handle has no chip) it is a square of the chip's grammar:
+   the same border and `--bg-surface` ground. One z-index step above the chip,
+   because it is drawn over the chip's reserved cell and must be the thing a
+   press lands on. Its bottom edge is the control's, so the 4rem band
+   `PluginFrame.css` reserves (1f8824c1) clears it as it clears the rest. */
+.sidebar-mobile-bell.notification-bell {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 261;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  background: var(--bg-surface);
+}
+
+/* Inside the chip: no box of its own, only a hairline divider, so the chip's
+   border and ground are the pill's and the bell reads as its last cell. */
+.sidebar-mobile-bell--in-chip.notification-bell {
+  border-color: transparent;
+  border-left-color: var(--border-subtle);
+  border-radius: 0 12px 12px 0;
+  background: transparent;
+}
+
+/* The chip reserves the bell's cell at its right end: the bell's 44px plus the
+   gap the chip already keeps between its cells. Padding, not width — the
+   chip's width budget above is untouched, so it still cannot meet the menu
+   control at 320px; the handle simply ellipsises sooner. */
+.sidebar-mobile-account--beside-bell {
+  padding-right: calc(44px + var(--space-2));
 }

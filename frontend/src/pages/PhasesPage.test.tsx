@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, act, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import '@testing-library/jest-dom/vitest';
@@ -11,6 +11,9 @@ import { PhasesPage } from './PhasesPage';
 vi.mock('../hooks/usePrincipals', () => ({ useMyPrincipal: () => ({ scopes: ['blueprints:write'] }) }));
 
 vi.mock('../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
+vi.mock('../hooks/useWebSocket', () => ({
+  useWebSocket: () => ({ subscribe: () => () => undefined, connected: false }),
+}));
 
 const mockFetch = vi.mocked(authenticatedFetch);
 
@@ -60,6 +63,27 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('PhasesPage', () => {
+  test('a delayed former Phase read cannot repopulate rows after a later denial', async () => {
+    routeFetch(); renderPage();
+    await screen.findByText('Substrate');
+    let resolveOld!: (value: Response) => void;
+    let phaseCalls = 0;
+    mockFetch.mockImplementation(async url => {
+      if (String(url).includes('/projects/p1/phases')) {
+        phaseCalls++;
+        if (phaseCalls === 1) return new Promise<Response>(resolve => { resolveOld = resolve; });
+        return jsonResponse({ success: false, code: 'RESOURCE_NOT_FOUND' }, false, 404);
+      }
+      return jsonResponse({ success: true, project: { id: 'p1', name: 'Fixture' } });
+    });
+    act(() => window.dispatchEvent(new Event('focus')));
+    act(() => window.dispatchEvent(new Event('focus')));
+    await waitFor(() => expect(phaseCalls).toBe(2));
+    await waitFor(() => expect(screen.queryByText('Substrate')).not.toBeInTheDocument());
+    await act(async () => { resolveOld(jsonResponse({ success: true, phases: PHASES })); });
+    expect(screen.queryByText('Substrate')).not.toBeInTheDocument();
+  });
+
   test('lists a project\'s phases with their goals', async () => {
     routeFetch();
     renderPage();
@@ -68,6 +92,9 @@ describe('PhasesPage', () => {
     // Two phases share position 0: overlapping phases are legal, and the page
     // must render both rather than treating position as a unique key.
     expect(screen.getByText('Falsification gate')).toBeInTheDocument();
+    for (const trigger of screen.getAllByRole('button', { name: 'View context' })) {
+      expect(trigger.closest('.phases-row-actions')).not.toBeNull();
+    }
   });
 
   test('empty state explains the backlog rather than reading as an error', async () => {
@@ -91,8 +118,8 @@ describe('PhasesPage', () => {
     renderPage();
     await screen.findByText('Substrate');
     await userEvent.click(screen.getByRole('button', { name: /New phase/i }));
-    await userEvent.type(screen.getByLabelText('Name'), 'Enforcement');
-    await userEvent.type(screen.getByLabelText('Phase goal'), 'One predicate, no bypasses');
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Enforcement' } });
+    fireEvent.change(screen.getByLabelText('Phase goal'), { target: { value: 'One predicate, no bypasses' } });
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     await waitFor(() => {

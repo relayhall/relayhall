@@ -72,6 +72,8 @@ import {
 } from './census';
 import { CLASS_2_CLAIM_PATH, CLASS_2_CLAIM_VALUE, CLASS_3_GROUP_VALUES, CONFORMANCE_HOST, FIXTURES } from './fixtures';
 import { ProviderDouble } from './providerDouble';
+// AZ-A12 build 1: a raw Group row needs its kind='group' principal first.
+import { insertGroupRow } from '../support/groupRows';
 
 // `system`, not `none`: `audit_events.auth_method` enumerates its permitted
 // values and the gate must write the ledger the way production does.
@@ -713,11 +715,9 @@ async function refusalCodeOf(action: () => Promise<unknown>): Promise<string> {
 }
 
 async function bindGroup(identityProviderId: string, externalGroupRef: string, name: string): Promise<string> {
-  const result = await pool.query(
-    `INSERT INTO groups (name, identity_provider_id, external_group_ref) VALUES ($1, $2, $3) RETURNING id`,
-    [`${name} ${crypto.randomBytes(3).toString('hex')}`, identityProviderId, externalGroupRef],
-  );
-  return String(result.rows[0].id);
+  return insertGroupRow(pool, {
+    name: `${name} ${crypto.randomBytes(3).toString('hex')}`, identityProviderId, externalGroupRef,
+  });
 }
 
 async function membershipCount(accountPrincipalId: string): Promise<number> {

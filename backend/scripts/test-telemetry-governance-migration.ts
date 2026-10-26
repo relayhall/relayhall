@@ -80,7 +80,9 @@ async function main(): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(`CREATE SCHEMA ${schema}; SET LOCAL search_path TO ${schema}, public`);
+    // Never fall through to public correlation tables when this focused fixture
+    // omits unrelated product migrations. The disposable schema owns every row.
+    await client.query(`CREATE SCHEMA ${schema}; SET LOCAL search_path TO ${schema}, pg_catalog`);
     // The handful of tables migration 055 has foreign keys into. Stubs, exactly
     // as the candidate-A probe uses: this control is about the 113 constraints,
     // and dragging the whole product schema in would only add ways to fail for
@@ -99,6 +101,22 @@ async function main(): Promise<void> {
     // Replaying the additive migration must be harmless — the runner is
     // allowed to see a partially applied deployment.
     await client.query(sql('113_telemetry_side_channel_governance.sql'));
+
+    // The current production sweep also includes review/implementation links.
+    // Narrow local table shapes exercise that sweep without importing unrelated
+    // Task/Service migrations or accidentally deleting a public-schema link.
+    await client.query(`
+      CREATE TABLE task_native_review_sessions (review_id uuid NOT NULL, pepper_id text NOT NULL, expires_at timestamptz NOT NULL);
+      CREATE TABLE task_native_execution_sessions (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), expires_at timestamptz NOT NULL);
+    `);
+    // Card ab8f78e9: the sweep's sixth class is the MCP action log. Its REAL
+    // migration is applied here (it references only the principals stub), so
+    // the class runs against the shipped table shape inside the fixture schema.
+    await client.query(sql('161_mcp_action_log.sql'));
+    for (const table of ['task_native_review_sessions','task_native_execution_sessions','mcp_action_log']) {
+      const namespace = (await client.query('SELECT relnamespace::regnamespace::text AS name FROM pg_class WHERE oid=to_regclass($1)', [table])).rows[0].name;
+      assert.equal(namespace, schema, 'the production sweep must resolve only fixture-owned correlation tables');
+    }
 
     // Two principals, so "another connector's blob" is a real other connector
     // and not a fabricated uuid the FK would have refused for the wrong reason.
@@ -571,7 +589,7 @@ async function main(): Promise<void> {
 
     // ---- TS-9 RETENTION, with receipts that cover the raw blobs ---------
     // Every claim here is about what the database did, because the sweep is
-    // three statements of SQL and nothing else: a double would be asserting
+    // one statement per governed class: a double would be asserting
     // that a string contains the words it contains.
     const retention = new TelemetryRetentionService(
       { query: (text: string, params?: unknown[]) => client.query(text, params) } as never);
@@ -618,7 +636,11 @@ async function main(): Promise<void> {
       [sha256('legacy-key'), sha256('legacy-payload')])).rows[0].quarantine_id;
 
     const swept = await retention.sweep(observedAt);
-    assert.equal(swept.receipts.length, 3, 'a sweep writes one receipt per class, always');
+    assert.deepEqual(swept.receipts.map(r => r.payloadClass), ['telemetry_event_metadata','telemetry_raw_blob','telemetry_quarantine','native_review_session_link','native_execution_session_link','mcp_action_log'], 'all six concrete classes produce receipts');
+    for (const receipt of swept.receipts.slice(3)) {
+      assert.equal(receipt.examined, 0, 'empty fixture-local link table');
+      assert.equal(receipt.removed, 0, 'no public link can be examined or erased');
+    }
 
     const byClass = new Map(swept.receipts.map((r) => [r.payloadClass, r]));
     const events = byClass.get('telemetry_event_metadata')!;
@@ -663,7 +685,7 @@ async function main(): Promise<void> {
     // A second pass has nothing to do and still leaves receipts, so an auditor
     // can tell "nothing was due" from "the sweep did not run".
     const again2 = await retention.sweep(observedAt);
-    assert.equal(again2.receipts.length, 3);
+    assert.equal(again2.receipts.length, 6);
     for (const receipt of again2.receipts) {
       assert.equal(receipt.removed, 0, `${receipt.payloadClass}: nothing was due`);
       assert.match(receipt.evidenceHash, /^[0-9a-f]{64}$/,
@@ -685,7 +707,7 @@ async function main(): Promise<void> {
       + 'the event carries the pointer, the expiry comes from the CONFIGURED TS-9 bound, a duplicate event '
       + 'stores NOTHING and claims no pointer even when its payload differs so no orphan blob can exist, '
       + 'another connector sending identical bytes gets '
-      + 'its OWN namespaced blob, and deleting one connector blobs leaves the other intact. QUARANTINE: a stored row carries its owner, its tier and the CONFIGURED short retention and holds no byte of the payload; an identical refusal bumps an occurrence count instead of writing twice; the fourth write past a quota of three is DROPPED AND COUNTED with nothing stored; exhausting one connector does not silence another; a window roll restores the budget while the lifetime drop count survives it; and the rate alarm fires for the flooded connector but not for the quiet one, while the production EVALUATOR raises once, stays silent as the flood continues, and clears exactly once on recovery EVEN WHEN two newer budget rows and a limit of one would have paged the alarming connector out, and the tracked set is CAPPED — two floods against a cap of one admit exactly one and announce the other as a single saturation signal. TS-9 RETENTION: a sweep expires the aged event, takes its governed blob with it because events go first, expires the quarantine row past its short bound, leaves everything inside its bound alone, NEVER touches a pre-envelope 055 quarantine row, writes one receipt per class whose examined count exceeds its removed count and whose evidence hash is reproducible from the removed ids, and writes three receipts again on a pass with nothing due.');
+      + 'its OWN namespaced blob, and deleting one connector blobs leaves the other intact. QUARANTINE: a stored row carries its owner, its tier and the CONFIGURED short retention and holds no byte of the payload; an identical refusal bumps an occurrence count instead of writing twice; the fourth write past a quota of three is DROPPED AND COUNTED with nothing stored; exhausting one connector does not silence another; a window roll restores the budget while the lifetime drop count survives it; and the rate alarm fires for the flooded connector but not for the quiet one, while the production EVALUATOR raises once, stays silent as the flood continues, and clears exactly once on recovery EVEN WHEN two newer budget rows and a limit of one would have paged the alarming connector out, and the tracked set is CAPPED — two floods against a cap of one admit exactly one and announce the other as a single saturation signal. TS-9 RETENTION: a sweep expires the aged event, takes its governed blob with it because events go first, expires the quarantine row past its short bound, leaves everything inside its bound alone, NEVER touches a pre-envelope 055 quarantine row, writes one receipt per class whose examined count exceeds its removed count and whose evidence hash is reproducible from the removed ids, and writes six receipts again on a pass with nothing due.');
   } finally {
     // ROLLBACK is the whole cleanup: `CREATE SCHEMA` is transactional, so the
     // throwaway schema disappears with it. Dropping it from a SECOND

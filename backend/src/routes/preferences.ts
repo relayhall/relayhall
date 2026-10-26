@@ -6,7 +6,8 @@
  * the principal from `req.principal` — the identity the auth middleware
  * resolved — and nothing else. There is no `/preferences/:principalId`, and a
  * `principalId` in the body is ignored by construction because the patch
- * parser only understands `theme` and `reducedMotion`. A cross-principal
+ * parser only understands `theme`, `reducedMotion` and `mapReportsMode` (the
+ * Map's Reports display, card 742fae98). A cross-principal
  * probe therefore cannot be expressed, which is the point (review S-F11): the
  * IDOR is prevented by the shape of the surface rather than by a check
  * somebody has to remember to write.

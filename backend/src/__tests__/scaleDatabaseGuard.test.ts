@@ -59,7 +59,13 @@ describe.each(['seed', 'live suite'] as const)('%s database entry guard', (entry
     expect(accepted).toBe(expected);
     if (!expected) {
       expect(error).toBeInstanceOf(Error);
-      expect(String(error)).toMatch(/deployment database|no database name|not local|non-local host/);
+      // The pool target guard now rejects a missing name before the seed's
+      // own disposable-target check. Pin that earlier refusal only here.
+      if (entry === 'seed' && database === '') {
+        expect(String(error)).toMatch(/DB_NAME is unset/);
+      } else {
+        expect(String(error)).toMatch(/deployment database|no database name|not local|non-local host/);
+      }
     }
   });
 });

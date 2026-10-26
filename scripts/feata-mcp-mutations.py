@@ -12,17 +12,24 @@ registry='src/mcp/registry.ts';spec='src/openapi/spec.ts'
 def once(source,before,after):
  assert source.count(before)==1,('Mutation anchor count',source.count(before),before[:90])
  return source.replace(before,after,1)
-create="return taskWriteResult(`Created Task ${id8(task.id)} — ${String(task.title ?? '')} (${String(task.status ?? '?')})\\nfull id: ${String(task.id ?? '?')}`, envelope);"
+create="return taskWriteResult(`Created Task ${id8(task.id)} — ${String(task.title ?? '')} (${String(task.status ?? '?')})\\nfull id: ${String(task.id ?? '?')}${expiryLine ? `\\n${expiryLine}` : ''}${warningLines}`, envelope);"
 update="return taskWriteResult(`Updated Task ${id8(task.id ?? taskId)} — fields: ${Object.keys(body).join(', ')}${warning}`, envelope);"
 create_selector='MCP Task create deadline receipt carries every canonical receipt value: Europe/Warsaw 2026-09-07T19:00:00.123456'
 update_selector=create_selector.replace('create','update',1)
+# P2-B (785e1eed) gave roleGrantExpiresAt the same {local, zone} arm, so a shape
+# anchor alone names two places. Each shape control is scoped to the Task
+# deadline's arm - the one the null arm follows - and makes the same edit there.
+due_arm="    { type: 'object', additionalProperties: false, required: ['local', 'zone'],\n      properties: { local: { type: 'string' }, zone: { type: 'string' } } },\n    { type: 'null' },"
+def in_due_arm(before,after):
+ assert due_arm.count(before)==1,('Deadline-arm anchor count',due_arm.count(before),before)
+ return due_arm,due_arm.replace(before,after,1)
 controls=[
  ('create-receipt',registry,create_selector,create,create.replace('return taskWriteResult(`','return `').replace('`, envelope);','`;'),'receipt'),
  ('update-receipt',registry,update_selector,update,update.replace('return taskWriteResult(`','return `').replace('`, envelope);','`;'),'receipt'),
- ('open-object',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":"2026-09-07T19:00:00","zone":"Europe/Warsaw","instant":"invented"}',"{ type: 'object', additionalProperties: false, required: ['local', 'zone'],","{ type: 'object', additionalProperties: true, required: ['local', 'zone'],",'shape'),
- ('missing-key',registry,'one exact advertised Task deadline shape refuses malformed structural input: {}',"required: ['local', 'zone'],","required: [],",'shape'),
- ('local-type',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":1,"zone":"Europe/Warsaw"}',"properties: { local: { type: 'string' }, zone: { type: 'string' } }","properties: { local: {}, zone: { type: 'string' } }",'shape'),
- ('zone-type',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":"2026-09-07T19:00:00","zone":null}',"properties: { local: { type: 'string' }, zone: { type: 'string' } }","properties: { local: { type: 'string' }, zone: {} }",'shape'),
+ ('open-object',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":"2026-09-07T19:00:00","zone":"Europe/Warsaw","instant":"invented"}',*in_due_arm("{ type: 'object', additionalProperties: false, required: ['local', 'zone'],","{ type: 'object', additionalProperties: true, required: ['local', 'zone'],"),'shape'),
+ ('missing-key',registry,'one exact advertised Task deadline shape refuses malformed structural input: {}',*in_due_arm("required: ['local', 'zone'],","required: [],"),'shape'),
+ ('local-type',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":1,"zone":"Europe/Warsaw"}',*in_due_arm("properties: { local: { type: 'string' }, zone: { type: 'string' } }","properties: { local: {}, zone: { type: 'string' } }"),'shape'),
+ ('zone-type',registry,'one exact advertised Task deadline shape refuses malformed structural input: {"local":"2026-09-07T19:00:00","zone":null}',*in_due_arm("properties: { local: { type: 'string' }, zone: { type: 'string' } }","properties: { local: { type: 'string' }, zone: {} }"),'shape'),
  ('fold-wording',spec,'one exact advertised Task deadline shape OpenAPI describes the measured PostgreSQL policy without an earlier-fold promise','PostgreSQL AT TIME ZONE using the post-transition offset','PostgreSQL AT TIME ZONE using the EARLIER occurrence','wording'),
 ]
 env=os.environ.copy()

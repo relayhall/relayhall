@@ -17,7 +17,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { AuditPage } from './AuditPage';
+import { AuditPage, filtersFromSearch } from './AuditPage';
 // The page's own source, for the one claim that is about what is ABSENT.
 import pageSource from './AuditPage.tsx?raw';
 
@@ -569,5 +569,32 @@ describe('the record is walkable from the keyboard', () => {
     rows()[0].focus();
     await user.keyboard('{Enter}');
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+});
+
+describe('a link may pre-set the text filters (card 549cc51f)', () => {
+  afterEach(() => { window.history.replaceState({}, '', '/'); });
+
+  test('the shared-area writer trail link opens the page filtered by its action prefix', async () => {
+    window.history.replaceState({}, '', '/audit?actionPrefix=knowledge.shared_writer');
+    render(<AuditPage />);
+    await waitFor(() => expect(calls.some((call) => call.includes('/audit'))).toBe(true));
+    expect(lastAuditCall().searchParams.get('actionPrefix')).toBe('knowledge.shared_writer');
+    expect(screen.getByDisplayValue('knowledge.shared_writer')).toBeInTheDocument();
+  });
+
+  test('only the three text filters are read, each bounded; nothing else in the URL is honoured', () => {
+    expect(filtersFromSearch('?actionPrefix=a.b&resourceType=knowledge_shared_writer&resourceId=x&outcome=denied&before=c'))
+      .toEqual({ actorPrincipalId: '', actionPrefix: 'a.b', outcome: '', since: '', until: '',
+        resourceType: 'knowledge_shared_writer', resourceId: 'x' });
+    expect(filtersFromSearch(`?actionPrefix=${'a'.repeat(129)}`).actionPrefix).toBe('');
+    expect(filtersFromSearch('')).toEqual(filtersFromSearch('?'));
+  });
+
+  test('a URL prefix the route would reject is refused with words, as a typed one is', async () => {
+    window.history.replaceState({}, '', '/audit?actionPrefix=DROP%20TABLE');
+    render(<AuditPage />);
+    expect(await screen.findByText(/An action filter is lower-case letters/)).toBeInTheDocument();
+    expect(calls.filter((call) => call.includes('/audit'))).toEqual([]);
   });
 });

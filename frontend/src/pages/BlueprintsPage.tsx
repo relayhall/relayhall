@@ -1,4 +1,4 @@
-import { IS_PUBLIC_BUILD, SOURCE_URL } from '../utils/build';
+import { BLUEPRINT_GUIDE_URL } from '../utils/build';
 import { BlueprintDraftEditor } from '../components/blueprints/BlueprintDraftEditor';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
@@ -100,7 +100,7 @@ export function BlueprintsPage() {
   const actions = detail?.availableActions || [];
   const filtered = items.filter(item => (!statusFilter || item.status===statusFilter) && (!targetFilter || item.target.mode===targetFilter || targetFilter==='existing-project' && item.target.allowExisting===true) && (!projectId || item.target.mode === 'existing-project' || item.target.allowExisting===true) && `${item.name} ${item.key} ${item.summary} ${item.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()));
   return <div className="blueprints-page">
-    <header className="blueprint-page-header"><div><h1><BookOpen aria-hidden="true" size={24} /> Blueprints</h1><p>Reusable plans that create ordinary Project work. {IS_PUBLIC_BUILD ? <a href={SOURCE_URL+'/blob/main/docs/blueprints/README.md'}>Blueprint guide</a> : <span>Guide: docs/blueprints/README.md</span>}</p></div>
+    <header className="blueprint-page-header"><div><h1><BookOpen aria-hidden="true" size={24} /> Blueprints</h1><p>Reusable plans that create ordinary Project work. <a href={BLUEPRINT_GUIDE_URL} target="_blank" rel="noreferrer noopener">Blueprint guide</a></p></div>
       {!wizard && canWrite && <div className="blueprint-actions"><Button variant="secondary" icon={<Upload size={16} aria-hidden="true" />} onClick={() => openEditor('import')}>Import JSON</Button><Button icon={<Plus size={16} aria-hidden="true" />} onClick={() => openEditor('create')}>New Blueprint</Button></div>}
     </header>
     {notice && <p role="status">{notice}</p>}

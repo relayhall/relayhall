@@ -1,6 +1,3 @@
-/* ToolsPage — empty-state core surface. Body styles come from
-   CoreSurfacePlaceholder.css; only the page frame and header live here. */
-
 .tools-page {
   padding: var(--space-5);
   max-inline-size: 1400px;
@@ -25,3 +22,15 @@
   line-height: var(--leading-tight);
   color: var(--text-primary);
 }
+
+.tools-filters { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-block: var(--space-5); }
+.tools-filters label { display: flex; flex-direction: column; gap: var(--space-2); flex: 1 1 240px; }
+.tools-filters input, .tools-filters select { width: 100%; min-height: var(--control-standard); padding: var(--space-2); color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.tools-catalogue { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+.tool-card { min-width: 0; padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: var(--bg-surface); }
+.tool-card h2 { font-size: var(--text-xl); overflow-wrap: anywhere; margin-top: 0; }
+.tool-card p { overflow-wrap: anywhere; }
+.tool-plane { color: var(--text-secondary); }
+.tool-description { white-space: pre-wrap; }
+.tool-card summary { cursor: pointer; padding-block: var(--space-2); }
+.tool-card pre { overflow: auto; max-height: 360px; font-size: var(--text-sm); }

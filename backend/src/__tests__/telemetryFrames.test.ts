@@ -124,7 +124,6 @@ jest.mock('../services/AuthorizationRepository', () => ({
   authorizationRepository: { authorizedIds: jest.fn(async () => new Set()) },
 }));
 jest.mock('../services/taskAnalyzer', () => ({ taskAnalyzer: {} }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: {} }));
 jest.mock('../services/TaskReviewerService', () => ({ taskReviewerService: {} }));
 jest.mock('../services/TaskOrchestrationService', () => ({
   taskOrchestrationService: {},

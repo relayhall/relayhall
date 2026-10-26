@@ -86,6 +86,52 @@ mode exists for automations that cannot be reached inbound. See
 [services.md](services.md) for registration and
 [mcp.md](mcp.md) for the tool surface.
 
+## One connector per harness
+
+The tiers say what a client can do. How a client is connected is separate: the
+Connect your agent wizard has a template for each of Claude Code, Codex,
+VS Code and Antigravity, and each makes one connector with one `any`-pinned
+token, registered and published with its telemetry tier and product. Antigravity
+has a template so that a connection made for it is registered and labelled as
+Antigravity; it stays a **Tier B** client (human-driven, no shell or scheduler
+of its own), whichever way it reaches the board. It has two:
+
+| Antigravity path | How | Token held by |
+| --- | --- | --- |
+| OAuth (above) | its remote MCP sign-in | Antigravity (an MCP-pinned OAuth token) |
+| The local connector (Windows) | `relayhall connector install --harness antigravity` writes one stdio server entry, `relayhall`, into `~/.gemini/config/mcp_config.json` (the file Antigravity reads its MCP servers from), and `relayhall connection-skill install --harness antigravity` writes the connection skill into `~/.gemini/antigravity/skills` | the connector's OS custody; Antigravity holds none |
+
+Antigravity starting a local stdio MCP server from that file has been seen on a
+working Windows install; macOS and Linux stay unverified, as for every harness.
+The token, the scopes, the descriptor and the install line are
+described in [connector-onboarding.md](connector-onboarding.md#one-connector-per-harness),
+and the local `relayhall connector` (Windows in this version: token custody, the
+client's stdio MCP entry, the sign-in task, and the usage-quota collector for
+Claude Code and Codex, which runs a harness binary only after it passes
+publisher trust) in
+[connector-onboarding.md](connector-onboarding.md#the-local-connector).
+
+## Being woken: the connector's ring
+
+For Claude Code and Codex CLI the local connector is also what wakes the
+harness. With its ring enabled it holds the board's wake socket, catches up
+on every reconnect and every five minutes, and decides locally what to do with
+each wake: an `implement` wake (and a `verify` wake when the connector is the
+Task's service Verifier) becomes an unattended run under a freshly minted,
+task-bounded Agent that is revoked when the run ends; a `stuck` wake only
+notifies. Details in
+[connector-onboarding.md](connector-onboarding.md#the-ring-wake-catch-up-and-runs).
+
+| Harness | Unattended run | Isolation of the run's MCP configuration | Notify a person | Live-session injection |
+|---|---|---|---|---|
+| Claude Code | `claude -p --output-format stream-json --verbose` | `--strict-mcp-config --mcp-config <run file>` (checked against the real CLI: without the flag the user's own entries start too) | Windows toast + the board's Action Center | not supported |
+| Codex CLI | `codex exec --json` | `--ignore-user-config` plus one `-c mcp_servers.relayhall=...` entry; a build that does not document the flag is refused (`HARNESS_CONFIG_NOT_ISOLATED`). A `-c` override alone is merged with the user's own entries, so it is not used alone | Windows toast | not supported |
+| VS Code, Antigravity | none (no supported way to start one) | — | Windows toast | — |
+
+The Codex desktop app itself is never driven. No harness documents a way for an
+outside process to add a turn to an open interactive session, so a person who
+works interactively is notified instead.
+
 ## The rule under all three rows
 
 Authority travels in the pull, never in the push. The board announces with an

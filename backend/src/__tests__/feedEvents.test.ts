@@ -82,8 +82,42 @@ describe('FeedEventService.listSince — grant-scoped at query time', () => {
     query: jest.fn(async (text: string, _params?: unknown[]) => {
       if (/FROM feed_events/i.test(text)) return { rows };
       if (/FROM grants/i.test(text)) return { rows: [] };
+      // AZ-A12 clause 13: the Group-owner basis; no recorded owner is a Group here.
+      if (/FROM unnest\(\$1::uuid\[\]\) AS recorded/i.test(text)) return { rows: [] };
       throw new Error(`unexpected: ${text.slice(0, 60)}`);
     }),
+  });
+
+  test('a recorded GROUP owner delivers a transition event to a member through the use-tier fragment (AZ-A12 clause 13)', async () => {
+    const GROUP = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const OTHER_GROUP = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    const asked: unknown[][] = [];
+    const pool = {
+      query: jest.fn(async (text: string, params?: unknown[]) => {
+        if (/FROM feed_events/i.test(text)) {
+          return { rows: [
+            feedRow(1, { name: 'project.acl_changed', object_type: 'project', object_id: T2, owner_principal_id: GROUP }),
+            feedRow(2, { name: 'project.acl_changed', object_type: 'project', object_id: T3, owner_principal_id: OTHER_GROUP }),
+            // An ORDINARY event a Group owns is never delivered by the recorded owner.
+            feedRow(3, { object_id: T1, owner_principal_id: GROUP }),
+          ] };
+        }
+        if (/FROM grants/i.test(text)) return { rows: [] };
+        if (/FROM unnest\(\$1::uuid\[\]\) AS recorded/i.test(text)) {
+          asked.push(params ?? []);
+          // The shared fragment, use tier: an active Group principal and an active member Account.
+          expect(text).toContain("owning_group.kind = 'group'");
+          expect(text).toContain("owning_group.status = 'active'");
+          expect(text).toContain("owning_group_account.status = 'active'");
+          expect(text).not.toContain('group_stewards');
+          return { rows: [{ owner_id: GROUP }] };
+        }
+        throw new Error(`unexpected: ${text.slice(0, 60)}`);
+      }),
+    };
+    const { events } = await new FeedEventService(pool as never).listSince(ACTOR, 0);
+    expect(events.map(e => e.objectId)).toEqual([T2]);
+    expect(asked).toEqual([[[GROUP, OTHER_GROUP], (ACTOR as { principalId: string }).principalId]]);
   });
 
   test('an id-independent (blanket) reader sees every event', async () => {
@@ -407,13 +441,16 @@ describe('emission coverage — every write path announces itself (round 1, F2/F
 
   test('orchestration, element, and review-attempt services all emit (round 2, F2)', () => {
     expect(svc('TaskOrchestrationService.ts'))
-      .toContain("payload: { status: 'in-progress', previousStatus: 'todo' }");
+      .toContain("payload: { status: 'in-progress', previousStatus: 'todo', fields: ['status'] }");
     expect(svc('TaskReviewAttemptService.ts'))
-      .toContain("payload: { status: nextStatus, previousStatus: 'review' }");
+      .toContain("payload: { status: nextStatus, previousStatus: 'review', fields: ['status'] }");
     const element = svc('TaskElementService.ts');
-    // createReport, linkReport, stream-entry link, finish→review, redaction.
-    expect(element.split('feedEventService.emit').length - 1).toBe(5);
-    expect(element).toContain("payload: { status: 'review', previousStatus: 'in-progress' }");
+    // createReport, linkReport, stream-entry link, finish→review, redaction,
+    // (card 5854f0d6) the public append's one announcement, and (owner ruling
+    // E462 S4b) a `none` Task's finish→completed.
+    expect(element.split('feedEventService.emit').length - 1).toBe(7);
+    expect(element).toMatch(/payload: \{\s+status: 'completed',\s+previousStatus: 'in-progress',\s+fields: \['status'\],/);
+    expect(element).toMatch(/payload: \{\s+status: 'review',\s+previousStatus: 'in-progress',\s+fields: \['status'\],/);
   });
 });
 
@@ -462,7 +499,7 @@ describe('emission rides the mutating transaction (round 2, F2 — behavioral)',
       query: jest.fn(async (text: string) => {
         statements.push(text);
         if (/FROM task_review_attempts a JOIN tasks t/.test(text)) {
-          return { rowCount: 1, rows: [{ id: 'a1', status: 'running', task_status: 'review', attempt_count: 0, max_retries: 3, current_task_updated_at: TS, task_snapshot_updated_at: TS, review_slice: [{ index: 0 }], task_id: T1 }] };
+          return { rowCount: 1, rows: [{ id: 'a1', status: 'running', task_status: 'review', attempt_count: 0, max_retries: 3, current_task_updated_at: TS, task_snapshot_updated_at: TS, review_slice: [{ index: 0 }], review_slice_version: 1, task_id: T1 }] };
         }
         if (/UPDATE subtasks/.test(text)) return { rowCount: 1, rows: [{ index: 0 }] };
         if (/SELECT status FROM subtasks/.test(text)) return { rows: [{ status: 'completed' }] };

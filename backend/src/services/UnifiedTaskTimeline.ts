@@ -10,9 +10,7 @@
 //      rows carrying legacy_source='task_history'; the exclusion below is the
 //      dedup rule).
 //   3. task.reviewHistory — synthesized review events, stable ids.
-//   4. Legacy sessionRefs — synthesized with STABLE timestamps
-//      (task.startedAt || task.created; never task.updated, which moves on
-//      every write).
+// Legacy Task session columns are retired; durable stream records remain.
 //
 // Attribution honesty: each source maps only what it truly stores.
 // `actorDetail` is per-source-nullable and never derives role-at-event-time
@@ -90,6 +88,14 @@ const KNOWN_SYSTEM_TYPES = new Set([
   'task.status_changed', 'task.priority_changed', 'task.notes_updated',
   'task.created', 'task.field_changed', 'task.arm', 'task.park',
   'session.reference',
+  // Card 6dea3cca: the Connector wake receipt (ConnectorWakeService).
+  'connector.wake',
+  // Owner ruling E462 (design section 6.7): what the Connector reported it
+  // did with a wake it acknowledged (ConnectorWakeService.recordOutcome).
+  'connector.trigger',
+  // Section 6.8 (E462 S4b): `verification: none` set or cleared
+  // (VerificationModes.recordVerificationNone / recordVerificationNoneCleared).
+  'task.verification_mode',
   // 086 legacy-backfill field names
   'status', 'priority', 'notes', 'title', 'subtask', 'created', 'autoStart',
   'archived', 'claimed', 'released',
@@ -175,6 +181,7 @@ function humanizeStreamType(eventType: string): string {
     case 'task.transitioned': return 'Task transitioned';
     case 'task.claimed': return 'Task claimed';
     case 'task.released': return 'Task released';
+    case 'task.verification_mode': return 'Verification mode changed';
     case 'status': return 'Status changed';
     default: return eventType.replace(/[._]/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
   }
@@ -337,26 +344,6 @@ export class UnifiedTaskTimeline {
     });
   }
 
-  buildSessionEvents(task: Task): UnifiedTimelineEvent[] {
-    // Stable by construction: startedAt/created never move after the fact.
-    const at = iso((task as any).startedAt || task.created);
-    return (task.sessionRefs || []).map((sessionKey: string) => ({
-      id: `legacy-session-${task.id}-${sessionKey}`,
-      at,
-      createdAt: at,
-      source: 'session' as const,
-      provenance: 'legacy' as const,
-      eventType: 'session.reference',
-      title: 'Legacy session reference',
-      description: 'Captured before durable task stream entries were enabled.',
-      actor: null,
-      actorDetail: null,
-      sessionKey,
-      harness: null,
-      metadata: {},
-      redaction: null,
-    }));
-  }
 
   /** Merge, classify, order, and paginate. `streamRows` are the rows the
    *  caller was authorized to see (listStream applies visibility). */
@@ -381,12 +368,7 @@ export class UnifiedTaskTimeline {
       logCaughtFailure('[UnifiedTaskTimeline] review synthesis failed', err);
       sourcesUnavailable.push('review');
     }
-    try {
-      events.push(...this.buildSessionEvents(task));
-    } catch (err) {
-      logCaughtFailure('[UnifiedTaskTimeline] session synthesis failed', err);
-      sourcesUnavailable.push('session');
-    }
+
 
     events.sort(compareEvents);
 

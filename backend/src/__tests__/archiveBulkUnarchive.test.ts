@@ -22,9 +22,6 @@ const poolQuery: jest.Mock = jest.fn(async () => ({ rows: [] as any[] }));
 jest.mock('../db/connection', () => ({
   pool: { query: (...args: unknown[]) => poolQuery(...args), connect: jest.fn() },
 }));
-jest.mock('../services/NotificationManager', () => ({
-  notificationManager: { notifyStatusChange: jest.fn().mockResolvedValue(undefined) },
-}));
 const priorStatusSpy: jest.Mock = jest.fn(async () => null);
 jest.mock('../services/TaskHistoryService', () => ({
   taskHistoryService: {
@@ -112,6 +109,9 @@ describe('TaskHistoryService.priorStatusBeforeArchive schema variants (found liv
     const sql = String(poolQuery.mock.calls[1][0]);
     expect(sql).toContain(expectedClause as string);
     expect(sql).toContain("new_value = 'archived'");
+    expect(sql).toContain('DENSE_RANK() OVER (ORDER BY created_at DESC NULLS FIRST)');
+    expect(sql).toContain('recency = 1 AND same_time = 1 AND created_at IS NOT NULL');
+    expect(sql.indexOf("new_value = 'archived'")).toBeGreaterThan(sql.indexOf(') AS status_history'));
   });
 
   test('no recognizable variant returns null instead of guessing', async () => {
@@ -180,7 +180,11 @@ describe('TaskManagerDB.bulkArchiveCompleted (E3)', () => {
     // The one real archive ran through archiveTask with the board emit
     // suppressed; the board refresh emitted exactly once, at the end.
     expect(archiveSpy).toHaveBeenCalledTimes(1);
-    expect(archiveSpy).toHaveBeenCalledWith(ID_A, { reason: 'sweep', suppressBoardEmit: true }, undefined);
+    expect(archiveSpy).toHaveBeenCalledWith(ID_A, { reason: 'sweep', suppressBoardEmit: true }, undefined, expect.any(Symbol));
+    const operation = archiveSpy.mock.calls[0][3];
+    if (typeof operation !== 'symbol') throw new Error('Bulk archive must carry a private operation symbol');
+    expect(operation.description).toBe('archive-completed');
+    expect(Symbol.keyFor(operation)).toBeUndefined(); // not constructible through Symbol.for or a JSON flag
     const boardEmits = emitSpy.mock.calls.filter(call => call[0] === 'tasks.updated');
     expect(boardEmits).toHaveLength(1);
   });
@@ -192,7 +196,7 @@ describe('TaskManagerDB.bulkArchiveCompleted (E3)', () => {
     jest.spyOn(taskManagerDB, 'getAllTasks').mockResolvedValue([] as any);
 
     const outcome = await taskManagerDB.bulkArchiveCompleted([ID_A]);
-    expect(outcome.results[0]).toEqual({ id: ID_A, archived: false, code: 'ERROR', error: 'The Task could not be archived' });
+    expect(outcome.results[0]).toEqual({ id: ID_A, archived: false, code: 'ERROR', error: 'The Task could not be archived', errorId: expect.any(String) });
     expect(JSON.stringify(outcome)).not.toContain(MARKER);
     expect(outcome.failedCount).toBe(1);
   });

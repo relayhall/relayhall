@@ -7,6 +7,10 @@
 import { Router, Request, Response } from 'express';
 import { generateThemeCss } from '../services/pluginTheme';
 import { PluginLoader } from '../services/PluginLoader';
+import type { AuthRequest } from '../middleware/auth';
+import { activePluginAccount } from '../services/PluginAccountScope';
+import { isPluginV1, pluginAccountCan, pluginCanWriteThroughProxy, pluginSettingReadOnly } from '../services/PluginHostContract';
+import { pluginAvailableTo, pluginSettingsService } from '../services/PluginSettingsService';
 
 const router = Router();
 
@@ -42,28 +46,79 @@ export function setPluginLoader(loader: PluginLoader) {
 /**
  * GET /plugins — list all registered plugins
  */
-router.get('/', (_req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
   if (!pluginLoader) {
     res.json({ plugins: [] });
     return;
   }
 
-  const registry = pluginLoader.getRegistry();
-  res.json({ plugins: registry });
+  const listed = pluginLoader.getRegistry();
+  let account: string | null = null;
+  if (listed.some(entry => isPluginV1(pluginLoader!.getPlugin(entry.name)?.manifest))) {
+    try { account = await activePluginAccount(req as AuthRequest); }
+    catch { res.status(503).json({ code: 'PLUGIN_UNAVAILABLE' }); return; }
+  }
+  // Card bedf50cc (E380): availability is ANDed with the file's view grant
+  // for v1 entries, never substituted for it; legacy entries are outside
+  // policy and listed as before (C10). One statement reads every state.
+  let availability: Awaited<ReturnType<typeof pluginSettingsService.availabilityFor>>;
+  try {
+    availability = await pluginSettingsService.availabilityFor(listed.filter(entry =>
+      isPluginV1(pluginLoader!.getPlugin(entry.name)?.manifest)).map(entry => entry.name), account);
+  } catch { res.status(503).json({ code: 'PLUGIN_UNAVAILABLE' }); return; }
+  const registry = listed.filter(entry => {
+    const plugin = pluginLoader!.getPlugin(entry.name);
+    return !plugin || !isPluginV1(plugin.manifest) || (pluginAccountCan(plugin.config, account)
+      && availability.get(entry.name)?.enabled === true);
+  });
+  // Only disclose settings destinations granted to the active Account. The
+  // proxy independently rechecks the same capability on every request. The
+  // deployment view default reaches `view` entries only; every other entry
+  // needs the explicit per-Account capability (pluginAccountCan).
+  const scopes = (req as AuthRequest).scopes ?? [];
+  const proxyRoutes = pluginLoader.getProxyRoutes();
+  res.json({ plugins: registry.map(entry => {
+    const plugin = pluginLoader!.getPlugin(entry.name);
+    // Registry and manifest values are never trusted to assert caller access.
+    const { hostProxyAccess: _ignored, ...visible } = entry;
+    const v1 = plugin && isPluginV1(plugin.manifest);
+    const baseRoute = v1 && proxyRoutes.find(route =>
+      route.pluginName === entry.name && route.pathPrefix === entry.api_base);
+    // Each visible settings entry says whether THIS caller can change it,
+    // computed from the compiled base route's rules for the entry's own path
+    // (a manifest-supplied readOnly is replaced). No base route: read-only.
+    return { ...visible, settings: v1
+      ? (entry.settings ?? []).filter(setting => pluginAccountCan(plugin.config, account, setting.capability))
+        .map(setting => ({ ...setting,
+          readOnly: pluginSettingReadOnly(plugin.config, account, scopes, baseRoute ? baseRoute.allow : [], setting.path) }))
+      : [], ...(baseRoute && account ? { hostProxyAccess: {
+        writeCapable: pluginCanWriteThroughProxy(plugin.config, account, scopes, baseRoute.allow),
+      } } : {}) };
+  }) });
 });
 
 
 /**
  * GET /plugins/:name — get details for a specific plugin
  */
-router.get('/:name', (req: Request, res: Response) => {
+router.get('/:name', async (req: Request, res: Response) => {
   if (!pluginLoader) {
     res.status(404).json({ error: 'Plugin system not initialized' });
     return;
   }
 
   const plugin = pluginLoader.getPlugin(req.params.name);
-  if (!plugin) {
+  // Card bedf50cc (E380): the active Account (activePluginAccount, as every
+  // other plugin site), and availability ANDed with the view grant for a v1
+  // plugin. A hidden plugin answers this route's existing 404.
+  let visible = !!plugin;
+  if (plugin && isPluginV1(plugin.manifest)) {
+    try {
+      const account = await activePluginAccount(req as AuthRequest);
+      visible = pluginAccountCan(plugin.config, account) && await pluginAvailableTo(plugin, account);
+    } catch { res.status(503).json({ code: 'PLUGIN_UNAVAILABLE' }); return; }
+  }
+  if (!plugin || !visible) {
     res.status(404).json({ error: `Plugin not found: ${req.params.name}` });
     return;
   }

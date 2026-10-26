@@ -8,7 +8,7 @@ import ExecutionProfileEditor from '../components/tasks/ExecutionProfileEditor';
 import AccessVehiclePicker from '../components/tasks/AccessVehiclePicker';
 import { authenticatedFetch } from '../utils/auth';
 import { taskDetailSectionsFor } from '../components/tasks/taskDetailSectionRegistry';
-import { PhaseSelect } from '../components/tasks/PhaseSelect';
+import { PhaseSelect, inboxPhaseInForce, usePhaseOptions } from '../components/tasks/PhaseSelect';
 import { PersonalitySummary } from '../types/personality';
 import { DueAtInput, ModelInput, PersonalitySelect, PrioritySelect, ProjectSelect, StatusSelect, TASK_STATUS_OPTIONS, TagsInput, TaskSectionShell, ThinkingSelect, parseTagsInput } from '../components/tasks/taskFieldEditors';
 import './TaskDetailPage.css';
@@ -56,18 +56,24 @@ export function TaskCreatePage() {
   const [searchParams] = useSearchParams();
 
   // Board context pre-fill (§7): the filtered board hands its project/phase/
-  // status context through the query string.
-  const validStatus = (value: string | null): TaskStatus =>
-    TASK_STATUS_OPTIONS.some(status => status.value === value && status.value !== 'archived') ? (value as TaskStatus) : 'todo';
+  // status context through the query string. A pre-filled value is a CHOICE,
+  // exactly as if the person had picked it; an absent one is no choice.
+  const chosenStatus = (value: string | null): TaskStatus | null =>
+    TASK_STATUS_OPTIONS.some(status => status.value === value && status.value !== 'archived') ? (value as TaskStatus) : null;
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [definitionOfDone, setDefinitionOfDone] = useState('');
   const [constraints, setConstraints] = useState('');
-  const [status, setStatus] = useState<TaskStatus>(() => validStatus(searchParams.get('status')));
+  // Card b13e5ac9: status and phase hold the person's CHOICE, null while they
+  // have made none. What the form shows - and sends - is the choice, or the
+  // Project's default: its inbox phase with status Ideas when it names one in
+  // force, otherwise no phase and To-Do. '' as a phase choice is the explicit
+  // backlog ("No phase"), which is sent as null and wins over the inbox.
+  const [statusChoice, setStatusChoice] = useState<TaskStatus | null>(() => chosenStatus(searchParams.get('status')));
   const [priority, setPriority] = useState<TaskPriority>('normal');
   const [projectName, setProjectName] = useState(() => searchParams.get('project') ?? '');
-  const [phaseId, setPhaseId] = useState(() => searchParams.get('phaseId') ?? '');
+  const [phaseChoice, setPhaseChoice] = useState<string | null>(() => searchParams.get('phaseId') || null);
   const [tags, setTags] = useState('');
   // Card 7d38a6e0. null is the ordinary state: most Tasks have no deadline.
   // The value is what will be SENT — a wall clock with its zone once the
@@ -100,9 +106,12 @@ export function TaskCreatePage() {
   // (review 26176eb3 B1): a priority-only change or an untyped-but-unsaved
   // subtask draft is user-entered state and must never be discarded silently.
   const initialSnapshotRef = useRef<string | null>(null);
+  // The CHOICES, not the shown values: the inbox preselection arrives with
+  // the Project and Phase lists, and a default the person never touched is
+  // not unsaved work (card b13e5ac9).
   const formSnapshot = JSON.stringify({
-    title, description, definitionOfDone, constraints, status, priority,
-    projectName, phaseId, tags, personalityId, model, thinking,
+    title, description, definitionOfDone, constraints, statusChoice, priority,
+    projectName, phaseChoice, tags, personalityId, model, thinking,
     executionProfile, subtasks, links, blockedReason,
     // Round-1 review F6: `dueAt` is an editable value like any other, and
     // leaving it out of the snapshot meant a form whose ONLY change was a
@@ -169,7 +178,7 @@ export function TaskCreatePage() {
       const response = await authenticatedFetch(`${API_BASE_URL}/projects`);
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.success) throw new Error(data.error || 'Projects could not be loaded.');
-      return (data.projects || []) as Array<{ id: string; name: string }>;
+      return (data.projects || []) as Array<{ id: string; name: string; inboxPhaseId?: string | null }>;
     },
   });
   const personalitiesQuery = useQuery({
@@ -184,6 +193,14 @@ export function TaskCreatePage() {
   const projects = projectsQuery.data || [];
   const personalities = personalitiesQuery.data || [];
   const currentProject = useMemo(() => projects.find(project => project.name === projectName) || null, [projects, projectName]);
+  // Card b13e5ac9 (Charter v5 §6.1): the inbox phase is PRESELECTED while the
+  // person has chosen no phase - and only while it is in force (offered, not
+  // archived, not restricted), which is exactly when the server would file a
+  // phase-less Task there. A Task landing in the inbox defaults to Ideas.
+  const phaseOptions = usePhaseOptions(currentProject?.id || null);
+  const inboxPhaseId = inboxPhaseInForce(phaseOptions, currentProject?.inboxPhaseId);
+  const phaseId = phaseChoice ?? inboxPhaseId ?? '';
+  const status: TaskStatus = statusChoice ?? (inboxPhaseId !== null && phaseId === inboxPhaseId ? 'ideas' : 'todo');
 
   const create = async () => {
     if (!title.trim()) {
@@ -201,7 +218,9 @@ export function TaskCreatePage() {
       title: title.trim(),
       description: description.trim(),
       project: projectName.trim() || undefined,
-      phaseId: phaseId || undefined,
+      // A chosen "No phase" is sent as null - the explicit backlog wins over
+      // the inbox on the server, as any explicit phase does.
+      phaseId: phaseId || (phaseChoice === '' ? null : undefined),
       priority,
       status,
       tags: parseTagsInput(tags),
@@ -328,11 +347,13 @@ export function TaskCreatePage() {
             <ProjectSelect projects={projects} value={currentProject?.id ?? ''} onChange={projectId => {
               const selected = projects.find(project => project.id === projectId);
               setProjectName(selected?.name ?? '');
-              setPhaseId('');
+              // A new Project: no phase chosen yet, so its own inbox phase
+              // (if any) is what the form preselects.
+              setPhaseChoice(null);
             }} />
           </label>
           <label>Phase
-            <PhaseSelect projectId={currentProject?.id || null} value={phaseId} currentPhase={null} onChange={setPhaseId} />
+            <PhaseSelect projectId={currentProject?.id || null} value={phaseId} currentPhase={null} onChange={setPhaseChoice} />
           </label>
           <label>Tags
             <TagsInput value={tags} onChange={setTags} />
@@ -390,7 +411,7 @@ export function TaskCreatePage() {
           </div>
         </div>
         <div className="task-detail-page-header-controls">
-          <label>Status<StatusSelect value={status} includeArchived={false} onChange={setStatus} /></label>
+          <label>Status<StatusSelect value={status} includeArchived={false} onChange={setStatusChoice} /></label>
           <label>Priority<PrioritySelect value={priority} onChange={setPriority} /></label>
           <Button variant="primary" className="task-create-primary" disabled={saving || dueRefusal !== null} onClick={() => void create()}>{saving ? 'Creating…' : 'Create Task'}</Button>
           <Button variant="secondary" disabled={saving} onClick={cancel}>Cancel</Button>

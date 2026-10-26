@@ -30,6 +30,11 @@ const ALLOWED_RAW_CALLERS: Record<string, string> = {
   // verifier — but they now name the principal that minted them and check
   // its status, which is what the allow-list entry is attesting to.
   'middleware/pluginProxy.ts': 'verifies the browser-access capability cookie; status-checks its sub',
+  // Card bedf50cc (E380, C8): a plugin ASSERTION is not a dashboard token. It
+  // is verified with the plugin's own key (HS256 pinned) for the backend
+  // effective-settings read only, and the route status-checks its sub with a
+  // fresh read before it answers.
+  'services/PluginAssertion.ts': 'verifies a core-issued plugin assertion (own key, HS256, issued jti); the route status-checks its sub',
   // routes/secondBrain.ts (qdrant-ui capability cookie) left core with the
   // Second Brain plugin (P1.3) — any reappearance must re-justify its entry.
 };

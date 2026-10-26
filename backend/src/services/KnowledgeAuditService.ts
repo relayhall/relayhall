@@ -58,6 +58,14 @@ export interface KnowledgeFanoutAuditEntry {
   invalidResults?: boolean;
   /** Set when core dropped results for volume. */
   truncatedResults?: boolean;
+  /**
+   * Card 40e0e542 (rider): the caller's archive opt-in for this SEARCH, written
+   * by the search ledger on every entry. `knowledge_search_audit` has no
+   * per-search column for it (one would need a migration), so it rides in the
+   * existing `fanout` document; a search that wrote no fan-out entry (the
+   * too-broad refusal) records no flag.
+   */
+  archiveIncluded?: boolean;
 }
 
 export interface KnowledgeSearchAuditInput {
@@ -120,6 +128,7 @@ export async function recordKnowledgeSearch(
 }
 
 export interface KnowledgeGetAuditInput {
+  auditRef?: string;
   sourceId: string;
   compartment: string;
   /** The DECODED raw ref. Hashed here and never stored or logged. */
@@ -137,8 +146,8 @@ export async function recordKnowledgeGet(
   try {
     await pool.query(
       `INSERT INTO knowledge_get_audit
-         (caller_principal_id, caller_credential_id, source_id, compartment, ref_sha256, outcome)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+         (caller_principal_id, caller_credential_id, source_id, compartment, ref_sha256, outcome${input.auditRef ? ', id' : ''})
+       VALUES ($1, $2, $3, $4, $5, $6${input.auditRef ? ', $7::uuid' : ''})`,
       [
         callerPrincipalId(req),
         callerCredentialId(req),
@@ -146,6 +155,7 @@ export async function recordKnowledgeGet(
         input.compartment,
         refSha256,
         input.outcome,
+        ...(input.auditRef ? [input.auditRef] : []),
       ],
     );
   } catch (e) {

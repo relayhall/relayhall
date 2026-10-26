@@ -26,6 +26,14 @@ jest.mock('../services/GrantService', () => ({
   },
 }));
 
+// Card ff410dc4 (E407 item 1): GET /grants reads through the paged list
+// service. The same failing driver stands behind it, so the helper chain under
+// test (sendGrantError + logGrantRouteFailure + sendApiError) is unchanged.
+jest.mock('../services/GrantListService', () => ({
+  grantListService: { page: jest.fn(async () => grantBehavior.list()) },
+  parseGrantListQuery: () => ({ limit: null }),
+}));
+
 import notificationEndpointsRouter from '../routes/notificationEndpoints';
 import grantsRouter from '../routes/grants';
 

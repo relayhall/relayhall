@@ -124,7 +124,7 @@ const { loginSessionService, SESSION_COOKIE_NAME } = require('../services/LoginS
 const { principalService } = require('../services/PrincipalService');
 const { CREATION_DEFAULT_SKIP_REASONS } = require('../services/HomeGroupService');
 const {
-  REQUIRED_ASSERTIONS, assertSerialised, assertionSet,
+  PROVENANCE_DOMAIN_CONSTRAINT, REQUIRED_ASSERTIONS, assertSerialised, assertionSet,
 } = require('./acceptance/lensesDrillOracles');
 
 jest.setTimeout(240_000);
@@ -260,11 +260,8 @@ async function rootBearerFor(label: string, accountId: string): Promise<Caller> 
 }
 
 async function makeGroup(name: string, featured: boolean): Promise<string> {
-  const result = await pool.query(
-    'INSERT INTO groups (name, description, featured) VALUES ($1, $2, $3) RETURNING id',
-    [name, 'lenses-b fixture', featured],
-  );
-  return String(result.rows[0].id);
+  // AZ-A12 build 1: a raw Group row needs its kind='group' principal first.
+  return require('./support/groupRows').insertGroupRow(pool, { name, description: 'lenses-b fixture', featured });
 }
 
 async function addMember(groupId: string, principalId: string): Promise<void> {
@@ -295,7 +292,12 @@ async function setPointer(principalId: string, groupId: string): Promise<void> {
  * which is why the cases below name the pair explicitly instead of expecting
  * an empty set or filtering it away.
  */
-function creatorPairOf(projectId: string | null, principalId: string): GrantRow[] {
+/** The creator pair a creator's project carries. Owner ruling E407 item 2: an
+ * administrator whose role derives root is already admitted and bypasses every
+ * delegation check, so its pair is held, never written (`written: false`); a
+ * Member's pair is written. */
+function creatorPairOf(projectId: string | null, principalId: string, written = true): GrantRow[] {
+  if (!written) return [];
   return ['read', 'write'].map((verb) => ({
     granteeType: 'principal',
     granteeId: principalId,
@@ -326,6 +328,27 @@ async function grantsFor(projectId: string | null): Promise<GrantRow[]> {
   }));
 }
 
+/** Owner ruling E407 item 2: the creator policy's own audit rows (one per
+ * verb), which say whether each creator row was written or already held. */
+async function creatorPolicyAuditsFor(projectId: string | null): Promise<AuditRow[]> {
+  if (!projectId) return [];
+  const rows = await pool.query(
+    `SELECT action, outcome, metadata FROM audit_events
+      WHERE resource_type = 'project' AND resource_id = $1 AND action = 'project.creator_access'
+      ORDER BY occurred_at, id`,
+    [projectId],
+  );
+  return rows.rows.map((row: any) => ({
+    action: String(row.action), outcome: String(row.outcome), metadata: row.metadata ?? {},
+  }));
+}
+
+/** The rows the observation reads: the home-group act's audit rows, then the
+ * creator policy's. */
+async function observedAudits(projectId: string | null): Promise<AuditRow[]> {
+  return [...await auditsFor(projectId), ...await creatorPolicyAuditsFor(projectId)];
+}
+
 async function auditsFor(projectId: string | null): Promise<AuditRow[]> {
   if (!projectId) return [];
   const rows = await pool.query(
@@ -340,8 +363,16 @@ async function auditsFor(projectId: string | null): Promise<AuditRow[]> {
   }));
 }
 
-async function everyGrantRow(): Promise<GrantRow[]> {
-  const rows = await pool.query(
+/**
+ * The pool, or ONE client inside a transaction a test will roll back. A
+ * schema mutation holds ACCESS EXCLUSIVE on `grants` until that rollback, so
+ * everything observed under it must travel on the same client: a pool query
+ * would wait on the lock its own test holds.
+ */
+type Queryable = { query: (text: string, values?: unknown[]) => Promise<any> };
+
+async function everyGrantRow(q: Queryable = pool): Promise<GrantRow[]> {
+  const rows = await q.query(
     `SELECT grantee_type, grantee_id, resource_type, resource_id, verb, origin, provenance FROM grants`,
   );
   return rows.rows.map((row: any) => ({
@@ -355,19 +386,26 @@ async function everyGrantRow(): Promise<GrantRow[]> {
   }));
 }
 
-async function schemaObservation(): Promise<SchemaObservation> {
-  const checks = await pool.query(
+/**
+ * What R-7 reads, measured. EVERY CHECK on `grants` is carried by name; the
+ * oracle selects the provenance domain by NAME (`PROVENANCE_DOMAIN_CONSTRAINT`).
+ * Selecting here by the substring `provenance` read migration 142's
+ * `grants_approval_shape` as a second domain (CI full tier run 5698).
+ */
+async function schemaObservation(within?: Queryable): Promise<SchemaObservation> {
+  const q: Queryable = within ?? pool;
+  const checks = await q.query(
     `SELECT conname, pg_get_constraintdef(oid) AS def
        FROM pg_constraint
-      WHERE conrelid = 'grants'::regclass AND contype = 'c'`,
+      WHERE conrelid = 'grants'::regclass AND contype = 'c'
+      ORDER BY conname`,
   );
-  const defs: string[] = checks.rows.map((row: any) => String(row.def));
-  const nonManual = (await everyGrantRow()).filter((row) => row.origin !== 'manual');
+  const nonManual = (await everyGrantRow(q)).filter((row) => row.origin !== 'manual');
   return {
-    provenanceCheckDefs: defs.filter((def) => def.includes('provenance')),
+    grantsChecks: checks.rows.map((row: any) => ({ name: String(row.conname), definition: String(row.def) })),
     originGroupOnly: checks.rows.some((row: any) => String(row.conname) === 'grants_origin_group_only'),
     nonManualRows: nonManual,
-    ...(await provenanceDomainProbe()),
+    ...(await provenanceDomainProbe(within)),
   };
 }
 
@@ -382,21 +420,24 @@ async function schemaObservation(): Promise<SchemaObservation> {
  * refusal-only assertion perfectly, which is the same shape as the defect this
  * repair exists for.
  *
- * Every probe row is written and rolled back inside one transaction, so the
- * table is unchanged.
+ * Every probe row - the probe Project too - is written and rolled back inside
+ * one transaction, so the tables are unchanged. Given a client already inside
+ * a caller's transaction (a schema mutation the caller rolls back), the probe
+ * runs under a savepoint on THAT client, so it measures the mutated schema
+ * and the caller's ROLLBACK discards it with everything else.
  */
-async function provenanceDomainProbe(): Promise<{
+async function provenanceDomainProbe(within?: Queryable): Promise<{
   arbitraryProvenanceRefused: boolean; ratifiedProvenanceAccepted: string[];
 }> {
-  const probeProject = await pool.query(
-    `INSERT INTO projects (name, status, visibility) VALUES ($1, 'active', 'private')
-     RETURNING id`, [`lensb-provenance-probe ${tag()}`]);
-  const projectId = String(probeProject.rows[0].id);
   const accepted: string[] = [];
   let refused = false;
-  const client = await pool.connect();
+  const client = within ?? await pool.connect();
   try {
-    await client.query('BEGIN');
+    await client.query(within ? 'SAVEPOINT provenance_probe' : 'BEGIN');
+    const probeProject = await client.query(
+      `INSERT INTO projects (name, status, visibility) VALUES ($1, 'active', 'private')
+       RETURNING id`, [`lensb-provenance-probe ${tag()}`]);
+    const projectId = String(probeProject.rows[0].id);
     const write = async (provenance: string, verb: string): Promise<boolean> => {
       await client.query('SAVEPOINT probe');
       try {
@@ -417,10 +458,13 @@ async function provenanceDomainProbe(): Promise<{
     }
     refused = !(await write('lensb-unratified-third-value', 'use'));
   } finally {
-    await client.query('ROLLBACK').catch(() => undefined);
-    client.release();
+    if (within) {
+      await client.query('ROLLBACK TO SAVEPOINT provenance_probe');
+    } else {
+      await client.query('ROLLBACK').catch(() => undefined);
+      (client as any).release();
+    }
   }
-  await pool.query('DELETE FROM projects WHERE id = $1', [projectId]);
   return { arbitraryProvenanceRefused: refused, ratifiedProvenanceAccepted: accepted };
 }
 
@@ -446,7 +490,7 @@ async function observe(
     expectation,
     projectId,
     grants: await grantsFor(projectId),
-    audits: await auditsFor(projectId),
+    audits: await observedAudits(projectId),
   };
 }
 
@@ -511,12 +555,23 @@ async function underBarrier(
  * for the literal cannot say that — `GrantService`'s `origin` type union
  * declares it, which is the whole point of declaring it. A write assigns it:
  * as a bound or inline value in a statement, or as an object property.
+ *
+ * A SQL comparison READS the column: `WHEN g.origin = 'steward' THEN ...` or
+ * `WHERE ... AND g.origin = 'steward'` puts `origin` after a predicate keyword
+ * (card ff410dc4: the Access list labels a row's origin that way). Every other
+ * `origin = 'steward'`, and `origin = CASE ... 'steward' ...`, is an assignment.
  */
 function writesStewardOrigin(line: string): boolean {
   const literal = /['\"]steward['\"]/;
   if (!literal.test(line)) return false;
   if (/(INSERT|UPDATE|VALUES)/i.test(line)) return true;
-  return /origin\s*[=:]\s*['\"]steward['\"]/.test(line);
+  const assignment = /[\w.]*origin\s*([=:])\s*(?:['\"]steward['\"]|CASE\b)/gi;
+  for (const match of line.matchAll(assignment)) {
+    const comparison = match[1] === '='
+      && /\b(WHEN|WHERE|AND|OR|ON|NOT|HAVING)\s*\(?\s*$/i.test(line.slice(0, match.index));
+    if (!comparison) return true;
+  }
+  return false;
 }
 
 const CASES: Observation[] = [];
@@ -565,15 +620,16 @@ afterAll(async () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('0 · the fixtures are real', () => {
-  it('a project created by the root session is PRIVATE, so only a grant can open it', async () => {
+  it('a project created by the root session is private and owned by that account', async () => {
     const { projectId } = await createProject(ROOT);
     expect(projectId).not.toBeNull();
     FIXTURE_PROJECTS.push(projectId!);
     const row = await pool.query('SELECT visibility, owner_principal_id FROM projects WHERE id = $1', [projectId]);
     // Without this, every "the member can read it" assertion below could be
     // explained by the visibility arm and would say nothing about the grant.
+    // Creator ownership is separate: neither MEMBER nor STRANGER is ROOT.
     expect(row.rows[0].visibility).toBe('private');
-    expect(row.rows[0].owner_principal_id).toBeNull();
+    expect(row.rows[0].owner_principal_id).toBe(ROOT.principalId);
   });
 
   it('the stranger reads NOTHING, before or after', async () => {
@@ -886,7 +942,7 @@ describe('4 · A-L22 · the four clause flips, under a real barrier', () => {
         expectation: { kind: 'skip', reason: reason as any },
         projectId,
         grants: await grantsFor(projectId),
-        audits: await auditsFor(projectId),
+        audits: await observedAudits(projectId),
       });
       if (projectId) FIXTURE_PROJECTS.push(projectId);
     } finally {
@@ -984,7 +1040,9 @@ describe('4 · A-L22 · the four clause flips, under a real barrier', () => {
   it('a root session with NO pointer at all also skips no_home_group — the ordinary path', async () => {
     const lonely = await sessionFor('lonely-root', await makeAccount('admin', 'lonely'), ['root']);
     const { projectId } = await createProject(lonely);
-    expect(await grantsFor(projectId)).toEqual(creatorPairOf(projectId, lonely.principalId!));
+    expect(await grantsFor(projectId)).toEqual(creatorPairOf(projectId, lonely.principalId!, false));
+    expect((await creatorPolicyAuditsFor(projectId)).map((row) => [row.metadata.verb, row.metadata.alreadyHeld, row.metadata.grantId]).sort())
+      .toEqual([['read', true, null], ['write', true, null]]);
     const audits = await auditsFor(projectId);
     expect(audits).toHaveLength(1);
     expect(audits[0].metadata.reason).toBe('no_home_group');
@@ -1159,11 +1217,24 @@ describe('7 · A-L23 and R-7 · the closures in SQL', () => {
     // looking at nothing.
     expect(writesStewardOrigin("origin: 'manual' | 'creation-default' | 'steward';")).toBe(false);
     expect(writesStewardOrigin("  * `steward` ships as a dormant CHECK value")).toBe(false);
+    // A comparison reads the column: the Access list's origin label (card
+    // ff410dc4) and a filter are not writers.
+    for (const read of [
+      "      WHEN g.origin = 'steward' THEN 'steward'",
+      "      WHERE g.grantee_type = 'group' AND g.origin = 'steward'",
+    ]) {
+      expect(writesStewardOrigin(read)).toBe(false);
+    }
     for (const planted of [
       "       VALUES ('group', $1, 'project', $2, $3, $4, 'steward')`,",
       "      await client.query(`UPDATE grants SET origin = 'steward' WHERE id = $1`);",
       "        origin: 'steward',",
       '        origin: "steward",',
+      // A write whose value is a CASE stays a write, even when a comparison
+      // precedes it on the line.
+      "         SET origin = CASE WHEN $2 THEN 'steward' ELSE origin END",
+      "      origin = CASE WHEN g.origin = 'manual' THEN 'steward' ELSE g.origin END,",
+      "      WHERE g.id = $1 AND g.origin = 'manual'; row.origin = 'steward';",
     ]) {
       expect(writesStewardOrigin(planted)).toBe(true);
     }
@@ -1194,14 +1265,102 @@ describe('7 · A-L23 and R-7 · the closures in SQL', () => {
     // oracle searched for two substrings and a named forbidden list, so a third
     // value nobody had thought of passed. This is that exact definition.
     const widened = await schemaObservation();
-    widened.provenanceCheckDefs = [
+    const domain = widened.grantsChecks.find((check) => check.name === PROVENANCE_DOMAIN_CONSTRAINT);
+    if (!domain) throw new Error(`the live catalogue has no ${PROVENANCE_DOMAIN_CONSTRAINT}`);
+    domain.definition =
       "CHECK (((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text,"
-      + " 'assignment:warrant'::text, 'unexpected-third-value'::text]))))",
-    ];
+      + " 'assignment:warrant'::text, 'unexpected-third-value'::text]))))";
     expect(assertionSet({
       cases: [], schema: widened,
       serialisation: SERIALISATION, allGrantRows: [],
     })['R-7:provenance']).not.toEqual([]);
+  });
+
+  // ── R-7 selects the domain BY NAME, proven on the real catalogue ────────────
+  //
+  // 785e1eed P1-B correction. CI full tier run 5698 failed R-7 on the literals
+  // of migration 142's `grants_approval_shape` ('principal', 'manual'): the
+  // observation then carried every CHECK whose text contained `provenance`,
+  // and 142's shape says `provenance IS NULL` as one conjunct of an
+  // approval-made row. The provenance domain itself (099:57-59) did not
+  // change. Each mutation below is real DDL inside ONE transaction on ONE
+  // client, rolled back: the database is a throwaway for the test's duration
+  // and unchanged after it. Each one reddens a DIFFERENT failure of R-7, and
+  // 142's shape alone reddens none.
+
+  /** Apply DDL in a transaction, measure R-7 on that client, roll it back. */
+  async function r7UnderDdl(ddl: string[]): Promise<{ failures: string[]; schema: SchemaObservation }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const statement of ddl) await client.query(statement);
+      const schema = await schemaObservation(client);
+      const failures: string[] = assertionSet({
+        cases: [], schema, serialisation: SERIALISATION, allGrantRows: await everyGrantRow(client),
+      })['R-7:provenance'];
+      return { failures, schema };
+    } finally {
+      try { await client.query('ROLLBACK'); } finally { client.release(); }
+    }
+  }
+
+  const checkNames = (schema: SchemaObservation): string[] => schema.grantsChecks.map((check) => check.name);
+
+  it('R-7 by name: 142\'s approval shape mentions provenance HERE, and R-7 is green with it and without it', async () => {
+    const live = await schemaObservation();
+    // The trap is really on this catalogue - otherwise the green below would
+    // be measured without it and prove nothing about the repair.
+    const mentioning = live.grantsChecks
+      .filter((check) => check.definition.includes('provenance')).map((check) => check.name);
+    expect(mentioning).toContain(PROVENANCE_DOMAIN_CONSTRAINT);
+    expect(mentioning).toContain('grants_approval_shape');
+    expect(assertionSet({
+      cases: [], schema: live, serialisation: SERIALISATION, allGrantRows: await everyGrantRow(),
+    })['R-7:provenance']).toEqual([]);
+    const without = await r7UnderDdl(['ALTER TABLE grants DROP CONSTRAINT grants_approval_shape']);
+    expect(checkNames(without.schema)).not.toContain('grants_approval_shape');
+    expect(without.failures).toEqual([]);
+  });
+
+  it('R-7 by name: a THIRD value written into the real domain is red in the set comparison, 142\'s shape in place', async () => {
+    const { failures, schema } = await r7UnderDdl([
+      `ALTER TABLE grants DROP CONSTRAINT ${PROVENANCE_DOMAIN_CONSTRAINT}`,
+      `ALTER TABLE grants ADD CONSTRAINT ${PROVENANCE_DOMAIN_CONSTRAINT} CHECK (provenance IS NULL OR provenance IN ('assignment:grant', 'assignment:warrant', 'lensb-third-value'))`,
+    ]);
+    expect(checkNames(schema)).toContain('grants_approval_shape');
+    // The probe's own arbitrary token is still refused and both ratified values
+    // still accepted, so the ONE failure is the extracted domain, named.
+    expect(schema.arbitraryProvenanceRefused).toBe(true);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain('admits {assignment:grant, assignment:warrant, lensb-third-value}');
+  });
+
+  it('R-7 by name: a same-literal widening (NOT IN) is red through the PROBE, not the string', async () => {
+    // NOT VALID: existing rows carry the ratified values this mutant refuses,
+    // and the probe measures what NEW rows are admitted.
+    const { failures } = await r7UnderDdl([
+      `ALTER TABLE grants DROP CONSTRAINT ${PROVENANCE_DOMAIN_CONSTRAINT}`,
+      `ALTER TABLE grants ADD CONSTRAINT ${PROVENANCE_DOMAIN_CONSTRAINT} CHECK (provenance IS NULL OR provenance NOT IN ('assignment:grant', 'assignment:warrant')) NOT VALID`,
+    ]);
+    expect(failures).toContain('PostgreSQL ACCEPTED an unratified provenance value: the CHECK is not the closure');
+    expect(failures.filter((failure) => failure.includes(' admits {'))).toEqual([]);
+  });
+
+  it('R-7 by name: a separately-named CHECK refusing a ratified value is red through the PROBE', async () => {
+    // The static half reads the domain by name and not this constraint: a
+    // separately-named CHECK can only narrow, and the database's answer sees it.
+    const { failures, schema } = await r7UnderDdl([
+      "ALTER TABLE grants ADD CONSTRAINT lensb_extra_narrowing CHECK (provenance IS DISTINCT FROM 'assignment:warrant') NOT VALID",
+    ]);
+    expect(checkNames(schema)).toContain('lensb_extra_narrowing');
+    expect(failures).toEqual(["PostgreSQL refused the ratified provenance value 'assignment:warrant'"]);
+  });
+
+  it('R-7 by name: the domain RENAMED is red as gone', async () => {
+    const { failures } = await r7UnderDdl([
+      `ALTER TABLE grants RENAME CONSTRAINT ${PROVENANCE_DOMAIN_CONSTRAINT} TO lensb_provenance_domain_v2`,
+    ]);
+    expect(failures).toEqual([`no CHECK named ${PROVENANCE_DOMAIN_CONSTRAINT} on grants: 099:55-59 is gone`]);
   });
 });
 
@@ -1385,7 +1544,7 @@ describe('10 · R-11-v1 and R-7, as one set', () => {
     // A case silently dropped would otherwise leave its assertion absent rather
     // than red, and an absent assertion is not a pass.
     const names = Object.keys(assertionSet({
-      cases: CASES, schema: { provenanceCheckDefs: [], originGroupOnly: true, nonManualRows: [] },
+      cases: CASES, schema: { grantsChecks: [], originGroupOnly: true, nonManualRows: [] },
       serialisation: SERIALISATION, allGrantRows: [],
     })).sort();
     expect(names).toEqual([...REQUIRED_ASSERTIONS].sort());
@@ -1494,6 +1653,39 @@ describe('11 · round-three home-pointer closure', () => {
     }
   });
 
+  /**
+   * Put the catalogue back at MIGRATION 128's position before 128 runs again.
+   *
+   * 128's postcondition refuses ANY CHECK other than grants_provenance_shape
+   * whose conkey includes provenance (128:189-195). That is right at 128's
+   * position in the chain and wrong at head: migration 142 added
+   * grants_approval_shape (142:183-187), which reads provenance as one
+   * conjunct of an approval-made row's shape and leaves the domain alone
+   * (section 7 measures that, by name). Re-run against the head catalogue,
+   * 128 refuses for 142's sake every time: the canonical case below can never
+   * pass, and every refusal case is red whatever its mutation - a refusal that
+   * proves nothing (785e1eed P1-B correction; CI full tier run 5698).
+   *
+   * Inside the rolled-back transaction the later dependents are set aside BY
+   * NAME - no IF EXISTS, so a wrong name fails here instead of being a silent
+   * no-op - and the catalogue is then required to hold no other dependent, by
+   * 128's own selector: a later migration that adds one fails HERE, naming
+   * it, instead of hollowing these controls.
+   */
+  const POST_128_PROVENANCE_DEPENDENTS = ['grants_approval_shape'];
+  async function atMigration128Position(client: Queryable): Promise<void> {
+    for (const name of POST_128_PROVENANCE_DEPENDENTS) {
+      await client.query(`ALTER TABLE grants DROP CONSTRAINT ${name}`);
+    }
+    const remaining = await client.query(
+      `SELECT c.conname FROM pg_constraint c
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attname = 'provenance'
+        WHERE c.conrelid = 'grants'::regclass AND c.contype = 'c'
+          AND c.conname <> 'grants_provenance_shape' AND a.attnum = ANY(c.conkey)
+        ORDER BY c.conname`);
+    expect(remaining.rows.map((row: any) => String(row.conname))).toEqual([]);
+  }
+
   it.each(['absent', 'unvalidated', 'same-literal-narrowed', 'same-literal-widened', 'third-literal-widened', 'missing-literal-narrowed', 'extra-same-literal-check'] as const)('migration refuses an %s provenance constraint', async (state) => {
     const fs = require('fs');
     const path = require('path');
@@ -1501,6 +1693,7 @@ describe('11 · round-three home-pointer closure', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await atMigration128Position(client);
       await client.query('ALTER TABLE grants DROP CONSTRAINT grants_provenance_shape');
       const canonical = "provenance IS NULL OR provenance IN ('assignment:grant', 'assignment:warrant')";
       const changed: Record<string, string> = {
@@ -1530,6 +1723,7 @@ describe('11 · round-three home-pointer closure', () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await atMigration128Position(client);
       const before = (await client.query("SELECT pg_get_expr(conbin, conrelid, false) AS expression FROM pg_constraint WHERE conrelid='grants'::regclass AND conname='grants_provenance_shape'")).rows;
       await client.query(migration); await client.query(migration);
       const after = (await client.query("SELECT pg_get_expr(conbin, conrelid, false) AS expression FROM pg_constraint WHERE conrelid='grants'::regclass AND conname='grants_provenance_shape'")).rows;
@@ -1540,7 +1734,7 @@ describe('11 · round-three home-pointer closure', () => {
 });
 
 describe('12 · B-L4 · creation-default Project Grants reach contained Tasks', () => {
-  it('B-L4: the home-group member reads and writes a new unrestricted Task, with live revocation and no Task Grant', async () => {
+  it('B-L4: the home-group member reads and writes a new unrestricted Task, with live revocation and no member Task Grant', async () => {
     const creator = await sessionFor('B-L4-root', await makeAccount('admin', 'bl4-root'), ['root']);
     const member = await sessionFor('B-L4-member', await makeAccount('user', 'bl4-member'),
       ['projects:read', 'projects:write', 'tasks:read', 'tasks:write']);
@@ -1571,7 +1765,20 @@ describe('12 · B-L4 · creation-default Project Grants reach contained Tasks', 
     expect((await call(stranger, 'PATCH', `/tasks/${taskId}`, { title: 'B-L4 concealed stranger edit' })).status).toBe(404);
     expect((await pool.query('SELECT owner_principal_id, title FROM tasks WHERE id=$1', [taskId])).rows[0])
       .toEqual({ owner_principal_id: taskBefore.owner_principal_id, title: 'B-L4 member edit' });
-    expect((await pool.query("SELECT id FROM grants WHERE resource_type='task' AND resource_id=$1", [taskId])).rows).toEqual([]);
+    // Creator bootstrap is independent of Project inheritance. The complete
+    // direct-Grant set never names the member or the group. Owner ruling E407
+    // item 2: the administrator creator already reads and writes it and
+    // bypasses every delegation check, so its creator pair is held and the
+    // set is EMPTY - its audit rows say so.
+    const directTaskGrants = async () => (await pool.query(`
+      SELECT grantee_type, grantee_id, verb, origin, provenance FROM grants
+      WHERE resource_type='task' AND resource_id=$1 ORDER BY verb`, [taskId])).rows;
+    const creatorGrants: unknown[] = [];
+    expect(await directTaskGrants()).toEqual(creatorGrants);
+    const taskPolicy = (await pool.query(`SELECT metadata FROM audit_events
+      WHERE resource_type='task' AND resource_id=$1 AND action='task.creator_access' ORDER BY occurred_at, id`, [taskId])).rows;
+    expect(taskPolicy.map((row: any) => [row.metadata.verb, row.metadata.alreadyHeld, row.metadata.grantId]).sort())
+      .toEqual([['read', true, null], ['write', true, null]]);
     // Revocation is a database input, and the next ordinary point/write calls
     // prove that no materialized Task authority survives the Project source.
     await pool.query('DELETE FROM grants WHERE id=$1', [defaults.find((row: any) => row.verb === 'write').id]);
@@ -1580,5 +1787,6 @@ describe('12 · B-L4 · creation-default Project Grants reach contained Tasks', 
     await pool.query('DELETE FROM grants WHERE id=$1', [defaults.find((row: any) => row.verb === 'read').id]);
     expect((await call(member, 'GET', `/tasks/${taskId}`)).status).toBe(404);
     expect((await call(member, 'PATCH', `/tasks/${taskId}`, { title: 'B-L4 revoked read' })).status).toBe(404);
+    expect(await directTaskGrants()).toEqual(creatorGrants);
   });
 });

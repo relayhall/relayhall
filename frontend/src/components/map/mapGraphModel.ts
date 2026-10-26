@@ -48,6 +48,32 @@ export interface MapEdge {
   kind: 'dependency' | 'knowledge';
 }
 
+/**
+ * One edge per (kind, from, to): the Map's relationship identity (card
+ * cae8dfe1, absorbed 01282f30).
+ *
+ * The graph read can list the same relationship more than once. Dependencies
+ * are unique in storage, but a Task may hold several `task` References to the
+ * same Task (different labels, one row each), and each becomes a knowledge row
+ * on the wire. The wire carries neither a row id nor the label, so parallel
+ * rows are indistinguishable on the Map: they are one drawn relationship.
+ * Keeping them all gave two edges the same React key and the same route-map
+ * entry. The first row of each identity is kept, in the order the read listed
+ * them, so the result is deterministic; an input with no repeat is returned
+ * as is.
+ */
+export function uniqueMapEdges(edges: readonly MapEdge[]): MapEdge[] {
+  const seen = new Set<string>();
+  const kept: MapEdge[] = [];
+  for (const edge of edges) {
+    const identity = JSON.stringify([edge.kind, edge.from, edge.to]);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    kept.push(edge);
+  }
+  return kept.length === edges.length ? edges as MapEdge[] : kept;
+}
+
 /** Phase identity from the graph read (card 8645e81c). */
 export interface MapPhase {
   id: string;
@@ -2339,8 +2365,8 @@ export interface AggregateFacts {
    * this quantity was already being computed; it was merely not surfaced.
    */
   archived: number;
-  /** §1 "who is working NOW" — brief requirement 6: from the existing `agent`
-   *  field on the graph node (tasks.active_agent), never a new read. */
+  /** Optional lawful actor-name badges from the graph. Current Task reads
+   *  supply none; Task status alone cannot manufacture agent liveness. */
   agentsLive: number;
   stuck: number;
   upNext: number;
@@ -3207,24 +3233,74 @@ export function segmentIntersectsBox(
   let t1 = 1;
   const dx = x2 - x1;
   const dy = y2 - y1;
-  const tests: Array<[number, number]> = [
-    [-dx, x1 - box.x],
-    [dx, box.x + box.w - x1],
-    [-dy, y1 - box.y],
-    [dy, box.y + box.h - y1],
-  ];
-  for (const [p, q] of tests) {
+  // Keep the four clips explicit and in order: this hot path runs for every
+  // obstacle check, so avoid per-edge loop dispatch without changing arithmetic.
+  const left = x1 - box.x;
+  const right = box.x + box.w - x1;
+  const top = y1 - box.y;
+  const bottom = box.y + box.h - y1;
+  {
+    const p = -dx;
+    const q = left;
     if (p === 0) {
-      if (q < 0) return false;     // parallel and outside this edge
-      continue;
-    }
-    const r = q / p;
-    if (p < 0) {
-      if (r > t1) return false;
-      if (r > t0) t0 = r;
+      if (q < 0) return false;
     } else {
-      if (r < t0) return false;
-      if (r < t1) t1 = r;
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+    }
+  }
+  {
+    const p = dx;
+    const q = right;
+    if (p === 0) {
+      if (q < 0) return false;
+    } else {
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+    }
+  }
+  {
+    const p = -dy;
+    const q = top;
+    if (p === 0) {
+      if (q < 0) return false;
+    } else {
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+    }
+  }
+  {
+    const p = dy;
+    const q = bottom;
+    if (p === 0) {
+      if (q < 0) return false;
+    } else {
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
     }
   }
   return true;
@@ -3265,18 +3341,22 @@ const withinEnvelope = (box: Box, envelope: Box | null) => (
  * routers just never looked for them, and bowed or stepped at arbitrary
  * offsets that happened to land on a node.
  */
-function gapCentres(
-  spans: ReadonlyArray<readonly [number, number]>,
-  prefer: number,
-  lo: number,
-  hi: number,
-): number[] {
+function mergeGapSpans(spans: ReadonlyArray<readonly [number, number]>): Array<[number, number]> {
   const merged: Array<[number, number]> = [];
   for (const [a, b] of [...spans].sort((p, q) => p[0] - q[0])) {
     const last = merged[merged.length - 1];
     if (last && a <= last[1]) last[1] = Math.max(last[1], b);
     else merged.push([a, b]);
   }
+  return merged;
+}
+
+function gapCentres(
+  merged: ReadonlyArray<readonly [number, number]>,
+  prefer: number,
+  lo: number,
+  hi: number,
+): number[] {
   const centres: number[] = [];
   // Outside the field entirely, on both sides.
   centres.push(merged.length ? merged[0][0] - CORRIDOR_MARGIN : prefer);
@@ -3325,9 +3405,12 @@ function corridorRoute(
 
   const xSpans = blocking.map(b => [b.x, b.x + b.w] as const);
   const ySpans = blocking.map(b => [b.y, b.y + b.h] as const);
-  const exits = gapCentres(xSpans, x1, lo, hi);
-  const entries = gapCentres(xSpans, x2, lo, hi);
-  const lanes = gapCentres(ySpans, (y1 + y2) / 2, loY, hiY);
+  // Exit and entry preferences share the same horizontal obstacle spans.
+  // Merge once for this call; centre selection remains preference-specific.
+  const mergedX = mergeGapSpans(xSpans);
+  const exits = gapCentres(mergedX, x1, lo, hi);
+  const entries = gapCentres(mergedX, x2, lo, hi);
+  const lanes = gapCentres(mergeGapSpans(ySpans), (y1 + y2) / 2, loY, hiY);
 
   let best = `M ${x1} ${y1} L ${x2} ${y2}`;
   const candidates: Array<{ points: Array<[number, number]>; cost: number }> = [];
@@ -3539,6 +3622,7 @@ export interface EdgeRoute {
   /** True when every offset in the ladder still left the curve crossing a
    *  node — surfaced rather than swallowed so a dev build can count them. */
   clipped: boolean;
+  points?: Array<[number, number]>;
 }
 
 /**
@@ -3652,9 +3736,35 @@ function localGapRoute(x1:number,y1:number,x2:number,y2:number,blocking:readonly
 /** Directional ports for the continuous plane. The short perpendicular stubs
  * are fixed, and the corridor between them is checked against every obstacle.
  * Transposing the routing space gives Vertical the same guarantees as Horizontal. */
+/** Round an obstacle-cleared polyline, checking each new corner curve. */
+export function roundedRoutePath(raw: Array<[number, number]>, obstacles: readonly Box[]): string {
+  const distinct = raw.filter((p,i) => !i || p[0] !== raw[i-1][0] || p[1] !== raw[i-1][1]);
+  const points = distinct.filter((p,i) => !i || i === distinct.length-1 ||
+    (p[0]-distinct[i-1][0])*(distinct[i+1][1]-p[1]) !== (p[1]-distinct[i-1][1])*(distinct[i+1][0]-p[0]));
+  if (!points.length) return '';
+  let d = `M ${points[0][0]} ${points[0][1]}`;
+  for (let i=1;i<points.length-1;i++) {
+    const a=points[i-1], b=points[i], c=points[i+1];
+    const incoming=Math.hypot(b[0]-a[0],b[1]-a[1]), outgoing=Math.hypot(c[0]-b[0],c[1]-b[1]);
+    let radius=Math.min(64,incoming/2,outgoing/2);
+    let rounded=false;
+    while(radius>=1) {
+      const x1=b[0]+(a[0]-b[0])*radius/incoming,y1=b[1]+(a[1]-b[1])*radius/incoming;
+      const x2=b[0]+(c[0]-b[0])*radius/outgoing,y2=b[1]+(c[1]-b[1])*radius/outgoing;
+      if (!obstacles.some(o=>quadraticIntersectsBox(x1,y1,b[0],b[1],x2,y2,o))) {
+        d+=` L ${x1} ${y1} Q ${b[0]} ${b[1]} ${x2} ${y2}`; rounded=true; break;
+      }
+      radius/=2;
+    }
+    if(!rounded)d+=` L ${b[0]} ${b[1]}`;
+  }
+  const end=points[points.length-1];
+  return d+` L ${end[0]} ${end[1]}`;
+}
+
 export function routeFlowEdge(
   source: Box, target: Box, obstacles: readonly Box[], envelope: Box | null,
-  organization: MapOrganization, report = false,
+  organization: MapOrganization, report = false, portOffset = 0, curved = false,
 ): EdgeRoute {
   if (source === target) return routeEdge(source, target, obstacles, envelope);
   const dx = target.x + target.w / 2 - source.x - source.w / 2;
@@ -3668,10 +3778,28 @@ export function routeFlowEdge(
   const blocking = [...obstacles.filter(o => o !== source && o !== target), shrunk(source), shrunk(target)].map(transform);
   const bounds = envelope && transform(envelope);
   const sign = reverse ? -1 : 1;
-  const x1 = reverse ? a.x : a.x + a.w, y1 = a.y + a.h / 2;
-  const x2 = reverse ? b.x + b.w : b.x, y2 = b.y + b.h / 2;
-  const path = (points: Array<[number, number]>) =>
-    'M ' + points.map(([x,y]) => vertical ? `${y} ${x}` : `${x} ${y}`).join(' L ');
+  const x1 = reverse ? a.x : a.x + a.w, y1 = a.y + a.h / 2 + Math.max(-a.h / 4, Math.min(a.h / 4, portOffset));
+  const x2 = reverse ? b.x + b.w : b.x, y2 = b.y + b.h / 2 + Math.max(-b.h / 4, Math.min(b.h / 4, portOffset));
+  const path = (points: Array<[number, number]>) => curved ? roundedRoutePath(
+    points.map(([x,y]) => vertical ? [y,x] : [x,y]),
+    [...obstacles.filter(o => o !== source && o !== target), shrunk(source), shrunk(target)])
+    : 'M ' + points.map(([x,y]) => vertical ? `${y} ${x}` : `${x} ${y}`).join(' L ');
+  const result = (raw: Array<[number, number]>, clipped = false): EdgeRoute => {
+    const points = raw.filter((p,i) => !i || p[0] !== raw[i-1][0] || p[1] !== raw[i-1][1]);
+    if (curved && !clipped) {
+      // Use a few visible waypoints; a diagonal through free space replaces a stair-step.
+      // Keep the endpoint stubs so links still leave/arrive perpendicular to cards.
+      for (let i = 1; i < points.length - 2; i++) {
+        for (let j = points.length - 2; j > i + 1; j--) {
+          const a = points[i], b = points[j];
+          if (!blocking.some(o => segmentIntersectsBox(a[0],a[1],b[0],b[1],o))) {
+            points.splice(i+1,j-i-1); break;
+          }
+        }
+      }
+    }
+    return { d: path(points), clipped, points: points.map(([x,y]) => vertical ? [y,x] : [x,y]) };
+  };
   const clear = (points: Array<[number, number]>) => points.every(([x,y],i) => {
     if (!i) return true;
     const [px,py] = points[i-1];
@@ -3682,22 +3810,22 @@ export function routeFlowEdge(
     const sx=x1+sign*stub, tx=x2-sign*stub;
     const middle=(sx+tx)/2;
     const direct: Array<[number,number]>=[[x1,y1],[sx,y1],[middle,y1],[middle,y2],[tx,y2],[x2,y2]];
-    if (sign*(tx-sx)>=0 && clear(direct)) return {d:path(direct),clipped:false};
+    if (sign*(tx-sx)>=0 && clear(direct)) return result(direct);
     if (!clear([[x1,y1],[sx,y1]]) || !clear([[tx,y2],[x2,y2]])) continue;
     const route=corridorRoute(sx,y1,tx,y2,blocking,bounds);
     if (!route.clear) {
       const local=localGapRoute(sx,y1,tx,y2,blocking,bounds);
-      if(local)return {d:path([[x1,y1],...local.map(p=>[p[0],p[1]] as [number,number]),[x2,y2]]),clipped:false};
+      if(local)return result([[x1,y1],...local.map(p=>[p[0],p[1]] as [number,number]),[x2,y2]]);
     }
     if (route.clear) {
       const numbers=route.d.match(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi)!.map(Number);
       const points: Array<[number,number]>=[[x1,y1]];
       for(let i=0;i<numbers.length;i+=2) points.push([numbers[i],numbers[i+1]]);
       points.push([x2,y2]);
-      return {d:path(points),clipped:false};
+      return result(points);
     }
   }
-  return {d:path([[x1,y1],[x1+sign*16,y1],[x2-sign*16,y2],[x2,y2]]),clipped:true};
+  return result([[x1,y1],[x1+sign*16,y1],[x2-sign*16,y2],[x2,y2]], true);
 }
 
 /* ======================================================================

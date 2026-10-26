@@ -33,9 +33,6 @@ jest.mock('../db/connection', () => ({
   },
 }));
 
-jest.mock('../services/NotificationManager', () => ({
-  notificationManager: { notifyStatusChange: jest.fn().mockResolvedValue(undefined) },
-}));
 
 jest.mock('../services/TaskHistoryService', () => ({
   taskHistoryService: { recordChange: jest.fn() },
@@ -59,14 +56,10 @@ function makeRow(id: string, overrides: Record<string, any> = {}) {
     thinking_auto_estimated: false,
     model: null,
     execution_mode: null,
-    auto_created: false,
     auto_start: false,
     blocked_reason: null,
     status_reason: null,
-    active_agent: null,
-    completed_by: null,
     attempt_count: 0,
-    session_refs: [],
     parent_id: null,
     personality_id: null,
     created_at: '2026-07-01T00:00:00.000Z',
@@ -246,6 +239,30 @@ describe('dependsOn referential integrity validation', () => {
     expect(err).toBeInstanceOf(DependencyValidationError);
     expect(err.code).toBe('SELF_DEPENDENCY');
     expect(err.offendingIds).toEqual([TASK_A]);
+  });
+
+  test('UUID case is canonical for self, known-target and cycle comparisons', async () => {
+    const lower = 'abcdefab-cdef-4abc-8abc-abcdefabcdef';
+    await expect((tm as any).validateDependencies([lower.toUpperCase()], lower)).rejects.toMatchObject({ code: 'SELF_DEPENDENCY' });
+    await expect((tm as any).validateDependencies([lower], lower.toUpperCase())).rejects.toMatchObject({ code: 'SELF_DEPENDENCY' });
+    mockQuery.mockImplementation(makeDispatcher({ taskRows: { [lower]: makeRow(lower) }, depRows: { [TASK_B]: [{ depends_on_task_id: lower }] } }));
+    await expect((tm as any).validateDependencies([lower.toUpperCase()], TASK_A)).resolves.toBeUndefined();
+    await expect((tm as any).hasCircularDependency(lower.toUpperCase(), TASK_B)).resolves.toBe(true);
+    await expect((tm as any).validateDependencies(['NOT-A-UUID'], TASK_A)).rejects.toMatchObject({ code: 'UNKNOWN_DEPENDENCY', offendingIds: ['NOT-A-UUID'] });
+  });
+
+  test('UUID plus a final newline stays malformed and preserves the exact offending value', async () => {
+    const malformed = 'ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF\n';
+    await expect((tm as any).validateDependencies([malformed], TASK_A)).rejects.toMatchObject({
+      code: 'UNKNOWN_DEPENDENCY', offendingIds: [malformed],
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+    mockClientQuery.mockResolvedValue({ rows: [] });
+    // The canonical writer passes source lookup before dependency validation;
+    // malformed source IDs must likewise remain byte-for-byte intact.
+    await expect(tm.addDependency(malformed, TASK_B)).rejects.toMatchObject({ code: 'TASK_NOT_FOUND' });
+    const lookup = mockClientQuery.mock.calls.find(([sql]) => String(sql).includes('WHERE t.id = $1'));
+    expect(lookup?.[1]).toEqual([malformed]);
   });
 
   test('existing dependencies of any status (archived included) pass validation', async () => {

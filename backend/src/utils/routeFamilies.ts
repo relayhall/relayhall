@@ -79,6 +79,9 @@ interface RouteLayer {
   route?: { path: unknown; methods?: Record<string, boolean> };
   name?: string;
   handle?: { stack?: RouteLayer[] };
+  /** Express 4 keeps a `use()` layer's mount path ONLY as this compiled pattern. */
+  regexp?: RegExp & { fast_slash?: boolean; fast_star?: boolean };
+  keys?: Array<{ name: unknown; optional?: boolean }>;
 }
 
 function joinMountPath(mount: string, routePath: string): string {
@@ -87,7 +90,118 @@ function joinMountPath(mount: string, routePath: string): string {
   return joined === '' ? '/' : joined;
 }
 
-function collectRouteLayers(router: Router, mount: string, out: Array<{ method: string; path: string }>): void {
+type PathToRegexp = (
+  path: string,
+  keys: Array<{ name: unknown; optional?: boolean }>,
+  options: { sensitive?: boolean; strict?: boolean; end?: boolean },
+) => RegExp;
+
+let expressPathCompiler: PathToRegexp | null = null;
+
+/**
+ * The path compiler EXPRESS uses, resolved from Express's own location: the
+ * tree also carries other `path-to-regexp` majors, and a prefix is only proved
+ * by recompiling it with the one that compiled the layer.
+ */
+function expressPathToRegexp(): PathToRegexp {
+  if (!expressPathCompiler) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    const { createRequire } = require('node:module') as typeof import('node:module');
+    expressPathCompiler = createRequire(require.resolve('express'))('path-to-regexp') as PathToRegexp;
+  }
+  return expressPathCompiler;
+}
+
+/** `\/?(?=\/|$)`: the tail Express's `use()` compiles onto every mount path (strict off, end off). */
+const MOUNT_TAIL = /\\?\/\?\(\?=\\?\/\|\$\)$/;
+
+/**
+ * One token of a compiled mount path: a `/:name` or `/:name?` parameter
+ * segment, a slash, an escaped dot, or one literal path character. Anything
+ * else — a custom parameter pattern, a `*`, a RegExp or array mount — is not
+ * decoded, and the mount is refused rather than guessed.
+ */
+const MOUNT_TOKEN = /^(?:\(\?:\\?\/\(\[\^\\?\/\]\+\?\)\)(\?)?|(\\?\/)|\\(\.)|([A-Za-z0-9_~-]))/;
+
+/**
+ * The mount prefix of a `use()` layer, spelled as the Express path that
+ * compiled it (`/otlp/v1`, `/services/:serviceId`, `/v/:version?`), `''` for a
+ * path-less `use()` or a mount at `/`, or null when it cannot be PROVED.
+ *
+ * Express 4 does not keep the string: a `use()` layer holds only the regexp
+ * `path-to-regexp` compiled from it and the parameter keys. The prefix is
+ * decoded from that regexp's source and then RECOMPILED with Express's own
+ * compiler under the layer's own options (case sensitivity from the flags;
+ * `use()` is always non-strict and non-ending); it is returned only if the
+ * recompiled source, flags and keys equal the layer's exactly. A decoded
+ * prefix is therefore one Express compiles to the very pattern it matches
+ * requests with — never an approximation of it.
+ */
+function nestedMountPrefix(layer: RouteLayer): string | null {
+  const pattern = layer.regexp;
+  if (!pattern || pattern.fast_star) return null;
+  if (pattern.fast_slash) return '';
+  if (!pattern.source.startsWith('^')) return null;
+  const tail = MOUNT_TAIL.exec(pattern.source);
+  if (!tail) return null;
+  let body = pattern.source.slice(1, tail.index);
+  const keys = layer.keys ?? [];
+  let keyIndex = 0;
+  let prefix = '';
+  while (body.length > 0) {
+    const token = MOUNT_TOKEN.exec(body);
+    if (!token) return null;
+    if (token[0].startsWith('(')) {
+      const key = keys[keyIndex++];
+      if (!key || typeof key.name !== 'string' || !/^\w+$/.test(key.name)) return null;
+      prefix += `/:${key.name}${token[1] ? '?' : ''}`;
+    } else if (token[2]) {
+      prefix += '/';
+    } else if (token[3]) {
+      prefix += '.';
+    } else {
+      prefix += token[4];
+    }
+    body = body.slice(token[0].length);
+  }
+  if (keyIndex !== keys.length) return null;
+
+  const recompiledKeys: Array<{ name: unknown; optional?: boolean }> = [];
+  const recompiled = expressPathToRegexp()(prefix, recompiledKeys, {
+    sensitive: !pattern.flags.includes('i'),
+    strict: false,
+    end: false,
+  });
+  if (recompiled.source !== pattern.source || recompiled.flags !== pattern.flags) return null;
+  if (recompiledKeys.length !== keys.length) return null;
+  const sameKeys = recompiledKeys.every((key, i) => key.name === keys[i].name && Boolean(key.optional) === Boolean(keys[i].optional));
+  return sameKeys ? prefix : null;
+}
+
+interface RawRouteFamilies {
+  routes: Array<{ method: string; path: string }>;
+  /** One sentence per nested mount whose prefix could not be proved. */
+  underivable: string[];
+}
+
+/**
+ * Walk a router's stack. A route contributes one entry per method and path,
+ * joined to `mount`. A NESTED ROUTER (a `use()` layer whose handle is itself a
+ * router) is walked under `mount` + its own mount prefix, at any depth, so
+ * every family it contributes carries the full path the app serves: a
+ * sub-router at `/otlp/v1` inside `/telemetry` contributes
+ * `POST /telemetry/otlp/v1/traces`, exactly as the same route mounted flat
+ * does.
+ *
+ * Dropping the nested prefix is NOT a safe omission. A prefix-less family is a
+ * path the app does not serve; it resolves against the route map to no rule,
+ * fails closed to root, and the boot census refuses it (RH-TW1b's lane portal,
+ * card 2c000125). Worse, where a prefix-less path happens to match a real
+ * rule, it would be censused under the WRONG requirement. A nested prefix that
+ * cannot be proved is therefore reported by name in `underivable`, never
+ * guessed and never skipped.
+ */
+function collectRouteLayers(router: Router, mount: string, out: RawRouteFamilies): void {
   const stack = (router as unknown as { stack?: RouteLayer[] }).stack ?? [];
   for (const layer of stack) {
     if (layer.route) {
@@ -96,15 +210,21 @@ function collectRouteLayers(router: Router, mount: string, out: Array<{ method: 
         if (typeof rawPath !== 'string') continue;
         for (const [method, enabled] of Object.entries(layer.route.methods ?? {})) {
           if (!enabled || method === '_all') continue;
-          out.push({ method: method.toUpperCase(), path: joinMountPath(mount, rawPath) });
+          out.routes.push({ method: method.toUpperCase(), path: joinMountPath(mount, rawPath) });
         }
       }
       continue;
     }
-    // A nested router mounted inside a router. None exists at this pin; the
-    // recursion is here so a future nesting is censused rather than silently
-    // absent from D2's completeness check.
-    if (layer.handle?.stack) collectRouteLayers(layer.handle as unknown as Router, mount, out);
+    if (!layer.handle?.stack) continue;
+    const prefix = nestedMountPrefix(layer);
+    if (prefix === null) {
+      out.underivable.push(
+        `cannot derive the mount prefix of a nested router under '${mount}' (compiled as ${String(layer.regexp)}); `
+        + 'mount it at a plain Express path so the route census can carry it',
+      );
+      continue;
+    }
+    collectRouteLayers(layer.handle as unknown as Router, `${mount}${prefix}`, out);
   }
 }
 
@@ -135,26 +255,37 @@ export function familyRequirement(family: ParsedFamily): RequiredScope {
   return requiredScopeFor(family.method, familySamplePath(family.path));
 }
 
-let cachedFamilies: RouteFamily[] | null = null;
+export interface ProtectedRouteFamilyDerivation {
+  families: RouteFamily[];
+  /**
+   * Nested routers whose mount prefix could not be proved, one sentence each.
+   * Their families are NOT in `families`; the boot census reports each one as
+   * a finding and refuses to serve.
+   */
+  underivable: string[];
+}
+
+let cachedDerivation: ProtectedRouteFamilyDerivation | null = null;
 
 /**
  * Every (method, mounted path) the protected routers actually serve, with the
- * requirement the route map answers for it. Derived from `router.stack`, so a
- * route added to a router is censused without anyone updating a list.
+ * requirement the route map answers for it, plus any nested mount the walk
+ * could not carry. Derived from `router.stack`, so a route added to a router
+ * is censused without anyone updating a list.
  *
  * This is CATALOGUE data about the code, not an authorization decision, and it
  * cannot change while the process runs: the routers are constructed at import.
  * Memoising it is therefore not the decision cache AZ-A5 clause 7 forbids.
  */
-export function enumerateProtectedRouteFamilies(): RouteFamily[] {
-  if (cachedFamilies) return cachedFamilies;
-  const raw: Array<{ method: string; path: string }> = [];
+export function deriveProtectedRouteFamilies(): ProtectedRouteFamilyDerivation {
+  if (cachedDerivation) return cachedDerivation;
+  const raw: RawRouteFamilies = { routes: [], underivable: [] };
   for (const registration of protectedRouteRegistrations()) {
     collectRouteLayers(registration.router, registration.path, raw);
   }
   const seen = new Set<string>();
   const families: RouteFamily[] = [];
-  for (const entry of raw) {
+  for (const entry of raw.routes) {
     const key = familyKey(entry.method, entry.path);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -166,13 +297,26 @@ export function enumerateProtectedRouteFamilies(): RouteFamily[] {
     });
   }
   families.sort((a, b) => a.key.localeCompare(b.key));
-  cachedFamilies = families;
-  return families;
+  cachedDerivation = { families, underivable: raw.underivable };
+  return cachedDerivation;
+}
+
+/**
+ * The protected route families. THROWS if any nested mount could not be
+ * carried: a family list missing a mounted router's routes is not one any
+ * caller may measure against.
+ */
+export function enumerateProtectedRouteFamilies(): RouteFamily[] {
+  const derivation = deriveProtectedRouteFamilies();
+  if (derivation.underivable.length > 0) {
+    throw new Error(`route family census incomplete: ${derivation.underivable.join('; ')}`);
+  }
+  return derivation.families;
 }
 
 /** Test-only: drop the memoised enumeration. */
 export function resetRouteFamilyCache(): void {
-  cachedFamilies = null;
+  cachedDerivation = null;
 }
 
 /**

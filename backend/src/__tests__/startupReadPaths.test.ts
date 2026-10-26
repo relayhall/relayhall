@@ -40,7 +40,6 @@ jest.mock('../services/TaskElementService', () => {
   return { ...actual, taskElementService: { listStream: jest.fn(async () => []), listReferences: jest.fn(async () => []) } };
 });
 jest.mock('../services/taskAnalyzer', () => ({ taskAnalyzer: {} }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: {} }));
 jest.mock('../services/TaskReviewerService', () => ({ taskReviewerService: {} }));
 jest.mock('../services/TaskOrchestrationService', () => ({
   taskOrchestrationService: {},

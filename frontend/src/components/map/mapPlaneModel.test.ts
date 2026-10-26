@@ -13,9 +13,15 @@
  */
 import { describe, expect, test } from 'vitest';
 
+import { readFileSync } from "node:fs";
+const mapCss = readFileSync(new URL("./MapView.css", import.meta.url), "utf8");
+const taskCss = readFileSync(new URL("../tasks/TaskCard.css", import.meta.url), "utf8");
+const tokensCss = readFileSync(new URL("../../styles/variables.css", import.meta.url), "utf8");
+
 import recorded from './__fixtures__/graph.task.json';
 import {
   FALLBACK_TILE,
+  computeDepths,
   findOverlaps,
   layoutHorizontal,
   type LayoutResult,
@@ -32,28 +38,27 @@ import {
 import {
   CROSSFADE_PX,
   EMPTY_PLANE_ANCHORS,
-  MAX_ANCHOR_BYTES,
-  MAX_SLOT_ANCHORS,
   PLANE_CARD_PX,
   PLANE_METRICS,
-  anchorBytes,
   assignSlots,
   cardFits,
   containerAlpha,
+  layoutContinuousPlane,
   layoutHorizontalPlane,
   layoutVerticalPlane,
   layoutRadialPlane,
   layoutOrganicPlane,
   ORGANIC_CORE,
   organicPlaneGraph,
-  parseAnchors,
+  pillGrid,
   planeFade,
   planeDetailBand,
+  planeContentBounds,
   projectPlaneAttention,
   planeSegments,
-  pruneAnchors,
   type MapPlaneAnchors,
 } from './mapPlaneModel';
+import { planeFitScale } from './useMapViewState';
 
 const graphFromRecorded = (): MapGraph => ({
   nodes: (recorded as any).nodes as MapTaskNode[],
@@ -326,21 +331,25 @@ describe('cross-fade (A3 clause 1 / R2)', () => {
     expect(middle).toBeLessThan(0.51);
   });
 
-  test('the three layers SUM TO ONE for every task at every scale', () => {
+  test('task geography remains visible independently of container captions', () => {
     for (const scale of scales) {
       const fade = planeFade(result.elements, scale);
       for (const tile of tilesOf(result)) {
         const phase = tile.bandId ? (fade.phase.get(tile.bandId) ?? 0) : 0;
         const project = fade.project.get(`container:${tile.laneId}`) ?? 0;
         const task = fade.task.get(tile.id) ?? 0;
-        expect(task + phase + project).toBeCloseTo(1, 6);
+        expect(phase + project).toBeLessThanOrEqual(1);
+        expect(task).toBeGreaterThanOrEqual(0);
+        expect(task).toBeLessThanOrEqual(1);
+        if (Math.min(tile.w, tile.h) * scale >= 10) expect(task).toBe(1);
+        if (Math.min(tile.w, tile.h) * scale <= 4) expect(task).toBe(0);
       }
     }
   });
 
-  test('nothing is ever a dot: below the floor the container carries the ink', () => {
-    // A scale at which a 170px tile lands under 40px on screen.
-    const scale = (CROSSFADE_PX.merged / FALLBACK_TILE.w) * 0.9;
+  test('only genuinely tiny tasks disappear while containers retain context', () => {
+    // Every task is below four screen pixels on its short side.
+    const scale = 3 / Math.max(...tilesOf(result).map(tile => Math.min(tile.w, tile.h)));
     const fade = planeFade(result.elements, scale);
     for (const tile of tilesOf(result)) expect(fade.task.get(tile.id)).toBe(0);
     for (const container of containersOf(result)) {
@@ -468,14 +477,26 @@ describe('positional stability (A3 clause 6 / R1)', () => {
     return { result, anchors: result.anchors, before: positionsOf(result), index: laneIndex(result) };
   };
 
-  test('(a) a task ARRIVES within the reservation and nothing already placed moves', () => {
-    const { anchors, before } = baseline();
+  test('(a) a task ARRIVES and no card already placed in its phase moves; nothing moves up or left', () => {
+    // E386: there is no reserved headroom any more, so an arrival that adds
+    // a row may translate what lies below or beyond it — but never a card
+    // already standing in its own phase, and never up or left.
+    const { anchors, before, result } = baseline();
     const churned: MapGraph = {
       ...graph,
       nodes: [...graph.nodes, ...addedNodes(graph, 2, phased.project, phased.phaseId)],
     };
     const after = positionsOf(layoutHorizontalPlane(churned, planeSizes(churned), anchors));
-    expect(movedIds(before, after)).toEqual([]);
+    const ownBand = `band:${phased.project}:${phased.phaseId}`;
+    const inOwnBand = new Set(tilesOf(result).filter(tile => tile.bandId === ownBand).map(tile => tile.id));
+    expect(inOwnBand.size).toBeGreaterThan(0);
+    expect(movedIds(before, after, id => inOwnBand.has(id))).toEqual([]);
+    for (const [id, from] of before) {
+      const to = after.get(id);
+      if (!to) continue;
+      expect(to.x, id).toBeGreaterThanOrEqual(from.x - TOLERANCE_PX);
+      expect(to.y, id).toBeGreaterThanOrEqual(from.y - TOLERANCE_PX);
+    }
   });
 
   test('(a) CONTROL: the pre-amendment engine moves things on the same churn', () => {
@@ -509,12 +530,24 @@ describe('positional stability (A3 clause 6 / R1)', () => {
     return new Set(chosen.slice(0, 2).map(node => node.id));
   };
 
-  test('(b) tasks LEAVE and nothing that stayed moves', () => {
-    const { anchors, before } = baseline();
+  test('(b) tasks LEAVE: their ground is given back and the survivors keep their order (E386)', () => {
+    const { anchors, result } = baseline();
     const gone = departures();
     const churned: MapGraph = { ...graph, nodes: graph.nodes.filter(n => !gone.has(n.id)) };
-    const after = positionsOf(layoutHorizontalPlane(churned, planeSizes(churned), anchors));
-    expect(movedIds(before, after, id => !gone.has(id))).toEqual([]);
+    const next = layoutHorizontalPlane(churned, planeSizes(churned), anchors);
+    // No area grew, and the plane did not.
+    const bandBefore = new Map(bandsOf(result).map(band => [band.id, band]));
+    for (const band of bandsOf(next)) {
+      const was = bandBefore.get(band.id)!;
+      expect(band.w * band.h, band.id).toBeLessThanOrEqual(was.w * was.h);
+    }
+    expect(next.height).toBeLessThanOrEqual(result.height);
+    // Inside every phase the survivors stand in the same reading order:
+    // column by column, top to bottom.
+    const order = (layout: LayoutResult, band: string) => tilesOf(layout)
+      .filter(tile => tile.bandId === band && !gone.has(tile.id))
+      .sort((a, b) => a.x - b.x || a.y - b.y).map(tile => tile.id);
+    for (const band of bandsOf(next)) expect(order(next, band.id), band.id).toEqual(order(result, band.id));
   });
 
   test('(b) CONTROL: the pre-amendment engine closes the hole and shuffles', () => {
@@ -525,37 +558,32 @@ describe('positional stability (A3 clause 6 / R1)', () => {
     expect(movedIds(before, after, id => !gone.has(id)).length).toBeGreaterThan(0);
   });
 
-  test('(b) the hole a departure leaves is REUSED by the next arrival', () => {
-    const { anchors } = baseline();
-    // A task with no dependencies at all, so the arrival that replaces it —
-    // which has none either — ranks into the SAME column. A hole is reused
-    // within its own column, not across the flow axis; picking a departure
-    // at some other depth would be testing the dependency ranking instead.
-    const goneNode = graph.nodes.find(node =>
-      departures().has(node.id)
-      && !graph.edges.some(edge => edge.from === node.id || edge.to === node.id))
-      ?? graph.nodes.find(node =>
-        !graph.edges.some(edge => edge.from === node.id || edge.to === node.id))!;
-    const gone = goneNode.id;
-    const removed: MapGraph = { ...graph, nodes: graph.nodes.filter(n => n.id !== gone) };
-    const step = layoutHorizontalPlane(removed, planeSizes(removed), anchors);
-    const arrival: MapGraph = {
-      ...removed,
-      nodes: [...removed.nodes,
-        ...addedNodes(graph, 1, goneNode.project, goneNode.phaseId, 'fill')],
-    };
-    const filled = layoutHorizontalPlane(arrival, planeSizes(arrival), step.anchors);
-    const hole = positionsOf(
-      layoutHorizontalPlane(graph, planeSizes(graph), EMPTY_PLANE_ANCHORS)).get(gone)!;
-    const newcomer = positionsOf(filled).get('fill-0')!;
-    expect(newcomer.x).toBeCloseTo(hole.x, 6);
-    expect(newcomer.y).toBeCloseTo(hole.y, 6);
-    // And the plane did not grow to take it.
-    expect(filled.height).toBeLessThanOrEqual(step.height);
+  test('(b) the hole a departure leaves is CLOSED, and the next arrival goes to the frontier (E386)', () => {
+    // A phase of three same-rank tasks in one column. The middle one leaves:
+    // the third closes up into its row, and the phase is one row shorter.
+    const template = templateNode(graph);
+    const node = (id: string, minute: number): MapTaskNode => ({ ...template, id, title: id,
+      project: 'Hole', phaseId: 'hole-phase', status: 'todo', agent: null,
+      updated: `2026-10-20T07:0${minute}:00.000Z` } as MapTaskNode);
+    const phases: MapPhase[] = [{ id: 'hole-phase', name: 'Hole', goal: null, projectId: 'hole', position: 0 }];
+    const three: MapGraph = { nodes: [node('first', 1), node('middle', 2), node('third', 3)], edges: [], phases };
+    const full = layoutHorizontalPlane(three, {}, EMPTY_PLANE_ANCHORS);
+    const at = (layout: LayoutResult, id: string) => positionsOf(layout).get(id)!;
+    const removed: MapGraph = { ...three, nodes: three.nodes.filter(n => n.id !== 'middle') };
+    const step = layoutHorizontalPlane(removed, {}, full.anchors);
+    expect(at(step, 'first')).toEqual(at(full, 'first'));
+    expect(at(step, 'third')).toEqual(at(full, 'middle'));
+    expect(bandsOf(step)[0].h).toBe(bandsOf(full)[0].h - PLANE_METRICS.tileCellH - 16);
+    // The next arrival does not reopen the closed hole: it stands below.
+    const arrival: MapGraph = { ...removed, nodes: [...removed.nodes, node('fill', 4)] };
+    const filled = layoutHorizontalPlane(arrival, {}, step.anchors);
+    expect(at(filled, 'first')).toEqual(at(step, 'first'));
+    expect(at(filled, 'third')).toEqual(at(step, 'third'));
+    expect(at(filled, 'fill')).toEqual(at(full, 'third'));
   });
 
-  test('(c) a task MOVES phase: it travels, nothing else does', () => {
-    const { anchors, before } = baseline();
+  test('(c) a task MOVES phase: it travels; other projects move only as whole lanes, vertically', () => {
+    const { anchors, before, index } = baseline();
     const target = graph.phases.find(p => p.id !== phased.phaseId)!;
     const churned: MapGraph = {
       ...graph,
@@ -563,7 +591,12 @@ describe('positional stability (A3 clause 6 / R1)', () => {
         node.id === phased.id ? { ...node, phaseId: target.id } : node),
     };
     const after = positionsOf(layoutHorizontalPlane(churned, planeSizes(churned), anchors));
-    expect(movedIds(before, after, id => id !== phased.id)).toEqual([]);
+    const byLane = displacementsByLane(before, after, index);
+    for (const [lane, set] of byLane) {
+      if (lane === phased.project) continue;
+      expect(set.size, lane).toBe(1);
+      expect([...set][0].startsWith('0,'), lane).toBe(true);
+    }
   });
 
   test('(c) CONTROL: the pre-amendment engine moves the neighbours too', () => {
@@ -703,9 +736,10 @@ describe('positional stability (A3 clause 6 / R1)', () => {
   test('(g) anchors survive a JSON round trip and restore the same world', () => {
     const sizes = planeSizes(graph);
     const first = layoutHorizontalPlane(graph, sizes, EMPTY_PLANE_ANCHORS);
-    const restored = parseAnchors(JSON.stringify(first.anchors));
-    // A NEW session: nothing in memory, the graph arriving in wire order,
-    // and only the persisted record to go on.
+    const restored = JSON.parse(JSON.stringify(first.anchors)) as MapPlaneAnchors;
+    // The record as it crosses the worker boundary (a structured clone), the
+    // graph arriving in wire order: the same world. (E386: nothing is
+    // persisted; the parser that read a stored record is gone.)
     const shuffled: MapGraph = { ...graph, nodes: [...graph.nodes].reverse() };
     const next = layoutHorizontalPlane(shuffled, sizes, restored);
     expect(movedIds(positionsOf(first), positionsOf(next))).toEqual([]);
@@ -723,9 +757,15 @@ describe('positional stability (A3 clause 6 / R1)', () => {
     expect(movedIds(positionsOf(first), positionsOf(withoutRecord)).length).toBeGreaterThan(0);
   });
 
-  test('nothing on the plane ever moves UP or LEFT under churn', () => {
+  test('nothing outside a departure\'s own phase moves UP or LEFT under churn (E386)', () => {
     // The direction rule behind clause 6: the world grows at its frontier.
-    const { anchors, before } = baseline();
+    // E386 (round-2 repair, by name): a departure CLOSES its hole, so the
+    // cards after it in its own phase close up — in their reading order —
+    // even when arrivals land in the same update. The arrivals go to the
+    // frontier; nothing else moves up or left.
+    const { anchors, before, result } = baseline();
+    const ownBand = `band:${phased.project}:${phased.phaseId}`;
+    const inOwnBand = new Set(tilesOf(result).filter(tile => tile.bandId === ownBand).map(tile => tile.id));
     const churned: MapGraph = {
       ...graph,
       nodes: [
@@ -734,72 +774,53 @@ describe('positional stability (A3 clause 6 / R1)', () => {
         ...addedNodes(graph, 2, 'Zed New Project', null, 'zed'),
       ],
     };
-    const after = positionsOf(layoutHorizontalPlane(churned, planeSizes(churned), anchors));
+    const next = layoutHorizontalPlane(churned, planeSizes(churned), anchors);
+    const after = positionsOf(next);
     for (const [id, from] of before) {
       const to = after.get(id);
-      if (!to) continue;
-      expect(to.x).toBeGreaterThanOrEqual(from.x - TOLERANCE_PX);
-      expect(to.y).toBeGreaterThanOrEqual(from.y - TOLERANCE_PX);
+      if (!to || inOwnBand.has(id)) continue;
+      expect(to.x, id).toBeGreaterThanOrEqual(from.x - TOLERANCE_PX);
+      expect(to.y, id).toBeGreaterThanOrEqual(from.y - TOLERANCE_PX);
     }
+    const reading = (layout: LayoutResult) => tilesOf(layout)
+      .filter(tile => inOwnBand.has(tile.id) && tile.id !== phased.id)
+      .sort((a, b) => a.x - b.x || a.y - b.y).map(tile => tile.id);
+    expect(reading(next)).toEqual(reading(result));
   });
 });
 
 describe('anchor persistence', () => {
   const graph = graphFromRecorded();
 
-  test('a corrupt, foreign or partial record falls back rather than throwing', () => {
-    expect(parseAnchors(null)).toEqual(EMPTY_PLANE_ANCHORS);
-    expect(parseAnchors('not json')).toEqual(EMPTY_PLANE_ANCHORS);
-    expect(parseAnchors('{"version":2}')).toEqual(EMPTY_PLANE_ANCHORS);
-    const partial = parseAnchors(JSON.stringify({
-      version: 1,
-      laneOrder: ['a', 7],
-      laneHeight: { a: 'tall', b: 120 },
-      cols: { s: [1, -2], t: [170] },
-      rows: {},
-      slots: { good: { seg: 's', col: 0, row: 1 }, bad: { seg: 's', col: -1, row: 0 } },
-    }));
-    expect(partial.laneOrder).toEqual(['a']);
-    expect(partial.laneHeight).toEqual({ b: 120 });
-    expect(partial.cols).toEqual({ t: [170] });
-    expect(Object.keys(partial.slots)).toEqual(['good']);
-  });
+  // E386 retired persistence, and with it the parser that read a stored
+  // record ('a corrupt, foreign or partial record falls back rather than
+  // throwing'; 'a rejected record still lays the plane out'): no stored
+  // record is ever read, so there is nothing to parse or reject.
 
-  test('a rejected record still lays the plane out — it just forgets', () => {
-    const sizes = planeSizes(graph);
-    const result = layoutHorizontalPlane(graph, sizes, parseAnchors('garbage'));
-    expect(findOverlaps(result.elements)).toEqual([]);
-    expect(tilesOf(result).length).toBe(graph.nodes.length);
-  });
-
-  test('anchors for absent tasks are KEPT — a filter is not a deletion (R8)', () => {
+  test('anchors for absent tasks are DROPPED — a filter shows less, and fits it (E386)', () => {
     const sizes = planeSizes(graph);
     const full = layoutHorizontalPlane(graph, sizes, EMPTY_PLANE_ANCHORS);
     const filtered: MapGraph = { ...graph, nodes: graph.nodes.filter(n => n.status !== 'completed') };
+    expect(filtered.nodes.length).toBeLessThan(graph.nodes.length);
     const scoped = layoutHorizontalPlane(filtered, planeSizes(filtered), full.anchors);
-    // Everything still in scope is exactly where it was.
-    const survivors = new Set(filtered.nodes.map(n => n.id));
-    expect(movedIds(positionsOf(full), positionsOf(scoped), id => survivors.has(id))).toEqual([]);
-    // And the record still remembers the ones the filter hid, so lifting it
-    // puts them back where they were rather than somewhere new.
-    for (const node of graph.nodes) expect(scoped.anchors.slots[node.id]).toBeDefined();
+    // The record carries exactly what is shown: nothing for the hidden tasks.
+    expect(Object.keys(scoped.anchors.slots).sort()).toEqual(filtered.nodes.map(n => n.id).sort());
+    expect(scoped.height).toBeLessThanOrEqual(full.height);
+    // Lifting the filter places the hidden tasks again, without overlap, and
+    // the plane is once more the size of the full scope.
     const lifted = layoutHorizontalPlane(graph, sizes, scoped.anchors);
-    expect(movedIds(positionsOf(full), positionsOf(lifted))).toEqual([]);
+    expect(tilesOf(lifted)).toHaveLength(graph.nodes.length);
+    expect(findOverlaps(lifted.elements)).toEqual([]);
   });
 
-  test('pruning keeps every present task and drops absent ones first', () => {
-    const slots: Record<string, { seg: string; col: number; row: number }> = {};
-    for (let i = 0; i < 60; i += 1) slots[`t${i}`] = { seg: 's', col: 0, row: i };
-    const anchors: MapPlaneAnchors = {
-      ...EMPTY_PLANE_ANCHORS, slots,
-    };
-    const present = new Set(Array.from({ length: 30 }, (_u, i) => `t${i}`));
-    const pruned = pruneAnchors(anchors, present, 40);
-    expect(Object.keys(pruned.slots).length).toBe(40);
-    for (const id of present) expect(pruned.slots[id]).toBeDefined();
-    // Under the cap it is a no-op, so ordinary use never loses a thing.
-    expect(pruneAnchors(anchors, present, 100)).toBe(anchors);
-    expect(MAX_SLOT_ANCHORS).toBeGreaterThan(1000);
+  test('the record holds no ground: every reservation comes back empty (E386)', () => {
+    const result = layoutHorizontalPlane(graph, planeSizes(graph), {
+      ...EMPTY_PLANE_ANCHORS, laneHeight: { Ghost: 9000 }, cols: { g: [9000] }, rows: { g: [9000] },
+      segWidth: { g: 9000 }, laneHeaderW: { Ghost: 900 } } as MapPlaneAnchors);
+    for (const retired of ['laneHeight', 'cols', 'rows', 'segWidth', 'laneHeaderW']) {
+      expect((result.anchors as unknown as Record<string, unknown>)[retired], retired).toBeUndefined();
+    }
+    expect(positionsOf(result)).toEqual(positionsOf(layoutHorizontalPlane(graph, planeSizes(graph), EMPTY_PLANE_ANCHORS)));
   });
 });
 
@@ -902,28 +923,86 @@ describe('performance', () => {
     expect(fade).toBeLessThan(1000);
   });
 
+  /**
+   * The minimum of interleaved samples per size.
+   *
+   * DEV CI run 5493 (Report 41475352) failed the ratio below at 49.84: in ONE
+   * sample 1,000 tasks took 19.5ms and 8,000 took 972.7ms, while the 5,000
+   * task layout in the same process took 147.5ms and four other runs at the
+   * same Map bytes (5494, 5609, 5614 and the TST run) measured 6.58 to 7.70.
+   * A single wall-clock sample cannot tell a quadratic pass from a runner
+   * that stalled for most of a second — the backend job records the same
+   * class (CI run 1031). A stall only ever ADDS time, so the minimum of a
+   * few samples is the cost the code itself imposes; a genuinely quadratic
+   * pass is slow in every sample and still fails. The bound is unchanged.
+   */
+  const minimumLayout = (graphs: readonly MapGraph[], samples = 5) => {
+    const prepared = graphs.map(graph => ({ graph, sizes: planeSizes(graph) }));
+    for (const { graph, sizes } of prepared) layoutHorizontalPlane(graph, sizes, EMPTY_PLANE_ANCHORS);
+    const best = prepared.map(() => Infinity);
+    const all = prepared.map(() => [] as number[]);
+    for (let sample = 0; sample < samples; sample += 1) {
+      prepared.forEach(({ graph, sizes }, index) => {
+        const started = performance.now();
+        layoutHorizontalPlane(graph, sizes, EMPTY_PLANE_ANCHORS);
+        const spent = performance.now() - started;
+        all[index].push(spent);
+        best[index] = Math.min(best[index], spent);
+      });
+    }
+    return { best, all };
+  };
+
   test('cost grows LINEARLY, not quadratically, with the estate', () => {
-    const small = timeLayout(1000);
-    const large = timeLayout(8000);
+    const { best: [small, large], all } = minimumLayout([syntheticGraph(1000), syntheticGraph(8000)]);
     // eslint-disable-next-line no-console
-    console.log(`[A7c perf] 1000: ${small.layout.toFixed(1)}ms  8000: ${large.layout.toFixed(1)}ms`
-      + `  ratio ${(large.layout / Math.max(0.01, small.layout)).toFixed(2)} (8x data)`);
+    console.log(`[A7c perf] 1000: ${small.toFixed(1)}ms  8000: ${large.toFixed(1)}ms`
+      + `  ratio ${(large / Math.max(0.01, small)).toFixed(2)} (8x data, minimum of`
+      + ` ${all[0].map(v => v.toFixed(1)).join('/')} and ${all[1].map(v => v.toFixed(1)).join('/')})`);
     // Eight times the data. Linear predicts ~8; quadratic predicts ~64. The
     // bound is generous enough that a loaded CI box cannot fail it, and tight
     // enough that a quadratic pass cannot pass it.
-    if (small.layout > 2) {
-      expect(large.layout / small.layout).toBeLessThan(24);
+    if (small > 2) {
+      expect(large / small).toBeLessThan(24);
     }
-    expect(large.layout).toBeLessThan(6000);
+    expect(large).toBeLessThan(6000);
+  });
+
+  test('cost grows linearly at production shape, Report grids and shelves included', () => {
+    // The 283-task production-shaped project (card 31454392), one copy
+    // against eight: every copy is its own wrapped lane with its own grids.
+    const estate = (copies: number): MapGraph => {
+      const parts = Array.from({ length: copies }, (_, i) => productionShape(true, `Production ${i}`));
+      return { nodes: parts.flatMap(p => p.nodes), edges: parts.flatMap(p => p.edges),
+        phases: parts.flatMap(p => p.phases), reports: parts.flatMap(p => p.reports!) };
+    };
+    const { best: [small, large], all } = minimumLayout([estate(1), estate(8)]);
+    // eslint-disable-next-line no-console
+    console.log(`[31454392 perf] 283: ${small.toFixed(1)}ms  2264: ${large.toFixed(1)}ms`
+      + `  ratio ${(large / Math.max(0.01, small)).toFixed(2)} (8x data, minimum of`
+      + ` ${all[0].map(v => v.toFixed(1)).join('/')} and ${all[1].map(v => v.toFixed(1)).join('/')})`);
+    if (small > 2) {
+      expect(large / small).toBeLessThan(24);
+    }
+    expect(large).toBeLessThan(6000);
   });
 });
 
 describe('metrics are derived, not invented', () => {
-  test('the headroom floor is three tile rows and the growth is geometric', () => {
-    expect(PLANE_METRICS.rowUnitY).toBe(FALLBACK_TILE.h + 16);
-    expect(PLANE_METRICS.laneHeadroomRows).toBe(3);
-    expect(PLANE_METRICS.laneHeadroomRatio).toBeGreaterThan(0);
-    expect(PLANE_METRICS.laneHeadroomRatio).toBeLessThan(1);
+  test('no headroom is reserved: a lane takes the depth it paints (E386)', () => {
+    expect('laneHeadroomRows' in PLANE_METRICS).toBe(false);
+    expect('laneHeadroomRatio' in PLANE_METRICS).toBe(false);
+    const graph = graphFromRecorded();
+    const containers = containersOf(layoutHorizontalPlane(graph, planeSizes(graph)))
+      .sort((a, b) => a.y - b.y);
+    expect(containers.length).toBeGreaterThan(1);
+    for (let i = 1; i < containers.length; i += 1) {
+      // The lane gap less the two 16-unit container margins, plus at most the
+      // 8-unit rhythm the lane depth rounds up to — and no headroom at all.
+      const gap = containers[i].y - (containers[i - 1].y + containers[i - 1].h);
+      expect(gap).toBeGreaterThanOrEqual(8);
+      expect(gap).toBeLessThan(8 + PLANE_METRICS.laneQuantumY);
+    }
   });
   test('the cross-fade band sits inside §5\'s far band and ends at the dot floor', () => {
     expect(CROSSFADE_PX.merged).toBe(40);
@@ -942,13 +1021,10 @@ export type _Elements = PlacedElement;
  * so that it fails against the reviewed candidate — and then holds the
  * repair. Where the reviewer gave a measured number, it is the number here.
  * ====================================================================== */
-describe('round-1 finding 1 — a filter is not a deletion', () => {
+describe('round-1 finding 1, superseded by E386 — a filter shows less, and the plane fits it', () => {
   const graph = graphFromRecorded();
 
-  test('emptying the FIRST phase of a lane does not pull the second one left', () => {
-    // The reviewer's reproduction, verbatim in shape: a lane with two
-    // phases, the first one filtered empty. Their probe measured the second
-    // phase moving -234px, from x=476 to x=242.
+  test('emptying the FIRST phase of a lane: it is not drawn, and the second takes its ground (E386)', () => {
     const phases: MapPhase[] = [
       { id: 'p1', name: 'One', goal: null, projectId: 'proj', position: 0 },
       { id: 'p2', name: 'Two', goal: null, projectId: 'proj', position: 1 },
@@ -962,15 +1038,16 @@ describe('round-1 finding 1 — a filter is not a deletion', () => {
 
     const filtered = { ...full, nodes: nodes.filter(node => node.id !== 'a') };
     const after = layoutHorizontalPlane(filtered, planeSizes(filtered), first.anchors);
+    const fresh = layoutHorizontalPlane(filtered, planeSizes(filtered), EMPTY_PLANE_ANCHORS);
 
-    expect(movedIds(positionsOf(first), positionsOf(after), id => id !== 'a')).toEqual([]);
-    // The emptied phase still holds its ground and still says what it is.
-    const one = bandsOf(after).find(band => band.label === 'One');
-    expect(one).toBeDefined();
-    expect(one!.w).toBe(bandsOf(first).find(band => band.label === 'One')!.w);
+    expect(bandsOf(after).map(band => band.label)).toEqual(['Two']);
+    expect(positionsOf(after)).toEqual(positionsOf(fresh));
+    // Lifting the filter puts One back where it was, in declared order.
+    const lifted = layoutHorizontalPlane(full, planeSizes(full), after.anchors);
+    expect(positionsOf(lifted)).toEqual(positionsOf(first));
   });
 
-  test('a project filtered out keeps its place, and coming back does not reorder', () => {
+  test('a project filtered out takes no ground, and coming back does not reorder (E386)', () => {
     const nodes: MapTaskNode[] = [
       { ...templateNode(graph), id: 'a1', project: 'A', phaseId: null },
       { ...templateNode(graph), id: 'b1', project: 'B', phaseId: null },
@@ -981,15 +1058,15 @@ describe('round-1 finding 1 — a filter is not a deletion', () => {
 
     const withoutA = { ...full, nodes: nodes.filter(node => node.project !== 'A') };
     const scoped = layoutHorizontalPlane(withoutA, planeSizes(withoutA), first.anchors);
-    // B does NOT climb into A's ground. The reviewer measured it jumping
-    // from y=504 to y=32.
-    expect(movedIds(positionsOf(first), positionsOf(scoped), id => id.includes('B')
-      || id === 'b1')).toEqual([]);
+    // B takes the ground A no longer needs: the plane fits what is shown.
+    const alone = layoutHorizontalPlane(withoutA, planeSizes(withoutA), EMPTY_PLANE_ANCHORS);
+    expect(positionsOf(scoped)).toEqual(positionsOf(alone));
+    // The ORDER is remembered for the session, so nothing is drawn for A...
     expect(scoped.anchors.laneOrder).toEqual(['A', 'B']);
-    // Nothing is drawn on the lane that is out of scope.
     expect(tilesOf(scoped).map(tile => tile.id)).toEqual(['b1']);
     expect(containersOf(scoped).map(container => container.laneId)).toEqual(['B']);
 
+    // ...and A comes back above B, exactly where it was.
     const restored = layoutHorizontalPlane(full, planeSizes(full), scoped.anchors);
     expect(restored.anchors.laneOrder).toEqual(['A', 'B']);
     expect(movedIds(positionsOf(first), positionsOf(restored))).toEqual([]);
@@ -1014,8 +1091,10 @@ describe('round-1 finding 1 — a filter is not a deletion', () => {
     const narrow = { ...planeSizes(filtered), 'lane:P': { w: 180, h: 56 } };
     const after = layoutHorizontalPlane(filtered, narrow, first.anchors);
 
-    expect(movedIds(positionsOf(first), positionsOf(after), id => id === 'keep'))
-      .toEqual([]);
+    // E386: the hidden connector's row closes, so `keep` may rise; what the
+    // narrower header must not do is pull the lane's work LEFT.
+    const xOf = (layout: LayoutResult) => tilesOf(layout).find(tile => tile.id === 'keep')!.x;
+    expect(xOf(after)).toBe(xOf(first));
     // The header's placed box is its CELL — the column it is guaranteed to
     // stand in, not the box it happened to measure. `.map-lane-header`
     // carries `inline-size: 220px`, so the column is what it paints.
@@ -1027,7 +1106,8 @@ describe('round-1 finding 1 — a filter is not a deletion', () => {
     const tiles = tilesOf(after);
     expect(new Set(tiles.map(tile => Math.round(tile.x))).size)
       .toBeLessThanOrEqual(tiles.length);
-    expect(after.anchors.laneHeaderW.P).toBe(PLANE_METRICS.laneHeaderW);
+    // E386: the record holds no header width; the column is declared.
+    expect(Object.keys(after.anchors).sort()).toEqual(['laneOrder', 'segOrder', 'slots', 'version']);
     // ROUND 2, AT THE CLASS. This used to end by asserting that a header
     // measuring 300 took 300 of ground — "under-reserving is the worse
     // failure". It is not: a reservation that reads the size map is a
@@ -1036,8 +1116,10 @@ describe('round-1 finding 1 — a filter is not a deletion', () => {
     // reaches the lattice at all, in either direction.
     const wider = { ...planeSizes(full), 'lane:P': { w: 300, h: 300 } };
     const grown = layoutHorizontalPlane(full, wider, after.anchors);
-    expect(grown.anchors.laneHeaderW.P).toBe(PLANE_METRICS.laneHeaderW);
+    expect(Object.keys(grown.anchors).sort()).toEqual(['laneOrder', 'segOrder', 'slots', 'version']);
     expect(movedIds(positionsOf(after), positionsOf(grown))).toEqual([]);
+    expect(movedIds(positionsOf(layoutHorizontalPlane(full, planeSizes(full), after.anchors)),
+      positionsOf(grown))).toEqual([]);
   });
 
   test('a CONNECTOR does not change gaps because a filter moved the boundary', () => {
@@ -1194,13 +1276,14 @@ describe('round-2 residual — a reservation is a DECLARED CEILING', () => {
     const after = layoutHorizontalPlane(graph, admitted, first.anchors);
 
     expect(movedIds(positionsOf(first), positionsOf(after))).toEqual([]);
-    expect(after.anchors.segWidth).toEqual(first.anchors.segWidth);
-    expect(after.anchors.cols).toEqual(first.anchors.cols);
+    expect(after.anchors).toEqual(first.anchors);
   });
 
-  test('(b) FILTER: narrowing the scope while measurements arrive moves nothing', () => {
+  test('(b) FILTER: narrowing the scope while measurements arrive moves nothing the filter did not', () => {
     // The live shape: the reader applies a status filter, the mounted set
     // changes, and boxes that had never been measured are measured now.
+    // E386: the filter itself closes the hole it leaves (`a2` rises into
+    // `a1`'s row); the late measurements must move NOTHING beyond that.
     const graph = twoPhaseGraph();
     const partial = measured(graph);
     delete (partial as Record<string, unknown>)['a2'];
@@ -1215,8 +1298,10 @@ describe('round-2 residual — a reservation is a DECLARED CEILING', () => {
       'chip:band:P:p1': { w: 260, h: 44 },
     };
     const after = layoutHorizontalPlane(kept, arrived, first.anchors);
+    const unmeasured = layoutHorizontalPlane(kept, partial, first.anchors);
 
-    expect(movedIds(positionsOf(first), positionsOf(after))).toEqual([]);
+    expect(positionsOf(after)).toEqual(positionsOf(unmeasured));
+    expect(movedIds(positionsOf(first), positionsOf(after))).toEqual(['a2']);
   });
 
   test('(c) RELOAD: the same world, measured from scratch, is the same world', () => {
@@ -1238,7 +1323,7 @@ describe('round-2 residual — a reservation is a DECLARED CEILING', () => {
   test('(d) NEW SESSION: a record through JSON restores the same world', () => {
     const graph = twoPhaseGraph();
     const first = layoutHorizontalPlane(graph, measured(graph), EMPTY_PLANE_ANCHORS);
-    const restored = parseAnchors(JSON.stringify(first.anchors));
+    const restored = JSON.parse(JSON.stringify(first.anchors)) as MapPlaneAnchors;
     // A new session measures nothing at first and everything eventually,
     // and neither state may move what the last session left standing.
     const opened = layoutHorizontalPlane(graph, {}, restored);
@@ -1320,7 +1405,7 @@ describe('round-2 residual — a reservation is a DECLARED CEILING', () => {
     const after = layoutHorizontalPlane(graph, expanded, first.anchors);
 
     expect(movedIds(positionsOf(first), positionsOf(after))).toEqual([]);
-    expect(after.anchors.segWidth).toEqual(first.anchors.segWidth);
+    expect(after.anchors).toEqual(first.anchors);
 
     // …and the chip is inside the band it labels, at both measurements.
     for (const result of [first, after]) {
@@ -1366,10 +1451,10 @@ describe('round-2 residual — a reservation is a DECLARED CEILING', () => {
   });
 });
 
-describe('round-1 finding 6 — a declared phase is a segment even when empty', () => {
+describe('round-1 finding 6, superseded by E386 — a phase with no shown task is not displayed', () => {
   const graph = graphFromRecorded();
 
-  test('an empty declared phase holds its place in the declared order', () => {
+  test('an empty declared phase is not a segment, and takes no ground', () => {
     const phases: MapPhase[] = [
       { id: 'p-empty', name: 'Empty', goal: null, projectId: 'proj', position: 0 },
       { id: 'p-used', name: 'Used', goal: null, projectId: 'proj', position: 1 },
@@ -1377,15 +1462,15 @@ describe('round-1 finding 6 — a declared phase is a segment even when empty', 
     const nodes: MapTaskNode[] = [
       { ...templateNode(graph), id: 'only', project: 'P', phaseId: 'p-used' },
     ];
-    // The reviewer's probe printed `empty-phase-segments [ 'phase:p-used' ]`.
     const segments = planeSegments(nodes, phases, new Map([['only', 0]]));
-    expect(segments.map(segment => segment.key)).toEqual(['phase:p-empty', 'phase:p-used']);
-    expect(segments[0].nodes).toEqual([]);
+    expect(segments.map(segment => segment.key)).toEqual(['phase:p-used']);
 
     const local = { nodes, edges: [], phases } as MapGraph;
     const result = layoutHorizontalPlane(local, planeSizes(local));
-    const labels = bandsOf(result).sort((a, b) => a.x - b.x).map(band => band.label);
-    expect(labels).toEqual(['Empty', 'Used']);
+    expect(bandsOf(result).map(band => band.label)).toEqual(['Used']);
+    expect(result.elements.filter(element => element.id.includes('p-empty'))).toEqual([]);
+    const alone = layoutHorizontalPlane({ ...local, phases: [phases[1]] }, planeSizes(local));
+    expect(positionsOf(result)).toEqual(positionsOf(alone));
     expect(findOverlaps(result.elements)).toEqual([]);
   });
 
@@ -1399,6 +1484,7 @@ describe('round-1 finding 6 — a declared phase is a segment even when empty', 
     ];
     const nodes: MapTaskNode[] = [
       { ...templateNode(graph), id: 'n1', project: 'X', phaseId: 'x1' },
+      { ...templateNode(graph), id: 'n3', project: 'X', phaseId: 'x2' },
       { ...templateNode(graph), id: 'n2', project: 'Y', phaseId: 'y1' },
     ];
     const local = { nodes, edges: [], phases } as MapGraph;
@@ -1410,66 +1496,13 @@ describe('round-1 finding 6 — a declared phase is a segment even when empty', 
   });
 });
 
-describe('round-1 finding 5 — the cap is a cap', () => {
-  const slotsFor = (count: number, prefix = 't') => {
-    const slots: Record<string, { seg: string; col: number; row: number }> = {};
-    for (let i = 0; i < count; i += 1) {
-      slots[`${prefix}${i}`] = { seg: `lane\u0000phase:p${i % 7}`, col: 0, row: i };
-    }
-    return slots;
-  };
-
-  test('present slots do not escape the cap', () => {
-    // The reviewer measured `cap 12000 ... all-present-slot-result 12001`.
-    const anchors: MapPlaneAnchors = { ...EMPTY_PLANE_ANCHORS, slots: slotsFor(12001) };
-    const present = new Set(Object.keys(anchors.slots));
-    const pruned = pruneAnchors(anchors, present, 12000);
-    expect(Object.keys(pruned.slots).length).toBe(12000);
-  });
-
-  test('absent lanes and segments are given up before present ones', () => {
-    const laneHeight: Record<string, number> = {};
-    const segWidth: Record<string, number> = {};
-    const segOrder: Record<string, string[]> = {};
-    for (let i = 0; i < 20000; i += 1) {
-      laneHeight[`ghost-lane-${i}`] = 400;
-      segWidth[`ghost-lane-${i}\u0000phase:p`] = 300;
-      segOrder[`ghost-lane-${i}`] = ['phase:p'];
-    }
-    // …and one lane that IS in scope, so the assertion below is about what
-    // survives rather than about an empty record.
-    laneHeight['live-lane'] = 400;
-    segWidth['live-lane\u0000phase:p'] = 300;
-    segOrder['live-lane'] = ['phase:p'];
-    const anchors: MapPlaneAnchors = {
-      ...EMPTY_PLANE_ANCHORS,
-      laneOrder: [...Object.keys(laneHeight)],
-      laneHeight, segWidth, segOrder,
-      slots: { live: { seg: 'live-lane\u0000phase:p', col: 0, row: 0 } },
-    };
-    // The reviewer measured this record serialising to 1,255,631 bytes and
-    // surviving every prune.
-    expect(anchorBytes(anchors)).toBeGreaterThan(1_000_000);
-    const pruned = pruneAnchors(anchors, new Set(['live']), 12000, 200_000);
-    expect(anchorBytes(pruned)).toBeLessThanOrEqual(200_000);
-    // What survives is exactly the ground the current scope is standing on.
-    expect(Object.keys(pruned.laneHeight)).toEqual(['live-lane']);
-    expect(Object.keys(pruned.slots)).toEqual(['live']);
-  });
-
-  test('it terminates even when the live record alone is too big', () => {
-    const anchors: MapPlaneAnchors = { ...EMPTY_PLANE_ANCHORS, slots: slotsFor(4000) };
-    const present = new Set(Object.keys(anchors.slots));
-    const pruned = pruneAnchors(anchors, present, 12000, 1000);
-    expect(anchorBytes(pruned)).toBeLessThanOrEqual(1000);
-  });
-
-  test('an ordinary record is returned untouched, and the budget is stated', () => {
-    const anchors: MapPlaneAnchors = { ...EMPTY_PLANE_ANCHORS, slots: slotsFor(50) };
-    expect(pruneAnchors(anchors, new Set(Object.keys(anchors.slots)))).toBe(anchors);
-    expect(MAX_SLOT_ANCHORS).toBe(12000);
-    // A third of a 5 MB origin quota, at most.
-    expect(MAX_ANCHOR_BYTES).toBeLessThanOrEqual(5_000_000 / 3);
+describe('E386 retired the cap: the record carries only what is shown', () => {
+  test('slots exist for the shown tasks and nothing else, whatever the record held', () => {
+    const graph = graphFromRecorded();
+    const ghosts: Record<string, { seg: string; col: number; row: number }> = {};
+    for (let i = 0; i < 5000; i += 1) ghosts[`ghost-${i}`] = { seg: `lane\u0000phase:p${i % 7}`, col: 0, row: i };
+    const result = layoutHorizontalPlane(graph, planeSizes(graph), { ...EMPTY_PLANE_ANCHORS, slots: ghosts });
+    expect(Object.keys(result.anchors.slots).sort()).toEqual(graph.nodes.map(node => node.id).sort());
   });
 });
 
@@ -1550,8 +1583,8 @@ describe('attention projection preserves the selected chain', () => {
 
 
 describe('RH-UI.17i rendered-width LOD', () => {
-  test.each([[160, 'full'], [159.99, 'compact'], [96, 'compact'], [95.99, 'aggregate'],
-    [40, 'aggregate'], [39.99, 'silhouette']] as const)('%s CSS pixels selects %s', (width, band) => {
+  test.each([[192, 'full'], [191.99, 'compact'], [136, 'compact'], [135.99, 'aggregate'],
+    [96, 'aggregate'], [95.99, 'silhouette']] as const)('%s CSS pixels selects %s', (width, band) => {
     expect(planeDetailBand(width)).toBe(band);
   });
   test('all four bands retain every container coordinate and extent', () => {
@@ -1638,7 +1671,7 @@ describe('owner sketches: Organic archive core and outward branches', () => {
     expect(organicPlaneGraph(graph).edges).toBe(graph.edges);
     expect(organicPlaneGraph(graph).nodes.find(n=>n.id==='old')?.project).toBe(ORGANIC_CORE);
     expect(findOverlaps(layout.elements)).toEqual([]);
-    expect(layoutOrganicPlane(graph,planeSizes(graph),parseAnchors(JSON.stringify(layout.anchors)))).toEqual(layout);
+    expect(layoutOrganicPlane(graph,planeSizes(graph),JSON.parse(JSON.stringify(layout.anchors)) as MapPlaneAnchors)).toEqual(layout);
   });
   test('unphased tasks contribute Project ground without a false Phase', () => {
     const graph=fixture();
@@ -1728,24 +1761,84 @@ describe('owner sketches: Organic archive core and outward branches', () => {
     expect(positionsOf(after)).toEqual(positionsOf(before));
     expect(after.organicRegions).toEqual(before.organicRegions);
   });
-  test('adding a project preserves the inhabited world origin and existing tasks', () => {
+  // E386 round 2 (review B2), superseding by name 'adding a project preserves
+  // the inhabited world origin and existing tasks' and 'filtering projects and
+  // archived work retains surviving tile positions': Organic keeps no home,
+  // cell, angle or core from one layout to the next, because a region that
+  // kept the ground it held while the archive was shown would never shrink
+  // back. The world is laid out from what is shown, and going back to a
+  // scope gives back that scope's world exactly.
+  test('adding a project lays the Organic world out for the new scope; removing it gives the old one back (E386)', () => {
     const graph=fixture(),sizes=planeSizes(graph),before=layoutOrganicPlane(graph,sizes);
     const added={...graph,nodes:[...graph.nodes,{...graph.nodes[0],id:'arrival',project:'A new project',phaseId:null}]};
     const after=layoutOrganicPlane(added,planeSizes(added),before.anchors);
-    for(const tile of tilesOf(before)) {
-      const current=tilesOf(after).find(e=>e.id===tile.id)!;
-      expect({x:current.x,y:current.y}).toEqual({x:tile.x,y:tile.y});
-    }
+    expect(after.organicRegions).toEqual(layoutOrganicPlane(added,planeSizes(added)).organicRegions);
     expect(findOverlaps(after.elements)).toEqual([]);
+    const back=layoutOrganicPlane(graph,sizes,after.anchors);
+    expect(positionsOf(back)).toEqual(positionsOf(before));
+    expect(back.organicRegions).toEqual(before.organicRegions);
   });
-  test('filtering projects and archived work retains surviving tile positions', () => {
+  test('filtering projects and archived work fits the Organic world to what is left, and lifting it returns the world (E386)', () => {
     const graph=fixture(),sizes=planeSizes(graph),before=layoutOrganicPlane(graph,sizes);
     const filtered={...graph,nodes:graph.nodes.filter(n=>n.id!=='old'&&n.id!=='small')};
     const after=layoutOrganicPlane(filtered,sizes,before.anchors);
-    for(const tile of tilesOf(after)) {
-      const previous=tilesOf(before).find(e=>e.id===tile.id)!;
-      expect({x:tile.x,y:tile.y}).toEqual({x:previous.x,y:previous.y});
+    const fresh=layoutOrganicPlane(filtered,sizes);
+    expect(positionsOf(after)).toEqual(positionsOf(fresh));
+    expect(after.organicRegions).toEqual(fresh.organicRegions);
+    // The core is back to its empty size, and the project region with it.
+    const core=(layout:typeof before)=>layout.organicRegions!.find(r=>r.core)!.box;
+    expect(core(after).w).toBeLessThanOrEqual(core(before).w);
+    const lifted=layoutOrganicPlane(graph,sizes,after.anchors);
+    expect(positionsOf(lifted)).toEqual(positionsOf(before));
+    expect(lifted.organicRegions).toEqual(before.organicRegions);
+  });
+});
+
+describe('navigation density and readable overview', () => {
+  const phase = { id: 'dense', projectId: 'dense-project', name: 'Delivery', goal: null, position: 0 };
+  const nodes = Array.from({ length: 65 }, (_, i) => ({ ...graphFromRecorded().nodes[0],
+    id: `dense-${i}`, project: 'Dense project', phaseId: phase.id, updated: '2026-09-24T00:00:00.000Z' }));
+  const graph: MapGraph = { nodes, phases: [phase], edges: [
+    ...nodes.slice(0, 64).map(node => ({ from: nodes[64].id, to: node.id, kind: 'dependency' as const })),
+  ] };
+
+  test.each(['horizontal', 'vertical'] as const)('%s wraps independent work while preserving dependency order and non-overlap', organization => {
+    const result = organization === 'horizontal' ? layoutHorizontalPlane(graph, planeSizes(graph))
+      : layoutVerticalPlane(graph, planeSizes(graph));
+    const tiles = tilesOf(result);
+    const downstream = tiles.find(t => t.id === nodes[64].id)!;
+    const upstream = tiles.filter(t => t !== downstream);
+    expect(findOverlaps(result.elements)).toEqual([]);
+    if (organization === 'horizontal') {
+      expect(Math.max(...upstream.map(t => t.x + t.w))).toBeLessThan(downstream.x);
+      expect(planeContentBounds(result.elements).h).toBeLessThan(2000);
+    } else {
+      expect(Math.max(...upstream.map(t => t.y + t.h))).toBeLessThan(downstream.y);
+      expect(planeContentBounds(result.elements).w).toBeLessThan(2000);
     }
+    expect(new Set(upstream.map(t => organization === 'horizontal' ? t.y : t.x)).size).toBe(8);
+  });
+
+  test('Fit sees only shown work: a remembered hidden project takes no ground (E386)', () => {
+    const anchors = { ...EMPTY_PLANE_ANCHORS,
+      laneOrder: ['Hidden project'], laneHeight: { 'Hidden project': 100_000 } } as MapPlaneAnchors;
+    const result = layoutHorizontalPlane(graph, planeSizes(graph), anchors);
+    const bounds = planeContentBounds(result.elements);
+    expect(result.height).toBeLessThan(2000);
+    expect(bounds.h).toBeLessThan(2000);
+    expect(positionsOf(result)).toEqual(positionsOf(layoutHorizontalPlane(graph, planeSizes(graph))));
+    expect(layoutHorizontalPlane(graph, {}, result.anchors).anchors.slots).toEqual(result.anchors.slots);
+  });
+
+  test('phase summaries coexist with task silhouettes through successive zoom steps', () => {
+    const layout = layoutHorizontalPlane(graph, {});
+    const tile = tilesOf(layout)[0];
+    for (const scale of [0.30, 0.375, 0.46875, 0.5859375, 0.65]) {
+      const fade = planeFade(layout.elements, scale);
+      expect(fade.phase.get(tile.bandId!)).toBeGreaterThan(0.5);
+      expect(fade.task.get(tile.id)).toBe(1);
+    }
+    expect(planeFade(layout.elements, 0.8).task.get(tile.id)).toBe(1);
   });
 });
 
@@ -1768,5 +1861,586 @@ describe('transverse Report cells',()=>{
       expect(pill.y+pill.h).toBeLessThanOrEqual(owner.y+owner.h);
     }
     expect(findOverlaps(result.elements)).toEqual([]);
+  });
+});
+
+// Synthetic acceptance-scale estate, using the recorded task row and the
+// maintained Report linkage shape. Author-only model evidence, not browser
+// rendering or smoothness evidence.
+describe('Map integration: 248 tasks, ten phases and linked Reports', () => {
+  const phases = Array.from({ length: 10 }, (_, index) => ({
+    id: 'integration-phase-' + index, name: 'Stage ' + index, goal: null,
+    projectId: 'integration-project', position: index,
+  }));
+  const nodes = Array.from({ length: 248 }, (_, index) => ({
+    ...graphFromRecorded().nodes[0], id: 'integration-task-' + index,
+    title: 'Integration work ' + index, status: 'todo', agent: null,
+    project: 'Integration project', phaseId: phases[index % 10].id,
+    updated: '2026-09-24T00:00:00.000Z',
+  }));
+  const graph: MapGraph = { nodes, phases,
+    edges: nodes.slice(10).map((node, index) => ({
+      from: node.id, to: nodes[index].id, kind: 'dependency' as const,
+    })),
+    reports: nodes.map(node => ({ id: 'report-' + node.id, taskId: node.id, title: 'Linked evidence' })),
+  };
+
+  test.each([
+    ['horizontal', layoutHorizontalPlane],
+    ['vertical', layoutVerticalPlane],
+    ['organic', layoutOrganicPlane],
+  ] as const)('%s preserves all work, phase counts, Report cells and anchored geometry', (_name, place) => {
+    const sizes = planeSizes(graph);
+    const result = place(graph, sizes);
+    expect(tilesOf(result)).toHaveLength(248);
+    expect(bandsOf(result)).toHaveLength(10);
+    expect(result.elements.filter(element => element.kind === 'pill')).toHaveLength(248);
+    expect(findOverlaps(result.elements)).toEqual([]);
+    for (const phase of phases) {
+      const member = tilesOf(result).find(tile => tile.node.phaseId === phase.id)!;
+      const band = bandsOf(result).find(element => element.id === member.bandId)!;
+      expect(band).toBeDefined();
+      expect(band.facts?.taskCount).toBe(nodes.filter(node => node.phaseId === phase.id).length);
+    }
+    const before = JSON.stringify(result.elements);
+    for (const scale of [0.05, 0.30, 0.375, 0.46875, 0.5859375, 0.65, 0.8, 1.2]) {
+      const fade = planeFade(result.elements, scale);
+      expect(fade.task.size).toBe(248);
+      expect(JSON.stringify(result.elements)).toBe(before);
+    }
+    const again = place(graph, sizes, result.anchors);
+    expect(positionsOf(again)).toEqual(positionsOf(result));
+    expect(planeContentBounds(again.elements)).toEqual(planeContentBounds(result.elements));
+  });
+});
+
+// CARD 31454392 — the Map at Fit for a production-shaped project.
+//
+// PRODUCTION SHAPE: the RelayHall project as the Map's graph read returned it
+// on 2026-10-08 — 223 active tasks in five phases, 74 dependency edges and
+// 1,938 Report links — anonymized to positions. Each phase lists the Report
+// count of each of its tasks; the edges index the tasks in that order. Before
+// this card it laid out 133,552 x 2,112 (Horizontal) and 2,448 x 71,832
+// (Vertical): at Fit a task was under one pixel tall. The owner's walkthrough
+// saw 283 tasks; `extended` adds five phases of twelve at the same edge
+// density (one dependency per three tasks) with light Report links, to the
+// ~280-task, ten-phase scale the card names.
+const PRODUCTION_REPORTS: ReadonlyArray<readonly [number, string]> = [
+  [10, '782 11 6 3 0 13 11 2 51'],
+  [11, '115 74 50 30 17 13 7 4 1 1 1 1 0 0 0 0 0 0 30 35 1 1'],
+  [12, '19 1 0 0 10 0 10 0'],
+  [13, '52 35 3 3 3 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 '
+    + '1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 '
+    + '0 7 2 2 1 1 1 0 0 9 4 4 4'],
+  [14, '45 37 25 22 21 18 17 15 13 13 12 8 7 6 5 5 4 4 4 3 3 3 3 3 2 2 2 1 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 '
+    + '0 0 0 0 0 0 0 0 0 0 0 0 7 7 6 4 0 26 4 4 4 4 3 11 4 4 4 4 7 4 8 7 7'],
+];
+const PRODUCTION_EDGES = [5,171,6,10,6,11,6,12,6,27,6,28,6,31,6,35,6,37,7,6,8,7,8,27,8,28,27,18,28,27,29,
+  28,30,28,35,31,35,34,36,33,37,31,37,36,38,36,135,39,135,160,136,40,137,40,138,40,139,61,140,90,141,75,
+  142,75,143,135,144,159,144,204,145,144,145,209,145,210,146,208,202,148,203,9,204,153,205,161,206,17,
+  207,150,207,204,208,204,209,159,209,204,210,159,210,204,211,205,212,203,213,147,213,150,213,204,213,
+  207,214,204,214,211,215,214,216,146,217,145,218,213,218,215,218,216,218,217,219,172,219,213,219,215,
+  219,216,219,217,220,218,221,220,222,221];
+const EXTENDED_REPORTS = [0, 1, 1, 2, 0, 1, 4, 1, 0, 3, 1, 7];
+
+const productionShape = (extended = false, project = 'Production project'): MapGraph => {
+  const phases: MapPhase[] = [];
+  const nodes: MapTaskNode[] = [];
+  const reports: Array<{ id: string; taskId: string; title: string }> = [];
+  const edges: MapEdge[] = [];
+  const add = (position: number, counts: readonly number[]) => {
+    const id = `${project}:stage-${position}`;
+    phases.push({ id, name: `Stage ${position}`, goal: null, projectId: project, position });
+    for (const count of counts) {
+      const taskId = `${project}:task-${String(nodes.length).padStart(3, '0')}`;
+      nodes.push({ ...graphFromRecorded().nodes[0], id: taskId, title: taskId, status: 'todo',
+        agent: null, project, phaseId: id, updated: '2026-10-08T00:00:00.000Z' });
+      for (let r = 0; r < count; r += 1) {
+        reports.push({ id: `${taskId}:report-${String(r).padStart(3, '0')}`, taskId, title: 'Linked evidence' });
+      }
+    }
+  };
+  for (const [position, counts] of PRODUCTION_REPORTS) add(position, counts.trim().split(/\s+/).map(Number));
+  for (let i = 0; i < PRODUCTION_EDGES.length; i += 2) {
+    edges.push({ from: nodes[PRODUCTION_EDGES[i]].id, to: nodes[PRODUCTION_EDGES[i + 1]].id, kind: 'dependency' });
+  }
+  if (extended) {
+    for (let position = 15; position < 20; position += 1) {
+      const first = nodes.length;
+      add(position, EXTENDED_REPORTS);
+      for (let j = 2; j < EXTENDED_REPORTS.length; j += 3) {
+        edges.push({ from: nodes[first + j].id, to: nodes[first + j - 1].id, kind: 'dependency' });
+      }
+    }
+  }
+  return { nodes, phases, edges, reports };
+};
+
+/** The task's short side on screen at Fit in the planner's declared canvas. */
+const fitTilePx = (result: LayoutResult) => {
+  const bounds = planeContentBounds(result.elements);
+  const scale = planeFitScale({ width: bounds.w, height: bounds.h },
+    { width: PLANE_METRICS.shelfViewW, height: PLANE_METRICS.shelfViewH });
+  return { bounds, scale, px: FALLBACK_TILE.h * scale,
+    aspect: Math.max(bounds.w, bounds.h) / Math.min(bounds.w, bounds.h) };
+};
+
+describe('Report cells wrap into a bounded grid (card 31454392)', () => {
+  test('a strip keeps its shape up to pillStripMin cells, then folds toward a square', () => {
+    const h = [PLANE_METRICS.pillReserveW + 4, PLANE_METRICS.pillReserveH + 8] as const;
+    const v = [PLANE_METRICS.pillReserveH + 4, PLANE_METRICS.pillReserveW + 8] as const;
+    expect(pillGrid(0, ...h)).toEqual({ perStrip: 0, strips: 0 });
+    for (let n = 1; n <= PLANE_METRICS.pillStripMin; n += 1) expect(pillGrid(n, ...h)).toEqual({ perStrip: n, strips: 1 });
+    expect(pillGrid(5, ...h)).toEqual({ perStrip: 4, strips: 2 });
+    // The production task with 782 Reports: 21 x 38 cells (2,096 x 2,128
+    // units) instead of one 78,196-unit strip.
+    expect(pillGrid(782, ...h)).toEqual({ perStrip: 21, strips: 38 });
+    expect(pillGrid(782, ...v)).toEqual({ perStrip: 40, strips: 20 });
+    for (const n of [1, 5, 13, 52, 115, 782]) {
+      const { perStrip, strips } = pillGrid(n, ...h);
+      expect(perStrip * strips).toBeGreaterThanOrEqual(n);
+      expect(perStrip * (strips - 1)).toBeLessThan(n);
+    }
+  });
+
+  test.each(['horizontal', 'vertical'] as const)('%s keeps every cell of a heavily cited task inside its own column and off its neighbours', organization => {
+    const base = productionShape();
+    const heavy = base.nodes[0].id;
+    expect(base.reports!.filter(r => r.taskId === heavy)).toHaveLength(782);
+    const place = organization === 'horizontal' ? layoutHorizontalPlane : layoutVerticalPlane;
+    const result = place(base, planeSizes(base));
+    const tile = tilesOf(result).find(t => t.id === heavy)!;
+    const pills = result.elements.filter(e => e.kind === 'pill' && e.taskId === heavy);
+    expect(pills).toHaveLength(782);
+    expect(result.elements.filter(e => e.kind === 'pill')).toHaveLength(1938);
+    const block = { x: Math.min(...pills.map(p => p.x)), y: Math.min(...pills.map(p => p.y)),
+      r: Math.max(...pills.map(p => p.x + p.w)), b: Math.max(...pills.map(p => p.y + p.h)) };
+    if (organization === 'horizontal') {
+      expect(block.b).toBeLessThan(tile.y);
+      expect(block.r - block.x).toBeLessThanOrEqual(21 * (PLANE_METRICS.pillReserveW + 4));
+    } else {
+      expect(block.r).toBeLessThan(tile.x);
+      expect(block.b - block.y).toBeLessThanOrEqual(40 * (PLANE_METRICS.pillReserveH + 4));
+    }
+    expect(findOverlaps(result.elements)).toEqual([]);
+  });
+
+  test('a record from the single-strip engine holds no ground: the grid is declared (E386)', () => {
+    const graph: MapGraph = { ...productionShape(), nodes: productionShape().nodes.slice(0, 1),
+      edges: [], reports: productionShape().reports!.slice(0, 782) };
+    const seg = 'Production project\u0000phase:Production project:stage-10';
+    // What the released engine wrote for this one task: a column of 782
+    // single-strip cells (782 x 100 - 4) and the band's reserved width.
+    const legacy = { ...EMPTY_PLANE_ANCHORS,
+      laneOrder: ['Production project'], laneHeight: { 'Production project': 800 },
+      cols: { [seg]: [78196] }, rows: { [seg]: [184] }, segWidth: { [seg]: 78244 },
+      segOrder: { 'Production project': ['phase:Production project:stage-10'] },
+      laneHeaderW: { 'Production project': 220 },
+      slots: { [graph.nodes[0].id]: { seg, col: 0, row: 0 } } } as MapPlaneAnchors;
+    const upgraded = layoutHorizontalPlane(graph, {}, legacy);
+    expect(Object.keys(upgraded.anchors).sort()).toEqual(['laneOrder', 'segOrder', 'slots', 'version']);
+    const fresh = layoutHorizontalPlane(graph, {});
+    expect(positionsOf(upgraded)).toEqual(positionsOf(fresh));
+    const band = bandsOf(upgraded)[0];
+    // 21 cells of the folded grid, and the band's padding: 2096 + 2 x 24.
+    expect(band.w).toBe(2144);
+  });
+});
+
+describe('Fit shows task shapes at production shape (card 31454392)', () => {
+  test('the anonymized production read keeps its recorded dependency structure', () => {
+    const graph = productionShape();
+    expect(graph.nodes).toHaveLength(223);
+    expect(graph.phases).toHaveLength(5);
+    expect(graph.edges).toHaveLength(74);
+    expect(graph.reports).toHaveLength(1938);
+    const depths = computeDepths(graph.nodes.map(n => n.id), graph.edges);
+    const histogram: number[] = [];
+    for (const depth of depths.values()) histogram[depth] = (histogram[depth] ?? 0) + 1;
+    expect(histogram).toEqual([178, 17, 11, 7, 4, 3, 1, 1, 1]);
+    const extended = productionShape(true);
+    expect(extended.nodes).toHaveLength(283);
+    expect(extended.phases).toHaveLength(10);
+    expect(extended.edges.length / extended.nodes.length).toBeCloseTo(74 / 223, 1);
+  });
+
+  const integration248 = (): MapGraph => {
+    const phases = Array.from({ length: 10 }, (_, index) => ({
+      id: 'integration-phase-' + index, name: 'Stage ' + index, goal: null,
+      projectId: 'integration-project', position: index,
+    }));
+    const nodes = Array.from({ length: 248 }, (_, index) => ({
+      ...graphFromRecorded().nodes[0], id: 'integration-task-' + index,
+      title: 'Integration work ' + index, status: 'todo', agent: null,
+      project: 'Integration project', phaseId: phases[index % 10].id,
+      updated: '2026-09-24T00:00:00.000Z',
+    }));
+    return { nodes, phases,
+      edges: nodes.slice(10).map((node, index) => ({ from: node.id, to: nodes[index].id, kind: 'dependency' as const })),
+      reports: nodes.map(node => ({ id: 'report-' + node.id, taskId: node.id, title: 'Linked evidence' })) };
+  };
+
+  // Measured at the planner's 1280 x 720 canvas (task short side at Fit,
+  // world aspect) — production as read H 6.1px 1.12, V 7.3px 2.07; at 283
+  // tasks H 6.1px 1.35, V 7.2px 1.67; 248/10 H 9.7px 2.61, V 12.8px 1.54.
+  // The released single-strip engine: 0.7px 63.2, 0.8px 29.3; 0.7px 66.1,
+  // 0.7px 31.1; 2.0px 68.8, 1.4px 96.8. The bounds sit under the measurements
+  // and fail that engine by an order of magnitude. The
+  // production floor is lower than the synthetic one because its 1,938
+  // Report cells are two thirds of its painted area (card 742fae98 groups
+  // them); 6px is where `taskShapeAlpha` paints a shape at a third of its ink.
+  test.each([
+    ['production as read', () => productionShape(), 6, 2.25],
+    ['production at 283 tasks', () => productionShape(true), 6, 2.25],
+    ['248 tasks, ten phases', integration248, 9.5, 3],
+  ] as const)('%s: both organizations frame task shapes at Fit with a bounded aspect', (name, make, minPx, maxAspect) => {
+    const graph = make();
+    for (const place of [layoutHorizontalPlane, layoutVerticalPlane]) {
+      const result = place(graph, {});
+      const fit = fitTilePx(result);
+      // eslint-disable-next-line no-console
+      console.log(`[31454392 fit] ${name} ${place.name}: world ${fit.bounds.w}x${fit.bounds.h}`
+        + ` aspect ${fit.aspect.toFixed(2)}, Fit ${fit.scale.toFixed(4)} in`
+        + ` ${PLANE_METRICS.shelfViewW}x${PLANE_METRICS.shelfViewH}, task ${fit.px.toFixed(1)}px`);
+      expect(fit.px, `${place.name} task short side at Fit`).toBeGreaterThanOrEqual(minPx);
+      expect(fit.aspect, `${place.name} world aspect`).toBeLessThanOrEqual(maxAspect);
+      // Counts are unchanged by wrapping: every task, phase and Report cell.
+      expect(tilesOf(result)).toHaveLength(graph.nodes.length);
+      expect(bandsOf(result)).toHaveLength(graph.phases.length);
+      expect(result.elements.filter(e => e.kind === 'pill')).toHaveLength(graph.reports!.length);
+      for (const band of bandsOf(result)) {
+        expect(band.facts?.taskCount).toBe(graph.nodes.filter(n => `band:${n.project}:${n.phaseId}` === band.id).length);
+      }
+      expect(findOverlaps(result.elements)).toEqual([]);
+    }
+  });
+
+  test.each([
+    ['horizontal', layoutHorizontalPlane, 'y', 'x'],
+    ['vertical', layoutVerticalPlane, 'x', 'y'],
+  ] as const)('%s wraps phases in declared order and keeps each phase whole', (_name, place, across, along) => {
+    const graph = productionShape(true);
+    const result = place(graph, planeSizes(graph));
+    const bands = bandsOf(result);
+    const order = [...graph.phases].sort((a, b) => a.position - b.position)
+      .map(phase => bands.find(b => b.id === `band:Production project:${phase.id}`)!);
+    const shelves = new Set(order.map(b => b[across])).size;
+    expect(shelves).toBeGreaterThan(1);
+    for (let i = 1; i < order.length; i += 1) {
+      const [a, b] = [order[i - 1], order[i]];
+      // Reading order: further along the same shelf, or on a later shelf.
+      if (a[across] === b[across]) expect(b[along]).toBeGreaterThan(a[along]);
+      else expect(b[across]).toBeGreaterThan(a[across]);
+    }
+    for (const tile of tilesOf(result)) {
+      const band = bands.find(b => b.id === tile.bandId)!;
+      expect(tile.x).toBeGreaterThanOrEqual(band.x);
+      expect(tile.y).toBeGreaterThanOrEqual(band.y);
+      expect(tile.x + tile.w).toBeLessThanOrEqual(band.x + band.w);
+      expect(tile.y + tile.h).toBeLessThanOrEqual(band.y + band.h);
+    }
+  });
+
+  test.each([
+    ['horizontal', layoutHorizontalPlane],
+    ['vertical', layoutVerticalPlane],
+  ] as const)('%s shelves follow what is shown: reload, filter, arrival (E386)', (_name, place) => {
+    const graph = productionShape(true);
+    const sizes = planeSizes(graph);
+    const first = place(graph, sizes);
+    const reloaded = place(graph, sizes, JSON.parse(JSON.stringify(first.anchors)) as MapPlaneAnchors);
+    expect(positionsOf(reloaded)).toEqual(positionsOf(first));
+    // A filter that hides the widest phase re-plans the lane from what is
+    // left: the phase is not drawn, the project is smaller, and the new plan
+    // is itself a fixed point.
+    const hidden = graph.phases.find(p => p.position === 13)!.id;
+    const filtered = { ...graph, nodes: graph.nodes.filter(n => n.phaseId !== hidden) };
+    const narrowed = place(filtered, sizes, first.anchors);
+    expect(bandsOf(narrowed).some(band => band.id.endsWith(':' + hidden))).toBe(false);
+    const area = (layout: LayoutResult) => containersOf(layout).reduce((sum, c) => sum + c.w * c.h, 0);
+    expect(area(narrowed)).toBeLessThan(area(first));
+    expect(positionsOf(place(filtered, sizes, narrowed.anchors))).toEqual(positionsOf(narrowed));
+    expect(findOverlaps(narrowed.elements)).toEqual([]);
+    // An arrival lands in its rank's free cell; no card of its phase moves
+    // relative to the phase.
+    const arrival = { ...filtered.nodes[filtered.nodes.length - 1], id: 'Production project:arrival',
+      updated: '2026-10-09T00:00:00.000Z' };
+    const grown = { ...filtered, nodes: [...filtered.nodes, arrival] };
+    const after = place(grown, planeSizes(grown), narrowed.anchors);
+    const relative = (layout: LayoutResult) => {
+      const bands = new Map(bandsOf(layout).map(band => [band.id, band]));
+      return new Map(tilesOf(layout).filter(tile => tile.bandId === `band:${arrival.project}:${arrival.phaseId}`)
+        .map(tile => [tile.id, { x: tile.x - bands.get(tile.bandId!)!.x, y: tile.y - bands.get(tile.bandId!)!.y }]));
+    };
+    expect(relative(after).size).toBeGreaterThan(1);
+    expect(movedIds(relative(narrowed), relative(after))).toEqual([]);
+    expect(tilesOf(after)).toHaveLength(filtered.nodes.length + 1);
+    expect(findOverlaps(after.elements)).toEqual([]);
+  });
+
+  test('a lane already readable at Fit keeps one shelf and records none', () => {
+    const graph = graphFromRecorded();
+    for (const place of [layoutHorizontalPlane, layoutVerticalPlane]) {
+      const result = place(graph, planeSizes(graph));
+      expect('shelfLen' in result.anchors).toBe(false);
+      expect('segShelf' in result.anchors).toBe(false);
+    }
+  });
+
+  test('a wrapped lane records no shelf either: the plan is made from what is shown (E386)', () => {
+    const graph = productionShape(true);
+    const result = layoutHorizontalPlane(graph, {});
+    expect(new Set(bandsOf(result).map(band => band.y)).size).toBeGreaterThan(1);
+    expect('shelfLen' in result.anchors).toBe(false);
+    expect('shelfHeight' in result.anchors).toBe(false);
+    expect('segShelf' in result.anchors).toBe(false);
+    const gone = graph.nodes[graph.nodes.length - 1].id;
+    const scoped = { ...graph, nodes: graph.nodes.filter(n => n.id !== gone) };
+    expect(positionsOf(layoutHorizontalPlane(scoped, {}, result.anchors)))
+      .toEqual(positionsOf(layoutHorizontalPlane(scoped, {}, layoutHorizontalPlane(scoped, {}, result.anchors).anchors)));
+  });
+});
+
+// F1: fresh density alone misses arrival into anchored downstream territory.
+describe("anchored rank wrapping under arrival and churn", () => {
+  test.each([
+    ["horizontal", layoutHorizontalPlane, "x", "w"],
+    ["vertical", layoutVerticalPlane, "y", "h"],
+  ] as const)("%s preserves flow, old positions and nonoverlap", (_name, place, axis, extent) => {
+    const node = (id: string) => ({ ...graphFromRecorded().nodes[0], id,
+      project: "Arrival project", phaseId: "arrival-phase", updated: "2026-10-03T00:00:00Z" });
+    const makeGraph = (ids: string[]): MapGraph => ({ nodes: [...ids.map(node), node("d")],
+      phases: [{ id: "arrival-phase", name: "Arrival", projectId: "arrival-project", position: 0, goal: null }],
+      edges: ids.map(id => ({ from: "d", to: id, kind: "dependency" })),
+      reports: ids.map(id => ({ id: "report-" + id, taskId: id, title: "Linked evidence" })),
+    });
+    let ids = Array.from({ length: 8 }, (_, i) => "a" + i);
+    let graph = makeGraph(ids);
+    let before = place(graph, planeSizes(graph));
+    // E386: a step that only ADDS moves nothing already placed; a step that
+    // removes closes the holes it leaves, keeping every survivor's order.
+    const check = (nextIds: string[]) => {
+      const previous = new Set(tilesOf(before).map(tile => tile.id));
+      graph = makeGraph(nextIds);
+      const after = place(graph, planeSizes(graph), before.anchors);
+      const removes = [...previous].some(id => !nextIds.includes(id) && id !== 'd');
+      expect(tilesOf(after)).toHaveLength(nextIds.length + 1);
+      expect(after.elements.filter(e => e.kind === "pill")).toHaveLength(nextIds.length);
+      expect(findOverlaps(after.elements)).toEqual([]);
+      const tiles = tilesOf(after);
+      const downstream = tiles.find(t => t.id === "d")!;
+      for (const tile of tiles.filter(t => t.id !== "d")) {
+        expect(tile[axis] + tile[extent], tile.id + " must precede d").toBeLessThan(downstream[axis]);
+      }
+      if (!removes) expect(movedIds(positionsOf(before), positionsOf(after), id => tiles.some(t => t.id === id))).toEqual([]);
+      const reading = (layout: LayoutResult) => tilesOf(layout).filter(t => t.id !== 'd' && previous.has(t.id)
+        && nextIds.includes(t.id)).sort((a, b) => a[axis] - b[axis] || (axis === 'x' ? a.y - b.y : a.x - b.x)).map(t => t.id);
+      expect(reading(after)).toEqual(reading(before));
+      const permuted = place({ ...graph, nodes: [...graph.nodes].reverse(), edges: [...graph.edges].reverse() },
+        planeSizes(graph), before.anchors);
+      expect(positionsOf(permuted)).toEqual(positionsOf(after));
+      before = after;
+    };
+    ids.push("a8");
+    check(ids);
+    expect(before.anchors.slots.a8.col).toBe(0);
+    expect(before.anchors.slots.a8.row).toBe(8);
+    ids.push(...Array.from({ length: 9 }, (_, i) => "a" + (i + 9)));
+    check(ids);
+    ids = ids.filter(id => id !== "a2" && id !== "a5");
+    check(ids);
+    ids.push("a18", "a19");
+    check(ids);
+    const full = before;
+    check(ids.filter(id => !["a1", "a7", "a8"].includes(id)));
+    check(ids);
+    // The returning tasks are arrivals, but every AREA is the size it was.
+    const areas = (layout: LayoutResult) => bandsOf(layout).map(band => [band.id, band.w, band.h]);
+    expect(areas(before)).toEqual(areas(full));
+  });
+});
+
+// F2: source-token calculations, NOT browser font measurements.
+const titleScreenRem = (scale: number) => {
+  const band = planeDetailBand(PLANE_METRICS.tileCellW * scale);
+  let expression = taskCss.match(/\.task-card-title-compact\s*\{[^}]*font-size:\s*([^;]+);/)![1];
+  for (const match of mapCss.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!match[1].includes(".task-card-title-compact")) continue;
+    if (!match[1].includes(".map-plane[data-plane-lod]")
+      && !match[1].includes(`.map-plane[data-plane-lod="${band}"]`)) continue;
+    const font = match[2].match(/font-size:\s*([^;]+);/);
+    if (font) expression = font[1];
+  }
+  expression = expression.replace(/var\((--[\w-]+)(?:,\s*[^)]+)?\)/g, (_all, token: string) => {
+    if (token === "--map-plane-inverse-scale") return String(1 / scale);
+    const value = tokensCss.match(new RegExp(token + ":\\s*([0-9.]+)rem"));
+    if (!value) throw new Error("Unsupported font token " + token);
+    return value[1];
+  }).replace(/calc\(/g, "(");
+  expect(expression).toMatch(/^[0-9.,+*/()\s\-a-z]+$/);
+  const value = Function("clamp", "min", "max", `return (${expression})`)(
+    (lo: number, value: number, hi: number) => Math.max(lo, Math.min(value, hi)), Math.min, Math.max);
+  return value * scale;
+};
+
+describe("continuous screen-space Map title typography (source-derived)", () => {
+  test("ordinary zoom steps never reduce the title, including detail takeover", () => {
+    const scales = [0.60, 0.65, 0.72, 0.79, 0.80, 0.9, 1, 1.1, 1.13, 1.2, 1.5, 2, 4];
+    const sizes = scales.map(titleScreenRem);
+    for (let i = 1; i < sizes.length; i += 1) expect(sizes[i]).toBeGreaterThanOrEqual(sizes[i - 1] - 1e-10);
+    expect(titleScreenRem(0.79) * 16).toBeCloseTo(15.8);
+    expect(titleScreenRem(0.8) * 16).toBeCloseTo(16);
+    expect(titleScreenRem(1.1) * 16).toBeGreaterThanOrEqual(16);
+  });
+  test.each([96 / 170, 136 / 170, 192 / 170, 16 / 14])("title is continuous across threshold %s", threshold => {
+    const before = titleScreenRem(threshold - 1e-7);
+    const after = titleScreenRem(threshold + 1e-7);
+    expect(after).toBeGreaterThanOrEqual(before - 1e-10);
+    expect(Math.abs(after - before)).toBeLessThan(1e-5);
+  });
+});
+
+// R1: retain only model-returned anchors through filter/arrival/deletion/return.
+// Total rank ordering must not destroy actual edges with feasible free holes.
+describe("filtered intermediate-rank return with consumed anchor territory", () => {
+  test.each([
+    ["horizontal", layoutHorizontalPlane, "x", "w", 0],
+    ["horizontal", layoutHorizontalPlane, "x", "w", 1],
+    ["vertical", layoutVerticalPlane, "y", "h", 0],
+    ["vertical", layoutVerticalPlane, "y", "h", 1],
+  ] as const)("%s exact R1 and repeated churn with %i Reports/task", (_org, place, axis, extent, reportCount) => {
+    const make = (active: string[], chain: string[]): MapGraph => {
+      const ids = [...active, ...chain, "c"];
+      return {
+        nodes: ids.map(id => ({ ...graphFromRecorded().nodes[0], id, title: id,
+          project: "R1", phaseId: "r1-phase", updated: "2026-10-03T00:00:00Z" })),
+        phases: [{ id: "r1-phase", name: "Return", projectId: "R1", position: 0, goal: null }],
+        edges: [...chain, "c"].map((id, i) => ({ from: id,
+          to: i ? chain[i - 1] : "a0", kind: "dependency" })),
+        reports: reportCount ? ids.map(id => ({ id: "report-" + id, taskId: id, title: "Evidence" })) : [],
+      };
+    };
+    // While hidden, keep the real edges to missing b: computeDepths ignores
+    // absent endpoints. No task or anchor coordinates are manually changed.
+    const hidden = (active: string[]): MapGraph => ({ ...make(active, []), edges: [
+      { from: "b", to: "a0", kind: "dependency" }, { from: "c", to: "b", kind: "dependency" },
+    ] });
+    let graph = make(Array.from({ length: 9 }, (_, i) => "a" + i), ["b"]);
+    let before = place(graph, planeSizes(graph));
+    expect(before.anchors.slots.b).toMatchObject({ col: 2, row: 0 });
+    expect(before.anchors.slots.c).toMatchObject({ col: 3, row: 0 });
+    // E386: a step that only ADDS moves nothing already placed; a step that
+    // hides work closes the holes it leaves, so it is not held to that.
+    const check = (next: MapGraph) => {
+      const previous = new Set(graph.nodes.map(node => node.id));
+      const removes = [...previous].some(id => !next.nodes.some(node => node.id === id))
+        // A NEW dependency into existing work may re-flow its segment: flow
+        // is the plane's first rule (`flowsBackward`).
+        || next.edges.some(edge => [edge.from, edge.to].every(id => next.nodes.some(node => node.id === id))
+          && previous.has(edge.from) !== previous.has(edge.to));
+      const after = place(next, planeSizes(next), before.anchors);
+      const tiles = tilesOf(after);
+      expect(tiles).toHaveLength(next.nodes.length);
+      expect(after.elements.filter(e => e.kind === "pill")).toHaveLength(next.nodes.length * reportCount);
+      expect(findOverlaps(after.elements)).toEqual([]);
+      // Also compare task/Report boxes directly, independent of containment rules.
+      const boxes = after.elements.filter(e => e.kind === "tile" || e.kind === "pill");
+      for (let i = 0; i < boxes.length; i += 1) for (let j = i + 1; j < boxes.length; j += 1) {
+        const a = boxes[i], b = boxes[j];
+        expect(a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h,
+          a.id + " / " + b.id).toBe(false);
+      }
+      for (const edge of next.edges) {
+        const parent = tiles.find(t => t.id === edge.to), child = tiles.find(t => t.id === edge.from);
+        if (parent && child) expect(parent[axis] + parent[extent], edge.to + " -> " + edge.from).toBeLessThan(child[axis]);
+      }
+      if (!removes) expect(movedIds(positionsOf(before), positionsOf(after), id => boxes.some(t => t.id === id))).toEqual([]);
+      const permutations = [next.nodes, [...next.nodes].reverse(),
+        [...next.nodes.slice(2), ...next.nodes.slice(0, 2)],
+        [...next.nodes].sort((a, b) => b.id.localeCompare(a.id))];
+      for (const nodes of permutations) {
+        const permuted = place({ ...next, nodes, edges: [...next.edges].reverse(), reports: [...(next.reports ?? [])].reverse() },
+          planeSizes(next), before.anchors);
+        expect(positionsOf(permuted)).toEqual(positionsOf(after));
+        expect(permuted.anchors.slots).toEqual(after.anchors.slots);
+      }
+      expect(positionsOf(place(next, planeSizes(next), after.anchors))).toEqual(positionsOf(after));
+      before = after; graph = next;
+    };
+    const original = Array.from({ length: 9 }, (_, i) => "a" + i);
+    const arrivals = Array.from({ length: 9 }, (_, i) => "new" + i);
+    check(hidden(original));
+    check(hidden([...original, ...arrivals]));
+    const survivors = ["a0", "new7", "new8"];
+    check(hidden(survivors));
+    check(make(survivors, ["b"]));
+    expect(before.anchors.slots.b.col).toBeLessThan(before.anchors.slots.c.col);
+    // A newly introduced rank between b and fixed c has a feasible col2 hole,
+    // despite unrelated depth-zero tasks already occupying that column.
+    check(make(survivors, ["b", "intermediate"]));
+    for (let cycle = 0; cycle < 6; cycle += 1) {
+      check(hidden(survivors));
+      const fresh = Array.from({ length: 17 + cycle * 2 }, (_, i) => "churn-" + cycle + "-" + i);
+      check(hidden([...survivors, ...fresh]));
+      check(hidden([...survivors, fresh[8], fresh[9]]));
+      check(make([...survivors, fresh[8], fresh[9]], ["b", "intermediate"]));
+      check(make(survivors, ["b", "intermediate"]));
+    }
+  });
+});
+
+// Card 2b6f21f6 (A), owner ruling SQ-1, superseded by owner ruling E386: with
+// archived work hidden, a shelf whose phases hold only archived tasks used to
+// shrink to its phase headers. E386 goes further: a phase with no shown task
+// is not drawn at all, the lane fits what is left, and showing the archive
+// again and hiding it returns every area to the same rectangle.
+describe('card 2b6f21f6 (A) under E386: an all-archived shelf disappears when archived work is hidden', () => {
+  test.each(['horizontal', 'vertical'] as const)('%s', organization => {
+    const lane = 'Production project';
+    const base = productionShape(true, lane);
+    const zeta: MapPhase = { id: 'zeta-phase', name: 'Zeta', goal: null, projectId: 'zeta', position: 0 };
+    const graph: MapGraph = { ...base, phases: [...base.phases, zeta],
+      nodes: [...base.nodes, ...addedNodes(base, 3, 'Zeta project', zeta.id, 'zeta')] };
+    const sizes = planeSizes(graph);
+    const place = (scope: MapGraph, anchors: MapPlaneAnchors) =>
+      layoutContinuousPlane(scope, sizes, organization, anchors);
+    const planned = place(graph, EMPTY_PLANE_ANCHORS);
+    const band = (result: LayoutResult, id: string) =>
+      bandsOf(result).find(b => b.id === `band:${lane}:${id}`);
+    const container = (result: LayoutResult, laneKey: string) =>
+      containersOf(result).find(c => c.laneId === laneKey)!;
+    // The first shelf: the phases that start the lane's reading order.
+    const across = organization === 'horizontal' ? 'y' : 'x';
+    const firstShelf = Math.min(...base.phases.map(phase => band(planned, phase.id)![across]));
+    const historic = base.phases.filter(phase => band(planned, phase.id)![across] === firstShelf).map(phase => phase.id);
+    const later = base.phases.filter(phase => !historic.includes(phase.id)).map(phase => phase.id);
+    // Not vacuous: the lane really is wrapped, with history on its first shelf.
+    expect(historic.length).toBeGreaterThan(0);
+    expect(later.length).toBeGreaterThan(0);
+
+    // The owner's shape: every task on the oldest shelf is archived.
+    const withArchive: MapGraph = { ...graph, nodes: graph.nodes.map(node =>
+      historic.includes(node.phaseId!) ? { ...node, status: 'archived' as const } : node) };
+    const live: MapGraph = { ...withArchive, nodes: withArchive.nodes.filter(node => node.status !== 'archived') };
+    const before = place(live, EMPTY_PLANE_ANCHORS);
+    const shown = place(withArchive, before.anchors);
+    const hidden = place(live, shown.anchors);
+
+    for (const id of historic) {
+      expect(band(shown, id), `${id} shown`).toBeDefined();
+      expect(band(hidden, id), `${id} hidden`).toBeUndefined();
+    }
+    for (const id of later) expect(band(hidden, id)).toBeDefined();
+    // The project gives the archive's ground back, and the lane after it
+    // rises by the same depth.
+    const depth = organization === 'horizontal' ? 'h' : 'w';
+    const freed = container(shown, lane)[depth] - container(hidden, lane)[depth];
+    expect(freed).toBeGreaterThan(0);
+    expect(container(shown, 'Zeta project')[across] - container(hidden, 'Zeta project')[across])
+      .toBeGreaterThan(0);
+    expect(findOverlaps(hidden.elements)).toEqual([]);
+    // Exact return: hiding the archive again is the world before it was shown.
+    const boxes = (result: LayoutResult) => result.elements.map(e => [e.id, e.x, e.y, e.w, e.h]);
+    expect(boxes(hidden)).toEqual(boxes(before));
   });
 });

@@ -1,4 +1,5 @@
 import type { BlueprintPlanData, BlueprintReference } from '../../types/blueprint';
+import { VerificationNoneBadge } from '../tasks/VerificationNoneBadge';
 
 /** Data is always rendered as text. Connector descriptors are never a GUI projection. */
 export function BlueprintData({ value }: { value: unknown }) {
@@ -19,6 +20,7 @@ export function BlueprintPlan({ plan, targetArchived }: { plan: BlueprintPlanDat
   return <div className="blueprint-plan">
     <p>Preview creates nothing. All created tasks begin parked. Choosing a gate arm grants no authority; a caller with task write authority may arm chosen tasks separately. Unchosen tasks remain parked.</p>
     {targetArchived && <p className="blueprint-error" role="alert">This Project is archived. The plan can be read, but it cannot be instantiated here.</p>}
+    {!!plan.warnings?.length && <section aria-label="Plan warnings"><h3>Plan warnings</h3><ul>{plan.warnings.map((warning, i) => <li key={i}><strong>{warning.code}</strong>: {warning.message}</li>)}</ul></section>}
     {!!plan.refusals?.length && <section aria-label="Plan refusals"><h3>Plan refusals</h3><ul>{plan.refusals.map((refusal, i) => <li key={i} className="blueprint-error"><strong>{refusal.code}</strong>: {refusal.error} ({refusal.field})</li>)}</ul></section>}
     <h3>Counts</h3><BlueprintData value={plan.counts} />
     <h3>Authority</h3><ul>{plan.authority.map((row, i) => <li key={i}>
@@ -28,7 +30,7 @@ export function BlueprintPlan({ plan, targetArchived }: { plan: BlueprintPlanDat
     <h3>Project</h3><BlueprintData value={plan.project || plan.target} />
     <h3>Phases</h3>{plan.phases.length ? plan.phases.map((phase, i) => <details key={i}><summary>{String(phase.name ?? phase.key)}</summary><BlueprintData value={phase} /></details>) : <p>No new Phases.</p>}
     <h3>Tasks and Subtasks</h3>{plan.tasks.map(task => <details key={task.key} data-task-key={task.key}>
-      <summary>{task.title} — {task.key} — parked</summary><BlueprintData value={task} />
+      <summary>{task.title} — {task.key} — parked{task.verificationNone === true && <> — <VerificationNoneBadge /></>}</summary><BlueprintData value={task} />
     </details>)}
     <h3>Dependencies</h3><ul>{plan.dependencies.map((edge, i) => <li key={i}>{edge.task} depends on {edge.dependsOn}</li>)}</ul>
     <h3>Reports and links</h3>{plan.reports.map((report, i) => <details key={i}><summary>{String(report.title ?? report.key)}</summary><BlueprintData value={report} /></details>)}

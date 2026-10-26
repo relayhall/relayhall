@@ -1,0 +1,12 @@
+{
+  "producer": "otel-python-sdk",
+  "producerVersion": "1.27.0",
+  "note": "OpenTelemetry Python SDK, http/protobuf: GenAI-semconv and OpenInference spans, a GenAI token histogram, one log",
+  "signal": "traces",
+  "path": "/v1/traces",
+  "contentType": "application/x-protobuf",
+  "userAgent": "OTel-OTLP-Exporter-Python/1.27.0",
+  "bytes": 530,
+  "sha256": "e7f256089b848fd879d55707053d91055aeb4f6808c1b85e6d6058d508916d96",
+  "bodyBase64": "Co8ECtwBCiIKFnRlbGVtZXRyeS5zZGsubGFuZ3VhZ2USCAoGcHl0aG9uCiUKEnRlbGVtZXRyeS5zZGsubmFtZRIPCg1vcGVudGVsZW1ldHJ5CiEKFXRlbGVtZXRyeS5zZGsudmVyc2lvbhIICgYxLjI3LjAKJAoMc2VydmljZS5uYW1lEhQKEm90ZWwtcHl0aG9uLXNhbXBsZQoaCg9zZXJ2aWNlLnZlcnNpb24SBwoFMC40LjEKKgoTc2VydmljZS5pbnN0YW5jZS5pZBITChFzYW1wbGUtaW5zdGFuY2UtMRKtAgoVCgxzYW1wbGUuZ2VuYWkSBTEuMi4wEpMCChB0t33hyT1esdHC3qEndsogEggX26DrBHCdXCIIR4m+KLB8cyIqGGV4ZWN1dGVfdG9vbCBnZXRfd2VhdGhlcjABOSSUL3F3798YQbAdy3F3798YSicKFWdlbl9haS5vcGVyYXRpb24ubmFtZRIOCgxleGVjdXRlX3Rvb2xKIQoQZ2VuX2FpLnRvb2wubmFtZRINCgtnZXRfd2VhdGhlckoiChNnZW5fYWkudG9vbC5jYWxsLmlkEgsKCWNhbGxfOXg4eUoeChBnZW5fYWkudG9vbC50eXBlEgoKCGZ1bmN0aW9uSiUKFmdlbl9haS5jb252ZXJzYXRpb24uaWQSCwoJY29udi03ZjNhegCFAQABAAA="
+}

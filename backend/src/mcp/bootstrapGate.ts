@@ -46,6 +46,7 @@
  */
 import { acceptPrincipalKey, type AuthRequest } from '../middleware/auth';
 import { isBootstrapLive } from '../services/McpBootstrapService';
+import type { DelegationActorLink } from '../services/AuthorizationService';
 import { MCP_TRANSPORT_STAMP, MCP_ROUTE_PATH } from './provenance';
 import { board, type McpCallContext } from './rest';
 import { untrusted, sections } from './shape';
@@ -174,13 +175,28 @@ export async function bootstrapGate(tool: McpTool, ctx: McpCallContext): Promise
 }
 
 /**
- * The credential this call actually authenticates as, resolved live.
+ * Who this call actually authenticates as, resolved live: the credential, the
+ * principal it acts as, and the delegation chain the shared acceptance built
+ * for it (acting first, Account last; `null` for an Account-plane credential).
  *
- * `acceptPrincipalKey` writes the resolved credential id onto the request it
- * is given; a bare object is enough, because nothing here needs the rest of an
- * Express request and nothing is written back to a response.
+ * `acceptPrincipalKey` writes all three onto the request it is given; a bare
+ * object is enough, because nothing here needs the rest of an Express request
+ * and nothing is written back to a response. Anything short of an `ok`
+ * outcome — including a lookup that THREW — is `null`: no caller.
+ *
+ * Two consumers, one resolution. The gate below reads the credential id. The
+ * MCP-derived session observer (`services/McpSessionTelemetry`, card
+ * `35b73092`) reads the principal and the chain, and hands the chain to the
+ * ratified telemetry derivation unchanged — so the owner of every row it
+ * writes comes from THIS credential's chain and never from a tool argument.
  */
-export async function resolveCredentialId(ctx: McpCallContext): Promise<string | null> {
+export interface McpCaller {
+  credentialId: string;
+  principalId: string | null;
+  delegationLinks: DelegationActorLink[] | null;
+}
+
+export async function resolveMcpCaller(ctx: McpCallContext): Promise<McpCaller | null> {
   const probe = {} as AuthRequest;
   try {
     const outcome = await acceptPrincipalKey(
@@ -190,5 +206,16 @@ export async function resolveCredentialId(ctx: McpCallContext): Promise<string |
   } catch {
     return null;
   }
-  return probe.credentialId ?? null;
+  if (!probe.credentialId) return null;
+  return {
+    credentialId: probe.credentialId,
+    principalId: probe.principal?.id ?? null,
+    delegationLinks: probe.delegationLinks ?? null,
+  };
+}
+
+/** The credential this call actually authenticates as, resolved live. */
+export async function resolveCredentialId(ctx: McpCallContext): Promise<string | null> {
+  const caller = await resolveMcpCaller(ctx);
+  return caller ? caller.credentialId : null;
 }

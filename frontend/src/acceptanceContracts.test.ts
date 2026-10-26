@@ -180,16 +180,18 @@ describe('clean-install owner acceptance contracts', () => {
     // pin that matched the explanation would fire on the code being correct.
     expect(wordmarkSource).not.toMatch(/^import .*(RelayHallConfigContext|config\/relayhall)/m);
 
-    // Public links ride the build flag and default to private, so a forgotten
-    // build argument cannot publish a link ahead of the owner's gate.
-    expect(buildSource).toContain("import.meta.env.VITE_PUBLIC_BUILD === 'true'");
-    expect(loginSource).toContain('IS_PUBLIC_BUILD ?');
-    expect(aboutSource).toContain('IS_PUBLIC_BUILD ?');
+    // E504: the public repository exists, so its links are live in every
+    // build. No build variable gates them and nothing in the image build
+    // carries one; a gate coming back is what this pins against.
+    expect(buildSource).not.toContain('VITE_PUBLIC_BUILD');
+    expect(buildSource).not.toContain('IS_PUBLIC_BUILD');
+    expect(loginSource).not.toContain('IS_PUBLIC_BUILD');
+    expect(aboutSource).not.toContain('IS_PUBLIC_BUILD');
     expect(aboutSource).toContain('DOCS_URL');
     expect(aboutSource).toContain('PROBLEM_URL');
-    expect(dockerfileSource).toContain('ARG VITE_PUBLIC_BUILD=false');
-    expect(dockerfileSource).toContain('ENV VITE_PUBLIC_BUILD=$VITE_PUBLIC_BUILD');
-    expect(composeSource).toContain('VITE_PUBLIC_BUILD: ${VITE_PUBLIC_BUILD:-false}');
+    expect(aboutSource).toContain('BLUEPRINT_GUIDE_URL');
+    expect(dockerfileSource).not.toContain('VITE_PUBLIC_BUILD');
+    expect(composeSource).not.toContain('VITE_PUBLIC_BUILD');
     expect(nginxSource).toMatch(/location = \/release-manifest\.json[\s\S]*Cache-Control "no-store" always;[\s\S]*X-Content-Type-Options "nosniff" always;/);
   });
 

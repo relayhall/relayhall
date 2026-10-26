@@ -35,7 +35,10 @@ describe('scope map', () => {
     expect(requiredScopeFor('POST', '/tasks/abc/prompt')).not.toBe('tasks:read');
     // The session altitude sits above the /principals family rules, or a
     // POST there would demand principals:admin and no agent could bootstrap.
-    expect(requiredScopeFor('POST', '/principals/me/brief')).toBe('principals:read');
+    // Card 1118fefa: its ceiling is the self-identity rule, so a credential
+    // without principals:read can bootstrap; the directory below it is not
+    // moved (asserted in 'identity plane' below).
+    expect(requiredScopeFor('POST', '/principals/me/brief')).toBe('authenticated');
     // A12's contracted Phase-3 removal, executed in RH-P3.C5: the
     // spawn-prompt alias is no longer a Brief surface. It must NOT resolve
     // to the read-narrowed prompt rule any more — it falls to the generic
@@ -316,7 +319,7 @@ describe('requested scope validation', () => {
 describe('handle validation', () => {
   it('accepts an ordinary new handle', () => {
     expect(validateNewHandle('casey')).toEqual({ ok: true, handle: 'casey' });
-    expect(validateNewHandle('clawd_cron').ok).toBe(true);
+    expect(validateNewHandle('nightly_cron').ok).toBe(true);
   });
 
   it('refuses the reserved seed handles', () => {

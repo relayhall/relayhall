@@ -52,6 +52,23 @@ export interface TelemetryValidationSuccess {
   identityArm: 'event_id' | 'stream_sequence' | 'content_hash';
 }
 
+/**
+ * Which §4.3 identity a caller is asking the validator to admit.
+ *
+ * `source` (the default, and the ONLY one the native endpoints use): the
+ * record must carry a real source identity — `event_id`, or
+ * `stream_generation` + `source_sequence` — exactly as TW1a froze it.
+ *
+ * `content_hash` (the OTLP receivers, card `dac2ca71`): the record must carry
+ * NO source identity at all, because the store derives the identity from the
+ * record it is about to STORE (§4.3's best-effort content-hash fallback, with
+ * its collision caveat). Refusing a record that carries both is what keeps the
+ * two arms from being mixed by a caller that half-filled one of them.
+ */
+export interface TelemetryValidationOptions {
+  identity?: 'source' | 'content_hash';
+}
+
 export type TelemetryValidationResult = TelemetryValidationSuccess | TelemetryValidationFailure;
 
 /**
@@ -80,7 +97,7 @@ const IDENTIFIER_RE = /^[A-Za-z0-9._:@+\-]{1,200}$/;
 /** W3C trace context: lowercase hex of a fixed width. */
 const TRACE_ID_RE = /^[0-9a-f]{8,64}$/;
 /** A correlation identifier that is retained RAW. Tight and short. */
-const CORRELATION_ID_RE = /^[A-Za-z0-9._:@+\-]{1,128}$/;
+export const CORRELATION_ID_RE = /^[A-Za-z0-9._:@+\-]{1,128}$/;
 /** A model or provider name: no spaces, so a sentence cannot ride in. */
 const MODEL_NAME_RE = /^[A-Za-z0-9._:+\-/]{1,80}$/;
 /**
@@ -89,8 +106,12 @@ const MODEL_NAME_RE = /^[A-Za-z0-9._:+\-/]{1,80}$/;
  * letters-only and passed it. The envelope reference calls this field semver,
  * so requiring a leading numeric component is not a narrowing of the contract —
  * it is the contract, and it excludes prose by construction.
+ *
+ * Exported because it is now asked twice: MCP-derived sessions (card
+ * `35b73092`) name the board's own version in a record only where this
+ * grammar admits it (`mcpAdapterVersion`). The grammar itself is unchanged.
  */
-const VERSION_RE = /^v?\d{1,6}(\.\d{1,6}){0,3}([.\-+][A-Za-z0-9.\-]{1,24})?$/;
+export const VERSION_RE = /^v?\d{1,6}(\.\d{1,6}){0,3}([.\-+][A-Za-z0-9.\-]{1,24})?$/;
 /**
  * A product / adapter key — THE INGEST PRODUCT GRAMMAR, and the one copy of it.
  *
@@ -305,7 +326,10 @@ function checkNumericBlock(
  * shape. Returns the record UNCHANGED on success (redaction is a later
  * stage), plus the §4.3 identity arm it can be keyed on.
  */
-export function validateTelemetryEnvelope(input: unknown): TelemetryValidationResult {
+export function validateTelemetryEnvelope(
+  input: unknown,
+  options: TelemetryValidationOptions = {},
+): TelemetryValidationResult {
   if (!isPlainObject(input)) {
     return fail('INVALID_ENVELOPE', '(root)', 'an envelope must be a JSON object');
   }
@@ -520,6 +544,17 @@ export function validateTelemetryEnvelope(input: unknown): TelemetryValidationRe
   }
 
   // ---- §4.3 identity arm -------------------------------------------------
+  if (options.identity === 'content_hash') {
+    for (const field of ['event_id', 'stream_generation', 'source_sequence'] as const) {
+      if (input[field] !== undefined && input[field] !== null) {
+        return fail(
+          'INVALID_ENVELOPE', field,
+          `${field} may not be supplied on a record whose identity is derived from its stored content (design 7d5c0cdc §4.3)`,
+        );
+      }
+    }
+    return { ok: true, envelope: input as unknown as TelemetryEnvelope, identityArm: 'content_hash' };
+  }
   const identityArm = telemetryEnvelopeIdentityArm(input as unknown as TelemetryEnvelope);
   if (identityArm === null) {
     return fail(
@@ -533,9 +568,10 @@ export function validateTelemetryEnvelope(input: unknown): TelemetryValidationRe
 
 /**
  * Which §4.3 arm keys this record. `content_hash` is deliberately NOT reached
- * by the validator: §4.3 makes it best-effort only, so ingest REQUIRES one of
- * the two real arms and refuses otherwise. The arm exists in the type because
- * TW1b's translators may key replayed fixtures on it under their own caveat.
+ * here: §4.3 makes it best-effort only, so NATIVE ingest REQUIRES one of the
+ * two real arms and refuses otherwise. The OTLP receivers reach it only by
+ * asking the validator for it explicitly (`identity: 'content_hash'`), and the
+ * key is then computed by `telemetryRecordIdentity` from the STORED record.
  */
 export function telemetryEnvelopeIdentityArm(envelope: TelemetryEnvelope): 'event_id' | 'stream_sequence' | null {
   if (typeof envelope.event_id === 'string' && envelope.event_id.length > 0) return 'event_id';

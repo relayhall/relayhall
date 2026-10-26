@@ -81,14 +81,32 @@
   color: var(--text-accent);
 }
 
-.about-page__links span {
-  color: var(--text-tertiary);
-}
-
 .about-page__link-kind {
   color: var(--text-tertiary);
   font-size: var(--text-xs);
   text-transform: capitalize;
+}
+
+/* Card 6d549392: each artefact's identity in its own block, so a field is
+   always attributed to the build that recorded it. */
+.about-page__build {
+  margin-top: var(--space-5);
+}
+
+.about-page__qualifier {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.about-page__conflict {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.about-page__card .about-page__conflict {
+  color: var(--text-warning);
 }
 
 .about-page__deployment-links {
@@ -103,7 +121,9 @@
 }
 
 .about-page__error,
+.about-page__notice,
 .about-page__loading {
+  margin-bottom: var(--space-5);
   padding: var(--space-5);
   color: var(--text-secondary);
   background: var(--bg-surface);
@@ -120,7 +140,16 @@
   border-color: var(--danger-color);
 }
 
-.about-page__error button {
+.about-page__notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.about-page__error button,
+.about-page__notice button {
+  flex-shrink: 0;
   min-width: 44px;
   min-height: var(--control-standard);
   padding: var(--space-2) var(--space-4);
@@ -166,8 +195,7 @@
   font-size: var(--text-sm);
 }
 
-.about-page__footer a,
-.about-page__footer span {
+.about-page__footer a {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);

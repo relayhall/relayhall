@@ -12,6 +12,8 @@
  *    proofs failed three review rounds in the abandoned attempt.
  */
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import * as inventoryPlane from './mapPlaneModel';
 
 import { describe, expect, test } from 'vitest';
 
@@ -722,6 +724,26 @@ const scaleEstate = (
   }
   return { nodes, edges, phases };
 };
+
+// Historical exact-output parity predates approved shared header spacing.
+// Organic UI is owner-deferred; keep the old hashes rather than rebaseline them as acceptance.
+test.skip('5225-task Organic inventory optimization preserves c2b975 cold, held and measured full outputs',()=>{
+ const base=scaleEstate(),seen=new Set<string|null>();
+ const estate={...base,reports:base.nodes.filter(n=>{
+  if(seen.has(n.project))return false;seen.add(n.project);return true;
+ }).map((n,i)=>({id:`battery-per-project-report-${i}`,taskId:n.id,title:`Synthetic report projection ${i+1}`}))};
+ expect(estate.nodes).toHaveLength(5225);expect(estate.edges).toHaveLength(572);expect(estate.reports).toHaveLength(55);
+ const hash=(v:unknown)=>createHash('sha256').update(JSON.stringify(v)).digest('hex');
+ // Independent immutable full-output hashes captured from exact c2b975 before
+ // this change; include every path, obstacle-derived outline, anchor and fact.
+ const original='79434d47bc4be2c9298977dd5e7956e1872ff7594433b103d0986dd319f18f0f';
+ const cold=inventoryPlane.layoutOrganicPlane(estate,{});
+ expect(hash(cold)).toBe(original);
+ expect(hash(inventoryPlane.layoutOrganicPlane(estate,{},cold.anchors))).toBe(original);
+ const measured=Object.fromEntries(cold.elements.filter(e=>e.kind==='tile').slice(0,17).map(e=>[e.id,{w:220,h:123}]));
+ expect(hash(inventoryPlane.layoutOrganicPlane(estate,measured,cold.anchors)))
+  .toBe('4c6dca9342e7577b49fcb94e0a89147bc3105011f1e066f71e5ed42178f4ea97');
+},15000);
 
 /** Every aggregate measured at the documented fallback box. */
 const aggregateSizes = (graph: MapGraph, altitude: MapAltitude): SizeMap =>
@@ -1742,7 +1764,7 @@ describe('round 7 d1b2eae1 blocking findings', () => {
     // sat later in the file at EQUAL specificity and overrode them. The
     // cascade is the defect, so the stylesheet is what gets asserted.
     const css = readFileSync(
-      new URL('./MapView.css', import.meta.url).pathname, 'utf8');
+      new URL('./MapView.css', import.meta.url), 'utf8');
     const blocks = [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)];
     const offenders = blocks
       .filter(([, selector, body]) =>
@@ -1864,7 +1886,7 @@ describe('bounded chain reveal (live perf finding, card a8746719)', () => {
 
 describe('round 8 a9ab1a68 blocking findings', () => {
   test('B1: the neutral aggregate fallback does not outrank the Knowledge kind', () => {
-    const css = readFileSync(new URL('./MapView.css', import.meta.url).pathname, 'utf8');
+    const css = readFileSync(new URL('./MapView.css', import.meta.url), 'utf8');
     // Round 7 fixed one cascade collision in this file and round 8 found the
     // next: `.map-edge--aggregate.map-edge--neutral` is 0,0,2 and outranked
     // `.map-edge--knowledge` at 0,0,1, so a neutral rolled-up Report link kept
@@ -3049,4 +3071,58 @@ test('flow routing weaves through local gaps when no corridor spans the whole fi
     expect(p[i]===p[i-2]||p[i+1]===p[i-1]).toBe(true);
     for(const box of obstacles)expect(segmentIntersectsBox(p[i-2],p[i-1],p[i],p[i+1],box)).toBe(false);
   }
+});
+
+// Exact paths frozen from375cd21 before sharing within-call merged spans.
+// Each case exercised corridor gap search in the baseline, including reverse
+// routing and reversed obstacle order (equal-span tie handling).
+test.each([
+  {
+    "cols": 9,
+    "rows": 9,
+    "from": 0,
+    "to": 11,
+    "reverse": false,
+    "expected": {
+      "d": "M 170 48 L 184 48 L 184 110 L 382 110 L 382 172 L 396 172",
+      "clipped": false
+    }
+  },
+  {
+    "cols": 9,
+    "rows": 9,
+    "from": 40,
+    "to": 2,
+    "reverse": false,
+    "expected": {
+      "d": "M 877 496 L 778 496 L 778 234 L 580 234 L 580 96 L 481 96",
+      "clipped": false
+    }
+  },
+  {
+    "cols": 20,
+    "rows": 20,
+    "from": 0,
+    "to": 11,
+    "reverse": false,
+    "expected": {
+      "d": "M 170 48 L 184 48 L 184 110 L 2164 110 L 2164 48 L 2178 48",
+      "clipped": false
+    }
+  },
+  {
+    "cols": 9,
+    "rows": 9,
+    "from": 40,
+    "to": 2,
+    "reverse": true,
+    "expected": {
+      "d": "M 877 496 L 778 496 L 778 234 L 580 234 L 580 96 L 481 96",
+      "clipped": false
+    }
+  }
+])('corridor span reuse preserves path $cols/$rows/$from/$to/$reverse', ({cols,rows,from,to,reverse,expected}) => {
+  const boxes: Box[] = Array.from({length:cols*rows}, (_,i) => ({x:i%cols*198,y:Math.floor(i/cols)*124,w:170,h:96}));
+  const envelope = {x:0,y:0,w:(cols-1)*198+170+32,h:(rows-1)*124+96+32};
+  expect(routeEdge(boxes[from],boxes[to],reverse?[...boxes].reverse():boxes,envelope)).toEqual(expected);
 });

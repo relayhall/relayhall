@@ -95,6 +95,13 @@ export const TELEMETRY_PROJECTION_DEFAULT_WINDOW_DAYS = 7;
 export const TELEMETRY_PROJECTION_MAX_WINDOW_DAYS = 90;
 export const TELEMETRY_TIMELINE_DEFAULT_EVENTS = 200;
 export const TELEMETRY_TIMELINE_MAX_EVENTS = 500;
+/**
+ * The only product with an action log: the server-written MCP key
+ * (`McpSessionTelemetry.MCP_SESSION_SOURCE_PRODUCT`), restated rather than
+ * imported because that module pulls the MCP write path into this read model.
+ * `mcpActionLog.test.ts` pins the two equal.
+ */
+export const MCP_ACTION_LOG_PRODUCT = 'mcp';
 
 /**
  * Narrow-only clamp. `requested` may lower a bound and can never raise it,
@@ -105,6 +112,48 @@ export function clampBound(requested: unknown, fallback: number, max: number): n
   const value = typeof requested === 'number' ? requested : Number(requested);
   if (!Number.isFinite(value) || value <= 0) return Math.min(fallback, max);
   return Math.min(Math.floor(value), max);
+}
+
+// ─────────────────────────── the short-session rule ──────────────────────────
+
+/**
+ * A SHORT session (card `0ac41d40`, owner ruling E89 (b)): the Sessions list
+ * hides it by default and counts it instead. ALL of these hold, each over the
+ * session's events inside the requested window and filters — the same events
+ * the row's own columns show:
+ *
+ *   - at most `TELEMETRY_SHORT_SESSION_MAX_EVENTS` events;
+ *   - last seen LESS than `TELEMETRY_SHORT_SESSION_MIN_DURATION_MS` after it
+ *     started (receiver clock) — exactly two minutes is NOT short;
+ *   - NO MODEL: no `model_call` event and no event naming a model provider,
+ *     requested model or resolved model (the Models column reads
+ *     `model.resolved` from any event kind, so a session that shows a model
+ *     can never count as model-less);
+ *   - NO TOKENS: input tokens and output tokens BOTH sum to zero. Both, rather
+ *     than their sum, because the Tier-0 engine admits negative numbers and a
+ *     sum could cancel to zero.
+ *
+ * The shape this exists for is the MCP-derived bootstrap, heartbeat and
+ * completion of a session that did nothing else. Nothing is deleted and
+ * nothing is re-labelled: retention is untouched (ruling E89 (c)), the point
+ * route reads a short session by its triple like any other, and Stats count
+ * every session and say how many are short.
+ */
+export const TELEMETRY_SHORT_SESSION_MAX_EVENTS = 3;
+export const TELEMETRY_SHORT_SESSION_MIN_DURATION_MS = 120_000;
+
+/**
+ * A list page offset: a whole number of rows to skip, or 0 for anything else.
+ *
+ * It has no ceiling of its own because it widens nothing — the window and the
+ * narrowing bound the scan and the row limit bounds the page, whatever the
+ * offset. It is held to a safe integer only so the value always reaches
+ * PostgreSQL as a plain integer.
+ */
+export function sessionPageOffset(requested: unknown): number {
+  const value = typeof requested === 'number' ? requested : Number(requested);
+  if (!Number.isFinite(value) || value < 1) return 0;
+  return Math.floor(Math.min(value, Number.MAX_SAFE_INTEGER));
 }
 
 // ───────────────────────────── the vocabularies ──────────────────────────────
@@ -170,6 +219,13 @@ export function deriveSessionState(
 export interface TelemetrySourceRow {
   connectorId: string;
   connectorHandle: string | null;
+  /**
+   * The Connector principal's display name (`principals.display_name`), so a
+   * person reads the name the Connector was given rather than a derived handle (card
+   * `35b73092`). Additive: the same row, the same narrowing, one more column
+   * of a principal this row already names.
+   */
+  connectorDisplayName: string | null;
   accountId: string;
   sourceProduct: string;
   /** §8.2 coverage labels, as the newest event of the source declared them. */
@@ -226,6 +282,8 @@ export interface TelemetrySessionRow {
   sessionRef: string;
   connectorId: string;
   connectorHandle: string | null;
+  /** As on the source row: the Connector principal's display name. */
+  connectorDisplayName: string | null;
   sourceProduct: string;
   state: TelemetrySessionState;
   startedAt: string;
@@ -238,6 +296,36 @@ export interface TelemetrySessionRow {
   outputTokens: number;
   totalTokens: number;
   requests: number;
+}
+
+/** The short-session thresholds, as the list and Stats report them. */
+export interface TelemetryShortSessionRule {
+  maxEvents: number;
+  minDurationMs: number;
+}
+
+/**
+ * One page of the Sessions list (card `0ac41d40`).
+ *
+ * `shortCount`, `hiddenCount` and `total` come from the SAME statement as the
+ * rows, so they describe exactly the set the page was cut from.
+ */
+export interface TelemetrySessionPage {
+  sessions: TelemetrySessionRow[];
+  /** Short sessions withheld from this list: `shortCount`, or 0 with `includeShort`. */
+  hiddenCount: number;
+  /** Short sessions inside the window and filters, whether shown or not. */
+  shortCount: number;
+  /** Rows the list holds under the current filters and toggle, across every page. */
+  total: number;
+  offset: number;
+  limit: number;
+  /** The offset of the next page, or null on the last one. */
+  nextOffset: number | null;
+  windowDays: number;
+  windowStart: string;
+  includeShort: boolean;
+  shortSession: TelemetryShortSessionRule;
 }
 
 export interface TelemetryTimelineEvent {
@@ -271,11 +359,35 @@ export interface TelemetrySessionKey {
   sourceProduct: string;
 }
 
+/**
+ * One row of an MCP-derived session's ACTION LOG (card `ab8f78e9`, owner
+ * ruling E91): which tool ran, the allowlisted object it named, how it ended
+ * and how long it took. Every field is a closed vocabulary, a UUID, a number
+ * or a time — `mcp_action_log` has no column for arguments or free text.
+ */
+export interface TelemetrySessionAction {
+  observedAt: string;
+  toolName: string;
+  targetType: string | null;
+  targetId: string | null;
+  outcome: 'ok' | 'error';
+  errorCode: string | null;
+  durationMs: number;
+}
+
 export interface TelemetrySessionDetail {
   session: TelemetrySessionRow;
   events: TelemetryTimelineEvent[];
   /** True when the timeline was cut by the event limit. */
   truncated: boolean;
+  /**
+   * The session's MCP action log, newest first — always empty for a session
+   * whose product is not `mcp` (card `ab8f78e9`). Read only after the session
+   * itself resolved under the caller's narrowing, and narrowed again per row.
+   */
+  actions: TelemetrySessionAction[];
+  /** True when the action log was cut by the event limit. */
+  actionsTruncated: boolean;
 }
 
 export interface TelemetryModelMixRow {
@@ -309,7 +421,16 @@ export interface TelemetryStats {
     reasoningTokens: number;
     toolTokens: number;
     totalTokens: number;
+    /**
+     * How many of `sessions` are SHORT (card `0ac41d40`), and how many of
+     * `events` they hold. The totals above INCLUDE them: Stats count every
+     * session and event received in the window, and the page labels the
+     * short share rather than subtracting it.
+     */
+    shortSessions: number;
+    shortSessionEvents: number;
   };
+  shortSession: TelemetryShortSessionRule;
   modelMix: TelemetryModelMixRow[];
   cost: TelemetryCostRow[];
   coverage: TelemetryPresenceRow[];
@@ -322,6 +443,18 @@ export interface TelemetryProjectionOptions {
   limit?: number;
   /** Injected for determinism in tests; defaults to the board clock. */
   now?: Date;
+}
+
+/** The Sessions list's own options (card `0ac41d40`). */
+export interface TelemetrySessionListOptions extends TelemetryProjectionOptions {
+  /** Rows to skip, after the short filter and in list order. See `sessionPageOffset`. */
+  offset?: number;
+  /** List short sessions too. Default false: they are hidden and counted. */
+  includeShort?: boolean;
+  /** Narrow to one reporting Connector. Applied AFTER the caller's narrowing. */
+  connectorId?: string | null;
+  /** Narrow to one product. Applied AFTER the caller's narrowing. */
+  sourceProduct?: string | null;
 }
 
 // ─────────────────────────────── SQL helpers ─────────────────────────────────
@@ -387,6 +520,77 @@ function envelopeRead(narrowing: TelemetryScopeSql, ...identity: string[]): stri
     ...identity.map((predicate) => `  AND ${predicate}`),
   ].join('\n            ');
 }
+
+/**
+ * THE PER-SESSION AGGREGATE AND ITS SHORT CLASSIFICATION, written ONCE.
+ *
+ * Two CTEs, `grouped` then `classified`, for the list and for the Stats split
+ * alike — so the rule that hides a session from the list and the rule that
+ * counts it as short on Stats are the same SQL and cannot drift. The read goes
+ * through `envelopeRead` like every other: the caller's narrowing first, then
+ * the window, then any filter, so a filter can only narrow what the caller
+ * could already read.
+ *
+ * The group key is the triple and never the Account (review `a4a748d5`). The
+ * thresholds are the exported constants, rendered as literals because they
+ * are module constants and not request values.
+ */
+function classifiedSessionsSql(narrowing: TelemetryScopeSql, filters: string[]): string {
+  return `grouped AS (
+         -- THE SESSION KEY IS THE TRIPLE, and the Account is not a fourth
+         -- member of it (review \`a4a748d5\`, BLOCKER). Grouping additionally
+         -- by \`account_id\` split a re-parented Connector's ONE advertised
+         -- session into an old-Account row and a new-Account row — while
+         -- \`TelemetrySessionRow\`, the point route, the react-query key, the
+         -- React key and the DOM id all remained triples. Root saw two
+         -- indistinguishable rows, the older was unaddressable, and
+         -- \`stats.totals.sessions\` counted the triple once while this list
+         -- returned it twice. The Account does its work in the narrowing of
+         -- every read, where it cannot split an identity.
+         SELECT e.session_ref,
+                e.connector_id,
+                e.source_product,
+                MIN(e.observed_at)                                        AS started_at,
+                MAX(e.observed_at)                                        AS last_seen_at,
+                COUNT(*)                                                  AS event_count,
+                COUNT(*) FILTER (WHERE e.event_kind = 'error')            AS error_count,
+                COALESCE(SUM(${USAGE('input_tokens')}), 0)                AS input_tokens,
+                COALESCE(SUM(${USAGE('output_tokens')}), 0)               AS output_tokens,
+                COALESCE(SUM(${USAGE('requests')}), 0)                    AS requests,
+                BOOL_OR(e.event_kind = 'model_call'
+                        OR e.payload->'model'->>'provider' IS NOT NULL
+                        OR e.payload->'model'->>'requested' IS NOT NULL
+                        OR e.payload->'model'->>'resolved' IS NOT NULL)   AS has_model
+           ${envelopeRead(narrowing, 'e.session_ref IS NOT NULL', 'e.observed_at >= $1', ...filters)}
+          GROUP BY e.session_ref, e.connector_id, e.source_product
+       ),
+       classified AS (
+         SELECT g.*,
+                (g.event_count <= ${TELEMETRY_SHORT_SESSION_MAX_EVENTS}
+                 AND g.last_seen_at - g.started_at < INTERVAL '${TELEMETRY_SHORT_SESSION_MIN_DURATION_MS} milliseconds'
+                 AND NOT g.has_model
+                 AND g.input_tokens = 0
+                 AND g.output_tokens = 0)                                  AS is_short
+           FROM grouped g
+       )`;
+}
+
+/** The thresholds as the routes report them, from the same constants. */
+const SHORT_SESSION_RULE: TelemetryShortSessionRule = {
+  maxEvents: TELEMETRY_SHORT_SESSION_MAX_EVENTS,
+  minDurationMs: TELEMETRY_SHORT_SESSION_MIN_DURATION_MS,
+};
+
+/**
+ * The list's TOTAL order: newest activity first, then the whole identity,
+ * byte-wise. Without the identity a tie on `last_seen_at` is ordered by the
+ * planner, and an offset page could repeat or skip a row; without `COLLATE
+ * "C"` the text members would follow the database locale. One spelling for
+ * the page and the outer select, so the two cannot disagree.
+ */
+const sessionListOrder = (alias: string): string =>
+  `${alias}.last_seen_at DESC, ${alias}.connector_id, ${alias}.source_product COLLATE "C", `
+  + `${alias}.session_ref COLLATE "C"`;
 
 /**
  * The Connector's CURRENT chain head, as `DelegationService.resolveChain`
@@ -549,6 +753,7 @@ export class TelemetryProjectionService {
        SELECT g.*,
               latest.account_id                          AS account_id,
               p.handle                                   AS connector_handle,
+              p.display_name                             AS connector_display_name,
               latest.phase                               AS last_phase,
               latest.adapter                             AS adapter,
               latest.adapter_version                     AS adapter_version,
@@ -595,6 +800,7 @@ export class TelemetryProjectionService {
       return {
         connectorId: String(row.connector_id),
         connectorHandle: text(row.connector_handle),
+        connectorDisplayName: text(row.connector_display_name),
         accountId: String(row.account_id),
         sourceProduct: String(row.source_product),
         adapter: text(row.adapter),
@@ -628,55 +834,80 @@ export class TelemetryProjectionService {
     });
   }
 
-  /** The Sessions timeline list: one row per `session_ref`, Tier-0 metadata only. */
+  /**
+   * The Sessions list: one row per session triple, Tier-0 metadata only, one
+   * page at a time.
+   *
+   * SHORT SESSIONS ARE HIDDEN HERE, BEFORE THE LIMIT (card `0ac41d40`). The
+   * `page` CTE drops them ahead of its ORDER BY, LIMIT and OFFSET, so a page
+   * is always the newest SHOWN rows rather than whatever survived a filter
+   * applied after the cut. `tally` counts the UNLIMITED classified set in
+   * the same statement, so `hiddenCount` and `total` describe exactly the
+   * set the page was cut from. `includeShort` lists them too.
+   *
+   * The reporter and product filters are two more predicates on the ONE
+   * grouping read, after the caller's narrowing: a filter naming another
+   * Account's Connector reads nothing and answers exactly as one naming no
+   * Connector at all.
+   */
   async sessions(
     scope: TelemetryReadScope,
-    options: TelemetryProjectionOptions = {},
-  ): Promise<TelemetrySessionRow[]> {
+    options: TelemetrySessionListOptions = {},
+  ): Promise<TelemetrySessionPage> {
     const now = options.now ?? new Date();
     const windowDays = clampBound(
       options.windowDays, TELEMETRY_PROJECTION_DEFAULT_WINDOW_DAYS, TELEMETRY_PROJECTION_MAX_WINDOW_DAYS);
     const limit = clampBound(options.limit, TELEMETRY_PROJECTION_DEFAULT_ROWS, TELEMETRY_PROJECTION_MAX_ROWS);
+    const offset = sessionPageOffset(options.offset);
+    const includeShort = options.includeShort === true;
     const windowStart = new Date(now.getTime() - windowDays * 86_400_000);
 
     const params: unknown[] = [windowStart];
     const narrowing = renderTelemetryScopeSql(scope, 'e.account_id', params.length + 1);
     params.push(...narrowing.params);
+    const filters: string[] = [];
+    for (const [column, value] of [
+      ['e.connector_id', options.connectorId],
+      ['e.source_product', options.sourceProduct],
+    ] as const) {
+      if (value) {
+        params.push(value);
+        filters.push(`${column} = $${params.length}`);
+      }
+    }
+    params.push(includeShort);
+    const includeParam = `$${params.length}::boolean`;
     params.push(limit);
     const limitParam = `$${params.length}`;
+    params.push(offset);
+    const offsetParam = `$${params.length}`;
 
     const result = await this.pool.query(
-      `WITH grouped AS (
-         -- THE SESSION KEY IS THE TRIPLE, and the Account is not a fourth
-         -- member of it (review \`a4a748d5\`, BLOCKER). Grouping additionally
-         -- by \`account_id\` split a re-parented Connector's ONE advertised
-         -- session into an old-Account row and a new-Account row — while
-         -- \`TelemetrySessionRow\`, the point route, the react-query key, the
-         -- React key and the DOM id all remained triples. Root saw two
-         -- indistinguishable rows, the older was unaddressable, and
-         -- \`stats.totals.sessions\` counted the triple once while this list
-         -- returned it twice. The Account does its work in the narrowing of
-         -- every read below, where it cannot split an identity.
-         SELECT e.session_ref,
-                e.connector_id,
-                e.source_product,
-                MIN(e.observed_at)                                        AS started_at,
-                MAX(e.observed_at)                                        AS last_seen_at,
-                COUNT(*)                                                  AS event_count,
-                COUNT(*) FILTER (WHERE e.event_kind = 'error')            AS error_count,
-                COALESCE(SUM(${USAGE('input_tokens')}), 0)                AS input_tokens,
-                COALESCE(SUM(${USAGE('output_tokens')}), 0)               AS output_tokens,
-                COALESCE(SUM(${USAGE('requests')}), 0)                    AS requests
-           ${envelopeRead(narrowing, 'e.session_ref IS NOT NULL', 'e.observed_at >= $1')}
-          GROUP BY e.session_ref, e.connector_id, e.source_product
-          ORDER BY MAX(e.observed_at) DESC
+      `WITH ${classifiedSessionsSql(narrowing, filters)},
+       tally AS (
+         -- Over the WHOLE classified set, uncut: what the page was cut from.
+         SELECT COUNT(c.session_ref) FILTER (WHERE c.is_short)                  AS short_count,
+                COUNT(c.session_ref) FILTER (WHERE ${includeParam} OR NOT c.is_short) AS listed_total
+           FROM classified c
+       ),
+       page AS (
+         SELECT c.*
+           FROM classified c
+          WHERE ${includeParam} OR NOT c.is_short
+          ORDER BY ${sessionListOrder('c')}
           LIMIT ${limitParam}
+         OFFSET ${offsetParam}
        )
-       SELECT g.*,
+       SELECT t.short_count,
+              t.listed_total,
+              g.*,
               p.handle       AS connector_handle,
+              p.display_name AS connector_display_name,
               latest.phase   AS last_phase,
               models.models  AS models
-         FROM grouped g
+         FROM tally t
+         -- ON TRUE, so an EMPTY page still returns one row carrying the counts.
+         LEFT JOIN page g ON TRUE
          LEFT JOIN principals p ON p.id = g.connector_id
          LEFT JOIN LATERAL (
            SELECT e.payload->>'phase' AS phase
@@ -706,12 +937,32 @@ export class TelemetryProjectionService {
                 LIMIT ${TELEMETRY_TIMELINE_MAX_EVENTS}
              ) m
          ) models ON TRUE
-        ORDER BY g.last_seen_at DESC`,
+        ORDER BY ${sessionListOrder('g')}`,
       params,
     );
 
     const nowMs = now.getTime();
-    return result.rows.map((row) => this.toSessionRow(row, nowMs));
+    const counts = result.rows[0] ?? {};
+    const shortCount = num(counts.short_count);
+    const total = num(counts.listed_total);
+    // The row an empty page leaves behind carries the counts and no session.
+    const sessions = result.rows
+      .filter((row) => row.session_ref !== null && row.session_ref !== undefined)
+      .map((row) => this.toSessionRow(row, nowMs));
+    const reached = offset + sessions.length;
+    return {
+      sessions,
+      hiddenCount: includeShort ? 0 : shortCount,
+      shortCount,
+      total,
+      offset,
+      limit,
+      nextOffset: sessions.length > 0 && reached < total ? reached : null,
+      windowDays,
+      windowStart: windowStart.toISOString(),
+      includeShort,
+      shortSession: { ...SHORT_SESSION_RULE },
+    };
   }
 
   /**
@@ -774,7 +1025,8 @@ export class TelemetryProjectionService {
     'e.source_product = $3')}
           GROUP BY e.session_ref, e.connector_id, e.source_product
        )
-       SELECT g.*, p.handle AS connector_handle, latest.phase AS last_phase
+       SELECT g.*, p.handle AS connector_handle, p.display_name AS connector_display_name,
+              latest.phase AS last_phase
          FROM grouped g
          LEFT JOIN principals p ON p.id = g.connector_id
          LEFT JOIN LATERAL (
@@ -824,10 +1076,13 @@ export class TelemetryProjectionService {
 
     const truncated = events.rows.length > eventLimit;
     const rows = truncated ? events.rows.slice(0, eventLimit) : events.rows;
+    const actionLog = await this.sessionActions(scope, key, eventLimit);
 
     return {
       session: this.toSessionRow(row, now.getTime()),
       truncated,
+      actions: actionLog.actions,
+      actionsTruncated: actionLog.truncated,
       events: rows.map((event) => ({
         eventId: String(event.event_id),
         observedAt: iso(event.observed_at),
@@ -843,6 +1098,54 @@ export class TelemetryProjectionService {
         inputTokens: numOrNull(event.input_tokens),
         outputTokens: numOrNull(event.output_tokens),
         contextUtilization: numOrNull(event.context_utilization),
+      })),
+    };
+  }
+
+  /**
+   * The ACTION LOG of one MCP-derived session (card `ab8f78e9`).
+   *
+   * Reached ONLY from `session()`, after the session's own header resolved
+   * under the caller's narrowing — so a session the caller cannot read yields
+   * no action rows, by the same `null` and the same 404 as every other part of
+   * it. Visibility is not decided here a second time; it is APPLIED a second
+   * time: every action row is narrowed by its OWN `account_id` with the same
+   * rendered predicate, so a Connector that changed Accounts mid-session shows
+   * each Account only the rows written under it, exactly as its envelope rows.
+   * A product other than `mcp` has no action log and reads nothing.
+   */
+  private async sessionActions(
+    scope: TelemetryReadScope,
+    key: TelemetrySessionKey,
+    limit: number,
+  ): Promise<{ actions: TelemetrySessionAction[]; truncated: boolean }> {
+    if (key.sourceProduct !== MCP_ACTION_LOG_PRODUCT) return { actions: [], truncated: false };
+    const params: unknown[] = [key.sessionRef, key.connectorId];
+    const narrowing = renderTelemetryScopeSql(scope, 'a.account_id', params.length + 1);
+    params.push(...narrowing.params);
+    params.push(limit + 1);
+    const result = await this.pool.query(
+      `SELECT a.observed_at, a.tool_name, a.target_type, a.target_id, a.outcome, a.error_code, a.duration_ms
+         FROM mcp_action_log a
+        WHERE a.session_ref = $1
+          AND a.connector_id = $2
+          AND ${narrowing.sql}
+        ORDER BY a.observed_at DESC, a.id DESC
+        LIMIT $${params.length}`,
+      params,
+    );
+    const truncated = result.rows.length > limit;
+    const rows = truncated ? result.rows.slice(0, limit) : result.rows;
+    return {
+      truncated,
+      actions: rows.map((action) => ({
+        observedAt: iso(action.observed_at),
+        toolName: String(action.tool_name),
+        targetType: text(action.target_type),
+        targetId: text(action.target_id),
+        outcome: action.outcome === 'ok' ? 'ok' : 'error',
+        errorCode: text(action.error_code),
+        durationMs: Number(action.duration_ms),
       })),
     };
   }
@@ -893,6 +1196,20 @@ export class TelemetryProjectionService {
       params,
     );
 
+    // THE SHORT SPLIT (card `0ac41d40`): how many of the sessions counted
+    // above are short, and how many events they hold — the SAME classified set
+    // the Sessions list hides by default, over the same window and narrowing.
+    // The totals above are left exactly as they were: Stats count every
+    // session received, and the page labels this share instead of subtracting
+    // it. One aggregate row, so it carries no row cap.
+    const shortSplit = await this.pool.query(
+      `WITH ${classifiedSessionsSql(narrowing, [])}
+       SELECT COUNT(*) FILTER (WHERE c.is_short)                           AS short_sessions,
+              COALESCE(SUM(c.event_count) FILTER (WHERE c.is_short), 0)     AS short_events
+         FROM classified c`,
+      params,
+    );
+
     const mixParams = [...params, limit];
     const modelMix = await this.pool.query(
       `SELECT e.payload->'model'->>'provider'                            AS provider,
@@ -922,6 +1239,7 @@ export class TelemetryProjectionService {
 
     const coverage = await this.presence(scope, { windowDays, limit, now });
     const row = totals.rows[0] ?? {};
+    const shortRow = shortSplit.rows[0] ?? {};
     const inputTokens = num(row.input_tokens);
     const outputTokens = num(row.output_tokens);
 
@@ -940,7 +1258,10 @@ export class TelemetryProjectionService {
         reasoningTokens: num(row.reasoning_tokens),
         toolTokens: num(row.tool_tokens),
         totalTokens: inputTokens + outputTokens,
+        shortSessions: num(shortRow.short_sessions),
+        shortSessionEvents: num(shortRow.short_events),
       },
+      shortSession: { ...SHORT_SESSION_RULE },
       modelMix: modelMix.rows.map((mix) => {
         const mixInput = num(mix.input_tokens);
         const mixOutput = num(mix.output_tokens);
@@ -977,6 +1298,7 @@ export class TelemetryProjectionService {
       sessionRef: String(row.session_ref),
       connectorId: String(row.connector_id),
       connectorHandle: text(row.connector_handle),
+      connectorDisplayName: text(row.connector_display_name),
       sourceProduct: String(row.source_product),
       state: deriveSessionState(nowMs, new Date(lastSeenAt).getTime(), text(row.last_phase)),
       startedAt: iso(row.started_at),

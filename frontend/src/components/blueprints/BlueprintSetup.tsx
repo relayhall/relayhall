@@ -1,11 +1,14 @@
 import { StepUpDialog } from '../access/StepUpDialog';
+import { useStepUpRetry } from '../access/useStepUpRetry';
+import { sendWithStepUpRetry } from '../../utils/stepUpChallenge';
+import { authenticatedFetch } from '../../utils/auth';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Button } from '../Button';
 import type { BlueprintSetupPlan, BlueprintSetupResult } from '../../types/blueprint';
-import { blueprintError, blueprintJson, blueprintRequest, BlueprintRequestError } from './api';
+import { BLUEPRINT_API_BASE, blueprintAnswer, blueprintError, blueprintJson, blueprintRequest, BlueprintRequestError } from './api';
 import { BlueprintData } from './BlueprintPlan';
 
-type Attempt = { key: string; body: string };
+type Attempt = { key: string; body: string; stepUpToken?: string; createWarrant?: { holderPrincipalId: string } };
 /** Assignment is a separately confirmed act. Never derive authority from the
  * staged profile, or send an activation field with this request. */
 export function BlueprintSetup({ instantiationId }: { instantiationId: string }) {
@@ -16,6 +19,7 @@ export function BlueprintSetup({ instantiationId }: { instantiationId: string })
   const [profiles,setProfiles]=useState<Array<{id:string;name:string}>>([]);
   const [holders,setHolders]=useState<Array<{id:string;handle:string;kind:string}>>([]);
   const [stepUp,setStepUp]=useState(false);
+  const { askForToken, retryDialog } = useStepUpRetry();
   useEffect(()=>{if(mode!=='new')return;let live=true;
     blueprintRequest<{profiles:typeof profiles}>('/access-profiles').then(data=>{if(live)setProfiles(data.profiles || []);}).catch(()=>{});
     blueprintRequest<{principals:typeof holders}>('/principals').then(data=>{if(live)setHolders((data.principals || []).filter(row=>row.kind==='service'));}).catch(()=>{});
@@ -46,9 +50,32 @@ export function BlueprintSetup({ instantiationId }: { instantiationId: string })
     if (inFlight.current) return;
     inFlight.current = true; const current = ++generation.current; setPending(true); setError(null);
     try {
-      const next = await blueprintRequest<BlueprintSetupResult>(path, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': confirmed.key }, body: confirmed.body,
-      });
+      let next: BlueprintSetupResult;
+      if (confirmed.stepUpToken && confirmed.createWarrant) {
+        // Card 72b8fb97 (SU-33): a new Warrant's token that no longer counts
+        // is answered with the step-up challenge for (warrant.create,
+        // holder); nothing was committed, so the person confirms once more
+        // and the SAME setup (same key, same body, the new token) is sent ONE
+        // more time. The attempt kept for "Retry same setup" carries it.
+        const send = (token: string) => {
+          const body = token === confirmed.stepUpToken ? confirmed.body
+            : JSON.stringify({ ...JSON.parse(confirmed.body), stepUpToken: token });
+          if (token !== confirmed.stepUpToken) setAttempt({ ...confirmed, body, stepUpToken: token });
+          return authenticatedFetch(`${BLUEPRINT_API_BASE}${path}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': confirmed.key }, body,
+          });
+        };
+        let sent;
+        try {
+          sent = await sendWithStepUpRetry(send, confirmed.stepUpToken,
+            { action: 'warrant.create', targetId: confirmed.createWarrant.holderPrincipalId }, askForToken);
+        } catch { throw new BlueprintRequestError('The connection ended before a response was received. Retry the same request.', 'CONNECTION_UNCERTAIN', undefined, true); }
+        next = blueprintAnswer<BlueprintSetupResult>(sent.response, sent.body);
+      } else {
+        next = await blueprintRequest<BlueprintSetupResult>(path, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': confirmed.key }, body: confirmed.body,
+        });
+      }
       if (current === generation.current) setResult(next);
     } catch (failure) { if (current === generation.current) setError(blueprintError(failure)); }
     finally { inFlight.current = false; if (current === generation.current) setPending(false); }
@@ -59,7 +86,8 @@ export function BlueprintSetup({ instantiationId }: { instantiationId: string })
       const key = typeof crypto.randomUUID === 'function' ? crypto.randomUUID()
         : Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
       const next = { key, body: JSON.stringify({ ...(plan.createWarrant ? {createWarrant:{holderPrincipalId:plan.createWarrant.holderPrincipalId,ceilingProfileId:plan.createWarrant.ceilingProfileId,expiresAt:plan.createWarrant.expiresAt},stepUpToken} : {warrantId:plan.warrantId}),
-        tasks: plan.tasks.map(task => ({ id: task.id, revision: task.revision })), confirmationHash: plan.confirmationHash }) };
+        tasks: plan.tasks.map(task => ({ id: task.id, revision: task.revision })), confirmationHash: plan.confirmationHash }),
+        ...(plan.createWarrant && stepUpToken ? { stepUpToken, createWarrant: { holderPrincipalId: plan.createWarrant.holderPrincipalId } } : {}) };
       setAttempt(next); void apply(next);
     } catch { setError(new BlueprintRequestError('A safe retry identifier could not be created.', 'CONFIRMATION_UNAVAILABLE')); }
   };
@@ -96,5 +124,6 @@ export function BlueprintSetup({ instantiationId }: { instantiationId: string })
     {stepUp && plan?.createWarrant && <StepUpDialog action="warrant.create" targetId={plan.createWarrant.holderPrincipalId}
       description="Confirm the displayed workflow Warrant and access assignments." onCancel={()=>setStepUp(false)}
       onToken={token=>{setStepUp(false);confirm(token);}} />}
+    {retryDialog}
   </section>;
 }

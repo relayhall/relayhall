@@ -27,6 +27,7 @@ import {
   classifyLoginSession,
   isBearerCredentialKind,
   isLoginSessionKind,
+  isStoredLoginSessionKind,
 } from '../utils/administratorSession';
 import { ASSIGNABLE_ROLES } from '../utils/credentialAuthority';
 import { resolveActorRole } from '../utils/taskAutomationRole';
@@ -36,6 +37,14 @@ const EVERY_AUTH_METHOD = [
   'local_admin', 'dashboard_jwt', 'principal_api_key',
   'legacy_api_key', 'reports_read_key', 'session', 'system', 'unknown',
 ];
+
+test('stored-session classification preserves the narrower revocable session boundary', () => {
+  for (const method of [...EVERY_AUTH_METHOD, undefined]) {
+    expect(isStoredLoginSessionKind(method)).toBe(method === 'session');
+  }
+  expect(isLoginSessionKind('dashboard_jwt')).toBe(true);
+  expect(isStoredLoginSessionKind('dashboard_jwt')).toBe(false);
+});
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 
@@ -599,5 +608,117 @@ describe('the front-end mirror', () => {
     expect(listed('ROLE_ACT_ISSUER_ROLES').length).toBe(3);
     expect(listed('ASSIGNABLE_ROLES').length).toBe(ASSIGNABLE_ROLES.size);
     expect(() => listed('NO_SUCH_LIST')).toThrow();
+  });
+});
+
+/**
+ * LENSES-c c1-A (card 46cfbd1d; design delta G.1 LC-C5, B-L18): THE IMPORTER
+ * REGISTER for the Group-role gates. Every handler that decides "is this a
+ * person's login session?" for a Group role act or read IMPORTS the one
+ * classification from `utils/administratorSession` and calls it; the census
+ * above already fails any private copy of the comparison, and this register
+ * fails a gate file that stops asking the seam at all (or asks something else).
+ */
+const GROUP_ROLE_GATE_IMPORTERS: Array<{ file: string; imports: string; calls: string[]; why: string }> = [
+  {
+    file: 'routes/groups.ts',
+    imports: "import { classifyLoginSession, isLoginSessionKind } from '../utils/administratorSession';",
+    calls: ['classifyLoginSession(req.authMethod, act)', 'const session = isLoginSessionKind(req.authMethod);'],
+    why: 'the root steward acts (C.3) and the SR-2 read (C.9)',
+  },
+  {
+    file: 'routes/directoryGroupReferences.ts',
+    imports: "import { isLoginSessionKind } from '../utils/administratorSession';",
+    calls: ['const session = isLoginSessionKind(req.authMethod);'],
+    why: "the catalog's root and steward rows (C.9)",
+  },
+  {
+    file: 'services/GroupStewardService.ts',
+    imports: "import { isLoginSessionKind } from '../utils/administratorSession';",
+    calls: ['if (!isLoginSessionKind(caller.authMethod)) {'],
+    why: "gate (iii)'s standing, step 1 (C.4): the manager removal (c1-A) and the manager appointment (c1-B)",
+  },
+  {
+    // LENSES-c c1-B (card b5c83682): gates (ii) and DD-5 on the steward routes.
+    file: 'services/GroupOwnerStewardTransfer.ts',
+    imports: "import { GROUP_OWNER_SESSION_ONLY, isLoginSessionKind } from '../utils/administratorSession';",
+    calls: ['if (!isLoginSessionKind(input.caller.authMethod)) {'],
+    why: "the steward transfers' standing, step 1 (C.6): a login session, else GROUP_OWNER_SESSION_ONLY",
+  },
+];
+
+describe('LC-C5 - the Group-role gates are importers of the one classification', () => {
+  it.each(GROUP_ROLE_GATE_IMPORTERS.map((entry) => [entry.file, entry]))('%s imports and calls the seam', (_file, entry) => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'backend', 'src', entry.file), 'utf8');
+    expect(source).toContain(entry.imports);
+    for (const call of entry.calls) expect({ file: entry.file, call, present: source.includes(call) }).toEqual({ file: entry.file, call, present: true });
+    expect(privateClassifications(source, entry.file)).toEqual([]);
+  });
+});
+
+/**
+ * RH-LENSES-d (card 4e159741; design v7.1 `96f0bd3d` obligation B-L18, ANNEX
+ * `d6637a92` control R-14 and acceptance A-L52): THE LENS IS AN IMPORTER, NEVER
+ * A SECOND SITE.
+ *
+ * This EXTENDS the census above rather than adding a second single-copy
+ * control beside it, because a second single-copy control is itself a second
+ * copy. The census already fails any `authMethod` comparison against a
+ * credential-kind literal outside the seam, wherever it lives. What it cannot
+ * see is a lens that stops asking the seam and decides some other way, a way
+ * the census does not spell (`['session', 'dashboard_jwt'].includes(...)`, a
+ * `switch`, a role read): acceptance A-L30 cannot see that either, because a
+ * handler with its own copy answers A-L30 perfectly until the seam changes.
+ * So the register names the one file that derives a lens, the one import it
+ * must carry, the one call it must make, and the VALUES it admits - none of
+ * its own; it admits exactly what the seam admits - and the route handler is
+ * named beside it, calling the derivation and holding no classification.
+ */
+const LENS_IMPORTERS: Array<{
+  file: string; imports: string; calls: string[]; admittedValues: string[]; why: string;
+}> = [
+  {
+    file: 'utils/lenses.ts',
+    imports: "import { isLoginSessionKind } from './administratorSession';",
+    calls: ['const admin = input.rootAuthorized && isLoginSessionKind(input.authMethod);'],
+    admittedValues: [],
+    why: 'the admin lens is a root LOGIN SESSION; the classification is the seam, called',
+  },
+  {
+    file: 'routes/principals.ts',
+    imports: "import { lensesFor } from '../utils/lenses';",
+    calls: ['res.json(lensesFor({ authMethod: req.authMethod, rootAuthorized, stewardedGroups }));'],
+    admittedValues: [],
+    why: 'GET /principals/me/lenses hands the server-derived authMethod to the derivation, unread',
+  },
+];
+
+describe('R-14 / A-L52 - the lens derivation imports the one classification', () => {
+  it.each(LENS_IMPORTERS.map((entry) => [entry.file, entry]))('%s is a registered lens importer', (_file, entry) => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'backend', 'src', entry.file), 'utf8');
+    expect({ file: entry.file, imports: source.includes(entry.imports) }).toEqual({ file: entry.file, imports: true });
+    for (const call of entry.calls) {
+      expect({ file: entry.file, call, present: source.includes(call) }).toEqual({ file: entry.file, call, present: true });
+    }
+    expect(privateClassifications(source, entry.file)).toEqual([]);
+  });
+
+  it('the lens derivation admits no credential-kind value of its own', () => {
+    // The register's VALUES column, measured: no literal the seam decides on
+    // appears in the derivation at all, in any syntax. The seam admits
+    // `session` and `dashboard_jwt` and names `principal_api_key`; a lens that
+    // spelled any of them would be holding its own answer.
+    const lens = LENS_IMPORTERS[0];
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'backend', 'src', lens.file), 'utf8')
+      .split('\n').filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line)).join('\n');
+    const spelled = CREDENTIAL_KIND_LITERALS.filter((literal) =>
+      source.includes(`'${literal}'`) || source.includes(`"${literal}"`) || source.includes(`\`${literal}\``));
+    expect({ file: lens.file, spelled }).toEqual({ file: lens.file, spelled: lens.admittedValues });
+  });
+
+  it('the value reader is not vacuous - it sees a literal in code and ignores one in a comment', () => {
+    const strip = (text: string): string => text.split('\n').filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line)).join('\n');
+    expect(strip("const ok = ['session', 'dashboard_jwt'].includes(input.authMethod);").includes("'session'")).toBe(true);
+    expect(strip(" * the board session ('session') and the dashboard token").includes("'session'")).toBe(false);
   });
 });

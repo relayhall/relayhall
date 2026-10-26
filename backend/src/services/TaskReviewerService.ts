@@ -9,10 +9,12 @@ import {
   taskManagerDB,
 } from './TaskManagerDB';
 import { reportManager, type ReviewerReportSummary } from './ReportManager';
-import { notificationManager } from './NotificationManager';
+import type { FeedActorRef } from './FeedEventService';
 import { taskNotificationService } from './TaskNotificationService';
 import { discordThreadService } from './DiscordThreadService';
+import { taskSessionEvidenceService } from './TaskSessionEvidenceService';
 import {
+  hashReviewReports,
   taskReviewAttemptService,
   type ReviewAttemptIdentity,
   type TaskReviewAttemptService,
@@ -27,8 +29,9 @@ const TEST_REQUIRED_PATTERN = /\b(?:tests?|build|compile|lint|type[ -]?check)\b/
 
 export interface ReviewerDependencies {
   getTask(taskId: string): Promise<Task | undefined>;
-  updateTask(taskId: string, updates: Partial<Task>): Promise<Task>;
+  updateTask(taskId: string, updates: Partial<Task>, feedActor?: FeedActorRef): Promise<Task>;
   getReportsForTask(taskId: string): Promise<ReviewerReportSummary[]>;
+  getExecutionEvidence?(taskId: string): Promise<Pick<ReviewHistoryEntry['evidence'], 'sessionRefs' | 'completedBy'>>;
   notifyEscalation(task: Task, summary: string): Promise<void>;
   resolveReviewedSubtasks?(taskId: string, outcome: 'accepted' | 'rejected' | 'stuck', note?: string): Promise<boolean>;
 }
@@ -51,6 +54,9 @@ export interface ReviewOutcome {
 interface RunReviewOptions {
   dryRun?: boolean;
   triggeredBy?: 'user' | 'agent' | 'system';
+  /** Card 5854f0d6, round 2: the person whose manual rejection this is; the
+   * feed rows of its writes record them (attribution only, never authority). */
+  feedActor?: FeedActorRef;
 }
 
 function normalizeTextList(value: string | string[] | undefined | null): string[] {
@@ -90,23 +96,19 @@ export class TaskReviewerService {
     const reports = await this.deps.getReportsForTask(task.id);
     const testSignals = this.extractTestSignals(reports);
     const negativeTestSignals = this.extractNegativeTestSignals(reports);
+    const executionEvidence = await this.executionEvidence(task.id);
     const evidence: ReviewHistoryEntry['evidence'] = {
       successCriteria,
       reports: reports.map((report) => ({ id: report.id, title: report.title, summary: report.summary })),
-      sessionRefs: task.sessionRefs || [],
-      completedBy: task.completedBy
-        ? {
-            name: task.completedBy.name,
-            sessionKey: task.completedBy.sessionKey,
-            harness: task.completedBy.harness,
-          }
-        : null,
+      ...executionEvidence,
       testSignals,
     };
 
     let attempt: ReviewAttemptIdentity | undefined;
     if (!options.dryRun && this.attemptService) {
-      attempt = await this.attemptService.beginAttempt(task, evidence);
+      attempt = await this.attemptService.beginAttempt(task, (task.subtasks || []).length === 0
+        ? { ...evidence, reportDigest: hashReviewReports(reports) }
+        : evidence);
     }
 
     const findings: ReviewFinding[] = [];
@@ -127,7 +129,7 @@ export class TaskReviewerService {
       .slice(firstReviewIndex + 1)
       .some((subtask, relativeIndex) => subtask.status === 'review'
         && subtasks[firstReviewIndex + relativeIndex].status !== 'review');
-    if (firstReviewIndex < 0 || invalidPrefix.length > 0 || reviewGap) {
+    if (subtasks.length > 0 && (firstReviewIndex < 0 || invalidPrefix.length > 0 || reviewGap)) {
       findings.push({
         severity: 'error',
         message: 'Task is not ready for review: review items must form a contiguous slice after a completed/skipped prefix.',
@@ -324,6 +326,9 @@ export class TaskReviewerService {
 
   async rejectTask(taskId: string, reason: string, options: RunReviewOptions = {}): Promise<ReviewOutcome> {
     const task = await this.requireTask(taskId);
+    const reports = (task.subtasks || []).length === 0
+      ? await this.deps.getReportsForTask(task.id)
+      : [];
     const triggeredBy = options.triggeredBy || 'user';
     const maxRetries = task.maxRetries ?? DEFAULT_MAX_RETRIES;
     let nextAttemptCount = (task.attemptCount ?? 0) + 1;
@@ -336,18 +341,15 @@ export class TaskReviewerService {
       : `Verifier rejected task: ${reason}`;
     const manualEvidence: ReviewHistoryEntry['evidence'] = {
       successCriteria: normalizeTextList(task.successCriteria ?? task.definitionOfDone),
-      reports: [],
-      sessionRefs: task.sessionRefs || [],
-      completedBy: task.completedBy
-        ? {
-            name: task.completedBy.name,
-            sessionKey: task.completedBy.sessionKey,
-            harness: task.completedBy.harness,
-          }
-        : null,
+      reports: (task.subtasks || []).length === 0
+        ? reports.map((report) => ({ id: report.id, title: report.title, summary: report.summary }))
+        : [],
+      ...await this.executionEvidence(task.id),
     };
     const attempt = this.attemptService
-      ? await this.attemptService.beginAttempt(task, manualEvidence)
+      ? await this.attemptService.beginAttempt(task, (task.subtasks || []).length === 0
+        ? { ...manualEvidence, reportDigest: hashReviewReports(reports) }
+        : manualEvidence)
       : undefined;
     const historyEntry: ReviewHistoryEntry = {
       id: randomUUID(),
@@ -366,14 +368,12 @@ export class TaskReviewerService {
     let authoritativeVerdictApplied = true;
     let persistedReviewHistoryLength = reviewHistory.length;
     if (attempt && this.attemptService) {
-      const applied = await this.attemptService.recordVerdict(
-        attempt.id,
-        decision,
-        findings,
-        { summary, historyEntryId: historyEntry.id },
-        undefined,
-        true,
-      );
+      const verdictRecord = { summary, historyEntryId: historyEntry.id };
+      // A person's manual rejection records them (card 5854f0d6, round 2).
+      const applied = options.feedActor
+        ? await this.attemptService.recordVerdict(attempt.id, decision, findings, verdictRecord, undefined, true,
+          undefined, options.feedActor)
+        : await this.attemptService.recordVerdict(attempt.id, decision, findings, verdictRecord, undefined, true);
       nextStatus = applied.status as TaskStatus;
       nextAttemptCount = applied.attemptCount;
       historyEntry.statusAfter = nextStatus;
@@ -387,12 +387,14 @@ export class TaskReviewerService {
           summary,
         );
       }
-      await this.deps.updateTask(task.id, {
+      const verdictUpdate: Partial<Task> = {
         status: nextStatus,
         attemptCount: nextAttemptCount,
         reviewHistory,
         needsReview: decision === 'escalate',
-      });
+      };
+      if (options.feedActor) await this.deps.updateTask(task.id, verdictUpdate, options.feedActor);
+      else await this.deps.updateTask(task.id, verdictUpdate);
     } else {
       const current = await this.requireTask(task.id);
       nextStatus = current.status;
@@ -418,6 +420,12 @@ export class TaskReviewerService {
       },
       historyEntry,
     };
+  }
+
+  private executionEvidence(taskId: string): Promise<Pick<ReviewHistoryEntry['evidence'], 'sessionRefs' | 'completedBy'>> {
+    return this.deps.getExecutionEvidence
+      ? this.deps.getExecutionEvidence(taskId)
+      : Promise.resolve({ sessionRefs: [], completedBy: null });
   }
 
   private async requireTask(taskId: string): Promise<Task> {
@@ -484,15 +492,17 @@ const INTERNAL_REVIEWER_ACTOR = {
   principalId: null,
   handle: 'task-reviewer-service',
   role: 'reviewer',
+  authMethod: 'system',
 } as const;
 
 const defaultDependencies: ReviewerDependencies = {
   getTask: (taskId: string) => taskManagerDB.getTask(taskId),
-  updateTask: (taskId: string, updates: Partial<Task>) => taskManagerDB.updateTask(taskId, updates, INTERNAL_REVIEWER_ACTOR),
+  updateTask: (taskId: string, updates: Partial<Task>, feedActor?: FeedActorRef) =>
+    taskManagerDB.updateTask(taskId, updates, INTERNAL_REVIEWER_ACTOR, undefined, undefined, undefined, undefined, feedActor),
   getReportsForTask: (taskId: string) => reportManager.getByTaskId(taskId),
+  getExecutionEvidence: (taskId: string) => taskSessionEvidenceService.reviewEvidence(taskId),
   resolveReviewedSubtasks: (taskId, outcome, note) => taskManagerDB.resolveReviewedSubtasks(taskId, outcome, note),
   notifyEscalation: async (task: Task, summary: string) => {
-    await notificationManager.notifyStatusChange(task.id, task.title, task.status, 'stuck', 'system');
     const notificationDestination = task.discordThreadId || discordThreadService.getSystemNotificationChannelId();
     if (notificationDestination) {
       const result = await taskNotificationService.deliver({

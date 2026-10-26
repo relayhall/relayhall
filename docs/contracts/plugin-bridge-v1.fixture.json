@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "rh.plugin.bridge/1",
+  "observedAt": "2026-09-10T19:00:00Z",
+  "sessions": [
+    {
+      "sessionRef": "example-pseudonym",
+      "connectorId": "11111111-1111-4111-8111-111111111111",
+      "connectorHandle": "reporter",
+      "sourceProduct": "openai-codex",
+      "state": "active",
+      "startedAt": "2026-09-10T18:58:00Z",
+      "lastSeenAt": "2026-09-10T19:00:00Z",
+      "lastPhase": "running",
+      "eventCount": 2,
+      "errorCount": 0,
+      "models": [
+        "example-model"
+      ],
+      "inputTokens": 500,
+      "outputTokens": 50,
+      "totalTokens": 550,
+      "requests": 1
+    }
+  ],
+  "metrics": {
+    "schemaVersion": "rh.plugin.metrics/1",
+    "queue": null,
+    "throughput": null
+  },
+  "quotas": {
+    "schemaVersion": "rh.usage-quota/1",
+    "truncated": false,
+    "accounts": [
+      {
+        "connectorId": "11111111-1111-4111-8111-111111111111",
+        "schemaVersion": "rh.usage-quota/1",
+        "sourceProduct": "openai-codex",
+        "provider": "openai",
+        "providerAccountId": "account-one",
+        "label": "Personal",
+        "observedAt": "2026-09-10T19:00:00.000Z",
+        "checkedAt": "2026-09-10T19:00:00.000Z",
+        "status": "reported",
+        "stale": false,
+        "windows": [
+          {
+            "id": "weekly",
+            "label": "Weekly",
+            "unit": "percent",
+            "used": 35,
+            "limit": 100,
+            "resetsAt": "2026-09-17T19:00:00.000Z"
+          }
+        ]
+      }
+    ]
+  }
+}

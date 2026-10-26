@@ -71,6 +71,7 @@ import { loginSessionService } from "../src/services/LoginSessionService";
 import { principalService } from "../src/services/PrincipalService";
 import { authMiddleware } from "../src/middleware/auth";
 import { ProviderDouble } from "../src/__tests__/conformance/providerDouble";
+import { insertGroupRow } from "../src/__tests__/support/groupRows";
 
 const ACTOR = { principalId: null, handle: "w3-live-proof", authMethod: "system" as const };
 const HOST = "https://idp.w3live.test";
@@ -164,11 +165,9 @@ async function loginRefusal(provider: any, subject: string, extraClaims: Record<
 }
 
 async function bindGroup(providerId: string, externalRef: string, name: string): Promise<string> {
-  const result = await pool.query(
-    "INSERT INTO groups (name, identity_provider_id, external_group_ref) VALUES ($1,$2,$3) RETURNING id",
-    [name + " " + crypto.randomBytes(3).toString("hex"), providerId, externalRef],
-  );
-  return String(result.rows[0].id);
+  return insertGroupRow(pool, {
+    name: name + " " + crypto.randomBytes(3).toString("hex"), identityProviderId: providerId, externalGroupRef: externalRef,
+  });
 }
 
 const membership = async (principalId: string): Promise<string[]> => {
@@ -215,9 +214,7 @@ async function main() {
       bobBefore.length === 2, bobBefore);
 
     // A local assignment that no claim will ever mention (T33).
-    const local = await pool.query("INSERT INTO groups (name) VALUES ($1) RETURNING id",
-      ["W3 local " + crypto.randomBytes(3).toString("hex")]);
-    const localGroupId = String(local.rows[0].id);
+    const localGroupId = await insertGroupRow(pool, { name: "W3 local " + crypto.randomBytes(3).toString("hex") });
     await groupService.addMember(localGroupId, { accountPrincipalId: alice.principalId, source: "local" }, ACTOR as never);
 
     // Alice logs in again, now claiming ONLY grp-a. Her grp-b directory row
@@ -526,8 +523,7 @@ async function main() {
     check("a Group that gates login cannot be deleted (named refusal)",
       deleteRefusal === "GROUP_GATES_LOGIN", deleteRefusal);
 
-    const plain = await pool.query("INSERT INTO groups (name) VALUES ($1) RETURNING id",
-      ["W3 plain " + crypto.randomBytes(3).toString("hex")]);
+    const plain = { rows: [{ id: await insertGroupRow(pool, { name: "W3 plain " + crypto.randomBytes(3).toString("hex") }) }] };
     let bindingRefusal = "<no refusal>";
     try {
       await groupService.update(String(plain.rows[0].id), { identityProviderId: provider.id }, ACTOR as never);

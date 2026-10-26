@@ -84,6 +84,11 @@ export const IDENTITY_PROVIDER_ERRORS = [
   'INVALID_SCIM_GROUP_REF_ATTRIBUTE',
   'LOGIN_GROUP_NOT_FOUND',
   'LOGIN_GROUP_NOT_LISTED',
+  // Card 7a99d63e (SU-17): the step-up policy is validated at write by ONE
+  // function, `validateStepUpPolicy`, and each rule refuses by name.
+  'PROVIDER_STEP_UP_POLICY_INVALID',
+  'PROVIDER_STEP_UP_MAX_AGE_INVALID',
+  'PROVIDER_STEP_UP_ASKS_NOTHING',
 ] as const;
 export type IdentityProviderErrorCode = (typeof IDENTITY_PROVIDER_ERRORS)[number];
 
@@ -118,6 +123,131 @@ export type ClientAuthMethod = 'client_secret_basic' | 'client_secret_post' | 'p
  */
 export const SCIM_GROUP_REF_ATTRIBUTES = ['externalId', 'displayName'] as const;
 export type ScimGroupRefAttribute = (typeof SCIM_GROUP_REF_ATTRIBUTES)[number];
+
+/**
+ * Card 7a99d63e (owner rulings E255-E257; design SU-4, SU-17): how a step-up
+ * asks THIS Identity provider for a fresh authentication.
+ *
+ * Every knob is an OpenID Connect Core §3.1.2.1 authorization parameter, and
+ * every value is configuration: nothing here names a vendor. Providers
+ * disagree about which standard question they honour (one ignores
+ * `max_age=0` and honours `prompt=login` once per provider session, while
+ * honouring a positive `max_age` every time), so the question is set per
+ * provider. The ANSWER is judged exactly as before: refusal 9 holds
+ * `auth_time` to the pending row's `requested_at` with no skew, whatever was
+ * asked, so no value here can make a stale authentication acceptable.
+ *
+ *   * `sso_step_up`  `enabled` (the default) or `disabled`: a provider that
+ *     cannot be asked for a fresh sign-in at all is never offered for step-up;
+ *   * `prompt_login` `true` (the default) sends `prompt=login`;
+ *   * `max_age`      `0` (the default) sends `max_age=0`; `null` sends none;
+ *     otherwise a whole number of seconds from 10 to 300.
+ *
+ * NULL (no policy) is today's request byte for byte. The strength fields of
+ * the design (`acr_values`, `claims_request`, `required_acr`, `amr_rungs`,
+ * `required_claims_any`, `when_unproven`, `actions`) belong to a later slice
+ * and are refused by name until it ships, rather than stored and ignored.
+ */
+export interface StepUpPolicy {
+  sso_step_up?: 'enabled' | 'disabled';
+  prompt_login?: boolean;
+  max_age?: number | null;
+}
+
+/** The knobs a step-up request actually sends, defaults applied. */
+export interface StepUpRequestKnobs {
+  prompt_login: boolean;
+  max_age: number | null;
+}
+
+const STEP_UP_POLICY_KEYS = ['sso_step_up', 'prompt_login', 'max_age'] as const;
+/** The design's strength fields (slice S-C): known, and not accepted yet. */
+const STEP_UP_POLICY_LATER_KEYS = [
+  'acr_values', 'claims_request', 'required_acr', 'amr_rungs', 'required_claims_any', 'when_unproven', 'actions',
+] as const;
+/**
+ * SU-4 / check note N-6: a positive `max_age` shorter than the provider's
+ * redirect round trip makes the provider force its flow and still find the
+ * login too old on return, a loop. 0 is the standard "authenticate now".
+ */
+export const STEP_UP_MAX_AGE_MIN_SECONDS = 10;
+export const STEP_UP_MAX_AGE_MAX_SECONDS = 300;
+const STEP_UP_POLICY_MAX_BYTES = 4096;
+
+/**
+ * SU-17: the ONE server-side validator, called by `create` and `update`, so
+ * every writer of the column shares it; a dashboard check is a convenience.
+ * `undefined` = not mentioned; `null` = clear the policy (today's request);
+ * otherwise the validated object, holding only the keys the caller sent.
+ */
+export function validateStepUpPolicy(value: unknown): StepUpPolicy | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const invalid = (message: string): never => {
+    throw new IdentityProviderError('PROVIDER_STEP_UP_POLICY_INVALID', message);
+  };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    invalid('stepUpPolicy must be an object, or null for the default step-up request');
+  }
+  const raw = value as Record<string, unknown>;
+  if (Buffer.byteLength(JSON.stringify(raw), 'utf8') > STEP_UP_POLICY_MAX_BYTES) {
+    invalid(`stepUpPolicy must be at most ${STEP_UP_POLICY_MAX_BYTES} bytes`);
+  }
+  for (const key of Object.keys(raw)) {
+    if ((STEP_UP_POLICY_LATER_KEYS as readonly string[]).includes(key)) {
+      invalid(`stepUpPolicy.${key} is not accepted by this release: only ${STEP_UP_POLICY_KEYS.join(', ')} are`);
+    }
+    if (!(STEP_UP_POLICY_KEYS as readonly string[]).includes(key)) {
+      invalid(`stepUpPolicy carries an unknown key: only ${STEP_UP_POLICY_KEYS.join(', ')} are accepted`);
+    }
+  }
+  const policy: StepUpPolicy = {};
+  if ('sso_step_up' in raw) {
+    if (raw.sso_step_up !== 'enabled' && raw.sso_step_up !== 'disabled') {
+      invalid('stepUpPolicy.sso_step_up must be enabled or disabled');
+    }
+    policy.sso_step_up = raw.sso_step_up as 'enabled' | 'disabled';
+  }
+  if ('prompt_login' in raw) {
+    if (typeof raw.prompt_login !== 'boolean') invalid('stepUpPolicy.prompt_login must be true or false');
+    policy.prompt_login = raw.prompt_login as boolean;
+  }
+  if ('max_age' in raw) {
+    const maxAge = raw.max_age;
+    const valid = maxAge === null
+      || maxAge === 0
+      || (typeof maxAge === 'number' && Number.isInteger(maxAge)
+        && maxAge >= STEP_UP_MAX_AGE_MIN_SECONDS && maxAge <= STEP_UP_MAX_AGE_MAX_SECONDS);
+    if (!valid) {
+      throw new IdentityProviderError(
+        'PROVIDER_STEP_UP_MAX_AGE_INVALID',
+        `stepUpPolicy.max_age must be null (not sent), 0, or a whole number of seconds from ${STEP_UP_MAX_AGE_MIN_SECONDS} to ${STEP_UP_MAX_AGE_MAX_SECONDS}: a shorter positive value makes the provider loop`,
+      );
+    }
+    policy.max_age = maxAge as number | null;
+  }
+  const knobs = stepUpRequestKnobs(policy);
+  if (policy.sso_step_up !== 'disabled' && !knobs.prompt_login && knobs.max_age === null) {
+    throw new IdentityProviderError(
+      'PROVIDER_STEP_UP_ASKS_NOTHING',
+      'a step-up must ask the Identity provider for something: keep prompt_login true, or send a max_age',
+    );
+  }
+  return policy;
+}
+
+/** SU-4: the knobs a step-up request sends under `policy`, defaults applied. */
+export function stepUpRequestKnobs(policy: StepUpPolicy | null): StepUpRequestKnobs {
+  return {
+    prompt_login: policy?.prompt_login ?? true,
+    max_age: policy && 'max_age' in policy ? policy.max_age ?? null : 0,
+  };
+}
+
+/** SU-17: `sso_step_up: disabled` takes the provider out of step-up entirely. */
+export function stepUpEnabledFor(provider: { stepUpPolicy: StepUpPolicy | null }): boolean {
+  return provider.stepUpPolicy?.sso_step_up !== 'disabled';
+}
 
 export interface IdentityProvider {
   id: string;
@@ -172,6 +302,11 @@ export interface IdentityProvider {
    * Never consulted on the local password path.
    */
   loginGroupWhitelistEnabled: boolean;
+  /**
+   * Card 7a99d63e (SU-17): how a step-up asks this provider for a fresh
+   * authentication, or null for the default request. Root-written only.
+   */
+  stepUpPolicy: StepUpPolicy | null;
   allowPrivateIssuerAddress: boolean;
   allowClaimMatching: boolean;
   retainIdToken: boolean;
@@ -196,7 +331,7 @@ const SELECT_COLUMNS = `
   subject_immutable, provisioning_mode, group_binding_mode,
   scim_group_ref_attribute,
   scim_client_principal_id, scim_heartbeat_interval_hours,
-  login_group_whitelist_enabled,
+  login_group_whitelist_enabled, step_up_policy,
   allow_private_issuer_address, allow_claim_matching, retain_id_token,
   provider_owns_profile, clock_skew_seconds, session_ttl_seconds,
   authentication_request_ttl_seconds, backchannel_logout_enabled,
@@ -233,6 +368,9 @@ function mapRow(row: Record<string, unknown>): IdentityProvider {
       ? null
       : Number(row.scim_heartbeat_interval_hours),
     loginGroupWhitelistEnabled: row.login_group_whitelist_enabled === true,
+    stepUpPolicy: row.step_up_policy === null || row.step_up_policy === undefined
+      ? null
+      : row.step_up_policy as StepUpPolicy,
     allowPrivateIssuerAddress: row.allow_private_issuer_address === true,
     allowClaimMatching: row.allow_claim_matching === true,
     retainIdToken: row.retain_id_token === true,
@@ -285,6 +423,12 @@ export interface CreateIdentityProviderInput {
   backchannelLogoutEnabled?: boolean;
   /** SSO-R8: `null` is a value (claim-sync semantics), `undefined` is "unset". */
   scimHeartbeatIntervalHours?: number | null;
+  /**
+   * Card 7a99d63e (SU-17): `null` clears the policy (the default request),
+   * `undefined` leaves it. Validated by `validateStepUpPolicy`, so the type is
+   * `unknown` here: the route hands the body's value through untouched.
+   */
+  stepUpPolicy?: unknown;
 }
 
 export type UpdateIdentityProviderInput = Partial<Omit<CreateIdentityProviderInput, 'subjectImmutable'>> & {
@@ -376,8 +520,8 @@ export class IdentityProviderService {
     return result.rows.map(mapRow);
   }
 
-  async get(id: string): Promise<IdentityProvider | undefined> {
-    const result = await pool.query(`SELECT ${SELECT_COLUMNS} FROM identity_providers WHERE id = $1`, [id]);
+  async get(id: string, queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool): Promise<IdentityProvider | undefined> {
+    const result = await queryable.query(`SELECT ${SELECT_COLUMNS} FROM identity_providers WHERE id = $1`, [id]);
     return result.rows[0] ? mapRow(result.rows[0]) : undefined;
   }
 
@@ -395,8 +539,8 @@ export class IdentityProviderService {
    * so "the active provider" is well defined and the `/config` presence block
    * and the login button can rely on it.
    */
-  async activeProvider(): Promise<IdentityProvider | undefined> {
-    const result = await pool.query(
+  async activeProvider(queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool): Promise<IdentityProvider | undefined> {
+    const result = await queryable.query(
       `SELECT ${SELECT_COLUMNS} FROM identity_providers WHERE status = 'active' LIMIT 1`,
     );
     return result.rows[0] ? mapRow(result.rows[0]) : undefined;
@@ -589,6 +733,7 @@ export class IdentityProviderService {
     }
 
     const heartbeatIntervalHours = heartbeatIntervalOf(input.scimHeartbeatIntervalHours) ?? null;
+    const stepUpPolicy = validateStepUpPolicy(input.stepUpPolicy) ?? null;
 
     // The id is minted here so the AEAD additional data can bind each
     // ciphertext to its row before the row exists (§7.2: a ciphertext copied
@@ -617,9 +762,9 @@ export class IdentityProviderService {
          allow_private_issuer_address, allow_claim_matching, retain_id_token,
          provider_owns_profile, clock_skew_seconds, session_ttl_seconds,
          authentication_request_ttl_seconds, backchannel_logout_enabled, created_by_principal_id,
-         scim_heartbeat_interval_hours)
+         scim_heartbeat_interval_hours, step_up_policy)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15,$16,$17,$18,$19::jsonb,
-               $20,$21,$22,$34,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
+               $20,$21,$22,$34,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$35::jsonb)
        RETURNING ${SELECT_COLUMNS}`,
       [
         id,
@@ -656,6 +801,7 @@ export class IdentityProviderService {
         actor.principalId ?? null,
         heartbeatIntervalHours,
         validateScimGroupRefAttribute(input.scimGroupRefAttribute) ?? 'externalId',
+        stepUpPolicy === null ? null : JSON.stringify(stepUpPolicy),
       ],
       ).catch((error: unknown) => {
         if (isUniqueViolation(error, 'ux_identity_providers_issuer')) {
@@ -689,6 +835,9 @@ export class IdentityProviderService {
         allow_claim_matching: created.allowClaimMatching,
         retain_id_token: created.retainIdToken,
         scim_heartbeat_interval_hours: created.scimHeartbeatIntervalHours,
+        // Card 7a99d63e (SU-27 c): how step-ups ask this provider is part of
+        // the owner-plane record, so a weakened question shows in the ledger.
+        step_up_policy: created.stepUpPolicy,
       },
     });
     return created;
@@ -736,6 +885,7 @@ export class IdentityProviderService {
     const secret = input.clientSecret ? encryptCredentialSecret(input.clientSecret, id) : undefined;
     const privateKey = input.clientPrivateKey ? encryptCredentialSecret(input.clientPrivateKey, id) : undefined;
     const heartbeatIntervalHours = heartbeatIntervalOf(input.scimHeartbeatIntervalHours);
+    const stepUpPolicy = validateStepUpPolicy(input.stepUpPolicy);
 
     const client = await pool.connect();
     let updated: IdentityProvider;
@@ -775,6 +925,7 @@ export class IdentityProviderService {
          authentication_request_ttl_seconds = COALESCE($29, authentication_request_ttl_seconds),
          backchannel_logout_enabled = COALESCE($30, backchannel_logout_enabled),
          scim_heartbeat_interval_hours = CASE WHEN $32::boolean THEN $33::integer ELSE scim_heartbeat_interval_hours END,
+         step_up_policy = CASE WHEN $35::boolean THEN $36::jsonb ELSE step_up_policy END,
          updated_at = now()
        WHERE id = $1
        RETURNING ${SELECT_COLUMNS}`,
@@ -814,6 +965,10 @@ export class IdentityProviderService {
         heartbeatIntervalHours !== undefined,
         heartbeatIntervalHours ?? null,
         validateScimGroupRefAttribute(input.scimGroupRefAttribute) ?? null,
+        // Card 7a99d63e: null is a value here (the default request), so
+        // presence and value travel apart, as SSO-R8's interval does.
+        stepUpPolicy !== undefined,
+        stepUpPolicy === undefined || stepUpPolicy === null ? null : JSON.stringify(stepUpPolicy),
       ],
       );
       updated = mapRow(result.rows[0]);
@@ -851,6 +1006,9 @@ export class IdentityProviderService {
         // SSO-R8: moving the interval changes when silence becomes an alarm.
         scim_heartbeat_interval_hours_before: current.scimHeartbeatIntervalHours,
         scim_heartbeat_interval_hours_after: updated.scimHeartbeatIntervalHours,
+        // Card 7a99d63e (SU-27 c): how step-ups ask this provider, both sides.
+        step_up_policy_before: current.stepUpPolicy,
+        step_up_policy_after: updated.stepUpPolicy,
       },
     });
     return updated;

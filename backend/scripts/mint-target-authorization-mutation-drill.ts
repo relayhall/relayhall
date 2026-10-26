@@ -34,7 +34,7 @@
  *
  * The DATABASE is written to and must be disposable — same contract as the gate
  * it drives (`src/__tests__/mintTargetAuthorization.test.ts`). Every file it
- * touches is restored, including on failure. Developer tool, not a CI step.
+ * touches is restored, including on failure. The full tier runs it in a throwaway checkout (job drill_controls, machinery queue 9b761f09).
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';

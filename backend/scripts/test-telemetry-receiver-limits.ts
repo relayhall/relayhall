@@ -18,18 +18,20 @@
  * connections that can SEE each other's committed rows, this script cannot hide
  * inside one rolled-back transaction like the migration probe does: it creates
  * the schema, commits, and DROPs it in a finally block.
+ *
+ * The schema's tables are DERIVED from the migrated database it runs on, never
+ * hand-copied (machinery queue 9b761f09): the hand copy of `tasks` drifted when
+ * `ingest` began joining it for Task attribution (card b595b3b0), and the probe
+ * failed on a column the copy never had. So it needs a MIGRATED disposable
+ * database (database/init.sql, then `npm run migrate`), and refuses, naming the
+ * missing tables, without one.
  */
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import { Pool } from 'pg';
 import {
   TelemetryRateLimitService, TELEMETRY_MIN_INTERVAL_MS,
 } from '../src/services/TelemetryRateLimitService';
 import { TelemetryService } from '../src/services/TelemetryService';
-
-const migrationsDir = path.resolve(__dirname, '../src/migrations');
-const receiverLimits = fs.readFileSync(path.join(migrationsDir, '112_telemetry_receiver_limits.sql'), 'utf8');
 
 const schema = `telemetry_limits_probe_${process.pid}_${Date.now()}`;
 const connection = {
@@ -107,12 +109,41 @@ async function drain(label: string, pool: Pool, ms = DRAIN_MS): Promise<void> {
 
 const admin = new Pool({ ...connection, max: 1 });
 
+/**
+ * The tables `TelemetryRateLimitService` and `TelemetryService.ingest` write or
+ * join, copied from the migrated public schema with every column, default,
+ * CHECK, NOT NULL and index (`LIKE ... INCLUDING ALL`), so a later migration
+ * reaches the probe without anyone editing it. LIKE copies no foreign key; the
+ * probe adds the two it measures against its own principal stub, and the Task
+ * key further down where the FK case needs it. The other tables `ingest` joins
+ * (`task_native_assignment_epochs`, `services`) resolve to public through the
+ * search path: the derived `tasks` is empty, so the join reads no row of them.
+ */
+const DERIVED_TABLES = ['telemetry_rate_limits', 'telemetry_frames', 'tasks'];
+
+async function deriveFixtureTables(): Promise<void> {
+  const missing = (await admin.query(
+    `SELECT name FROM unnest($1::text[]) AS name WHERE to_regclass('public.' || name) IS NULL`,
+    [DERIVED_TABLES])).rows.map((row) => String(row.name));
+  if (missing.length > 0) {
+    throw new Error(`the probe derives its tables from a MIGRATED database, and public has no ${missing.join(', ')}: `
+      + 'load database/init.sql into a disposable database and run npm run migrate first');
+  }
+  for (const table of DERIVED_TABLES) {
+    await admin.query(`CREATE TABLE ${schema}.${table} (LIKE public.${table} INCLUDING ALL)`);
+  }
+  for (const table of ['telemetry_rate_limits', 'telemetry_frames']) {
+    await admin.query(`ALTER TABLE ${schema}.${table}
+      ADD FOREIGN KEY (principal_id) REFERENCES ${schema}.principals(id) ON DELETE CASCADE`);
+  }
+}
+
 async function main(): Promise<void> {
   await admin.query(`CREATE SCHEMA ${schema}`);
   try {
     await admin.query(`SET search_path TO ${schema}, public`);
     await admin.query(`CREATE TABLE ${schema}.principals (id uuid PRIMARY KEY DEFAULT gen_random_uuid())`);
-    await admin.query(`SET search_path TO ${schema}, public; ${receiverLimits}`);
+    await deriveFixtureTables();
 
     const principal = (await admin.query(
       `INSERT INTO ${schema}.principals DEFAULT VALUES RETURNING id`)).rows[0].id as string;
@@ -210,15 +241,6 @@ async function main(): Promise<void> {
       // loudly instead of stalling the run.
       const ingestPool = poolInSchema(4, INGEST_ABORT_MS);
       try {
-        await admin.query(`CREATE TABLE IF NOT EXISTS ${schema}.telemetry_frames (
-          id BIGSERIAL PRIMARY KEY,
-          principal_id UUID NOT NULL REFERENCES ${schema}.principals(id) ON DELETE CASCADE,
-          task_id UUID,
-          kind TEXT NOT NULL,
-          status TEXT,
-          payload JSONB NOT NULL,
-          received_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
-
         // BOTH must be injected: `TelemetryService`'s default limiter is the
         // module singleton bound to the DEFAULT pool, which knows nothing of
         // this throwaway schema. Passing only the pool sends the refusal
@@ -255,9 +277,8 @@ async function main(): Promise<void> {
 
         // ---- F4 through `ingest`: a failed insert must not charge ------
         // A task_id that violates nothing here would not exercise it, so the
-        // FK is made to fail with a task_id that cannot exist.
-        await admin.query(`CREATE TABLE IF NOT EXISTS ${schema}.tasks (
-          id uuid PRIMARY KEY DEFAULT gen_random_uuid())`);
+        // FK is made to fail with a task_id that cannot exist (the derived
+        // `tasks` is empty).
         await admin.query(`ALTER TABLE ${schema}.telemetry_frames
           ADD CONSTRAINT frames_task_fk FOREIGN KEY (task_id) REFERENCES ${schema}.tasks(id)`);
         const fkPrincipal = (await admin.query(

@@ -54,8 +54,25 @@ WHAT IT ENFORCES, over both `.github/workflows/*.yml` and `.gitea/workflows/*.ym
      of 2026-09-07 moved the full matrix off every push, and the guard on that
      ruling is that when the full matrix DOES run, nothing in it can be skipped.
 
+ 10. THE FRONTEND UNIT TESTS ARE SHARDED WITHOUT LOSING A SHARD. When
+     `scripts/frontend-test-shards.json` exists, `ci.yml` must carry the job
+     `frontend-unit` whose matrix is EXACTLY the shards that file declares
+     (`shard: [1, ..., N]`, no `include` or `exclude` that could add or drop one,
+     `fail-fast: false` so every shard reports), whose `if:` and `needs:` equal
+     the `frontend` job's (a shard that runs while the job it belongs to is
+     skipped, or the reverse, is a test that silently stops running), whose one
+     test step runs `frontend-test-shard.py run --shard ${{ matrix.shard }}/N`,
+     and the `frontend` job must run `frontend-test-shard.py check` once and no
+     longer carry a serial `npm run test:unit` step. Rule 10 is the workflow half
+     of the sharding contract; that the shards cover the file set exactly once is
+     held by `scripts/frontend-test-shard.py check` and its control
+     `scripts/test-frontend-test-shard-gate.py`. Keyed on the plan file's
+     presence, like rules 8 and 9, and the control requires the real repository
+     to carry it.
+
 Rules 7-9 arrived with card 5de6ed89 (RH-CI.SPEED), which split one hour-long
-workflow into two. Rules 8 and 9 are the ones that make the split reversible
+workflow into two. Rule 10 arrived with E473, which split the Frontend job's
+serial unit-test step because it had become the critical path of the fast tier. Rules 8 and 9 are the ones that make the split reversible
 rather than lossy: 8 says the set of gates did not change, 9 says the full tier
 still means what it meant when it was unconditional.
 
@@ -85,7 +102,9 @@ null-`run` probe, and a case for every rule above, and requires a red for each.
 """
 from __future__ import annotations
 
+import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -109,6 +128,14 @@ GATE_CENSUS = 'scripts/ci-gate-steps.txt'
 # file the owner ruling made conditional-by-trigger; `ci.yml` is expected to
 # carry `if:` (that is what the path focus IS).
 FULL_TIER = 'ci-full.yml'
+
+# Rule 10. The plan file whose presence puts the Frontend shards under the
+# contract, and the two jobs of `ci.yml` the rule is about.
+SHARD_PLAN = 'scripts/frontend-test-shards.json'
+SHARDED_JOB = 'frontend'
+SHARD_JOB = 'frontend-unit'
+SHARD_COMMAND = 'python3 ../scripts/frontend-test-shard.py'
+FAST_TIER = 'ci.yml'
 
 # The key a bare `on:` actually lands under. Named rather than written as a
 # literal `True` at the lookup, because `document[True]` reads like a mistake.
@@ -342,6 +369,100 @@ def check_gate_census(root: pathlib.Path, documents: dict) -> list[str]:
     return problems
 
 
+def _runs(job: dict) -> list[str]:
+    """Every `run:` string of a job's steps, in order."""
+    return [step['run'] for step in (job.get('steps') or [])
+            if isinstance(step, dict) and isinstance(step.get('run'), str)]
+
+
+def check_frontend_shards(root: pathlib.Path, documents: dict) -> list[str]:
+    """Rule 10: the Frontend unit-test shards in `ci.yml` are the shards the plan declares."""
+    plan_path = root / SHARD_PLAN
+    if not plan_path.exists():
+        return []
+
+    where = f'{FAST_TIER} (rule 10)'
+    try:
+        shards = json.loads(plan_path.read_text(encoding='utf-8')).get('shards')
+    except (ValueError, AttributeError) as error:
+        return [f'{SHARD_PLAN}: is not a JSON object ({error})']
+    if isinstance(shards, bool) or not isinstance(shards, int) or shards < 2:
+        return [f'{SHARD_PLAN}: `shards` is {shards!r}; it must be an integer of at least 2']
+
+    document = documents.get(FAST_TIER)
+    jobs = (document or {}).get('jobs')
+    if not isinstance(jobs, dict):
+        return [f'{where}: {FAST_TIER} has no jobs, but {SHARD_PLAN} puts the Frontend unit tests in shards']
+    sharded, unit = jobs.get(SHARDED_JOB), jobs.get(SHARD_JOB)
+    problems: list[str] = []
+    if not isinstance(sharded, dict):
+        problems.append(f'{where}: job {SHARDED_JOB!r} is missing')
+    if not isinstance(unit, dict):
+        problems.append(f'{where}: job {SHARD_JOB!r} is missing - the Frontend unit tests run nowhere')
+    if problems:
+        return problems
+
+    strategy = unit.get('strategy') or {}
+    matrix = strategy.get('matrix') if isinstance(strategy, dict) else None
+    expected = list(range(1, shards + 1))
+    if not isinstance(matrix, dict) or matrix.get('shard') != expected:
+        problems.append(
+            f'{where}: job {SHARD_JOB!r} matrix `shard` is '
+            f'{matrix.get("shard") if isinstance(matrix, dict) else matrix!r}, but {SHARD_PLAN} declares '
+            f'{shards} shards, so the matrix must be exactly {expected} - a missing shard is a slice of the '
+            'tests that never runs')
+    if isinstance(matrix, dict) and set(matrix) != {'shard'}:
+        problems.append(
+            f'{where}: job {SHARD_JOB!r} matrix carries {sorted(set(matrix) - {"shard"})}; `include` and '
+            '`exclude` can add or drop a shard behind the declared list, so the matrix is `shard` and nothing else')
+    if not isinstance(strategy, dict) or strategy.get('fail-fast') is not False:
+        problems.append(
+            f'{where}: job {SHARD_JOB!r} must set `fail-fast: false` so one red shard does not hide '
+            'whether the others are green')
+    for key in ('if', 'needs'):
+        if unit.get(key) != sharded.get(key):
+            problems.append(
+                f'{where}: job {SHARD_JOB!r} `{key}` is {unit.get(key)!r} but job {SHARDED_JOB!r} has '
+                f'{sharded.get(key)!r}; the shards and the job they belong to must be skipped together')
+    wanted_name = f'Frontend unit tests (shard ${{{{ matrix.shard }}}} of {shards})'
+    if unit.get('name') != wanted_name:
+        problems.append(f'{where}: job {SHARD_JOB!r} is named {unit.get("name")!r}, expected {wanted_name!r}')
+
+    # `continue-on-error` turns a red shard green: the step (or job) fails, the
+    # forge still reports the run as a success, and a slice of the tests has
+    # stopped gating anything. Any value is refused, `false` included: the key
+    # has no honest use here, and a value that is an expression cannot be read.
+    if 'continue-on-error' in unit:
+        problems.append(
+            f'{where}: job {SHARD_JOB!r} sets `continue-on-error`; a red shard would still leave the run '
+            'green, so the tests of that shard would no longer gate anything')
+    for index, step in enumerate(unit.get('steps') or []):
+        if isinstance(step, dict) and 'continue-on-error' in step:
+            named = step.get('name', f'<step {index}>')
+            problems.append(
+                f'{where}: job {SHARD_JOB!r} step {named!r} sets `continue-on-error`; a red shard would '
+                'still leave the run green, so the tests of that shard would no longer gate anything')
+
+    wanted_run = f'{SHARD_COMMAND} run --shard ${{{{ matrix.shard }}}}/{shards}'
+    shard_steps = [run for run in _runs(unit) if 'frontend-test-shard.py' in run]
+    if shard_steps != [wanted_run]:
+        problems.append(
+            f'{where}: job {SHARD_JOB!r} must have exactly one shard step `{wanted_run}`, found {shard_steps}')
+
+    for job_name, job in jobs.items():
+        for run in _runs(job or {}):
+            if re.search(r'npm run test:unit(\s|$)', run):
+                problems.append(
+                    f'{where}: job {job_name!r} still runs `npm run test:unit` serially; the shards '
+                    'would run every test a second time and the serial step stays the critical path')
+    checks = [run for run in _runs(sharded) if 'frontend-test-shard.py' in run]
+    if checks != [f'{SHARD_COMMAND} check']:
+        problems.append(
+            f'{where}: job {SHARDED_JOB!r} must run `{SHARD_COMMAND} check` exactly once '
+            f'(the coverage proof), found {checks}')
+    return problems
+
+
 def main() -> int:
     root = repository_root()
     files = sorted(
@@ -369,6 +490,7 @@ def main() -> int:
 
     problems.extend(check_forge_parity(root))
     problems.extend(check_gate_census(root, documents))
+    problems.extend(check_frontend_shards(root, documents))
 
     if problems:
         print('Workflow shape contract FAILED:', file=sys.stderr)

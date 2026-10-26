@@ -498,6 +498,50 @@ describe('ANY refusal from the issue step rolls the registration back (card 3f14
   });
 });
 
+describe('a board with no credential key set refuses by name and writes nothing', () => {
+  /**
+   * An install made before `./setup.sh` generated the key sets (or one whose
+   * `relayhall.keys.env` was lost) answered the wizard's first request with
+   * `500 INTERNAL_ERROR, 'Failed to register the service'`. No injection here:
+   * the key set is genuinely absent from the environment, the real crypto
+   * module's cache is dropped, and the real route, registry, transaction and
+   * database answer.
+   */
+  const { resetKeysetCache } = require('../utils/credentialCrypto');
+
+  async function withoutCredentialKeys<T>(act: () => Promise<T>): Promise<T> {
+    const saved = [process.env.RELAYHALL_CREDENTIAL_KEYS, process.env.RELAYHALL_CREDENTIAL_ACTIVE_KEY];
+    delete process.env.RELAYHALL_CREDENTIAL_KEYS;
+    delete process.env.RELAYHALL_CREDENTIAL_ACTIVE_KEY;
+    resetKeysetCache();
+    try {
+      return await act();
+    } finally {
+      process.env.RELAYHALL_CREDENTIAL_KEYS = saved[0];
+      process.env.RELAYHALL_CREDENTIAL_ACTIVE_KEY = saved[1];
+      resetKeysetCache();
+    }
+  }
+
+  it('answers 503 CREDENTIAL_KEYS_NOT_CONFIGURED, telling the operator what to run', async () => {
+    const slug = `fixb-nokeys-${tag()}`;
+    const answer = await withoutCredentialKeys(() =>
+      call(SESSIONS.user, 'POST', '/services', connectBody(slug, ['tasks:read'])));
+    expect(answer.status).toBe(503);
+    expect(answer.json.code).toBe('CREDENTIAL_KEYS_NOT_CONFIGURED');
+    expect(String(answer.json.message)).toContain('./setup.sh');
+    expect(await serviceRowsFor(slug)).toBe(0);
+    expect(await connectorPrincipalsFor(slug)).toBe(0);
+  });
+
+  it('NEGATIVE CONTROL: with the key set back the identical call succeeds', async () => {
+    const slug = `fixb-nokeys-control-${tag()}`;
+    const answer = await call(SESSIONS.user, 'POST', '/services', connectBody(slug, ['tasks:read']));
+    expect(answer.status).toBe(201);
+    expect(await serviceRowsFor(slug)).toBe(1);
+  });
+});
+
 describe('CONTROL — the transactional change did not break the plain paths', () => {
   it('a registration WITHOUT a credential request still commits', async () => {
     // `register` now branches on whether a caller transaction was supplied. The
@@ -539,10 +583,12 @@ describe('CONTROL — the transactional change did not break the plain paths', (
  * The owner minted a connection on TST with the wizard's day-one default and
  * the agent could do nothing at all. Every work-plane MCP tool is closed to a
  * credential until it calls `relayhall_brief_compile {session: true}`; that
- * call reads the caller's own principal and so sits behind `principals:read`;
- * and the template working set the wizard defaulted to does not carry it. The
- * flow ended in `403 FORBIDDEN: This call needs the principals:read scope` for
- * the exact person the flow exists for.
+ * call then sat behind `principals:read`; and the template working set the
+ * wizard defaulted to did not carry it. The flow ended in `403 FORBIDDEN: This
+ * call needs the principals:read scope` for the exact person the flow exists
+ * for. (Card 1118fefa later moved that call to a self-identity ceiling, so a
+ * credential without `principals:read` now bootstraps too; the arm below that
+ * used to reproduce the 403 now pins the repair.)
  *
  * The owner ruled the DEFAULT, not the check (2026-09-07): a new connection
  * starts with the whole delegable catalogue and narrows from there. So what is
@@ -570,18 +616,18 @@ describe('the wizard default bootstraps (card 07d09eaf)', () => {
    *
    * It is written out because the frontend package cannot be imported from a
    * backend suite, and it is NOT trusted: the arm below asserts the PREMISE
-   * (that this set omits the bootstrap scope) before it asserts the
-   * consequence. If the frontend list ever drifts, this stops measuring "the
-   * old default" and keeps measuring the property that matters — a credential
-   * without `principals:read` cannot bootstrap — or fails outright.
+   * (that this set omits `principals:read`) before it asserts the consequence.
+   * If the frontend list ever drifts, this stops measuring "the old default"
+   * and keeps measuring the property that matters — since card 1118fefa, that a
+   * credential WITHOUT `principals:read` bootstraps — or fails outright.
    */
   const OLD_WIZARD_DEFAULT = [
     'tasks:read', 'tasks:write', 'reports:read', 'reports:write',
     'projects:read', 'phases:read', 'skills:read', 'skills:use',
   ];
 
-  /** What `relayhall_brief_compile {session: true}` sits behind. */
-  const BOOTSTRAP_SCOPE = 'principals:read';
+  /** What `relayhall_brief_compile {session: true}` sat behind until card 1118fefa. */
+  const FORMER_BOOTSTRAP_SCOPE = 'principals:read';
 
   /**
    * A work-plane READ the bootstrap gate actually closes.
@@ -602,24 +648,30 @@ describe('the wizard default bootstraps (card 07d09eaf)', () => {
     return { slug, token };
   }
 
-  it('RED — the set the wizard used to default to cannot bootstrap, and the work plane stays shut', async () => {
+  // This arm reproduced the 07d09eaf defect verbatim: the old default could
+  // not bootstrap, because the session brief sat behind principals:read. Card
+  // 1118fefa moved that ceiling to the credential's own identity, so the SAME
+  // set, through the SAME route and ingress, now bootstraps — and the arm pins
+  // the repair instead. If the ceiling moved back, this goes red.
+  it('card 1118fefa — the set the wizard used to default to now bootstraps, and the gate opens', async () => {
     const me = await call(SESSIONS.admin, 'GET', '/principals/me');
     const delegable: string[] = me.json.delegableScopes;
     // The premise, asserted rather than assumed.
-    expect(OLD_WIZARD_DEFAULT).not.toContain(BOOTSTRAP_SCOPE);
-    expect(delegable).toContain(BOOTSTRAP_SCOPE);
+    expect(OLD_WIZARD_DEFAULT).not.toContain(FORMER_BOOTSTRAP_SCOPE);
+    expect(delegable).toContain(FORMER_BOOTSTRAP_SCOPE);
 
     const { token } = await connectAs(SESSIONS.admin, OLD_WIZARD_DEFAULT);
 
     const boot = await mcpCall(token, BOOTSTRAP_VERB, { session: true });
-    expect(mcpFailed(boot)).toBe(true);
-    // The owner's own sentence, from the board rather than from this file.
-    expect(mcpText(boot)).toContain(BOOTSTRAP_SCOPE);
+    expect(mcpFailed(boot)).toBe(false);
+    expect(mcpText(boot)).toContain('Bootstrapped');
+    expect(mcpText(boot)).not.toContain(FORMER_BOOTSTRAP_SCOPE);
 
-    // And with the bootstrap refused, the work plane is closed — which is what
-    // "the agent can call nothing that changes board state" meant.
+    // The gate opened: the work-plane read is no longer refused "bootstrap
+    // first". It may still be refused by its own route ceiling — this set
+    // carries no Blueprint scope — which is the scope plane doing its job.
     const work = await mcpCall(token, GATED_WORK_READ);
-    expect(mcpText(work)).toContain(BOOTSTRAP_REFUSAL_MARKER);
+    expect(mcpText(work)).not.toContain(BOOTSTRAP_REFUSAL_MARKER);
   });
 
   it('GREEN — a credential carrying the ruled default bootstraps, then reaches the work plane', async () => {
@@ -661,7 +713,7 @@ describe('the wizard default bootstraps (card 07d09eaf)', () => {
     expect(whoami.status).toBe(200);
     expect(new Set(whoami.json.scopes)).toEqual(new Set(delegable));
     expect(whoami.json.scopes).not.toContain(ROOT_SCOPE);
-    expect(whoami.json.scopes).toContain(BOOTSTRAP_SCOPE);
+    expect(whoami.json.scopes).toContain(FORMER_BOOTSTRAP_SCOPE);
   });
 
   it('CONTROL — a Member mints THEIR whole delegable set, which is smaller', async () => {
@@ -798,5 +850,354 @@ describe('Create identity — the sequence each kind actually performs (card 559
     });
     expect(refusal.status).toBe(403);
     expect(refusal.json?.code).toBe('OWNER_OUT_OF_SUBTREE');
+  });
+});
+
+/**
+ * THE HARNESS WIZARD, MEASURED (E462 slice S1; universal harness connector
+ * design v1.5 sections 3.1 and 9).
+ *
+ * The four harness templates register their Connector, publish its first
+ * descriptor (telemetry tier and product) and mint ONE `any`-pinned token in a
+ * single call. Each property below is a stored-row or authenticated-request
+ * fact, which is why it lives in this suite and not in a unit test:
+ *
+ *   - one transaction: a refusal AFTER the registry row exists leaves nothing,
+ *     the published descriptor included;
+ *   - the service really is `published`, with the declared tier and product,
+ *     because the wake needs exactly one published service and quota posts need
+ *     the declared product;
+ *   - the token really is pinned `any` and carries the harness scope set, no
+ *     more: it answers on REST and on MCP, and holds no `:admin`, no
+ *     `services:write`, no `root`.
+ */
+describe('the harness wizard: one registration, one descriptor, one token (E462 S1)', () => {
+  /** Restated here on purpose: the frontend drift test pins the wizard's
+   *  constant to the mintable catalogue, and this list is what the live token
+   *  is asserted against, so a change to either side fails a suite instead of
+   *  silently changing what a harness token may do. */
+  const HARNESS_SET = [
+    'tasks:read', 'tasks:write', 'reports:read', 'reports:write',
+    'projects:read', 'phases:read', 'skills:read', 'skills:use',
+    'telemetry:write', 'services:read', 'principals:read',
+    // Owner ruling E475 (1): research, personality reads and Blueprint use.
+    'knowledge-contents:read', 'personalities:read', 'blueprints:use',
+    // Owner ruling E480: what instantiating a Blueprint needs, Phases included.
+    'projects:write', 'phases:write',
+  ];
+
+  const harnessBody = (slug: string, product = 'claude-code', tier: 'presence' | 'full' = 'full') => ({
+    slug,
+    name: slug,
+    description: 'Claude Code, connected from the Connect your agent flow.',
+    kind: 'connector',
+    descriptor: { options: [], telemetry: { tier, products: [product] } },
+    issueCredential: { scopes: HARNESS_SET, label: slug, transport: 'any' },
+  });
+
+  const descriptorRows = async (slug: string): Promise<any[]> => (await pool.query(
+    `SELECT v.version, v.descriptor FROM service_descriptor_versions v
+       JOIN services s ON s.id = v.service_id WHERE s.slug = $1 ORDER BY v.version`, [slug])).rows;
+
+  it.each(ROLES)('%s: the connector is published with its declared telemetry and the token works on REST and MCP', async (role) => {
+    const slug = `s1-${role}-${tag()}`;
+    const created = await call(SESSIONS[role], 'POST', '/services', harnessBody(slug));
+    expect(created.status).toBe(201);
+    expect(created.json.service.status).toBe('published');
+    expect(created.json.service.currentDescriptorVersion).toBe(1);
+    expect(created.json.service.telemetryTier).toBe('full');
+
+    const rows = await descriptorRows(slug);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].descriptor.telemetry).toEqual({ tier: 'full', products: ['claude-code'] });
+
+    // The wake resolves the connector by principal and needs EXACTLY ONE
+    // published service for it; the telemetry policy reads the same row.
+    const published = await pool.query(
+      `SELECT count(*)::int AS n FROM services
+        WHERE principal_id = (SELECT principal_id FROM services WHERE slug = $1)
+          AND kind = 'connector' AND status = 'published'`, [slug]);
+    expect(published.rows[0].n).toBe(1);
+
+    const token: string = created.json.onboarding.credential.secretOnce;
+    expect(token).toMatch(TOKEN);
+    expect(created.json.onboarding.credential.transport).toBe('any');
+
+    // `any` is a real pin: REST and MCP both accept it.
+    const rest = await call(bearer('harness connector', '', token), 'GET', '/principals/me');
+    expect(rest.status).toBe(200);
+    expect(new Set(rest.json.scopes)).toEqual(new Set(HARNESS_SET));
+    const mcp = await mcpCall(token, 'relayhall_principal_whoami');
+    expect(mcpFailed(mcp)).toBe(false);
+  });
+
+  it('the token holds no root, no :admin family and no services:write', async () => {
+    const slug = `s1-shape-${tag()}`;
+    const created = await call(SESSIONS.admin, 'POST', '/services', harnessBody(slug));
+    expect(created.status).toBe(201);
+    const stored = await pool.query(
+      `SELECT c.scopes, c.transport FROM principal_credentials c
+         JOIN services s ON s.principal_id = c.principal_id WHERE s.slug = $1`, [slug]);
+    expect(stored.rows).toHaveLength(1);
+    expect(stored.rows[0].transport).toBe('any');
+    const scopes: string[] = stored.rows[0].scopes;
+    expect(scopes).not.toContain(ROOT_SCOPE);
+    expect(scopes).not.toContain('services:write');
+    expect(scopes.filter((scope) => scope.endsWith(':admin'))).toEqual([]);
+    // E475: blueprints:use is not blueprints:read, and nothing outside the set rides along.
+    expect(scopes).not.toContain('blueprints:read');
+    expect(new Set(scopes)).toEqual(new Set(HARNESS_SET));
+  });
+
+  it('presence-tier products are declared exactly as asked (VS Code and Antigravity)', async () => {
+    for (const product of ['vscode', 'antigravity']) {
+      const slug = `s1-${product}-${tag()}`;
+      const created = await call(SESSIONS.user, 'POST', '/services', harnessBody(slug, product, 'presence'));
+      expect(created.status).toBe(201);
+      expect(created.json.service.telemetryTier).toBe('presence');
+      expect((await descriptorRows(slug))[0].descriptor.telemetry).toEqual({ tier: 'presence', products: [product] });
+    }
+  });
+
+  it('a refusal after the registry row exists leaves no service, no principal and no descriptor', async () => {
+    const slug = `s1-rollback-${tag()}`;
+    const spy = jest.spyOn(principalService, 'issueCredential').mockRejectedValueOnce(
+      new CredentialPolicyError(409, 'PRINCIPAL_TERMINATED', 'injected'));
+    try {
+      const answer = await call(SESSIONS.user, 'POST', '/services', harnessBody(slug));
+      expect(answer.status).toBe(409);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await serviceRowsFor(slug)).toBe(0);
+    expect(await connectorPrincipalsFor(slug)).toBe(0);
+    expect(await descriptorRows(slug)).toEqual([]);
+  });
+
+  it('an invalid descriptor is a named 422 and leaves nothing behind', async () => {
+    const slug = `s1-bad-${tag()}`;
+    const body = harnessBody(slug);
+    (body.descriptor as any).telemetry.tier = 'loud';
+    const refused = await call(SESSIONS.user, 'POST', '/services', body);
+    expect(refused.status).toBe(422);
+    expect(refused.json.code).toBe('DESCRIPTOR_INVALID_TELEMETRY');
+    expect(await serviceRowsFor(slug)).toBe(0);
+    expect(await connectorPrincipalsFor(slug)).toBe(0);
+  });
+
+  it('a descriptor on a plain service is refused by name', async () => {
+    const slug = `s1-plain-${tag()}`;
+    const body: any = { ...harnessBody(slug), kind: 'service' };
+    delete body.issueCredential;
+    const refused = await call(SESSIONS.admin, 'POST', '/services', body);
+    expect(refused.status).toBe(422);
+    expect(refused.json.code).toBe('INVALID_SERVICE_VALUE');
+    expect(await serviceRowsFor(slug)).toBe(0);
+  });
+
+  it('a dry run publishes nothing', async () => {
+    const slug = `s1-dry-${tag()}`;
+    const body: any = harnessBody(slug);
+    delete body.issueCredential;
+    const answer = await call(SESSIONS.user, 'POST', '/services?dryRun=true', body);
+    expect(answer.status).toBe(201);
+    expect(answer.json.dryRun).toBe(true);
+    expect(await serviceRowsFor(slug)).toBe(0);
+    expect(await descriptorRows(slug)).toEqual([]);
+  });
+
+  it('CONTROL: a connector registered without a descriptor stays a draft with no version', async () => {
+    const slug = `s1-control-${tag()}`;
+    const created = await call(SESSIONS.user, 'POST', '/services', connectBody(slug, ['tasks:read'], 'any'));
+    expect(created.status).toBe(201);
+    expect(created.json.service.status).toBe('draft');
+    expect(await descriptorRows(slug)).toEqual([]);
+  });
+
+  // ── Owner rulings E475 (1) and E480: what the harness token can do with a Blueprint ──
+  //
+  // E475 gave the set `blueprints:use` and NOT `blueprints:read`; E480 adds
+  // `projects:write` and `phases:write`, so the token instantiates a Blueprint
+  // and does not only preview it. These measure, with a token minted by the
+  // wizard's own route and through the production router, what that token can
+  // do with a published Blueprint, so the docs say what is true rather than what
+  // the scope names suggest. Object grants on the Blueprint and the target
+  // Project are given outright: the question is the SCOPE set, not the object
+  // authority.
+
+  /** A published Blueprint that creates two Tasks and one Report in an existing
+   *  Project; with `phased`, it also creates one Phase and puts both Tasks in it. */
+  async function publishedBlueprint(phased = false): Promise<string> {
+    const inPhase = phased ? { phase: 'prepare' } : {};
+    const doc = {
+      schemaVersion: 'rh.blueprint/1.0',
+      blueprint: { key: `e475-${tag()}`, name: 'Harness set probe', version: 1, summary: '', description: '', tags: [], provenance: 'human-authored' },
+      parameters: [{ key: 'project', label: 'Project', promptText: 'Which existing Project?', type: 'project-ref', required: true }],
+      target: { mode: 'existing-project', project: '{{project}}' },
+      phases: phased ? [{ key: 'prepare', name: 'Prepare', position: 0 }] : [],
+      tasks: [{ key: 'first', title: 'First', ...inPhase, subtasks: [{ text: 'Check' }] }, { key: 'second', title: 'Second', ...inPhase }],
+      dependencies: [{ task: 'second', dependsOn: 'first' }],
+      references: [], humanGates: [],
+      reports: [{ key: 'record', title: 'Record', content: 'Ordinary record', tasks: ['first', 'second'] }],
+    };
+    const drafted = await call(SESSIONS.operator, 'POST', '/blueprints', doc);
+    expect(drafted.status).toBe(201);
+    const id: string = drafted.json.blueprint.id;
+    expect((await call(SESSIONS.operator, 'POST', `/blueprints/${id}/versions/1/submit`, {})).status).toBe(200);
+    // Publication is an independent act: a different principal from the author.
+    expect((await call(SESSIONS.admin, 'POST', `/blueprints/${id}/versions/1/publish`, {})).status).toBe(200);
+    return id;
+  }
+
+  /** A harness connector minted by the wizard's route with `scopes`, granted use of the Blueprint and the Project. */
+  async function harnessConnector(scopes: string[], blueprintId: string, projectId: string): Promise<Caller> {
+    const slug = `e475-${tag()}`;
+    const created = await call(SESSIONS.user, 'POST', '/services',
+      { ...harnessBody(slug), issueCredential: { scopes, label: slug, transport: 'any' } });
+    expect(created.status).toBe(201);
+    const token: string = created.json.onboarding.credential.secretOnce;
+    const principalId = String((await pool.query('SELECT principal_id FROM services WHERE slug = $1', [slug])).rows[0].principal_id);
+    // The connector's effective authority is its own intersected with its Account's, so both are granted.
+    for (const grantee of [principalId, SESSIONS.user.principalId]) {
+      for (const [kind, id, verb] of [['blueprint', blueprintId, 'use'], ['project', projectId, 'read'], ['project', projectId, 'write']]) {
+        await pool.query(
+          `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+           VALUES ('principal', $1, $2, $3, $4, $5)`, [grantee, kind, id, verb, SESSIONS.admin.principalId]);
+      }
+    }
+    return bearer(`harness connector ${slug}`, principalId, token);
+  }
+
+  const existingProject = async (): Promise<string> => String((await pool.query(
+    "INSERT INTO projects (name, status, visibility) VALUES ($1, 'active', 'private') RETURNING id", [`E475 target ${tag()}`])).rows[0].id);
+
+  async function instantiate(who: Caller, blueprintId: string, body: unknown): Promise<Answer & { text: string }> {
+    const response = await fetch(`${origin}/blueprints/${blueprintId}/instantiations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `e475-${tag()}-${tag()}`, ...who.headers },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let json: any = null;
+    try { json = JSON.parse(text); } catch { json = null; }
+    return { status: response.status, json, text };
+  }
+
+  const counts = async (projectId: string) => (await pool.query(
+    `SELECT (SELECT count(*)::int FROM tasks WHERE project_id = $1) AS tasks,
+            (SELECT count(*)::int FROM phases WHERE project_id = $1) AS phases,
+            (SELECT count(*)::int FROM blueprint_instantiations) AS instantiations`, [projectId])).rows[0];
+
+  const targetBody = (project: string) => ({ target: { mode: 'existing-project', project }, parameterValues: { project } });
+
+  it('E480: the set is exactly sixteen: blueprints:use, projects:write and phases:write; never blueprints:read, root, an :admin scope or services:write', () => {
+    expect(HARNESS_SET).toHaveLength(16);
+    expect(new Set(HARNESS_SET).size).toBe(16);
+    expect(HARNESS_SET).toEqual(expect.arrayContaining(['blueprints:use', 'projects:write', 'phases:write']));
+    expect(HARNESS_SET).not.toContain('blueprints:read');
+    expect(HARNESS_SET).not.toContain(ROOT_SCOPE);
+    expect(HARNESS_SET).not.toContain('services:write');
+    expect(HARNESS_SET.filter((scope) => scope.endsWith(':admin'))).toEqual([]);
+  });
+
+  it('E480: the harness token previews AND instantiates a Blueprint, without blueprints:read', async () => {
+    const blueprintId = await publishedBlueprint();
+    const project = await existingProject();
+    const connector = await harnessConnector(HARNESS_SET, blueprintId, project);
+
+    // Discovery works on the use-only projection; the read-only version history does not.
+    const listed = await call(connector, 'GET', '/blueprints');
+    expect(listed.status).toBe(200);
+    expect(listed.json.blueprints.find((row: any) => row.id === blueprintId)?.projection).toBe('use');
+    const history = await call(connector, 'GET', `/blueprints/${blueprintId}/versions`);
+    expect(history.status).toBe(403);
+    expect(JSON.stringify(history.json)).toContain('blueprints:read');
+
+    // Preview: 200, and no authority is reported missing any more.
+    const preview = await call(connector, 'POST', `/blueprints/${blueprintId}/instantiations/preview`, targetBody(project));
+    expect(preview.status).toBe(200);
+    expect(preview.json.plan.counts).toMatchObject({ projects: 0, phases: 0, tasks: 2 });
+    expect(preview.json.plan.authority.length).toBeGreaterThan(0);
+    expect(preview.json.plan.authority.filter((item: any) => !item.allowed)).toEqual([]);
+    expect(JSON.stringify(preview.json.plan.authority)).not.toContain('blueprints:read');
+
+    // Instantiate: 201 through the real route, and the Tasks exist.
+    const before = await counts(project);
+    const created = await instantiate(connector, blueprintId, targetBody(project));
+    expect(created.status).toBe(201);
+    expect(Object.keys(created.json.tasks).sort()).toEqual(['first', 'second']);
+    expect(created.text).not.toContain('blueprints:read');
+    expect(await counts(project)).toEqual({ tasks: before.tasks + 2, phases: 0, instantiations: before.instantiations + 1 });
+  });
+
+  it('E480: the harness token instantiates a Blueprint WITH Phases: the Phase is created and both Tasks sit in it', async () => {
+    const blueprintId = await publishedBlueprint(true);
+    const project = await existingProject();
+    const connector = await harnessConnector(HARNESS_SET, blueprintId, project);
+
+    const preview = await call(connector, 'POST', `/blueprints/${blueprintId}/instantiations/preview`, targetBody(project));
+    expect(preview.status).toBe(200);
+    expect(preview.json.plan.counts).toMatchObject({ projects: 0, phases: 1, tasks: 2 });
+    // The Phase requirement is in the plan, and it is met.
+    expect(preview.json.plan.authority).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: 'phase.create', scope: 'phases:write', allowed: true })]));
+    expect(preview.json.plan.authority.filter((item: any) => !item.allowed)).toEqual([]);
+
+    const before = await counts(project);
+    const created = await instantiate(connector, blueprintId, targetBody(project));
+    expect(created.status).toBe(201);
+    expect(Object.keys(created.json.phases)).toEqual(['prepare']);
+    expect(Object.keys(created.json.tasks).sort()).toEqual(['first', 'second']);
+    expect(await counts(project)).toEqual({ tasks: before.tasks + 2, phases: before.phases + 1, instantiations: before.instantiations + 1 });
+    const inPhase = await pool.query('SELECT count(*)::int AS n FROM tasks WHERE project_id = $1 AND phase_id = $2',
+      [project, created.json.phases.prepare]);
+    expect(inPhase.rows[0].n).toBe(2);
+  });
+
+  it('E480 CONTROL: the set WITHOUT projects:write previews, lists projects:write missing, and the instantiation is refused by name, creating nothing', async () => {
+    // The E475 measurement, kept as the control that projects:write is what the
+    // instantiation above needed.
+    const blueprintId = await publishedBlueprint();
+    const project = await existingProject();
+    const connector = await harnessConnector(HARNESS_SET.filter((scope) => scope !== 'projects:write'), blueprintId, project);
+
+    const preview = await call(connector, 'POST', `/blueprints/${blueprintId}/instantiations/preview`, targetBody(project));
+    expect(preview.status).toBe(200);
+    expect(preview.json.plan.authority.filter((item: any) => !item.allowed))
+      .toEqual([expect.objectContaining({ operation: 'project.write', scope: 'projects:write' })]);
+
+    const before = await counts(project);
+    const refused = await instantiate(connector, blueprintId, targetBody(project));
+    expect(refused.status).toBe(403);
+    expect(refused.json).toMatchObject({ code: 'BLUEPRINT_AUTHORITY_REQUIRED', error: 'Required scope: projects:write' });
+    expect(refused.text).not.toContain('blueprints:read');
+    expect(await counts(project)).toEqual(before);
+  });
+
+  it('E480 CONTROL: the set WITHOUT phases:write is refused by name for a Blueprint with Phases, creating nothing', async () => {
+    const blueprintId = await publishedBlueprint(true);
+    const project = await existingProject();
+    const connector = await harnessConnector(HARNESS_SET.filter((scope) => scope !== 'phases:write'), blueprintId, project);
+
+    const preview = await call(connector, 'POST', `/blueprints/${blueprintId}/instantiations/preview`, targetBody(project));
+    expect(preview.status).toBe(200);
+    expect(preview.json.plan.authority.filter((item: any) => !item.allowed))
+      .toEqual([expect.objectContaining({ operation: 'phase.create', scope: 'phases:write' })]);
+
+    const before = await counts(project);
+    const refused = await instantiate(connector, blueprintId, targetBody(project));
+    expect(refused.status).toBe(403);
+    expect(refused.json).toMatchObject({ code: 'BLUEPRINT_AUTHORITY_REQUIRED', error: 'Required scope: phases:write' });
+    expect(await counts(project)).toEqual(before);
+  });
+
+  it('E475 CONTROL: without blueprints:use the same token cannot even preview', async () => {
+    const blueprintId = await publishedBlueprint();
+    const project = await existingProject();
+    const connector = await harnessConnector(HARNESS_SET.filter((scope) => scope !== 'blueprints:use'), blueprintId, project);
+    const refused = await call(connector, 'POST', `/blueprints/${blueprintId}/instantiations/preview`,
+      { target: { mode: 'existing-project', project }, parameterValues: { project } });
+    expect(refused.status).toBe(403);
+    expect(JSON.stringify(refused.json)).toContain('blueprints:use');
   });
 });

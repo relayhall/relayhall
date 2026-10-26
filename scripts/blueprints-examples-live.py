@@ -5,7 +5,7 @@ Only the local profile inspects the already-running owned Docker container.
 Database operations use Node pg in both profiles. No container lifecycle acts.
 Optional exporter mutation is confined to a disposable source copy.
 """
-import argparse,datetime,hashlib,json,os,pathlib,shutil,subprocess,urllib.parse
+import argparse,datetime,hashlib,json,os,pathlib,re,shutil,subprocess,time,urllib.parse
 
 NAMES={s:f'blueprint_examples_test_{s}_20260906' for s in 'abc'}
 KEYS=['DB_HOST','DB_PORT','DB_NAME','DB_USER','DB_PASSWORD']
@@ -65,11 +65,111 @@ def self_test(root,out):
  receipts.extend(json.loads(result.stdout));(out/'config-controls.json').write_text(json.dumps(receipts,indent=2))
  print('PASS',len(receipts),'non-DB configuration controls; no production module or connection opened',flush=True)
 
+def migration_progress(log_path,migration_names):
+ # Never publish arbitrary child text. Only exact pinned-source migration
+ # filenames on the runner's complete progress lines may leave the private log.
+ last_running=last_completed=None;completed=set();available=False
+ try:
+  with log_path.open(encoding='utf-8',errors='replace') as log:
+   available=True
+   for line in log:
+    match=re.fullmatch(r'(?:▶️  Running: |✅ Completed: )([0-9]{3}_[a-z0-9_]+\.sql)\s*',line)
+    if match is None or match.group(1) not in migration_names:continue
+    name=match.group(1)
+    if line.startswith('▶️  Running: '):last_running=name
+    else:last_completed=name;completed.add(name)
+ except OSError:pass
+ return {'logAvailable':available,'lastRunning':last_running,'lastCompleted':last_completed,'completionCount':len(completed)}
+
+def run_phase(label,command,env,folder,cwd,timeout=180,migration_names=()):
+ match=re.fullmatch(r'([abc])-(init|migrate|tests)',label)
+ assert match is not None,'Unexpected fixture phase'
+ stage,phase=match.groups();scenario=folder.name if folder.name in {'baseline','exporter-mutant','exporter-restored'} else None;start=datetime.datetime.now(datetime.timezone.utc).isoformat();clock=time.monotonic()
+ log_path=folder/(label+'.log');exit_code=None;outcome='startup-error'
+ print(json.dumps({'fixturePhase':{'scenario':scenario,'stage':stage,'phase':phase,'event':'start','startedAt':start,'timeoutSeconds':timeout}}),flush=True)
+ try:
+  with log_path.open('wb') as log:
+   os.fchmod(log.fileno(),0o600)
+   try:result=subprocess.run(command,cwd=cwd,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=timeout)
+   except subprocess.TimeoutExpired:outcome='timeout';raise
+  exit_code=result.returncode;outcome='exit'
+  return exit_code
+ finally:
+  evidence={'scenario':scenario,'stage':stage,'phase':phase,'event':'end','startedAt':start,'endedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'elapsedSeconds':max(0,time.monotonic()-clock),'timeoutSeconds':timeout,'outcome':outcome,'exitCode':exit_code,'privateLog':log_path.name}
+  if phase=='migrate':evidence.update(migration_progress(log_path,set(migration_names)))
+  print(json.dumps({'fixturePhase':evidence}),flush=True)
+
+class FixtureAdminError(AssertionError):
+ # An admin statement failed. Carries only the driver's bounded error identifier
+ # (a SQLSTATE such as 3D000, or an error name), never SQL, stderr, connection
+ # settings or server messages. Still an AssertionError, as the failure was before.
+ def __init__(self,code):super().__init__('Fixture admin SQL failed (no deployment fallback)');self.code=code
+
+def admin_sql(root,env,statement,params=None):
+ program="const fs=require('fs'),{Client}=require('pg');const input=JSON.parse(fs.readFileSync(0,'utf8'));const client=new Client({host:process.env.DB_HOST,port:Number(process.env.DB_PORT),database:'postgres',user:process.env.DB_USER,password:process.env.DB_PASSWORD});(async()=>{await client.connect();try{const r=await client.query(input.sql,input.params);process.stdout.write(JSON.stringify(r.rows))}finally{await client.end()}})().catch(e=>{console.error('Fixture admin SQL failed:',e.code||e.name);process.exit(1)});"
+ result=subprocess.run(['node','-e',program],cwd=root/'backend',env=env,input=json.dumps({'sql':statement,'params':params or []}),text=True,capture_output=True,timeout=30)
+ if result.returncode!=0:
+  # Preserve only the driver's bounded error identifier, never SQL, stderr,
+  # connection settings or server messages (which may contain credentials).
+  match=re.fullmatch(r'Fixture admin SQL failed: ([A-Za-z0-9_]{1,64})\s*',result.stderr)
+  code=match.group(1) if match else 'UNCLASSIFIED'
+  print(json.dumps({'fixtureAdminFailure':code,'exit':result.returncode}),flush=True)
+  raise FixtureAdminError(code)
+ return json.loads(result.stdout)
+
+DROP_POLL_SECONDS=2;DROP_POLL_BUDGET_SECONDS=120
+
+def failure_cause(error,phase):
+ # Card 696f3bb8 (CI run 5685 job 14990): a migrate that timed out was reported
+ # only as "Owned DB cleanup incomplete", because the cleanup error raised in
+ # the finally replaced it. The cause is carried into the cleanup record and its
+ # error, bounded and payload-free: the phase label, its budget, the exception
+ # type, and for an AssertionError this script's own literal text.
+ where=phase or 'scenario setup'
+ if isinstance(error,subprocess.TimeoutExpired):return f'{where} timed out after {round(error.timeout)} s'
+ if isinstance(error,FixtureAdminError):return f'{where}: FixtureAdminError {error.code}'
+ if isinstance(error,AssertionError) and str(error):return f'{where}: AssertionError: {error}'
+ return f'{where}: {type(error).__name__}'
+
+def absence_confirmed(sql,name):
+ # One catalog read. A read that itself times out is no evidence either way.
+ try:return sql('SELECT count(*)::int AS n FROM pg_database WHERE datname=$1',[name])==[{'n':0}]
+ except subprocess.TimeoutExpired:return False
+
+def wait_for_absence(sql,name):
+ # A client-side timeout does not stop a server-side DROP DATABASE ... WITH (FORCE):
+ # it can commit after the client gave up, so one immediate read can still see the
+ # row. Re-read on a bounded budget; a row still present when it is spent fails.
+ deadline=time.monotonic()+DROP_POLL_BUDGET_SECONDS
+ while not absence_confirmed(sql,name):
+  if time.monotonic()>=deadline:return False
+  time.sleep(DROP_POLL_SECONDS)
+ return True
+
+def drop_owned_database(sql, name, created, dropped=()):
+ # Only this invocation's admitted fixtures may be removed, and only while one of
+ # their creations is not yet recorded as dropped (a name is created again by
+ # each scenario, so creations and drops are counted, not looked up).
+ assert name in NAMES.values() and any(row['database']==name for row in created)
+ assert sum(row['database']==name for row in created)>sum(row['database']==name for row in dropped)
+ try:
+  sql('DROP DATABASE "'+name+'" WITH (FORCE)')
+  return 'drop-confirmed'
+ except subprocess.TimeoutExpired:
+  if wait_for_absence(sql,name):return 'absence-confirmed-after-timeout'
+  raise
+ except FixtureAdminError as error:
+  # SQLSTATE 3D000 (the driver's bounded code): an earlier timed-out DROP of this
+  # owned name committed after its own check. Corroborate with a catalog read
+  # (which also needs the admin database to exist); every other code still fails.
+  if error.code=='3D000' and wait_for_absence(sql,name):return 'absent-before-drop'
+  raise
+
 def main():
  p=argparse.ArgumentParser();p.add_argument('--root',type=pathlib.Path,required=True);p.add_argument('--output',type=pathlib.Path,required=True);p.add_argument('--profile',choices=['local','ci']);p.add_argument('--env-file',type=pathlib.Path);p.add_argument('--self-test',action='store_true');p.add_argument('--with-exporter-mutation',action='store_true');args=p.parse_args()
  root=args.root.resolve();out=args.output.resolve();assert (root/TEST).is_file()
  assert root!=out and root not in out.parents and out not in root.parents
- out.mkdir(parents=True,exist_ok=False)
+ out.mkdir(parents=True,exist_ok=False,mode=0o700)
  if args.self_test:self_test(root,out);return
  if args.profile=='local':
   assert args.env_file and args.env_file.is_file(),'Local profile requires explicit owner fixture env file'
@@ -82,36 +182,41 @@ def main():
   config=admit('ci',{k:os.environ.get(k) for k in KEYS},os.environ.get('CI'))
  base_env=clean_environment(config)
  manifest={'profile':args.profile,'created':[],'dropped':[],'cleanupErrors':[]}
- current=set();receipts=[];copy=out/'source-copy'
+ current=set();receipts=[];copy=out/'source-copy';phase=[None];causes=[]
  def record():
   manifest['currentlyOwned']=sorted(current);manifest['updatedAt']=datetime.datetime.now(datetime.timezone.utc).isoformat();(out/'database-manifest.json').write_text(json.dumps(manifest,indent=2))
- def sql(statement,params=None):
-  program="const fs=require('fs'),{Client}=require('pg');const input=JSON.parse(fs.readFileSync(0,'utf8'));const client=new Client({host:process.env.DB_HOST,port:Number(process.env.DB_PORT),database:'postgres',user:process.env.DB_USER,password:process.env.DB_PASSWORD});(async()=>{await client.connect();try{const r=await client.query(input.sql,input.params);process.stdout.write(JSON.stringify(r.rows))}finally{await client.end()}})().catch(e=>{console.error('Fixture admin SQL failed:',e.code||e.name);process.exit(1)});"
-  result=subprocess.run(['node','-e',program],cwd=root/'backend',env=base_env,input=json.dumps({'sql':statement,'params':params or []}),text=True,capture_output=True,timeout=30)
-  assert result.returncode==0,'Fixture admin SQL failed (no deployment fallback)';return json.loads(result.stdout)
+ def sql(statement,params=None):return admin_sql(root,base_env,statement,params)
  def fingerprints():
   files=list((root/'backend/src').rglob('*'))+list((root/'backend/scripts').rglob('*'))+list((root/'docs/blueprints/examples').glob('*.json'))+[root/f for f in ['database/init.sql','backend/package.json','backend/package-lock.json','backend/jest.config.js','backend/tsconfig.json','scripts/blueprints-examples-live.py']]
   return {str(f.relative_to(root)):hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(set(files)) if f.is_file() and ('__tests__' not in f.parts or f.name=='blueprintExamplesLive.test.ts')}
  def run(label,command,env,folder,timeout=180):
-  with (folder/(label+'.log')).open('wb') as log:result=subprocess.run(command,cwd=copy/'backend',env=env,stdout=log,stderr=subprocess.STDOUT,timeout=timeout)
-  return result.returncode
+  names={f.name for f in (copy/'backend/src/migrations').glob('*.sql')}
+  phase[0]=label
+  return run_phase(label,command,env,folder,copy/'backend',timeout,names)
  def cleanup(label):
+  cause=causes[0] if causes else None
+  if cause:print(json.dumps({'fixtureCleanupAfterFailure':{'scenario':label,'cause':cause,'owned':sorted(current)}}),flush=True)
   for name in sorted(current,reverse=True):
    try:
-    assert name in NAMES.values() and any(r['database']==name for r in manifest['created'])
-    sql('DROP DATABASE "'+name+'" WITH (FORCE)');current.remove(name);manifest['dropped'].append({'database':name,'scenario':label});record()
+    outcome=drop_owned_database(sql,name,manifest['created'],manifest['dropped'])
+    current.remove(name);manifest['dropped'].append({'database':name,'scenario':label,'outcome':outcome});record()
    except Exception as error:manifest['cleanupErrors'].append({'database':name,'errorType':type(error).__name__});record()
-  if current:raise RuntimeError('Owned DB cleanup incomplete; see exact-name manifest')
+  if current:
+   # CI disposes the job filesystem; retain the exact-name, payload-free
+   # ownership/error-type evidence in its log before preserving the failure.
+   if cause:manifest['cleanupCause']=cause;record()
+   print(json.dumps({'fixtureCleanupFailure':manifest}),flush=True)
+   raise RuntimeError('Owned DB cleanup incomplete'+(' after '+cause if cause else '')+'; see exact-name manifest')
  def scenario(label,stages,mutation=False):
-  folder=out/label;folder.mkdir()
+  folder=out/label;folder.mkdir();phase[0]=None
   try:
    for name in NAMES.values():assert sql('SELECT count(*)::int AS n FROM pg_database WHERE datname=$1',[name])[0]['n']==0,'Example DB already exists; refuse rather than adopt'
    for stage in stages:
-    name=NAMES[stage];sql('CREATE DATABASE "'+name+'" TEMPLATE template0');current.add(name);manifest['created'].append({'database':name,'scenario':label});record()
+    name=NAMES[stage];phase[0]=stage+'-create';sql('CREATE DATABASE "'+name+'" TEMPLATE template0');current.add(name);manifest['created'].append({'database':name,'scenario':label});record()
     env={**base_env,'DB_NAME':name,'BLUEPRINT_EXAMPLE_STAGE':stage,'BLUEPRINT_EXAMPLE_PROFILE':args.profile,'BLUEPRINT_EXAMPLE_ARTIFACTS':str(folder)}
     env['RELAYHALL_TEST_DB_URL']='postgresql://'+urllib.parse.quote(config['DB_USER'],safe='')+':'+urllib.parse.quote(config['DB_PASSWORD'],safe='')+'@'+config['DB_HOST']+':'+config['DB_PORT']+'/'+name
     assert run(stage+'-init',['node','scripts/load-base-schema.js'],env,folder)==0,'Fixture schema initialization failed'
-    assert run(stage+'-migrate',['npm','run','migrate'],env,folder)==0,'Fixture migration failed'
+    assert run(stage+'-migrate',['npm','run','migrate'],env,folder,timeout=900)==0,'Fixture migration failed'
     report=folder/(stage+'-jest.json');rc=run(stage+'-tests',['node','node_modules/jest/bin/jest.js','--runInBand','--testPathIgnorePatterns=/node_modules/','--runTestsByPath','src/__tests__/blueprintExamplesLive.test.ts','--json','--outputFile',str(report)],env,folder)
     assert report.is_file(),'No structured Jest assertions (not evidence)';result=json.loads(report.read_text());failed=[a for suite in result.get('testResults',[]) for a in suite.get('assertionResults',[]) if a.get('status')=='failed']
     receipt={'scenario':label,'stage':stage,'passed':result.get('numPassedTests'),'failed':result.get('numFailedTests')}
@@ -123,6 +228,9 @@ def main():
     else:
      assert rc==0 and result.get('success') and result.get('numPassedTests')=={'a':3,'b':4,'c':2}[stage] and not failed,'Example baseline/restored assertions must pass'
     receipts.append(receipt);(out/'test-receipts.json').write_text(json.dumps(receipts,indent=2));print(label,stage,receipt['passed'],'PASS',receipt['failed'],'intended RED' if mutation else 'FAIL',flush=True)
+  except BaseException as error:
+   if not causes:causes.append(failure_cause(error,phase[0]))
+   raise
   finally:cleanup(label)
  record();before=fingerprints();(out/'source-snapshot.json').write_text(json.dumps(before,indent=2))
  try:

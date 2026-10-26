@@ -627,7 +627,7 @@ def main() -> int:
 
     files = css_files()
     texts = {p: p.read_text(encoding="utf-8") for p in files}
-    rel = {p: str(p.relative_to(ROOT)) for p in files}
+    rel = {p: p.relative_to(ROOT).as_posix() for p in files}
     baseline = load_baseline()
 
     if args.update_literal_baseline:

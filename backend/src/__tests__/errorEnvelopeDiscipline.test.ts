@@ -30,26 +30,47 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import * as ts from 'typescript';
 
+// Owner ruling E462 S4b: the Verifier identity check reads the chain guard in
+// SQL (covered live by verificationModesLive); this suite models only the
+// identity half of it.
+jest.mock('../services/VerificationModes', () => ({
+  ...jest.requireActual('../services/VerificationModes'),
+  verifierStanding: jest.fn(async (_q: unknown, task: { verifier_principal_id?: string | null }, principalId: string | null) =>
+    (principalId && task.verifier_principal_id === principalId ? 'exact' : null)),
+}));
 jest.mock('../db/connection', () => ({
   pool: { query: jest.fn(async () => ({ rows: [] })), connect: jest.fn() },
 }));
 jest.mock('../services/AuthorizationRepository', () => ({
   authorizationRepository: {
     authorizedIds: jest.fn(async (_actor: unknown, _type: string, _ids: string[]) => new Set<string>()),
+    // Card b1e3b16d (hub lane L2): the notification read builds its task list
+    // scope before it reads, so the failure below is the READ's own.
+    listScope: jest.fn((_actor: unknown, type: string) => ({
+      type, from: 'tasks t', id: 't.id', render: () => ({ sql: 'FALSE', params: [] }),
+    })),
     authorizePoint: jest.fn(async (actor: { principalId?: string }, type: string, id: string, verb: string) => ({
       allowed: actor.principalId === '99999999-9999-4999-8999-999999999999'
         && type === 'task' && id === '00000000-0000-4000-8000-000000000000' && verb === 'verify',
     })),
   },
 }));
-jest.mock('../services/NotificationManager', () => ({
-  notificationManager: {
-    getUnreadNotifications: jest.fn(async () => { throw new Error('SECRET-DB-DETAIL row=(a,b,c)'); }),
-    getNotifications: jest.fn(async () => []),
-    markAsRead: jest.fn(async () => true),
-    markAllAsRead: jest.fn(async () => 0),
-  },
-}));
+// Card b1e3b16d (hub lane L2): the notification history is read from the
+// ledgers through NotificationHistoryService; ITS failure is the one the
+// envelope must not echo.
+const mockNotificationReadFailure = jest.fn(async () => { throw new Error('SECRET-DB-DETAIL row=(a,b,c)'); });
+jest.mock('../services/NotificationHistoryService', () => {
+  const actual = jest.requireActual('../services/NotificationHistoryService');
+  return {
+    ...actual,
+    notificationHistoryService: {
+      list: (...args: unknown[]) => mockNotificationReadFailure(...(args as [])),
+      unreadCount: jest.fn(async () => 0),
+      markRead: jest.fn(async () => false),
+      markAllRead: jest.fn(async () => 0),
+    },
+  };
+});
 const taskManagerBehavior: {
   createTask: (() => Promise<unknown>) | null;
   archiveTask: (() => Promise<unknown>) | null;
@@ -142,6 +163,10 @@ const APPROVED_CLASSES = new Set([
   // developer-authored in `services/FirstRunService` by construction, and no
   // arm of it ever quotes a caught value.
   'FirstRunError',
+  // Selector amendment v1.1 (accepted 80ffd828): both constructor messages
+  // are literals; production codes/statuses are fixed at call sites and the
+  // optional auditRef is core-generated, never source/caller error text.
+  'KnowledgeSelectorError',
   // AZ-S4 (design 4d961e37 §6): warrant/approval/mint refusals carry
   // developer-authored codes and messages by construction.
   'WarrantError', 'ApprovalError', 'AgentMintError',
@@ -180,6 +205,17 @@ const APPROVED_CLASSES = new Set([
   // and message are developer-authored in `services/HomeGroupService` by
   // construction and no arm of it quotes a caught value.
   'HomeGroupError',
+  // Card 549cc51f: the shared-area writer list's refusals. Status, code, field
+  // and message are developer-authored literals in
+  // services/KnowledgeSharedWriterService; no arm quotes a caught value, a
+  // reason or a secret.
+  'SharedWriterError',
+  // Card bedf50cc (plugin availability and settings, E380): the plugin
+  // settings refusals. Status, code, field (a setting KEY, never a value) and
+  // message are developer-authored literals in services/PluginSettingsSchema
+  // and services/PluginSettingsService; no arm quotes a caught value, a value
+  // or a secret. PluginNotFoundError answers the fixed concealment body.
+  'PluginSettingsError', 'PluginRevisionError', 'PluginNotFoundError',
 ]);
 
 /** Calls whose return value is safe even though a caught value went in:
@@ -207,10 +243,26 @@ const APPROVED_RESPONSE_HELPERS = new Set([
   'sendStringTooLongError', 'sendSkillError', 'sendError', 'next',
   'respondFailure', 'sendGrantError', 'sendGroupError', 'sendAccessProfileError', 'sendCredentialLifecycleError', 'sendPhaseError', 'sendCharterError',
   'sendServiceError', 'sendTaskElementError',
+  // Exact PZ001-only helpers send fixed 409 envelopes; neither copies caught text.
+  'sendFlatReviewContention', 'sendReviewEvidenceBusy',
   // RH-LENSES-a (card 74e02a05): forwards ONLY typed DirectoryCarriageError
   // refusals (instanceof-guarded) and returns false for anything else,
   // which then rides logCaughtFailure and the generic 500 envelope.
   'sendCarriageError',
+  // Owner rulings E413 and E418(b): the grant revoke and bulk revoke step-up
+  // refusal. It forwards ONLY a typed StepUpError (instanceof-guarded) whose
+  // status, code and message are developer-authored in StepUpService, plus
+  // the typed SU-14 challenge, after a durable denied audit, and returns false
+  // for anything else, which then rides sendGrantError and the 500 handling.
+  'sendStepUpRefusal',
+  // Card 311229fd (AZ-A12 clause 9(e)): the Group ownership transfer act's
+  // refusals. It forwards ONLY a typed GroupOwnershipTransferError
+  // (instanceof-guarded) whose status, code, field and message are
+  // developer-authored literals in GroupOwnershipTransfer and the two
+  // ownership services, plus the typed SU-14 challenge, and returns false for
+  // anything else, which then rides the route's existing contract and 500
+  // handling.
+  'sendGroupTransferRefusal',
   // Cards 9c3a1aa4 / 7d38a6e0: the shared Task write-field refusal, shaped
   // exactly like sendPhaseBindingRefusal beside it. It forwards ONLY a
   // typed TaskFieldError (instanceof-guarded) whose code, field and message
@@ -227,6 +279,40 @@ const APPROVED_RESPONSE_HELPERS = new Set([
   // false for anything else, which then rides logCaughtFailure + the
   // generic envelope.
   'sendWarrantError', 'sendApprovalError', 'sendMintError',
+  // Card 549cc51f: the shared-area writer list's route-local sender. It
+  // forwards only a typed SharedWriterError or StepUpError (instanceof-guarded)
+  // with their developer-authored code, field and message plus the typed SU-14
+  // challenge, and returns false for anything else, which then rides
+  // logCaughtFailure and the generic 500 envelope.
+  'sendSharedWriterError',
+  // Card 08792425 (member N6): knowledge source registration's route-local
+  // sender. It forwards only a typed KnowledgeSourceRegistrationError,
+  // StepUpError or ServiceRegistryError (instanceof-guarded) with their
+  // developer-authored code, field and message plus the typed SU-14 challenge,
+  // and the lifecycle-policy envelope exactly as sendServiceError does; it
+  // returns null for anything else, which then rides logCaughtFailure and the
+  // generic 500 envelope.
+  'sendRegistrationError',
+  // Card bedf50cc: the plugin host and administration routes' sender. It
+  // forwards only a typed PluginNotFoundError (the fixed 404 body),
+  // PluginRevisionError, PluginSettingsError or StepUpError (instanceof-
+  // guarded) with developer-authored code, field and message plus the typed
+  // SU-14 challenge, and returns false for anything else, which then rides
+  // logCaughtFailure and the generic 503 envelope with its errorId.
+  'sendPluginSettingsError',
+  // AZ-A9 clause 9 (card 785e1eed P1-B): the /delegation/access-requests
+  // sender, the same shape as sendMintError beside it. It forwards only the
+  // typed ApprovalError / AgentMintError / AccessProfileError refusals
+  // (instanceof-guarded) with their developer-authored {rule, subject, clause},
+  // and returns false for anything else, which then rides logCaughtFailure and
+  // the generic 500 envelope.
+  'sendAccessRequestError',
+  // Card 1a38270d (AZ-A13): the three edit routes' sender
+  // (routes/authorityEditRoute.ts), the same shape as sendAccessRequestError.
+  // It forwards only the typed AuthorityEditError (instanceof-guarded) with its
+  // developer-authored {rule, subject, clause}, and returns false for anything
+  // else, which then rides logCaughtFailure and the generic 500 envelope.
+  'sendAuthorityEditError',
   // RH-P5.SSO.W2: forwards only the typed relying-party refusals above
   // (instanceof-guarded) and returns false for anything else, which then rides
   // logCaughtFailure and the generic 500 envelope.
@@ -598,6 +684,8 @@ describe('AST taint gate: caught values never reach a response sink unguarded', 
       "try { f(); } catch (err) { res.send(`failed: ${err}`); }"],
     ['guard on a NON-approved class',
       "try { f(); } catch (err) { if (err instanceof Error) { res.status(500).json({ error: err.message }); } }"],
+    ['raw fields on a typed session lookup fault',
+      "try { f(); } catch (err) { if (err instanceof SessionAuthenticationUnavailableError) { const errorId = logCaughtFailure('[x]:', err); res.status(err.status).json({ error: err.message, code: err.code, errorId }); return; } }"],
     ['alias of an alias',
       "try { f(); } catch (err) { const a = err.message; const b = a; res.status(500).json({ error: b }); }"],
     ['assignment-expression alias (review 3db17273 r4 B1)',
@@ -620,6 +708,8 @@ describe('AST taint gate: caught values never reach a response sink unguarded', 
   const RED_HELPERS_AND_ORDER: Array<[string, string]> = [
     ['catch handing the caught value to an unapproved res-taking helper',
       "try { f(); } catch (err) { sendFancyError(res, err); }"],
+    ['a same-named session sender in an unrelated file remains unapproved',
+      "try { f(); } catch (err) { sendSessionAuthenticationUnavailable(res, err); }"],
     ['typed guard AFTER the sanitizer call drops the minted id',
       "try { f(); } catch (err) { const errorId = logCaughtFailure('[x]:', err); if (err instanceof RequestFaultError) { res.status(err.status).json({ success: false, code: err.code, error: err.message }); return; } res.status(500).json({ success: false, code: 'X_FAILED', error: 'It failed', errorId }); }"],
   ];
@@ -791,6 +881,8 @@ describe('behavioral proof: thrown text never reaches the caller', () => {
     expect(typeof body.errorId).toBe('string');
     expect(body.errorId.length).toBeGreaterThan(8);
     expect(JSON.stringify(body)).not.toContain('SECRET-DB-DETAIL');
+    // The 500 is the read's own failure, not an earlier one.
+    expect(mockNotificationReadFailure).toHaveBeenCalled();
   });
 
   test('a FOREIGN error carrying every dispatch phrase takes the fixed 500, never a sniffed status (review 3db17273 B4)', async () => {
@@ -812,7 +904,7 @@ describe('behavioral proof: thrown text never reaches the caller', () => {
     expect(JSON.stringify(body)).not.toContain('relation');
   });
 
-  test('POST /tasks keeps its base statuses: typed create-time faults take the fixed 500 (review 3db17273 r2 B1)', async () => {
+  test('POST /tasks forwards trusted create-time fault status and code', async () => {
     const { ForbiddenFault, ConflictFault } = jest.requireActual('../utils/httpErrors');
     const arms = [
       new ForbiddenFault('Only an independent Verifier identity can create a completed subtask'),
@@ -827,29 +919,37 @@ describe('behavioral proof: thrown text never reaches the caller', () => {
         body: JSON.stringify({ title: 'parity probe' }),
       });
       const body = (await response.json()) as any;
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(fault.status);
       expect(body).toMatchObject({
         success: false,
-        code: 'TASK_CREATE_FAILED',
-        error: 'The task could not be created',
+        code: fault.code,
+        error: fault.message,
       });
-      expect(typeof body.errorId).toBe('string');
-      expect(JSON.stringify(body)).not.toContain(fault.message);
+
     }
     taskManagerBehavior.createTask = null;
   });
 
-  test('POST /tasks/:id/archive keeps its base 400 for a typed agent-role refusal, 404 for typed not-found (review 3db17273 r3 B1)', async () => {
+  test('POST /tasks does not relay a foreign error with forged fault properties', async () => {
+    taskManagerBehavior.createTask = async () => { throw Object.assign(new Error('private driver detail'), { status: 403, code: 'FORBIDDEN' }); };
+    const response = await fetch(`${base}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'foreign fault probe' }) });
+    const body = await response.json() as any;
+    expect(response.status).toBe(500);
+    expect(body).toMatchObject({ success: false, code: 'TASK_CREATE_FAILED', error: 'The task could not be created' });
+    expect(typeof body.errorId).toBe('string');
+    expect(JSON.stringify(body)).not.toContain('private driver detail');
+    taskManagerBehavior.createTask = null;
+  });
+
+  test('POST /tasks/:id/archive returns 403 for a typed agent-role refusal, 404 for typed not-found (review 3db17273 r3 B1)', async () => {
     const { ForbiddenFault: FF, NotFoundFault: NF } = jest.requireActual('../utils/httpErrors');
     taskManagerBehavior.archiveTask = async () => { throw new FF("Implementation agents cannot move tasks to 'archived'"); };
     let response = await fetch(`${base}/tasks/00000000-0000-4000-8000-000000000000/archive`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     });
     let body = (await response.json()) as any;
-    expect(response.status).toBe(400);
-    expect(body).toMatchObject({ success: false, code: 'TASK_ARCHIVE_FAILED', error: 'The task could not be archived' });
-    expect(typeof body.errorId).toBe('string');
-    expect(JSON.stringify(body)).not.toContain('Implementation agents');
+    expect(response.status).toBe(403);
+    expect(body).toMatchObject({ success: false, code: 'FORBIDDEN', error: "Implementation agents cannot move tasks to 'archived'" });
 
     taskManagerBehavior.archiveTask = async () => { throw new NF('Task not found: 00000000-0000-4000-8000-000000000000', 'TASK_NOT_FOUND'); };
     response = await fetch(`${base}/tasks/00000000-0000-4000-8000-000000000000/archive`, {
@@ -858,6 +958,27 @@ describe('behavioral proof: thrown text never reaches the caller', () => {
     body = (await response.json()) as any;
     expect(response.status).toBe(404);
     expect(body).toMatchObject({ success: false, code: 'TASK_NOT_FOUND' });
+    taskManagerBehavior.archiveTask = null;
+  });
+
+  test('archive exposes only the new trusted authority refusal and conceals forged faults', async () => {
+    const { ForbiddenFault: FF } = jest.requireActual('../utils/httpErrors');
+    const denial = 'Archiving and restoring require a current human Account with Task WRITE';
+    for (const [fault, status, code] of [
+      [new FF(denial, 'TASK_ARCHIVE_FORBIDDEN'), 403, 'TASK_ARCHIVE_FORBIDDEN'],
+      [Object.assign(new Error('private driver detail'), { status: 403, code: 'TASK_ARCHIVE_FORBIDDEN' }), 400, 'TASK_ARCHIVE_FAILED'],
+    ] as const) {
+      taskManagerBehavior.archiveTask = async () => { throw fault; };
+      const response = await fetch(`${base}/tasks/00000000-0000-4000-8000-000000000000/archive`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      const body = await response.json() as any;
+      expect(response.status).toBe(status);
+      expect(body.code).toBe(code);
+      expect(JSON.stringify(body)).not.toContain('private driver detail');
+      if (status === 403) expect(body.error).toBe(denial);
+      else expect(typeof body.errorId).toBe('string');
+    }
     taskManagerBehavior.archiveTask = null;
   });
 

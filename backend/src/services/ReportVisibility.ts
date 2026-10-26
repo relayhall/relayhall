@@ -23,7 +23,8 @@
  *      assignment membership (`TaskElementService.filterPromotedReports`).
  */
 import type { AuthRequest } from '../middleware/auth';
-import { filterAuthorizedResources } from '../middleware/sharedAuthorization';
+import { authorizedListScope, filterAuthorizedResources } from '../middleware/sharedAuthorization';
+import type { AuthorizationListScope } from './AuthorizationRepository';
 import { scopesSatisfy } from '../utils/scopeMap';
 import { taskElementService } from './TaskElementService';
 import { reportManager } from './ReportManager';
@@ -101,6 +102,57 @@ export async function filterVisibleReports<T extends ReportVisibilityRow>(
     (report) => ({ type: 'report', id: report.id }),
   );
   return filterVisiblePromotions(req, authorized);
+}
+
+/**
+ * Narrowings 2 and 3 (plus the soft-delete exclusion) as SQL conjuncts over the
+ * Report row aliased `report`, for a read that must narrow IN THE QUERY: the
+ * Timeline's report arm (card 5854f0d6, Notifications and Timeline design
+ * section 4.5) pages with LIMIT, so a post-filter would return short pages.
+ * Narrowing 1 is the shared predicate the caller renders beside this, from
+ * `authorizedListScope(req, 'report', 'read')`.
+ *
+ * ONE builder, the same rule as `filterVisiblePromotions`:
+ *   - `r.deleted_at IS NULL` (the list and the point read both hide a
+ *     soft-deleted Report);
+ *   - narrowing 2: an auto-promoted Report only where its SOURCE TASK passes
+ *     the shared task predicate (the task list scope, correlated);
+ *   - narrowing 3: an auto-promoted `assigned-only` outpost Report only where
+ *     the caller is the claimant, shepherd or verifier of its source Task's
+ *     assignment; root is exempt, as `filterPromotedReports` is.
+ * A live parity test (notificationsTimelineLive) proves this builder and
+ * `filterVisibleReports` return the same id set for two Accounts over seeded
+ * promoted, outpost and deleted Reports. `params` is the statement's parameter
+ * list; the builder appends what it binds and never interpolates data.
+ */
+export function reportVisibilitySql(
+  report: string,
+  input: { taskScope: AuthorizationListScope<'task'>; principalId: string; root: boolean },
+  params: unknown[],
+): string {
+  const taskNarrowing = input.taskScope.render(params.length + 1);
+  params.push(...taskNarrowing.params);
+  params.push(input.principalId);
+  const me = `$${params.length}`;
+  const sourceTaskVisible = `EXISTS (SELECT 1 FROM ${input.taskScope.from}
+             WHERE ${input.taskScope.id} = ${report}.source_task_id AND ${taskNarrowing.sql})`;
+  const assigned = `EXISTS (SELECT 1 FROM task_assignments report_assignment
+             WHERE report_assignment.task_id = ${report}.source_task_id
+               AND ${me}::uuid IN (report_assignment.claimant_principal_id,
+                 report_assignment.shepherd_principal_id, report_assignment.verifier_principal_id))`;
+  return `(${report}.deleted_at IS NULL
+      AND (NOT COALESCE(${report}.auto_promoted, FALSE) OR ${sourceTaskVisible})
+      AND (${input.root ? 'TRUE' : 'FALSE'}
+        OR NOT (COALESCE(${report}.auto_promoted, FALSE)
+          AND ${report}.source_outpost_visibility_tier IS NOT DISTINCT FROM 'assigned-only')
+        OR ${assigned}))`;
+}
+
+/** `reportVisibilitySql`'s input for one request: the task list scope and the
+ * promoted-report actor `filterVisiblePromotions` uses, never a second copy. */
+export function reportVisibilityInput(req: AuthRequest): { taskScope: AuthorizationListScope<'task'>; principalId: string; root: boolean } {
+  const promoted = promotedReportActor(req);
+  return { taskScope: authorizedListScope(req, 'task', 'read'), principalId: promoted.principalId, root: promoted.root };
 }
 
 /**

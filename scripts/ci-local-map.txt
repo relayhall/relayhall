@@ -1,0 +1,67 @@
+# scripts/ci-local-map.txt - local database requirements for scripts/ci-local.py.
+#
+# In CI every live suite sees the job's service: host `postgres`, port 5432 and
+# the service's own database name, which each suite guard admits through its CI
+# arm. Locally the database is on 127.0.0.1, so a suite is admitted only through
+# its LOCAL arm, and that arm usually asks for a database NAME that looks
+# disposable - some of them for one exact name. This file names those guards.
+# ci-local.py finds every file a step reaches (npm scripts, the test files they
+# name, the scripts a step runs and the files those name) and, before the step,
+# renames the job database to the one name every reached guard admits.
+# `python3 scripts/ci-local.py map` prints the resulting step list;
+# `python3 scripts/ci-local.py check` fails when a line here matches nothing, or
+# when a reached guard names a database this file does not cover.
+#
+# default <name>     the job database's name when no special guard applies. It
+#                    must satisfy the generic local arm below.
+# generic <regex>    the local arm most live suites share.
+# require <id> name=<local name> db=<regex> sig=<regex>
+#                    a reached file whose text matches sig admits only a loopback
+#                    database whose whole name matches db; name is the one used.
+# cionly <id> sig=<regex> note=<text>
+#                    a reached file that admits the CI service and no loopback
+#                    database the step's own arguments allow; the step is recorded
+#                    env-unmet with the note instead of failing for that reason.
+# known <literal> <why>
+#                    a database-name literal in a guard that needs no line above.
+
+default relayhall_ci_local_test
+generic (test|contract|fixture)
+
+# P2-D authority preview suite and its browser fixture: 127.0.0.1 or localhost
+# and a name starting relayhall_p2d_test.
+require p2d name=relayhall_p2d_test db=relayhall_p2d_test.* sig=relayhall_p2d_test
+# backend/src/__tests__/support/standaloneReportTestTarget.ts and the suites that
+# import it (standalone Report, account control, metrics, charter approval audit)
+# plus the charter approval audit drill: 127.0.0.1 and exactly this name.
+require report-sponsor name=relayhall_report_sponsor_test db=relayhall_report_sponsor_test sig=relayhall_report_sponsor_test|standaloneReportTestTarget\(
+# Native review and execution, Task creator access, claim and MCP Task history
+# suites: a loopback host and exactly this name.
+require native-review name=relayhall_native_review_test db=relayhall_native_review_test sig=relayhall_native_review_test
+# Immutable Personality versions suite: personality_contract_<suffix>.
+require personality-contract name=personality_contract_ci_local db=personality_contract_[a-z0-9_]+ sig=personality_contract_
+# Skill draft provenance suite: skill_provenance_<suffix>.
+require skill-provenance name=skill_provenance_ci_local_test db=skill_provenance_[a-z0-9_]+ sig=skill_provenance_
+# Skill ownership suite (migration 162): skill_ownership_<suffix>.
+require skill-ownership name=skill_ownership_ci_local_test db=skill_ownership_[a-z0-9_]+ sig=skill_ownership_
+# Task activity mutation controls (scripts/task-activity-mutations.py): 127.0.0.1
+# or localhost and exactly this name.
+require task-activity name=relayhall_task_activity_test db=relayhall_task_activity_test sig=relayhall_task_activity_test
+# The completion reference lifecycle job keeps its own service database name
+# (mixed_cleanup_test_lifecycle), which its local entry guard already admits.
+
+# The Blueprint example and replay-order drills take --profile ci in the workflow,
+# which admits only the CI service; their local profile uses a fixed fixture
+# container of their own.
+cionly blueprint-profile sig=blueprints_contract_20260906 note=the step passes --profile ci, which admits only the CI service; run the script with --profile local and its own fixture database instead
+
+known relayhall_ci the CI service database name (CI arm only)
+known relayhall_dev a deployment database name every live guard refuses
+known relayhall_tst a deployment database name every live guard refuses
+known relayhall_prod a deployment database name every live guard refuses
+known relayhall_boot_check_none the boot check's unreachable placeholder
+known relayhall_test_unreachable the mocked suite's unreachable default
+known relayhall_guard_probe a probe value inside the connection-guard suite
+known relayhall_scratch a probe value inside the connection-guard suite
+known relayhall_w2_r4_review a probe value inside the connection-guard suite
+known relayhall_scale_guard_probe a probe value of the scale guard suite

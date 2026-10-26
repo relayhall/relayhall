@@ -40,7 +40,7 @@ describe('post-089 live authentication baseline fixture', () => {
     expect(probes.some(({ path: probePath }) => probePath === '/status' || probePath === '/journal')).toBe(false);
   });
 
-  it('pins generic fail-closed authorization after proving the same principal key works in scope', () => {
+  it('pins fail-closed authorization that names only the scope the route requires, after proving the same principal key works in scope', () => {
     expect(byId.get('095-rh-key-tasks-in-scope')).toEqual({
       id: '095-rh-key-tasks-in-scope',
       method: 'GET',
@@ -63,12 +63,26 @@ describe('post-089 live authentication baseline fixture', () => {
       error: 'This identity is not authorized for the requested operation',
       code: 'FORBIDDEN',
       message: 'This identity is not authorized for the requested operation',
+      details: { requiredScopes: ['reports:read'] },
     });
-    expect(Object.keys(denial)).toEqual(['success', 'error', 'code', 'message']);
-    expect(reportsProbe?.body).not.toMatch(/reports:read|required scope/i);
+    expect(Object.keys(denial)).toEqual(['success', 'error', 'code', 'message', 'details']);
+    // The 403 keeps its status, code and text; the one addition is the scope
+    // the route ceiling checked. It is the route's own requirement and nothing
+    // of the credential: the key holds tasks:read, and that never appears.
+    expect(Object.keys(denial.details)).toEqual(['requiredScopes']);
+    expect(reportsProbe?.body).not.toContain('tasks:read');
 
-    // a658e191 captured a scope-disclosing denial. The shared-authorization
-    // hardening in bcf89ccb and 54566ac supersedes that stale expectation.
+    // History of this pin. a658e191 captured a scope-disclosing denial; the
+    // shared-authorization hardening in bcf89ccb and 54566ac, and the capture
+    // of b42af322 ("off-scope stays generic"), pinned the bare 4-key body
+    // instead. Owner ruling D6 (card fbeb86f1, KEEP) reverses that stance for
+    // the route ceiling: when the credential carries neither the route's scope
+    // nor root, the 403 names the scope it checked in details.requiredScopes,
+    // because the scope vocabulary and route families are already public
+    // (docs/api.md, /tool-catalogue requiredScope) and a credential that is
+    // told nothing cannot be repaired by its owner. This fixture is therefore
+    // the LIVE 5-key body, re-captured with backend/scripts/auth-baseline-capture.sh
+    // on a disposable stack built from main d9b291f6, not an edited expectation.
   });
 
   it('keeps both historical fixtures byte-identical', () => {

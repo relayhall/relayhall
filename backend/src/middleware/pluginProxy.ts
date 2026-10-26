@@ -15,6 +15,14 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import http from 'http';
+import { authMiddleware, type AuthRequest } from './auth';
+import { activePluginAccount } from '../services/PluginAccountScope';
+import { isPluginV1, pluginAccountCan, pluginAccountHasExplicitGrant, matchingPluginRule } from '../services/PluginHostContract';
+import { actorFromRequest } from './sharedAuthorization';
+import { authorizationRepository } from '../services/AuthorizationRepository';
+import { isValidTaskId } from '../utils/taskIds';
+import { signPluginAssertion } from '../services/PluginAssertion';
+import { pluginAvailableTo } from '../services/PluginSettingsService';
 import jwt from 'jsonwebtoken';
 import { PluginLoader, PluginProxyRoute } from '../services/PluginLoader';
 import { getJwtSecret } from '../config/secrets';
@@ -37,6 +45,7 @@ const FORWARDED_REQUEST_HEADERS = new Set([
   'content-type',
   'if-modified-since',
   'if-none-match',
+  'if-range',
   'last-event-id',
   'range',
   'user-agent',
@@ -152,9 +161,9 @@ export function findPluginProxyRoute(
   routes: PluginProxyRoute[],
   path: string
 ): PluginProxyRoute | undefined {
-  return routes.find(
+  return routes.filter(
     route => path === route.pathPrefix || path.startsWith(`${route.pathPrefix}/`)
-  );
+  ).sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0];
 }
 
 /** Whether a method+sub-path pair is permitted by the route's compiled allowlist. */
@@ -203,6 +212,20 @@ export function hasTraversal(rawPath: string): boolean {
   return decoded.split('/').includes('..');
 }
 
+/**
+ * Append the unmatched public suffix under proxy_to. Authorization uses the
+ * final upstream pathname, so aliases cannot bypass a narrower capability.
+ */
+export function resolvePluginProxyTarget(route: PluginProxyRoute, requestPath: string): URL {
+  const suffix = requestPath.slice(route.pathPrefix.length);
+  if (hasTraversal(requestPath) || isHostOverridingPath(suffix) || requestPath.includes('\\')) throw new Error('Invalid plugin path');
+  const base = new URL(route.target);
+  const result = new URL(base);
+  result.pathname = suffix ? base.pathname.replace(/\/+$/, '') + suffix : base.pathname;
+  if (base.username || base.password || !resolvesToPluginOrigin(route.target, result)) throw new Error('Invalid plugin origin');
+  return result;
+}
+
 export function createPluginProxy(pluginLoader: PluginLoader) {
   return async (req: Request, res: Response, next: NextFunction) => {
     const routes = pluginLoader.getProxyRoutes();
@@ -214,7 +237,54 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
       return;
     }
 
-    if (!(await isBrowserAccessAuthorized(req))) {
+    let targetUrl: URL;
+    try { targetUrl = resolvePluginProxyTarget(route, req.path); }
+    catch { res.status(404).json({ error: 'Not Found' }); return; }
+    const targetPath = targetUrl.pathname;
+    const plugin = pluginLoader.getPlugin(route.pluginName);
+    const v1 = !!plugin?.manifest && isPluginV1(plugin.manifest);
+    let assertion: string | undefined;
+    if (v1) {
+      // V1 never falls back to the legacy broad browser capability.
+      let authenticated = false;
+      await authMiddleware(req as AuthRequest, res, () => { authenticated = true; });
+      if (!authenticated) return;
+      const scope = ['GET','HEAD'].includes(req.method) ? 'services:read' : 'services:write';
+      const scopes = (req as AuthRequest).scopes ?? [];
+      if (!scopes.includes('root') && !scopes.includes(scope)) {
+        res.status(403).json({code:'PLUGIN_SCOPE_REQUIRED'}); return;
+      }
+      try {
+        const account = await activePluginAccount(req as AuthRequest);
+        const rule = matchingPluginRule(route.allow,req.method,targetPath);
+        const capability = rule?.capability ?? 'view';
+        // A write needs the explicit per-Account grant; the deployment view
+        // default admits reads only, whatever the selected rule is labelled.
+        const granted = scope === 'services:write'
+          ? pluginAccountHasExplicitGrant(plugin!.config,account,capability)
+          : pluginAccountCan(plugin!.config,account,capability);
+        if (!rule || !granted) {
+          res.status(404).json({code:'PLUGIN_NOT_FOUND'}); return;
+        }
+        // Card bedf50cc (E380): availability is ANDed AFTER the capability
+        // check, for reads and writes alike, and never substituted for it: an
+        // explicit non-view grant does not bypass a hidden plugin.
+        if (!(await pluginAvailableTo(plugin, account))) {
+          res.status(404).json({code:'PLUGIN_NOT_FOUND'}); return;
+        }
+        const taskId = req.headers['x-relayhall-task-id'];
+        if (taskId !== undefined && (typeof taskId !== 'string' || !isValidTaskId(taskId) ||
+            (!scopes.includes('root') && (!scopes.includes('tasks:write') || !scopes.includes('tasks:read'))) ||
+            !(await authorizationRepository.authorizePoint(actorFromRequest(req as AuthRequest),'task',taskId,'read')).allowed ||
+            !(await authorizationRepository.authorizePoint(actorFromRequest(req as AuthRequest),'task',taskId,'write')).allowed)) {
+          res.status(404).json({code:'PLUGIN_TASK_NOT_FOUND'}); return;
+        }
+        assertion = signPluginAssertion(plugin!.config,route.pluginName,account!,(req as AuthRequest).principal!.id,rule.capability ?? 'view',typeof taskId === 'string' ? taskId : undefined);
+      } catch {
+        res.status(503).json({code:'PLUGIN_UNAVAILABLE'}); return;
+      }
+    }
+    if (!v1 && !(await isBrowserAccessAuthorized(req))) {
       res.status(401).json({
         error: 'Unauthorized',
         message: 'Plugin access requires an authenticated session',
@@ -222,30 +292,12 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
       return;
     }
 
-    if (hasTraversal(req.path)) {
-      res.status(404).json({ error: 'Not Found' });
-      return;
-    }
-
-    const targetPath = req.path.slice(route.pathPrefix.length) || '/';
-
     // 404 rather than 405: do not disclose which methods a plugin implements.
     if (!isPluginProxyRequestAllowed(route, req.method, targetPath)) {
       res.status(404).json({ error: 'Not Found' });
       return;
     }
 
-    if (isHostOverridingPath(targetPath)) {
-      res.status(404).json({ error: 'Not Found' });
-      return;
-    }
-
-    const targetUrl = new URL(targetPath, route.target);
-    // Belt and braces: whatever the path did, the upstream must still be the plugin.
-    if (!resolvesToPluginOrigin(route.target, targetUrl)) {
-      res.status(404).json({ error: 'Not Found' });
-      return;
-    }
     targetUrl.search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
 
     const upstreamHeaders = buildUpstreamHeaders(req.headers, {
@@ -254,6 +306,13 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
       forwardedFor: req.ip || req.socket.remoteAddress || '',
       forwardedProto: req.protocol,
     });
+
+    if (assertion) upstreamHeaders['x-relayhall-assertion'] = assertion;
+
+    // Global JSON parsing consumed this stream already; forward those bytes once.
+    const parsedBody = !['GET','HEAD'].includes(req.method) && req.is('application/json') && req.body !== undefined
+      ? Buffer.from(JSON.stringify(req.body)) : null;
+    if (parsedBody) upstreamHeaders['content-length'] = String(parsedBody.length);
 
     const proxyReq = http.request(
       {
@@ -289,7 +348,14 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
           res.removeHeader(h);
         }
 
-        res.writeHead(proxyRes.statusCode || 502, filterResponseHeaders(proxyRes.headers));
+        const responseHeaders = filterResponseHeaders(proxyRes.headers);
+        if (v1) responseHeaders['cache-control'] = 'private, no-store';
+        res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+        // An upstream that aborts or fails after its headers must not leave the
+        // client waiting or look complete: destroy the downstream response so
+        // the client sees an incomplete transfer, never a clean end.
+        proxyRes.on('error', () => res.destroy());
+        proxyRes.on('close', () => { if (!proxyRes.complete) res.destroy(); });
         proxyRes.pipe(res);
       }
     );
@@ -297,7 +363,8 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
     const failUpstream = (label: string, detail: string) => {
       console.error(`🔌 Proxy ${label} for ${route.pluginName}: ${detail}`);
       if (res.headersSent) {
-        res.end();
+        // Headers are out: only an incomplete transfer is honest now.
+        res.destroy();
         return;
       }
       // Generic body: the upstream error string can disclose internal topology.
@@ -315,7 +382,7 @@ export function createPluginProxy(pluginLoader: PluginLoader) {
 
     // Pipe request body
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      req.pipe(proxyReq);
+      if (parsedBody) proxyReq.end(parsedBody); else req.pipe(proxyReq);
     } else {
       proxyReq.end();
     }

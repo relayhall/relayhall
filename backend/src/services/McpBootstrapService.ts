@@ -92,6 +92,45 @@ export async function isBootstrapLive(credentialId: string): Promise<boolean> {
 }
 
 /**
+ * The bootstrap EPOCH this credential holds, live or lapsed, or null when it
+ * holds none. READ-ONLY.
+ *
+ * MCP-derived sessions (card 35b73092) need what `isBootstrapLive` cannot
+ * say: WHICH bootstrap the credential is inside. The MCP surface is stateless
+ * and keys nothing on a protocol session identifier, so the one durable fact
+ * that separates one working session from the next is the moment the
+ * credential last pulled its session brief. That timestamp is the epoch; the
+ * credential id plus it is the session seed, pseudonymized before anything is
+ * stored (`services/McpSessionTelemetry`).
+ *
+ * `live` is decided in the query against the database clock, for the same
+ * reason the gate's own lookup is: the clock that wrote `expires_at` is the
+ * one that judges it. A lapsed row is returned rather than hidden, because a
+ * lapsed epoch is exactly the session that has ENDED and still needs saying so.
+ */
+export interface BootstrapEpoch {
+  bootstrappedAt: Date;
+  expiresAt: Date;
+  live: boolean;
+}
+
+export async function readBootstrapEpoch(credentialId: string): Promise<BootstrapEpoch | null> {
+  const result = await pool.query(
+    `SELECT bootstrapped_at, expires_at, (expires_at > now()) AS live
+       FROM mcp_bootstrap_records
+      WHERE credential_id = $1`,
+    [credentialId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    bootstrappedAt: new Date(row.bootstrapped_at),
+    expiresAt: new Date(row.expires_at),
+    live: row.live === true,
+  };
+}
+
+/**
  * Drop lapsed rows. Nothing depends on this for correctness — `isBootstrapLive`
  * already refuses an expired row — it exists so the table stays proportional to
  * live credentials rather than to every credential that ever bootstrapped.

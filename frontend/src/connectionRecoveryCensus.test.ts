@@ -58,10 +58,6 @@ const ALLOWED: Array<{ value: string; why: string }> = [
     why: 'a failure toast on the rotate call, which only a session that passed mayRegenerateCredential can reach.',
   },
   {
-    value: "A credential&rsquo;s authority is fixed when it is issued: regeneration copies the scope set and the transport pin verbatim, and the board refuses a regeneration that tries to change either. To narrow this connection, make a narrower one and disable this.",
-    why: 'states what rotation DOES (AUTHZ §7.3). It makes no claim that the reader may perform it, and it sits directly above the control with its reason.',
-  },
-  {
     value: '${API_BASE}/credentials/${credential.id}/rotate',
     why: 'the REST path of the rotate endpoint. Not prose; never rendered.',
   },
@@ -228,5 +224,15 @@ describe('regeneration advice is composed in exactly one place', () => {
       expect(entry.why.length).toBeGreaterThan(30);
       expect(PATTERN.test(entry.value)).toBe(true);
     }
+  });
+});
+
+
+describe('connection permissions copy', () => {
+  it('does not restore the superseded fixed-at-issue advice anywhere in frontend/src', () => {
+    const findings = sourceFiles(SRC).flatMap(file => userFacingChunks(readFileSync(file, 'utf8'))
+      .filter(value => /fixed when issued|make a narrower one/i.test(value))
+      .map(value => `${relative(SRC, file)}: ${JSON.stringify(normalise(value))}`));
+    expect(findings).toEqual([]);
   });
 });
