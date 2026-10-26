@@ -109,6 +109,9 @@ const { principalService } = require('../services/PrincipalService');
 const { loginSessionService, SESSION_COOKIE_NAME } = require('../services/LoginSessionService');
 const { resetTelemetryPepperCache } = require('../utils/telemetryPepper');
 const { TELEMETRY_MIN_INTERVAL_MS } = require('../services/TelemetryRateLimitService');
+// The PRODUCTION builder of the MCP-derived session shape (card `35b73092`),
+// so the short-session fixtures carry exactly what that path stores.
+const { mcpSessionEnvelope } = require('../services/McpSessionTelemetry');
 
 /** The batch interval, taken from the limiter itself and never copied. */
 const TELEMETRY_BATCH_INTERVAL_MS: number = TELEMETRY_MIN_INTERVAL_MS.events_batch;
@@ -252,8 +255,13 @@ async function sessionCallerFor(label: string, principalId: string): Promise<Cal
  * descriptor version that DECLARES a telemetry tier and its product allowlist.
  * Every one of those is load-bearing: drop any and ingest refuses, which is
  * the D3 deny-by-default this suite depends on being satisfied honestly.
+ *
+ * `alsoDeclares` adds further products to the same allowlist, for a reporter
+ * that reports more than one product (the short-session fixtures).
  */
-async function makeReporter(accountId: string, product: string): Promise<{ caller: Caller; connectorId: string }> {
+async function makeReporter(
+  accountId: string, product: string, alsoDeclares: string[] = [],
+): Promise<{ caller: Caller; connectorId: string }> {
   const connector = await pool.query(
     `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
      VALUES ('service', $1, 'telemetry projection suite connector', 'active', $2, $3, $4::jsonb) RETURNING id`,
@@ -262,7 +270,7 @@ async function makeReporter(accountId: string, product: string): Promise<{ calle
   );
   const connectorId = String(connector.rows[0].id);
 
-  const descriptor = { telemetry: { tier: 'presence', products: [product] } };
+  const descriptor = { telemetry: { tier: 'presence', products: [product, ...alsoDeclares] } };
   const service = await pool.query(
     `INSERT INTO services (slug, name, description, kind, status, principal_id, current_descriptor_version)
      VALUES ($1, 'telemetry projection suite connector', 'telemetry projection suite', 'connector', 'published', $2, 1)
@@ -362,6 +370,18 @@ async function pushEvents(
   const lines = indices.map((index) => JSON.stringify(envelope(product, seed, index))).join('\n');
   const answer = await send(who, 'POST', '/telemetry/events/batch', 'application/x-ndjson', lines);
   if (answer.status !== 200 || answer.json?.refused !== 0) {
+    throw new Error(`${label} ingest fixture refused: ${answer.status} ${answer.raw}`);
+  }
+}
+
+/**
+ * Pre-built records as ONE spool upload, for fixtures whose shape `envelope()`
+ * does not make. Same production route, and every line must be ACCEPTED: a
+ * duplicate or a refusal is a broken fixture, not a finding.
+ */
+async function pushLines(who: Caller, lines: string[], label: string): Promise<void> {
+  const answer = await send(who, 'POST', '/telemetry/events/batch', 'application/x-ndjson', lines.join('\n'));
+  if (answer.status !== 200 || answer.json?.refused !== 0 || answer.json?.accepted !== lines.length) {
     throw new Error(`${label} ingest fixture refused: ${answer.status} ${answer.raw}`);
   }
 }
@@ -913,5 +933,438 @@ describe('a replayed batch moves nothing', () => {
     expect(before).toBe(A.sessionSeeds.length * 2 + 3);
     await replayBatch(A);
     expect(await countOf()).toBe(before);
+  });
+});
+
+// ───────────── short sessions, the reporter filter and paging ────────────────
+
+/**
+ * Card `0ac41d40` (owner ruling E89 (b), "Tidy the page") — THE LIST HIDES
+ * SHORT SESSIONS SERVER-SIDE, BEFORE THE ROW LIMIT, AND COUNTS WHAT IT HID.
+ *
+ * A session is SHORT when ALL of these hold over its in-window events: at most
+ * three events, last seen less than two minutes after it started, no model
+ * (no `model_call` event and no event naming a model) and no tokens (input
+ * and output both zero). The MCP-derived bootstrap/heartbeat/completed triple
+ * is the shape this exists for: the task bridge produced ~59 of them an hour,
+ * so a fifty-row page held under an hour and the reporter sessions fell off.
+ *
+ * THE FIXTURES, under one fresh Account X with two reporters (R1 declares
+ * `mcp` and P2, R2 declares P2), each built in the shape it claims and
+ * ingested through the PRODUCTION batch route. The receiver clock overwrites
+ * `observed_at`, so exact durations cannot come from the route: each envelope
+ * carries the intended instant as its SOURCE clock (`occurred_at`), and one
+ * UPDATE copies it into `observed_at` for these reporters' rows only — then
+ * the substrate is READ BACK per session (count, first, last, model, tokens)
+ * before anything is asserted, so a fixture that is not what it claims fails
+ * as a fixture.
+ *
+ *   F1  MCP, 3 events over 90 s, no model, no tokens        HIDDEN
+ *   F2  3 events over 90 s, ONE model_call, no usage        shown  (model check)
+ *   F3  3 events over 90 s, tokens, no model at all         shown  (tokens check)
+ *   F4  FOUR events over 90 s, no model, no tokens          shown  (event-count check)
+ *   F5  MCP, 3 events over EXACTLY 120 s                    shown  (the duration boundary)
+ *   F6  six model_calls over 30 minutes                     shown
+ *   F7  MCP, 3 events over 60 s, newer than every shown row HIDDEN
+ *   F8  2 events over 10 s, newest but one                  HIDDEN
+ *   F9  1 event, the newest of all                          HIDDEN
+ *
+ * F3 and F4 end at the same instant on the same reporter and product, so the
+ * order between them is decided by the tiebreak alone; and the four hidden
+ * rows include the NEWEST three, so a filter applied after `LIMIT 2` would
+ * return nothing at all. That is the before-the-LIMIT proof, with a fixture
+ * larger than the limit.
+ *
+ * THE EXPECTED ORDER is not read from the projection: it is the documented
+ * order (last seen DESC, then Connector, product and session reference
+ * ascending, byte-wise) applied to identities and instants read back from the
+ * stored rows. Every assertion is scoped to the fresh Account or to a fresh
+ * Connector, because the mutation drill reruns this suite many times against
+ * ONE database and a root-wide exact count would measure the drill.
+ */
+describe('short sessions are hidden before the LIMIT and counted; the filter and paging are exact', () => {
+  type Shape = 'mcp' | 'model' | 'tokens' | 'plain' | 'long';
+  interface Fixture {
+    name: string;
+    reporter: 'R1' | 'R2';
+    product: 'mcp' | 'P2';
+    shape: Shape;
+    /** Offsets of each event from the fixture base, in milliseconds. */
+    offsets: number[];
+    short: boolean;
+    seed: string;
+    /** Read back from the stored rows. */
+    sessionRef: string;
+    connectorId: string;
+    sourceProduct: string;
+    lastSeenMs: number;
+  }
+
+  const MINUTE = 60_000;
+  const plan: Array<Pick<Fixture, 'name' | 'reporter' | 'product' | 'shape' | 'offsets' | 'short'>> = [
+    { name: 'F1', reporter: 'R1', product: 'mcp', shape: 'mcp', offsets: [50 * MINUTE, 50 * MINUTE + 30_000, 50 * MINUTE + 90_000], short: true },
+    { name: 'F2', reporter: 'R1', product: 'P2', shape: 'model', offsets: [60 * MINUTE, 60 * MINUTE + 30_000, 60 * MINUTE + 90_000], short: false },
+    { name: 'F3', reporter: 'R2', product: 'P2', shape: 'tokens', offsets: [70 * MINUTE, 70 * MINUTE + 30_000, 70 * MINUTE + 90_000], short: false },
+    { name: 'F4', reporter: 'R2', product: 'P2', shape: 'plain', offsets: [70 * MINUTE, 70 * MINUTE + 20_000, 70 * MINUTE + 40_000, 70 * MINUTE + 90_000], short: false },
+    { name: 'F5', reporter: 'R1', product: 'mcp', shape: 'mcp', offsets: [40 * MINUTE, 40 * MINUTE + 60_000, 40 * MINUTE + 120_000], short: false },
+    { name: 'F6', reporter: 'R2', product: 'P2', shape: 'long', offsets: [0, 6, 12, 18, 24, 30].map((m) => m * MINUTE), short: false },
+    { name: 'F7', reporter: 'R1', product: 'mcp', shape: 'mcp', offsets: [80 * MINUTE, 80 * MINUTE + 30_000, 80 * MINUTE + 60_000], short: true },
+    { name: 'F8', reporter: 'R1', product: 'P2', shape: 'plain', offsets: [85 * MINUTE, 85 * MINUTE + 10_000], short: true },
+    { name: 'F9', reporter: 'R2', product: 'P2', shape: 'plain', offsets: [90 * MINUTE], short: true },
+  ];
+
+  let X: { accountId: string; reader: Caller };
+  let Y: { accountId: string; reader: Caller; connectorId: string; product: string };
+  let R1: { caller: Caller; connectorId: string };
+  let R2: { caller: Caller; connectorId: string };
+  let P2: string;
+  let fixtures: Fixture[];
+
+  const key = (row: { connectorId: string; sourceProduct: string; sessionRef: string }): string =>
+    `${row.connectorId}|${row.sourceProduct}|${row.sessionRef}`;
+  const named = (...names: string[]): Fixture[] => names.map((name) => fixtures.find((f) => f.name === name)!);
+  /** The documented order: last seen DESC, then the identity ascending, byte-wise. */
+  const inListOrder = (rows: Fixture[]): string[] => [...rows]
+    .sort((a, b) => (b.lastSeenMs - a.lastSeenMs)
+      || (a.connectorId < b.connectorId ? -1 : a.connectorId > b.connectorId ? 1 : 0)
+      || (a.sourceProduct < b.sourceProduct ? -1 : a.sourceProduct > b.sourceProduct ? 1 : 0)
+      || (a.sessionRef < b.sessionRef ? -1 : a.sessionRef > b.sessionRef ? 1 : 0))
+    .map(key);
+  const where = (predicate: (f: Fixture) => boolean): Fixture[] => fixtures.filter(predicate);
+
+  async function listOf(who: Caller, query = ''): Promise<any> {
+    const answer = await call(who, 'GET', `/telemetry/sessions${query}`);
+    expect({ query, status: answer.status }).toEqual({ query, status: 200 });
+    return answer.json;
+  }
+
+  /** One fixture's events, each carrying its intended instant as the SOURCE clock. */
+  function linesFor(f: Pick<Fixture, 'name' | 'shape' | 'offsets' | 'seed'>, product: string, base: number): string[] {
+    return f.offsets.map((offset, index) => {
+      const at = new Date(base + offset);
+      const last = index === f.offsets.length - 1;
+      const phase = index === 0 ? 'started' : last ? 'completed' : 'running';
+      if (f.shape === 'mcp') {
+        // The PRODUCTION builder: kind `session`, product `mcp`, adapter
+        // `relayhall-mcp`, no model block and no usage block.
+        return JSON.stringify(mcpSessionEnvelope(f.seed, `${f.seed}-ref`, phase, at));
+      }
+      const common = {
+        schema_version: 'rh.ai.telemetry/1.0',
+        event_id: `short-${f.seed}-${index}`,
+        occurred_at: at.toISOString(),
+        source: { product, adapter: 'suite-adapter', adapter_version: '1.0.0', mechanism: 'push', support_level: 'tested' },
+        correlation: { session_id: f.seed },
+      };
+      if (f.shape === 'long') {
+        return JSON.stringify({
+          ...common, kind: 'model_call', phase: last ? 'completed' : 'running',
+          model: { provider: 'anthropic', resolved: 'claude-opus-5', operation: 'chat' },
+          usage: { input_tokens: 10, output_tokens: 2, requests: 1 },
+        });
+      }
+      if (f.shape === 'model' && index === 1) {
+        // A model and NOTHING ELSE: no usage block, so its tokens are zero and
+        // only the model check can keep the session listed.
+        return JSON.stringify({
+          ...common, kind: 'model_call', phase: 'running',
+          model: { provider: 'anthropic', resolved: 'claude-opus-5', operation: 'chat' },
+        });
+      }
+      if (f.shape === 'tokens' && index === 1) {
+        // Tokens and NOTHING ELSE: no model block and not a model_call, so
+        // only the tokens check can keep the session listed.
+        return JSON.stringify({
+          ...common, kind: 'turn', phase: 'running',
+          usage: { input_tokens: 40, output_tokens: 8 },
+        });
+      }
+      return JSON.stringify({ ...common, kind: 'session', phase });
+    });
+  }
+
+  beforeAll(async () => {
+    const xAccount = await makeHuman('user');
+    X = { accountId: xAccount, reader: await sessionCallerFor('short-session Account X reader', xAccount) };
+    P2 = `tel-s-${tag()}`;
+    R1 = await makeReporter(X.accountId, 'mcp', [P2]);
+    R2 = await makeReporter(X.accountId, P2);
+
+    const yAccount = await makeHuman('user');
+    const yProduct = `tel-y-${tag()}`;
+    const yReporter = await makeReporter(yAccount, yProduct);
+    Y = {
+      accountId: yAccount,
+      reader: await sessionCallerFor('short-session Account Y reader', yAccount),
+      connectorId: yReporter.connectorId,
+      product: yProduct,
+    };
+
+    // Three hours back, so every instant is inside the default window and in
+    // the past; whole minutes, so the instants are exact to the millisecond.
+    const base = Math.floor((Date.now() - 3 * 60 * MINUTE) / MINUTE) * MINUTE;
+    const seeded = plan.map((p) => ({ ...p, seed: `short-${p.name.toLowerCase()}-${tag()}` }));
+    const productOf = (p: { product: 'mcp' | 'P2' }): string => (p.product === 'mcp' ? 'mcp' : P2);
+    for (const [label, reporter] of [['R1', R1], ['R2', R2]] as const) {
+      await pushLines(reporter.caller,
+        seeded.filter((p) => p.reporter === label).flatMap((p) => linesFor(p, productOf(p), base)),
+        `short-session reporter ${label}`);
+    }
+    await pushLines(yReporter.caller, linesFor(
+      { name: 'FY', shape: 'long', offsets: [0, 5 * MINUTE], seed: `short-fy-${tag()}` }, yProduct, base),
+    'short-session reporter Y');
+
+    // The receiver clock, set to the source clock — for THESE reporters' rows only.
+    const reporters = [R1.connectorId, R2.connectorId, yReporter.connectorId];
+    await pool.query(
+      `UPDATE session_events SET observed_at = source_occurred_at
+        WHERE schema_version IS NOT NULL AND connector_id = ANY($1::uuid[])`,
+      [reporters],
+    );
+
+    // READ BACK: identity, count, first, last, model and tokens per fixture,
+    // from the stored rows. The first event of every fixture carries an
+    // event id the fixture chose, which is how a stored session is tied back
+    // to the plan without trusting the projection under test.
+    fixtures = [];
+    for (const p of seeded) {
+      const firstEventId = p.shape === 'mcp' ? `mcp.start.${p.seed}-ref` : `short-${p.seed}-0`;
+      const reporter = p.reporter === 'R1' ? R1 : R2;
+      const identity = await pool.query(
+        `SELECT session_ref, source_product FROM session_events
+          WHERE schema_version IS NOT NULL AND connector_id = $1 AND source_event_id = $2`,
+        [reporter.connectorId, firstEventId],
+      );
+      if (identity.rows.length !== 1) throw new Error(`${p.name}: no stored first event`);
+      const sessionRef = String(identity.rows[0].session_ref);
+      const sourceProduct = String(identity.rows[0].source_product);
+      const stored = await pool.query(
+        `SELECT COUNT(*)::int AS events,
+                (EXTRACT(EPOCH FROM MIN(observed_at)) * 1000)::bigint AS first_ms,
+                (EXTRACT(EPOCH FROM MAX(observed_at)) * 1000)::bigint AS last_ms,
+                BOOL_OR(event_kind = 'model_call' OR payload->'model'->>'resolved' IS NOT NULL) AS model,
+                COALESCE(SUM((payload->'usage'->>'input_tokens')::numeric), 0)::int AS input_tokens,
+                COALESCE(SUM((payload->'usage'->>'output_tokens')::numeric), 0)::int AS output_tokens
+           FROM session_events
+          WHERE schema_version IS NOT NULL AND connector_id = $1 AND source_product = $2 AND session_ref = $3`,
+        [reporter.connectorId, sourceProduct, sessionRef],
+      );
+      const row = stored.rows[0];
+      const expected = {
+        name: p.name,
+        product: productOf(p),
+        events: p.offsets.length,
+        first: base + p.offsets[0],
+        last: base + p.offsets[p.offsets.length - 1],
+        model: p.shape === 'model' || p.shape === 'long',
+        tokens: p.shape === 'tokens' || p.shape === 'long',
+      };
+      const actual = {
+        name: p.name,
+        product: sourceProduct,
+        events: row.events,
+        first: Number(row.first_ms),
+        last: Number(row.last_ms),
+        model: row.model === true,
+        tokens: Number(row.input_tokens) > 0 && Number(row.output_tokens) > 0,
+      };
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new Error(`fixture ${p.name} is not what it claims: ${JSON.stringify({ expected, actual })}`);
+      }
+      fixtures.push({
+        ...p, sessionRef, connectorId: reporter.connectorId, sourceProduct, lastSeenMs: expected.last,
+      });
+    }
+  });
+
+  test('HIDDEN BY DEFAULT: exactly the short sessions are withheld, and hiddenCount is exact', async () => {
+    const list = await listOf(X.reader);
+    expect({
+      rows: (list.sessions as any[]).map(key),
+      hiddenCount: list.hiddenCount,
+      shortCount: list.shortCount,
+      total: list.total,
+      nextOffset: list.nextOffset,
+    }).toEqual({
+      rows: inListOrder(where((f) => !f.short)),
+      hiddenCount: 4,
+      shortCount: 4,
+      total: 5,
+      nextOffset: null,
+    });
+    // The definition travels with the answer, so the page states it from the
+    // server's values instead of from a second copy.
+    expect(list.shortSession).toEqual({ maxEvents: 3, minDurationMs: 120_000 });
+  });
+
+  test('BOUNDARIES: a model, tokens, a fourth event or exactly two minutes each keep a session listed', async () => {
+    const listed = new Set(((await listOf(X.reader)).sessions as any[]).map(key));
+    for (const fixture of named('F2', 'F3', 'F4', 'F5', 'F6')) {
+      expect({ fixture: fixture.name, listed: listed.has(key(fixture)) })
+        .toEqual({ fixture: fixture.name, listed: true });
+    }
+    for (const fixture of named('F1', 'F7', 'F8', 'F9')) {
+      expect({ fixture: fixture.name, listed: listed.has(key(fixture)) })
+        .toEqual({ fixture: fixture.name, listed: false });
+    }
+  });
+
+  test('BEFORE THE LIMIT: a page smaller than the hidden rows still returns the newest SHOWN rows', async () => {
+    // The three newest sessions are hidden ones. A filter applied after
+    // `LIMIT 2` would leave this page empty.
+    const page = await listOf(X.reader, '?limit=2');
+    expect({
+      rows: (page.sessions as any[]).map(key),
+      hiddenCount: page.hiddenCount,
+      total: page.total,
+      nextOffset: page.nextOffset,
+    }).toEqual({
+      rows: inListOrder(where((f) => !f.short)).slice(0, 2),
+      hiddenCount: 4,
+      total: 5,
+      nextOffset: 2,
+    });
+  });
+
+  test('includeShort=true lists every session, in the same order, and hides nothing', async () => {
+    const list = await listOf(X.reader, '?includeShort=true');
+    expect({
+      rows: (list.sessions as any[]).map(key),
+      hiddenCount: list.hiddenCount,
+      shortCount: list.shortCount,
+      total: list.total,
+      includeShort: list.includeShort,
+    }).toEqual({
+      rows: inListOrder(fixtures),
+      hiddenCount: 0,
+      shortCount: 4,
+      total: 9,
+      includeShort: true,
+    });
+    // Only the exact word turns it on.
+    const notQuite = await listOf(X.reader, '?includeShort=yes');
+    expect({ hiddenCount: notQuite.hiddenCount, includeShort: notQuite.includeShort })
+      .toEqual({ hiddenCount: 4, includeShort: false });
+  });
+
+  test('the REPORTER and PRODUCT filter narrow the rows and the counts exactly', async () => {
+    const cases: Array<{ query: string; rows: Fixture[]; hidden: number }> = [
+      { query: `connectorId=${R1.connectorId}`, rows: where((f) => f.reporter === 'R1' && !f.short), hidden: 3 },
+      { query: `connectorId=${R2.connectorId}`, rows: where((f) => f.reporter === 'R2' && !f.short), hidden: 1 },
+      { query: 'sourceProduct=mcp', rows: where((f) => f.product === 'mcp' && !f.short), hidden: 2 },
+      { query: `sourceProduct=${P2}`, rows: where((f) => f.product === 'P2' && !f.short), hidden: 2 },
+      { query: `connectorId=${R1.connectorId}&sourceProduct=${P2}`, rows: named('F2'), hidden: 1 },
+      { query: `connectorId=${R2.connectorId}&sourceProduct=mcp`, rows: [], hidden: 0 },
+      {
+        query: `connectorId=${R1.connectorId}&includeShort=true`,
+        rows: where((f) => f.reporter === 'R1'),
+        hidden: 0,
+      },
+    ];
+    for (const { query, rows, hidden } of cases) {
+      const list = await listOf(X.reader, `?${query}`);
+      expect({ query, rows: (list.sessions as any[]).map(key), hiddenCount: list.hiddenCount, total: list.total })
+        .toEqual({ query, rows: inListOrder(rows), hiddenCount: hidden, total: rows.length });
+    }
+  });
+
+  test('PAGING: limit and offset walk the list with no duplicate, no gap and a final null', async () => {
+    const whole = inListOrder(where((f) => !f.short));
+    const walked: string[] = [];
+    const offsets: Array<number | null> = [];
+    let offset: number | null = 0;
+    while (offset !== null) {
+      const page = await listOf(X.reader, `?limit=2&offset=${offset}`);
+      expect({ offset, hiddenCount: page.hiddenCount, total: page.total, echoed: page.offset })
+        .toEqual({ offset, hiddenCount: 4, total: 5, echoed: offset });
+      walked.push(...(page.sessions as any[]).map(key));
+      offset = page.nextOffset;
+      offsets.push(offset);
+      if (walked.length > 10) break;
+    }
+    expect({ walked, offsets }).toEqual({ walked, offsets: [2, 4, null] });
+    expect(walked).toEqual(whole);
+    // The filter and the toggle compose with the offset.
+    const mixed = await listOf(X.reader, '?includeShort=true&limit=4&offset=4');
+    expect((mixed.sessions as any[]).map(key)).toEqual(inListOrder(fixtures).slice(4, 8));
+    expect(mixed.nextOffset).toBe(8);
+    // A malformed offset is the first page, never an error or a wider read.
+    const malformed = await listOf(X.reader, '?limit=2&offset=-3');
+    expect((malformed.sessions as any[]).map(key)).toEqual(whole.slice(0, 2));
+  });
+
+  test('a HIDDEN session is still readable by its deep link', async () => {
+    const [hidden] = named('F1');
+    const point = await call(X.reader, 'GET', pointPath(hidden));
+    expect(point.status).toBe(200);
+    expect({ ref: point.json.session.sessionRef, events: point.json.events.length })
+      .toEqual({ ref: hidden.sessionRef, events: 3 });
+  });
+
+  test('CONCEALMENT is unchanged: a filter naming another Account\'s Connector answers like one naming nothing', async () => {
+    // Y sees its own session and nothing of X's.
+    const yList = await listOf(Y.reader);
+    expect((yList.sessions as any[]).map((row) => row.connectorId)).toEqual([Y.connectorId]);
+    expect(yList.hiddenCount).toBe(0);
+
+    const normalize = (body: any): string => {
+      const clone = JSON.parse(JSON.stringify(body));
+      delete clone.windowStart;
+      return JSON.stringify(clone);
+    };
+    for (const query of [`connectorId=${R1.connectorId}`, `connectorId=${R1.connectorId}&includeShort=true`]) {
+      const foreign = await listOf(Y.reader, `?${query}`);
+      const nothing = await listOf(Y.reader, `?${query.replace(R1.connectorId, crypto.randomUUID())}`);
+      expect(foreign.sessions).toEqual([]);
+      expect(foreign.hiddenCount).toBe(0);
+      expect(normalize(foreign)).toBe(normalize(nothing));
+    }
+    // And X, filtering by Y's reporter, sees nothing of it either.
+    const reverse = await listOf(X.reader, `?connectorId=${Y.connectorId}&includeShort=true`);
+    expect({ rows: reverse.sessions, total: reverse.total, shortCount: reverse.shortCount })
+      .toEqual({ rows: [], total: 0, shortCount: 0 });
+    // The deep link to a hidden session of X is a 404 for Y, like any other.
+    const [hidden] = named('F1');
+    expect((await call(Y.reader, 'GET', pointPath(hidden))).status).toBe(404);
+  });
+
+  test('ROOT sees the fresh reporter\'s rows under the same rule', async () => {
+    // Root is estate-wide, so its exact assertions are narrowed to a
+    // Connector this run created.
+    const shown = await listOf(ROOT, `?connectorId=${R1.connectorId}`);
+    expect({ rows: (shown.sessions as any[]).map(key), hiddenCount: shown.hiddenCount })
+      .toEqual({ rows: inListOrder(where((f) => f.reporter === 'R1' && !f.short)), hiddenCount: 3 });
+    const every = await listOf(ROOT, `?connectorId=${R1.connectorId}&includeShort=true`);
+    expect((every.sessions as any[]).map(key)).toEqual(inListOrder(where((f) => f.reporter === 'R1')));
+  });
+
+  test('a malformed filter is refused before any row is read', async () => {
+    for (const query of [
+      'connectorId=not-a-uuid',
+      `sourceProduct=${encodeURIComponent('not a product!')}`,
+      `sourceProduct=${'x'.repeat(65)}`,
+    ]) {
+      const answer = await call(X.reader, 'GET', `/telemetry/sessions?${query}`);
+      expect({ query, status: answer.status, code: answer.json?.code })
+        .toEqual({ query, status: 400, code: 'INVALID_SESSION_FILTER' });
+    }
+  });
+
+  test('STATS count every session and say how many of them are short', async () => {
+    const stats = await statsOf(X.reader);
+    const every = await listOf(X.reader, '?includeShort=true');
+    const shortEvents = where((f) => f.short).reduce((sum, f) => sum + f.offsets.length, 0);
+    expect({
+      sessions: stats.totals.sessions,
+      events: stats.totals.events,
+      shortSessions: stats.totals.shortSessions,
+      shortSessionEvents: stats.totals.shortSessionEvents,
+    }).toEqual({
+      sessions: every.total,
+      events: fixtures.reduce((sum, f) => sum + f.offsets.length, 0),
+      shortSessions: every.shortCount,
+      shortSessionEvents: shortEvents,
+    });
+    expect({ sessions: every.total, short: every.shortCount, shortEvents }).toEqual({ sessions: 9, short: 4, shortEvents: 9 });
   });
 });

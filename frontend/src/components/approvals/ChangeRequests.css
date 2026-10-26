@@ -1,0 +1,197 @@
+/* The universal change request's surfaces (card 502fb19e, slice S3): the
+   generic decide form with its Before and after region, the "Request a
+   change" dialog and the My requests list. Theme tokens only, so each Theme
+   draws them; the dialog is the approval drawer's shape (a right-hand panel
+   over a scrim, the full width of a phone). */
+
+.change-request {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.change-request-facts {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.change-request-facts dt {
+  color: var(--text-tertiary);
+}
+
+.change-request-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.change-request-diff {
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.change-request-diff-heading {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.change-request-summary {
+  margin: var(--space-2) 0;
+  font-size: var(--text-sm);
+}
+
+.change-request-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.change-request-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.change-request-table caption {
+  padding-block-end: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-align: start;
+}
+
+.change-request-table th,
+.change-request-table td {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.change-request-table thead th {
+  color: var(--text-tertiary);
+}
+
+.change-request-narrow {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.change-request-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.change-request-muted {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+/* The "Request a change" dialog. */
+.change-request-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.change-request-dialog {
+  width: min(520px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-5);
+  border-left: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-3);
+}
+
+.change-request-dialog:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.change-request-dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-block-end: var(--space-4);
+}
+
+.change-request-dialog-head h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+}
+
+.change-request-form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.change-request-form textarea {
+  min-height: 96px;
+}
+
+.change-request-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.change-request-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+/* My requests: the session's own change requests. */
+.change-request-list {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.change-request-item {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.change-request-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 640px) {
+  .change-request-dialog {
+    width: 100%;
+    padding: var(--space-4);
+    border-left: 0;
+  }
+
+  .change-request-facts {
+    grid-template-columns: 1fr;
+  }
+}

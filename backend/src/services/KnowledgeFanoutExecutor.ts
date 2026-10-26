@@ -27,7 +27,7 @@
  *     asked for kinds this source does not carry" discloses nothing new, and
  *     hiding it would make coverage dishonest.
  *
- * ── `consulted` IS THE FINAL SET, NOT THE SELECTED SET (sol R1-4) ──
+ * ── `consulted` IS THE FINAL SET, NOT THE SELECTED SET (review R1-4) ──
  *
  * "`consulted` = the FINAL set that survived the §5.2 signing-time
  * re-evaluation (for `none`-mode and board sources, selection and finality
@@ -50,9 +50,12 @@
  * ── WHAT NEVER GOES ON THE WIRE ──
  *
  * `kinds` is a CORE routing arm and is NOT sent (§5.5, §7.2). The caller's
- * credential never leaves core (§5.4). A source receives `{ q, limit,
- * assertion? }` and nothing else — no other source's anything, no foreign
- * refs, no group ids beyond the §5.3 minimization the signer applies.
+ * credential never leaves core (§5.4). A v1 source receives `{ q, limit,
+ * assertion? }`; a v2 source `{ q, limit, protocol_version: 2, filter,
+ * budget_ms, assertion? }`, where `filter` is the normalized category filter
+ * and `budget_ms` the time core waits for it (card 3e0ae06e). Nothing else —
+ * not `includeArchive`, no other source's anything, no foreign refs, no group
+ * ids beyond the §5.3 minimization the signer applies.
  */
 import type { AuthRequest } from '../middleware/auth';
 import { logCaughtFailure } from '../utils/secretSafeLog';
@@ -94,6 +97,7 @@ import {
   KNOWLEDGE_CANDIDATE_ROWS_MAX,
   KNOWLEDGE_LEDGER_MAX_MS,
   KNOWLEDGE_FANOUT_CONCURRENCY as FANOUT_CONCURRENCY,
+  knowledgeSourceBudgetMs,
 } from './KnowledgeDeadline';
 import { KnowledgeRequestClock } from './KnowledgeRequestClock';
 
@@ -105,7 +109,14 @@ export const KNOWLEDGE_LIMIT_PER_SOURCE_MAX = 25;
 export const KNOWLEDGE_LIMIT_PER_SOURCE_DEFAULT = 8;
 export const KNOWLEDGE_TIMEOUT_MS_MIN = 500;
 export const KNOWLEDGE_TIMEOUT_MS_MAX = 8000;
-export const KNOWLEDGE_TIMEOUT_MS_DEFAULT = 3000;
+/**
+ * Card 3e0ae06e: the default is the maximum. A store's first search for a text
+ * it has never searched takes about 6 s, so a 3000 default answered every such
+ * search `partial`/`deadline` with no rows for a caller that sent no
+ * `timeoutMs` (the MCP tool forwards none). A caller that prefers a sooner,
+ * possibly partial answer sends a smaller one.
+ */
+export const KNOWLEDGE_TIMEOUT_MS_DEFAULT = KNOWLEDGE_TIMEOUT_MS_MAX;
 // §7.1's whole-request deadline lives in its own module, so a control can
 // watch which COUNT the executor computes it from — see KnowledgeDeadline.ts.
 export {
@@ -138,13 +149,24 @@ export function kindPriority(env: NodeJS.ProcessEnv = process.env): readonly Kno
   return [...named, ...DEFAULT_KIND_PRIORITY.filter((kind) => !named.includes(kind))];
 }
 
+import { normalizeKnowledgeFilter, validateRetrieval, KnowledgeSelectorError, KnowledgeCompartment, scopedSourceCategories, type KnowledgeFilter, DEADLINE_FIRED, type DeadlineFired } from './KnowledgeV2';
+
 export interface KnowledgeQueryRequest {
+  protocol_version?: 2;
+  categories?: readonly string[];
   q: string;
   kinds: readonly KnowledgeContentKind[];
   /** §7.1's narrowing-only `sources[]`, already deduplicated and capped. */
   sources?: readonly string[];
   limitPerSource: number;
   timeoutMs: number;
+  /**
+   * Card 40e0e542 (selector amendment v1.2): the caller opts in to the archive
+   * categories sources declare. Absent or false is the DEFAULT SCOPE, current
+   * knowledge. It is converted into each source's `filter.categories` by
+   * `scopedSourceCategories` and is never sent to a source.
+   */
+  includeArchive?: boolean;
 }
 
 export interface KnowledgeGroup {
@@ -162,13 +184,15 @@ export interface KnowledgeEmittedResult {
   title: string;
   snippet: string;
   contentKind: KnowledgeContentKind;
-  compartment: string;
+  compartment: string | KnowledgeCompartment;
+  category?: string;
   score: number;
   updatedAt?: string;
   parentHandle?: string;
 }
 
 export interface KnowledgeQueryResponse {
+  protocol_version?: 2;
   coverage: KnowledgeCoverage;
   groups: KnowledgeGroup[];
   auditRef: string;
@@ -195,6 +219,16 @@ interface SelectedSource {
   classes: KnowledgeContentKind[];
   compartments: string[];
   descriptorVersion: number;
+  protocolVersion?: 2;
+  categories?: string[];
+  /** Card 40e0e542: the declared archive categories (a subset of `categories`). */
+  archiveCategories?: string[];
+  /**
+   * Card 40e0e542: the categories THIS source is asked to search, decided once
+   * at selection: the wire filter, the sealed handles and the result check all
+   * read this, never the raw request. `undefined` = no category filter.
+   */
+  searchCategories?: string[];
 }
 
 /**
@@ -215,7 +249,7 @@ interface AdmittedSource {
 /** The per-source result of one leg, before it becomes coverage. */
 type LegOutcome =
   | { kind: 'absent' }
-  | { kind: 'answered'; results: ValidatedKnowledgeResult[]; invalid: boolean; truncated: boolean; assertionJti?: string }
+  | { kind: 'answered'; partialReasons?: string[]; deadlineFired?: DeadlineFired; results: ValidatedKnowledgeResult[]; invalid: boolean; truncated: boolean; assertionJti?: string }
   | { kind: 'timedOut' }
   | { kind: 'unavailable'; reason: 'transport' | 'rate-limited'; retryAfterSeconds?: number }
   | { kind: 'refusedBySource' }
@@ -261,7 +295,7 @@ export async function executeKnowledgeQuery(
   // re-argued.
   const clock = new KnowledgeRequestClock();
   const actor = req.authorizationActor ?? actorFromRequest(req);
-  const coverage = new KnowledgeCoverageBuilder();
+  const coverage = new KnowledgeCoverageBuilder({ archiveIncluded: request.includeArchive === true });
 
   // ── LIMB (a) — knowledge-configured, decided by the ONE predicate ──
   //
@@ -285,6 +319,11 @@ export async function executeKnowledgeQuery(
       classes: (block?.classes ?? []).map((entry) => entry.content),
       compartments: block?.compartments ?? [...BOARD_COMPARTMENTS],
       descriptorVersion: row.current_descriptor_version ?? 1,
+      ...(block?.protocol_version === 2 ? {
+        protocolVersion: 2 as const,
+        categories: block.categories,
+        ...(block.archiveCategories?.length ? { archiveCategories: block.archiveCategories } : {}),
+      } : {}),
     });
   }
 
@@ -345,7 +384,35 @@ export async function executeKnowledgeQuery(
       coverage.markSkipped(source.row.id);
       continue;
     }
-    selected.push(source);
+    if (source.protocolVersion === 2 && request.protocol_version !== 2) { coverage.markSkipped(source.row.id, 'unsupported-selector', 'protocol'); continue; }
+    if (request.categories !== undefined && source.protocolVersion !== 2) { coverage.markSkipped(source.row.id, 'unsupported-selector', 'categories'); continue; }
+    // ── THE DEFAULT SCOPE (card 40e0e542, owner ruling E127 (5)) ──
+    //
+    // The categories this source is asked to search: the request's, minus the
+    // archive the source declares unless the caller opted in. Decided HERE,
+    // once, so the wire filter, the sealed handles and the result check all
+    // carry the same narrowed set. A source left with nothing current to
+    // search is skipped with the existing reason `categories`.
+    const searchCategories = source.protocolVersion === 2
+      ? scopedSourceCategories({
+        requested: request.categories,
+        declared: source.categories,
+        archive: source.archiveCategories,
+        includeArchive: request.includeArchive === true,
+      })
+      : undefined;
+    if (searchCategories !== undefined && !source.categories?.some(c => searchCategories.includes(c))) { coverage.markSkipped(source.row.id, 'categories'); continue; }
+    selected.push(searchCategories === undefined ? source : { ...source, searchCategories });
+  }
+
+  if (request.categories !== undefined) {
+    const vocabulary = new Set(capable.filter(s => visible.has(s.row.id) && covered.has(s.row.id) && (!narrowing || narrowing.has(s.row.id))).flatMap(s => s.categories ?? []));
+    if (request.categories.some(c => !vocabulary.has(c))) throw new KnowledgeSelectorError('INVALID_SELECTOR');
+  }
+  if (request.protocol_version === 2 && selected.length > 16) {
+    // Refuse before admission/signing; the audit contains no source ids/counts.
+    const auditRef = await writeSearchAudit(req, request, clock, []);
+    throw new KnowledgeSelectorError('SOURCE_SELECTION_TOO_BROAD', 422, auditRef);
   }
 
   // ── PHASE 1: ADMISSION — the evaluation AND the signing, before the count ──
@@ -467,22 +534,32 @@ export async function executeKnowledgeQuery(
     };
   });
 
+  let emittedBytes = 0;
   for (const { source, outcome } of legs) {
     const id = source.row.id;
     if (outcome.kind === 'absent') {
-      // sol R1-4: silently absent, identical to never-selected. No coverage
+      // review R1-4: silently absent, identical to never-selected. No coverage
       // entry, no group, and no audit line either — an audit line would be a
       // record of a source the caller was never told about.
       continue;
     }
     if (outcome.kind === 'answered') {
       coverage.record(id, 'answered');
+      markSearched(coverage, source);
       if (outcome.truncated) coverage.markTruncated(id);
       if (outcome.invalid) coverage.markInvalid(id);
+      if (outcome.partialReasons?.length) coverage.markPartial(id, outcome.partialReasons, outcome.deadlineFired);
+      const emitted = outcome.results.map((result) => emit(result, id, source.descriptorVersion, source.protocolVersion === 2 ? normalizeKnowledgeFilter(request.kinds, source.searchCategories) : undefined));
+      const bounded = emitted.filter(result => {
+        if (request.protocol_version !== 2) return true;
+        const bytes = Buffer.byteLength(JSON.stringify(result));
+        if (emittedBytes + bytes > 900 * 1024) { coverage.markTruncated(id); return false; }
+        emittedBytes += bytes; return true;
+      });
       groups.push({
         sourceId: id,
         sourceSlug: source.row.slug,
-        results: outcome.results.map((result) => emit(result, id, source.descriptorVersion)),
+        results: bounded,
       });
       audit.push({
         sourceId: id,
@@ -500,6 +577,7 @@ export async function executeKnowledgeQuery(
     } else {
       coverage.record(id, outcome.kind);
     }
+    markSearched(coverage, source);
     audit.push({ sourceId: id, sourceSlug: source.row.slug, outcome: outcome.kind });
   }
 
@@ -557,6 +635,35 @@ export async function executeKnowledgeQuery(
     }
   }
 
+  const auditRef = await writeSearchAudit(req, request, clock, audit);
+
+  // §7.3's ordering, made structural: coverage is the first key of the object
+  // literal, so a serializer that truncates by bytes truncates groups.
+  return { coverage: coverage.build(), groups, auditRef, ...(request.protocol_version === 2 ? { protocol_version: 2 as const } : {}) };
+}
+
+/**
+ * Card 40e0e542: name, for one CONSULTED source, the categories it was asked
+ * to search — `all` when no category filter was sent (a v1 source, or a v2
+ * source with neither a requested nor an archive-narrowed set), else the
+ * filter's categories that this source declares. The builder refuses an
+ * archive category here when the answer says the archive was excluded.
+ */
+function markSearched(coverage: KnowledgeCoverageBuilder, source: SelectedSource): void {
+  const declared = source.categories ?? [];
+  coverage.markSearchedCategories(
+    source.row.id,
+    source.searchCategories === undefined ? 'all' : source.searchCategories.filter((category) => declared.includes(category)),
+    source.archiveCategories ?? [],
+  );
+}
+
+async function writeSearchAudit(
+  req: AuthRequest,
+  request: KnowledgeQueryRequest,
+  clock: KnowledgeRequestClock,
+  fanout: readonly KnowledgeFanoutAuditEntry[],
+): Promise<string> {
   // §7.7's ledger write, through the clock like everything else. The ref is
   // minted HERE so that the response carries the same identifier whatever the
   // write does: a write that does not settle is treated exactly like the write
@@ -570,7 +677,10 @@ export async function executeKnowledgeQuery(
       auditRef,
       queryText: request.q,
       kinds: request.kinds,
-      fanout: audit,
+      // Card 40e0e542 (rider): every entry carries the caller's archive opt-in,
+      // so the ledger says which scope each search asked for. There is no
+      // per-search column for it; see `KnowledgeFanoutAuditEntry`.
+      fanout: fanout.map((entry) => ({ ...entry, archiveIncluded: request.includeArchive === true })),
     }),
     KNOWLEDGE_LEDGER_MAX_MS,
   );
@@ -583,9 +693,7 @@ export async function executeKnowledgeQuery(
     );
   }
 
-  // §7.3's ordering, made structural: coverage is the first key of the object
-  // literal, so a serializer that truncates by bytes truncates groups.
-  return { coverage: coverage.build(), groups, auditRef };
+  return auditRef;
 }
 
 /**
@@ -776,18 +884,23 @@ async function runLeg(
   if (!credential) return { kind: 'unavailable', reason: 'transport' };
   const channel = channelAuthDialOptions(credential);
 
-  // §7.2's source-facing contract. `kinds` is NOT here, deliberately.
-  const body = JSON.stringify({
-    q: request.q,
-    limit: request.limitPerSource,
-    ...(assertion ? { assertion } : {}),
-  });
-
   // The dial client keeps its own socket timeout — that is where a stalled
   // TLS handshake is named — and the clock races it with the SAME budget, so a
   // dial client that ever failed to honour its own timer still cannot outlive
   // the request. Both answers are §7.1's `timedOut`, so a tie changes nothing.
   const legBudgetMs = Math.max(1, Math.min(request.timeoutMs, clock.legsRemainingMs()));
+
+  // §7.2's source-facing contract. `kinds` is NOT here, deliberately.
+  // Card 3e0ae06e: a v2 source is told how long core waits for it (`budget_ms`,
+  // the dial budget less the return margin, KnowledgeDeadline.ts), so its own
+  // deadline is derived from the caller's budget, not from a shorter constant.
+  const body = JSON.stringify({
+    q: request.q,
+    limit: request.limitPerSource,
+    ...(source.protocolVersion === 2 ? { protocol_version: 2, filter: normalizeKnowledgeFilter(request.kinds, source.searchCategories) } : {}),
+    ...(source.protocolVersion === 2 ? { budget_ms: knowledgeSourceBudgetMs(legBudgetMs) } : {}),
+    ...(assertion ? { assertion } : {}),
+  });
   const raced = await clock.race(dialKnowledgeSource({
     url: endpoint,
     method: 'POST',
@@ -796,6 +909,8 @@ async function runLeg(
     allowedNetworks: source.row.knowledge_allowed_networks ?? [],
     ...(channel.clientCertificate ? { clientCertificate: channel.clientCertificate } : {}),
     timeoutMs: legBudgetMs,
+    // Preserve the legacy dial ceiling; only v2 declares a 256 KiB wire envelope.
+    ...(source.protocolVersion === 2 ? { maxResponseBytes: KNOWLEDGE_RESPONSE_MAX_BYTES } : {}),
     ...(options.trustAnchors !== undefined ? { trustAnchors: options.trustAnchors } : {}),
   }), legBudgetMs);
   if (raced.kind === 'unsettled') return { kind: 'timedOut' };
@@ -834,21 +949,35 @@ async function runLeg(
     // An unparseable body answered nothing. It is `answered` with every
     // result dropped — the source WAS reachable and DID answer — and
     // `invalidResults` names it, which is exactly §7.3's all-dropped shape.
+    if (source.protocolVersion === 2) return { kind: 'unavailable', reason: 'transport' };
     return { kind: 'answered', results: [], invalid: true, truncated: false, ...(jti ? { assertionJti: jti } : {}) };
   }
   if ((parsed as { refused?: unknown } | null)?.refused === true) return { kind: 'refusedBySource' };
 
+  const retrieval = source.protocolVersion === 2 ? validateRetrieval((parsed as { retrieval?: unknown })?.retrieval) : null;
+  if (source.protocolVersion === 2 && ((parsed as { protocol_version?: unknown })?.protocol_version !== 2 || ((parsed as {truncated?:unknown})?.truncated !== undefined && typeof (parsed as {truncated?:unknown}).truncated !== 'boolean') || !retrieval || !Array.isArray((parsed as {results?:unknown})?.results))) return { kind: 'unavailable', reason: 'transport' };
+  // Card 3e0ae06e: `deadline_fired` names the budget behind a `deadline` reason.
+  // Optional; when present it must be one of the two names and accompany that
+  // reason, or the answer is malformed like any other v2 shape violation.
+  const deadlineFired = source.protocolVersion === 2 ? (parsed as { deadline_fired?: unknown })?.deadline_fired : undefined;
+  if (deadlineFired !== undefined
+    && (!(DEADLINE_FIRED as readonly unknown[]).includes(deadlineFired) || !retrieval?.reasons.includes('deadline'))) {
+    return { kind: 'unavailable', reason: 'transport' };
+  }
   const validated = validateSourceResults({
     raw: parsed,
     requestedKinds: request.kinds,
     declaredCompartments: source.compartments,
     limit: request.limitPerSource,
+    protocolVersion: source.protocolVersion, categories: source.searchCategories, declaredCategories: source.categories,
   });
   return {
     kind: 'answered',
     results: validated.results,
+    ...(retrieval?.status === 'partial' ? { partialReasons: retrieval.reasons } : {}),
+    ...(deadlineFired !== undefined ? { deadlineFired: deadlineFired as DeadlineFired } : {}),
     invalid: validated.invalid,
-    truncated: validated.truncated,
+    truncated: validated.truncated || (source.protocolVersion === 2 && (parsed as {truncated?:unknown}).truncated === true),
     ...(jti ? { assertionJti: jti } : {}),
   };
 }
@@ -858,6 +987,9 @@ function emit(
   result: ValidatedKnowledgeResult,
   sourceId: string,
   descriptorVersion: number,
+  // v2 only: the filter this source was SENT (card 40e0e542: the narrowed
+  // one), sealed into every handle so a cited GET re-applies it.
+  filter?: KnowledgeFilter,
 ): KnowledgeEmittedResult {
   return {
     handle: sealKnowledgeHandle({
@@ -865,11 +997,13 @@ function emit(
       dv: descriptorVersion,
       c: result.compartment,
       r: result.ref,
+      ...(filter ? { f: filter } : {}),
     }),
     title: result.title,
     snippet: result.snippet,
     contentKind: result.contentKind,
-    compartment: result.compartment,
+    compartment: filter ? { id: result.compartment, ...(result.compartmentLabel ? { label: result.compartmentLabel } : {}) } : result.compartment,
+    ...(result.category ? { category: result.category } : {}),
     score: result.score,
     ...(result.updatedAt ? { updatedAt: result.updatedAt } : {}),
     ...(result.parentRef
@@ -879,6 +1013,7 @@ function emit(
           dv: descriptorVersion,
           c: result.compartment,
           r: result.parentRef,
+          ...(filter ? { f: filter } : {}),
         }),
       }
       : {}),

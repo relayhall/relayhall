@@ -12,8 +12,11 @@
 jest.mock('../db/connection', () => ({
   pool: { query: jest.fn(), connect: jest.fn() },
 }));
+jest.mock('../services/AuditService', () => ({ auditService: { record: jest.fn().mockResolvedValue({}) } }));
 
 import { pool } from '../db/connection';
+import { authorizationRepository } from '../services/AuthorizationRepository';
+import type { CharterApprovalActor } from '../services/CharterService';
 import { CharterService, CharterError, CHARTER_CONTENT_MAX_LENGTH } from '../services/CharterService';
 
 const PROJECT_ID = 'f2735f1b-0000-4000-8000-000000000001';
@@ -196,5 +199,104 @@ describe('reads', () => {
     await expectCharterError(service.getVersion(PROJECT_ID, 99), 404, 'CHARTER_VERSION_NOT_FOUND');
     const v1 = await service.getVersion(PROJECT_ID, 1);
     expect(v1.content).toBe('# Charter v1');
+  });
+});
+
+describe('human Project Charter approval', () => {
+  const OWNER = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const actor = (overrides: any = {}): CharterApprovalActor => ({
+    authMethod: 'session',
+    audit: { principalId: OWNER, handle: 'owner', authMethod: 'session' },
+    authorization: { principalId: OWNER, handle: 'owner', role: 'user',
+      scopes: ['projects:write'], authenticated: true },
+    ...overrides,
+  });
+  let principal: any;
+  let owner: string | null;
+  let writesAllowed: boolean;
+  let adminsAllowed: boolean;
+  let authority: jest.SpyInstance;
+  beforeEach(() => {
+    principal = { id: OWNER, handle: 'owner', kind: 'human', status: 'active', role: 'user', parent_principal_id: null };
+    owner = OWNER; writesAllowed = true; adminsAllowed = false;
+    const ordinaryQuery = (pool.query as jest.Mock).getMockImplementation()!;
+    const query = jest.fn(async (text: string, params?: any[]) => {
+      if (text.startsWith('SELECT id, handle, kind')) return { rows: principal ? [principal] : [] };
+      if (text.startsWith('SELECT owner_principal_id')) return { rows: [{ owner_principal_id: owner }] };
+      // Card b5c83682 (LENSES-c gate (i)): the Group-owner arm reads the owner's kind
+      // after the administrator test refused; a person owner is no Group, so it refuses.
+      if (text.startsWith('SELECT p.id::text AS project_id')) {
+        return { rows: owner ? [{ project_id: PROJECT_ID, id: owner, kind: 'human', status: 'active' }] : [] };
+      }
+      return ordinaryQuery(text, params);
+    });
+    (pool.connect as jest.Mock).mockResolvedValue({ query, release: jest.fn() });
+    authority = jest.spyOn(authorizationRepository, 'authorizedIds').mockImplementation(async (_actor, _type, ids, action, queryable) => {
+      expect(queryable).toBeDefined();
+      return new Set((action === 'write' ? writesAllowed : adminsAllowed) ? ids : []);
+    });
+  });
+  afterEach(() => authority.mockRestore());
+
+  test('active human owner creates and revises with attributable versions', async () => {
+    const first = await service.approve(PROJECT_ID, '# Approved', undefined, actor());
+    expect(first.created).toBe(true);
+    expect(first.charter.updatedByPrincipalId).toBe(OWNER);
+    expect(state.versionInserts[0][3]).toBe(OWNER);
+    const next = await service.approve(PROJECT_ID, '# Revised', first.charter.revision, actor());
+    expect(next.charter.version).toBe(2);
+    expect(next.charter.updatedByPrincipalId).toBe(OWNER);
+  });
+
+  test.each(['principal_api_key', 'api_key', 'reports_api_key', undefined])('refuses authentication method %s', async authMethod => {
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor({ authMethod }))).rejects.toMatchObject({ status: 403 });
+    expect(state.mutations).toEqual([]);
+  });
+  test.each([false, 0, '', null, undefined, {}, { authorization: null }])('invalid approval actor %p cannot fall into root write', async bad => {
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, bad as any)).rejects.toMatchObject({ status: 403 });
+    expect(state.mutations).toEqual([]);
+  });
+  test.each([
+    { kind: 'service' }, { kind: 'agent' }, { status: 'disabled' },
+    { parent_principal_id: 'parent' }, { role: 'viewer' }, { role: null },
+  ])('refuses current Account %p', async patch => {
+    Object.assign(principal, patch);
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor())).rejects.toMatchObject({ status: 403 });
+    expect(state.mutations).toEqual([]);
+  });
+  test('refuses missing live Account, missing request scope and narrower session role', async () => {
+    principal = null;
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor())).rejects.toMatchObject({ status: 403 });
+    principal = { id: OWNER, handle: 'owner', kind: 'human', status: 'active', role: 'admin', parent_principal_id: null };
+    for (const authorization of [
+      { ...actor().authorization, scopes: [] },
+      { ...actor().authorization, role: 'viewer' },
+    ]) {
+      await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor({ authorization }))).rejects.toMatchObject({ status: 403 });
+    }
+    expect(state.mutations).toEqual([]);
+  });
+  test('project write alone is insufficient for a nonowner; canonical project admin permits approval', async () => {
+    owner = 'someone-else';
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor())).rejects.toMatchObject({ status: 403 });
+    expect(state.mutations).toEqual([]);
+    adminsAllowed = true; principal.role = 'operator';
+    const approved = await service.approve(PROJECT_ID, '# Admin approved', undefined,
+      actor({ authorization: { ...actor().authorization, role: 'operator' } }));
+    expect(approved.created).toBe(true);
+  });
+  test('revoked object write refuses even the owner; lookup errors roll back', async () => {
+    writesAllowed = false;
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor())).rejects.toMatchObject({ status: 403 });
+    authority.mockRejectedValueOnce(new Error('test lookup failure'));
+    await expect(service.approve(PROJECT_ID, '# Denied', undefined, actor())).rejects.toThrow('test lookup failure');
+    expect(state.mutations).toEqual([]);
+  });
+  test('approval retains revision conflicts and archived-project refusal', async () => {
+    state.head = headRow();
+    await expect(service.approve(PROJECT_ID, '# New', 'stale', actor())).rejects.toMatchObject({ code: 'REVISION_MISMATCH' });
+    state.projectStatus = 'archived';
+    await expect(service.approve(PROJECT_ID, '# New', REVISION, actor())).rejects.toMatchObject({ code: 'PROJECT_ARCHIVED' });
+    expect(state.mutations).toEqual([]);
   });
 });

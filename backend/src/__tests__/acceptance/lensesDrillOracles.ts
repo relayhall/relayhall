@@ -87,10 +87,23 @@ export interface Observation {
   refusal?: { status: number; code: string };
 }
 
+/** One CHECK on `grants`, as the catalogue names and renders it. */
+export interface GrantsCheck {
+  /** `pg_constraint.conname`. */
+  name: string;
+  /** `pg_get_constraintdef(oid)`. */
+  definition: string;
+}
+
 /** The schema facts control R-7 is a statement about. */
 export interface SchemaObservation {
-  /** `pg_get_constraintdef` of every CHECK on `grants` mentioning `provenance`. */
-  provenanceCheckDefs: string[];
+  /**
+   * EVERY CHECK on `grants`, by name. R-7 reads exactly one of them, the
+   * provenance domain, which it selects by NAME
+   * ({@link PROVENANCE_DOMAIN_CONSTRAINT}); the selection is the oracle's,
+   * never the caller's, so the drill can prove it discriminates.
+   */
+  grantsChecks: GrantsCheck[];
   /**
    * Did the REAL constraint refuse an arbitrary, unratified provenance value?
    * `undefined` when the observation was built without a database (the
@@ -155,22 +168,45 @@ function creatorRows(obs: Observation): GrantRow[] {
     && row.resourceId === obs.projectId);
 }
 
+/**
+ * Owner ruling E407 item 2 (2026-10-20): the creator policy writes each verb's
+ * row only when the authorization engine says it changes access or what its
+ * holder may delegate, and the policy's OWN audit row (`project.creator_access`,
+ * one per verb, in the same transaction) says which: `alreadyHeld: true` with
+ * `grantId: null` wrote no row. So the expected creator rows are read off those
+ * audit rows - an administrator creator's pair is held, a Member's is written -
+ * and the audit rows must name each creator verb exactly once, so a build that
+ * dropped a row without saying so, or said so and wrote it anyway, stays red.
+ */
+function creatorPolicyAudits(obs: Observation): AuditRow[] {
+  return obs.audits.filter((row) => row.action === 'project.creator_access');
+}
+
 function assertCreatorPair(obs: Observation): { bad: string[]; rows: GrantRow[] } {
   const bad: string[] = [];
   const rows = creatorRows(obs);
+  const policy = creatorPolicyAudits(obs);
   if (obs.actor.principalId === null) {
     if (rows.length !== 0) {
       bad.push(`an acting channel with no resolved principal left ${rows.length} creator rows`);
     }
+    if (policy.length !== 0) bad.push(`an acting channel with no resolved principal audited ${policy.length} creator acts`);
     return { bad, rows };
   }
-  if (rows.length !== 2) {
-    bad.push(`expected exactly two project-creator rows for ${obs.actor.principalId}, saw ${rows.length}`);
-  } else {
-    const verbs = rows.map((row) => row.verb).sort();
-    if (JSON.stringify(verbs) !== JSON.stringify(CREATOR_VERBS)) {
-      bad.push(`expected creator verbs ${CREATOR_VERBS.join('+')}, saw ${verbs.join('+') || '(none)'}`);
+  const audited = policy.map((row) => String(row.metadata.verb)).sort();
+  if (JSON.stringify(audited) !== JSON.stringify(CREATOR_VERBS)) {
+    bad.push(`expected the creator policy to audit ${CREATOR_VERBS.join('+')} once each for ${obs.actor.principalId}, saw ${audited.join('+') || '(none)'}`);
+  }
+  for (const row of policy) {
+    const held = row.metadata.alreadyHeld === true;
+    if (held !== (row.metadata.grantId === null)) {
+      bad.push(`the creator audit for ${String(row.metadata.verb)} says alreadyHeld=${held} but grantId=${String(row.metadata.grantId)}`);
     }
+  }
+  const written = policy.filter((row) => row.metadata.alreadyHeld !== true).map((row) => String(row.metadata.verb)).sort();
+  const verbs = rows.map((row) => row.verb).sort();
+  if (JSON.stringify(verbs) !== JSON.stringify(written)) {
+    bad.push(`expected the project-creator rows its audit says were written (${written.join('+') || 'none'}) for ${obs.actor.principalId}, saw ${verbs.join('+') || 'none'}`);
   }
   for (const row of rows) {
     if (row.origin !== 'manual') {
@@ -421,6 +457,38 @@ export function assertSerialised(obs: SerialisationObservation): string[] {
 export const RATIFIED_PROVENANCE_VALUES = ['assignment:grant', 'assignment:warrant'];
 
 /**
+ * The CHECK that IS the provenance domain, by NAME: `099:57-59` installs it
+ * under this name and migration 128's postcondition requires it by this name
+ * (`128:183`).
+ *
+ * WHY NAME AND NOT TEXT (785e1eed P1-B correction, CI full tier run 5698).
+ * This oracle once read every CHECK whose definition contained the substring
+ * `provenance`. Migration 142's `grants_approval_shape` (`142:183-187`) says
+ * `provenance IS NULL` as ONE CONJUNCT of an approval-made row's shape, admits
+ * no provenance value, and the substring filter read its other literals
+ * ('principal', 'manual') as the provenance domain: a red that measured a
+ * different constraint. A definition that MENTIONS a column is not that
+ * column's domain.
+ *
+ * Nothing is lost by ignoring the other CHECKs. PostgreSQL ANDs every CHECK
+ * on a table, so a separately-named CHECK can only NARROW what this one
+ * admits, never widen it; a widening has to edit, replace or rename THIS
+ * constraint. A new literal is red in the set comparison below, a
+ * same-literal widening (`NOT IN`) is red in the behavioural probe
+ * (`arbitraryProvenanceRefused`), and a drop or a rename is red as "gone".
+ * A narrowing ELSEWHERE that refuses a ratified value is the probe's to catch
+ * (`ratifiedProvenanceAccepted`): the database's answer covers every
+ * constraint at once, and no name census has to be complete for it.
+ *
+ * NOT covered, before this repair or after it: a widening inside this
+ * constraint conditioned on ANOTHER column (`... OR approval_id IS NOT NULL`)
+ * adds no literal and is not exercised by the probe's rows. Migration 128's
+ * exact-expression postcondition (`128:179-195`) refuses it at 128's position
+ * in the chain; nothing here re-measures it at head.
+ */
+export const PROVENANCE_DOMAIN_CONSTRAINT = 'grants_provenance_shape';
+
+/**
  * Every single-quoted literal in a constraint definition, in order.
  *
  * `pg_get_constraintdef` renders the CHECK as, e.g.,
@@ -450,10 +518,13 @@ export function quotedLiterals(definition: string): string[] {
 
 export function assertProvenanceCollisionAvoided(schema: SchemaObservation): string[] {
   const bad: string[] = [];
-  if (schema.provenanceCheckDefs.length === 0) {
-    bad.push('no CHECK on grants mentions provenance: 099:55-59 is gone');
+  const domain = schema.grantsChecks
+    .filter((check) => check.name === PROVENANCE_DOMAIN_CONSTRAINT)
+    .map((check) => check.definition);
+  if (domain.length === 0) {
+    bad.push(`no CHECK named ${PROVENANCE_DOMAIN_CONSTRAINT} on grants: 099:55-59 is gone`);
   }
-  for (const def of schema.provenanceCheckDefs) {
+  for (const def of domain) {
     // THE SET, not two substrings and a forbidden list (round-1 review
     // finding B3). A list of values that must not appear is satisfied by the
     // next value nobody thought to forbid, which is exactly how this control

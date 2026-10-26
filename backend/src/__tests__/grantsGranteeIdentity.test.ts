@@ -18,16 +18,28 @@ jest.mock('../services/GrantService', () => ({
   grantService: { list: jest.fn(), create: jest.fn(), remove: jest.fn() },
   GrantError: class extends Error {},
 }));
+// Card ff410dc4 (E407 item 1): GET /grants reads through the paged list
+// service; the rows it hands the route are what these assertions name.
+jest.mock('../services/GrantListService', () => ({
+  grantListService: { page: jest.fn() },
+  parseGrantListQuery: () => ({ limit: null }),
+}));
 jest.mock('../services/PrincipalService', () => ({
   principalService: { getPrincipalById: jest.fn() },
 }));
 
 import grantsRoutes from '../routes/grants';
 import { grantService } from '../services/GrantService';
+import { grantListService } from '../services/GrantListService';
 import { principalService } from '../services/PrincipalService';
 
 const grants = grantService as jest.Mocked<typeof grantService>;
 const principals = principalService as jest.Mocked<typeof principalService>;
+const listed = grantListService as jest.Mocked<typeof grantListService>;
+/** The list service answers rows; the legacy read is every row, unpaged. */
+function listRows(rows: unknown[]) {
+  listed.page.mockResolvedValue({ grants: rows, pagination: {} } as never);
+}
 
 const READER_ID = 'df2425ad-e41d-4e2b-8774-476269649574';
 const ADMIN_ID = '9afb0f9f-9e08-4e8d-85e4-090156891344';
@@ -65,7 +77,7 @@ const SEEDED_GRANT = {
   createdAt: '2026-09-05T02:27:23.033Z',
 };
 
-async function listGrants(): Promise<any> {
+async function listGrants(method = 'GET', body?: unknown): Promise<any> {
   const app = express();
   app.use(express.json());
   app.use('/grants', grantsRoutes);
@@ -74,7 +86,9 @@ async function listGrants(): Promise<any> {
     await new Promise<void>((resolve) => server.once('listening', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('not listening');
-    const response = await fetch(`http://127.0.0.1:${address.port}/grants`);
+    const response = await fetch(`http://127.0.0.1:${address.port}/grants`, {
+      method, ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+    });
     return { status: response.status, json: await response.json() };
   } finally {
     await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
@@ -92,7 +106,7 @@ beforeEach(() => {
 
 describe('GET /grants names the identity every grant is held by', () => {
   it('names the HIDDEN compatibility grantee the directory listing omits', async () => {
-    grants.list.mockResolvedValue([SEEDED_GRANT] as never);
+    listRows([SEEDED_GRANT]);
     const answer = await listGrants();
     expect(answer.status).toBe(200);
     const [row] = answer.json.grants;
@@ -111,14 +125,14 @@ describe('GET /grants names the identity every grant is held by', () => {
     // Naming it is not enough for a surface whose only affordance is "Revoke":
     // the operator has to be able to tell a seeded compatibility grant from
     // one somebody made. `compatibility` and `status` are what carry that.
-    grants.list.mockResolvedValue([SEEDED_GRANT] as never);
+    listRows([SEEDED_GRANT]);
     const [row] = (await listGrants()).json.grants;
     expect(`compatibility: ${row.grantee.compatibility}`).toBe('compatibility: true');
     expect(`status: ${row.grantee.status}`).toBe('status: disabled');
   });
 
   it('names the granter too, so a standing grant says who made it', async () => {
-    grants.list.mockResolvedValue([SEEDED_GRANT] as never);
+    listRows([SEEDED_GRANT]);
     const [row] = (await listGrants()).json.grants;
     expect(row.grantedBy).toMatchObject({ handle: 'ada', compatibility: false });
   });
@@ -126,7 +140,7 @@ describe('GET /grants names the identity every grant is held by', () => {
   it('a grantee whose row is genuinely gone resolves to null, not to a wrong name', async () => {
     // The surface then says so about a SPECIFIC id, which is a different
     // statement from "I could not find a name for this".
-    grants.list.mockResolvedValue([{ ...SEEDED_GRANT, granteeId: GONE_ID }] as never);
+    listRows([{ ...SEEDED_GRANT, granteeId: GONE_ID }]);
     const [row] = (await listGrants()).json.grants;
     expect(row.grantee).toBeNull();
     expect(row.granteeId).toBe(GONE_ID);
@@ -135,11 +149,37 @@ describe('GET /grants names the identity every grant is held by', () => {
   it('resolves EVERY row, not just the first', async () => {
     // A per-row resolution that only ran once would pass every assertion
     // above and leave a second grant unnamed on the page.
-    grants.list.mockResolvedValue([
+    listRows([
       { ...SEEDED_GRANT, id: 'a' },
       { ...SEEDED_GRANT, id: 'b', granteeId: ADMIN_ID },
-    ] as never);
+    ]);
     const rows = (await listGrants()).json.grants;
     expect(rows.map((row: any) => row.grantee?.handle)).toEqual(['reports_reader', 'ada']);
+  });
+});
+
+describe('POST /grants returns the same resolved identity shape as listing', () => {
+  it('returns the full created row with the same safe grantee and granter summaries as GET', async () => {
+    const created = { ...SEEDED_GRANT, granteeId: ADMIN_ID, resourceId: GONE_ID, expiresAt: '2099-12-01T10:00:00.000Z' };
+    const input = { granteeType: 'principal', granteeId: ADMIN_ID, resourceType: 'report', resourceId: GONE_ID, verb: 'read', expiresAt: created.expiresAt };
+    grants.create.mockResolvedValue(created as never);
+    listRows([created]);
+    const answer = await listGrants('POST', input);
+    expect(answer.status).toBe(201); expect(answer.json.success).toBe(true);
+    expect(grants.create).toHaveBeenCalledTimes(1);
+    expect(grants.create).toHaveBeenCalledWith(input, expect.any(Object));
+    expect(answer.json.grant).toEqual({
+      ...created,
+      grantee: { id: ADMIN_ID, handle: 'ada', displayName: 'Ada', kind: 'human', status: 'active', compatibility: false },
+      grantedBy: { id: ADMIN_ID, handle: 'ada', displayName: 'Ada', kind: 'human', status: 'active', compatibility: false },
+    });
+    expect(answer.json.grant).toEqual((await listGrants()).json.grants[0]);
+  });
+  it('preserves null identity summaries when a principal is genuinely gone or no granter was recorded', async () => {
+    const created = { ...SEEDED_GRANT, granteeId: GONE_ID, grantedByPrincipalId: null };
+    grants.create.mockResolvedValue(created as never);
+    const answer = await listGrants('POST', { granteeType: 'principal', granteeId: GONE_ID, resourceType: 'report', verb: 'read' });
+    expect(answer.status).toBe(201);
+    expect(answer.json.grant).toEqual({ ...created, grantee: null, grantedBy: null });
   });
 });

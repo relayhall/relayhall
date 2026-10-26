@@ -395,6 +395,32 @@ describe('§5.5 / item 1 — the caller × selector table, over real selectors',
     expect(beta.requests).toHaveLength(0);
   });
 
+  it.each(['kind', 'status', 'parentPrincipalId'])('missing middleware Account field %s never signs or dials', async (field) => {
+    await assignServiceSelector(USER_A.principalId, 'exact', [SOURCE_ALPHA]);
+    const req = await requestFor(USER_A);
+    expect(req.principal).toMatchObject({ kind: 'human', status: 'active', parentPrincipalId: null });
+    delete req.principal[field];
+    const response = await executeKnowledgeQuery(req, {
+      q: NEEDLE, kinds: ['docs'], sources: [SOURCE_ALPHA], limitPerSource: 8, timeoutMs: 3000,
+    }, { issuer: 'https://relayhall.test', callerGroupIds: [], trustAnchors: [alpha.certificate.cert] });
+    expect(runConsulted(response)).toEqual([]);
+    expect(alpha.requests).toHaveLength(0);
+  });
+
+  it('projects current disabled Account state from the database and refuses the dial', async () => {
+    await assignServiceSelector(USER_A.principalId, 'exact', [SOURCE_ALPHA]);
+    await pool.query("UPDATE principals SET status = 'disabled' WHERE id = $1", [USER_A.principalId]);
+    try {
+      const req = await requestFor(USER_A);
+      expect(req.principal.status).toBe('disabled');
+      const response = await searchDialing(USER_A, { sources: [SOURCE_ALPHA] });
+      expect(runConsulted(response)).toEqual([]);
+      expect(alpha.requests).toHaveLength(0);
+    } finally {
+      await pool.query("UPDATE principals SET status = 'active' WHERE id = $1", [USER_A.principalId]);
+    }
+  });
+
   it('all-of-type: every capable source, including one configured AFTER the grant', async () => {
     await assignServiceSelector(USER_A.principalId, 'all-of-type', []);
     const late = await makeSource(`kw1late${tag()}`, alpha.port, 'alpha/core');
@@ -533,11 +559,11 @@ async function runAs(who: Caller, scopes: string[]): Promise<any> {
 
 /** A request object carrying the caller's real actor, for the mutation drills. */
 async function requestFor(who: Caller, scopeList?: string[]): Promise<any> {
-  const principal = await pool.query('SELECT id, handle, role FROM principals WHERE id = $1', [who.principalId]);
+  const principal = await pool.query('SELECT id, handle, role, kind, status, parent_principal_id FROM principals WHERE id = $1', [who.principalId]);
   const row = principal.rows[0];
   const scopes = scopeList ?? [KNOWLEDGE_SCOPE, ...BOARD_SCOPES];
   return {
-    principal: { id: String(row.id), handle: row.handle, role: row.role },
+    principal: { id: String(row.id), handle: row.handle, role: row.role, kind: row.kind, status: row.status, parentPrincipalId: row.parent_principal_id },
     userId: row.handle,
     credentialId: null,
     // The middleware stamps both of these for a resolved login session, and

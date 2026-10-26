@@ -45,7 +45,13 @@ def main():
             if selector:cmd += ['--testNamePattern','^'+re.escape(selector)+'$']
             with (out/(name+'.log')).open('w') as log:code=subprocess.run(cmd,cwd=backend,env=env,stdout=log,stderr=subprocess.STDOUT).returncode
             result=json.loads((out/(name+'.json')).read_text());return code,result
-        code,data=run('baseline');assert code==0 and data['numPassedTests']==39 and data['numFailedTests']==0,'Baseline refused'
+        # The inventory is the baseline's own (machinery queue 9b761f09: a literal
+        # count drifts the first time the suite grows); every declared test must
+        # be one of its tests, and the closing run must measure the same set.
+        names=lambda d:sorted(a['fullName'] for r in d['testResults'] for a in r.get('assertionResults',[]))
+        code,data=run('baseline');baseline=names(data)
+        assert code==0 and baseline and data['numFailedTests']==0 and data['numPassedTests']==len(baseline),'Baseline refused'
+        assert all(baseline.count(c[4])==1 for c in CASES),'a declared test is not exactly one baseline test'
         for name,relative,old,new,selector,tokens in CASES:
             p=backend/relative;original=p.read_bytes();text=original.decode();assert text.count(old)==1,(name,'anchor count')
             try:
@@ -59,13 +65,13 @@ def main():
             assert p.read_bytes()==original,(name,'restore mismatch')
             code,data=run(name+'-restored',selector);assert code==0 and data['numPassedTests']==1 and data['numFailedTests']==0,(name,'restored not green')
             assert inputs()==before,'Live input file-set/hash changed'
-        code,data=run('restored');assert code==0 and data['numPassedTests']==39 and data['numFailedTests']==0,'Final restore refused'
+        code,data=run('restored');assert code==0 and names(data)==baseline and data['numFailedTests']==0 and data['numPassedTests']==len(baseline),'Final restore refused'
         assert inputs()==before,'Live source drift'
-        receipt.update({'status':'PASS','baselinePassed':39,'restoredPassed':39,'sourceUnchanged':True})
+        receipt.update({'status':'PASS','baselinePassed':len(baseline),'restoredPassed':len(baseline),'sourceUnchanged':True})
     finally:
         assert copy.parent==out and copy.name=='private-copy'
         if copy.exists():shutil.rmtree(copy)
         receipt['copyRemoved']=not copy.exists();(out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
-    print('PASS: 39 baseline/restored, four exact semantic controls; no live database proof.')
+    print(f"PASS: {receipt['baselinePassed']} baseline/restored, four exact semantic controls; no live database proof.")
 
 if __name__=='__main__':main()

@@ -763,45 +763,32 @@ describe('the connection acquisition deadline survives an event-loop stall', () 
 // ───────── 3d · the destructive fixture refuses a deployment database ────────
 
 describe('the seed script refuses the database the pool would actually reach', () => {
-  test('an absent DB_NAME is refused, because the pool resolves it to a deployment database', () => {
-    // Round-1 REJECT, blocking finding 1, promoted from the reviewer's probe
-    // into a control. The guard used to read `process.env.DB_NAME`, find the
-    // empty string, and pass — while the pool resolved that same absent
-    // variable to `relayhall_dev`. A destructive script that claims to refuse
-    // deployment databases would have written thousands of rows into DEV
-    // whenever it ran with no environment, which is how it would most likely
-    // be run by accident.
-    //
-    // The case is set up as an EMPTY string rather than by deleting the key:
-    // `dotenv` populates absent keys from a `.env` file and skips present
-    // ones, so an empty value is the only way to pin what the pool resolves
-    // regardless of what is on disk.
+  test('an absent DB_NAME is refused before the seed can reach a pool', () => {
+    // D11 now refuses an unnamed database at module load, before the seed's
+    // disposable-target guard. Keep the original empty-value control (dotenv
+    // cannot fill a present empty key), and assert that earlier safe boundary.
     const saved = { ...process.env };
     let refusal: Error | null = null;
-    let accepted = false;
-    let resolvedDatabase = '';
+    let poolConfigurationExposed = false;
+    let seedGuardReached = false;
     try {
       process.env.DB_NAME = '';
       process.env.DB_HOST = '';
-      // A fresh module registry, so `db/connection` re-reads the environment.
-      // Constructing a Pool opens nothing — `pg` connects lazily — and nothing
-      // below queries it.
       jest.isolateModules(() => {
-        const { databasePoolConfig } = require('../db/connection');
-        resolvedDatabase = String(databasePoolConfig.database ?? '');
-        const { assertDisposableTarget } = require('../../scripts/seed-scale-fixture');
-        try { assertDisposableTarget(); accepted = true; } catch (err) { refusal = err as Error; }
+        try {
+          require('../db/connection');
+          poolConfigurationExposed = true;
+          const { assertDisposableTarget } = require('../../scripts/seed-scale-fixture');
+          seedGuardReached = true;
+          assertDisposableTarget();
+        } catch (err) { refusal = err as Error; }
       });
     } finally {
       process.env = saved;
     }
-
-    // The premise, measured rather than assumed: with no DB_NAME the pool
-    // really does resolve to a deployment database. If this ever stops being
-    // true the control below is testing nothing, so it is asserted first.
-    expect(resolvedDatabase).toBe('relayhall_dev');
-    expect(accepted).toBe(false);
-    expect(String((refusal as unknown as Error)?.message)).toContain('deployment database');
+    expect(poolConfigurationExposed).toBe(false);
+    expect(seedGuardReached).toBe(false);
+    expect(String((refusal as unknown as Error)?.message)).toContain('DB_NAME is unset');
   });
 
   test('a disposable local database is accepted, so the guard is not simply always refusing', () => {

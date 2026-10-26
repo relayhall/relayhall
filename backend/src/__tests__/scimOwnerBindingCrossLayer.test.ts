@@ -354,7 +354,7 @@ const registryAskedOf = () => statements
   .filter((s) => s.sql.includes('AS is_connector'))
   .map((s) => String(s.params[0]));
 
-const OWNER = { principalId: 'owner', handle: 'wadera', authMethod: 'session' as const };
+const OWNER = { principalId: 'owner', handle: 'river', authMethod: 'session' as const };
 
 beforeAll(async () => {
   const app = express();
@@ -385,8 +385,8 @@ beforeAll(async () => {
   // middleware is proved, not re-proved by this file.
   app.use('/identity-providers', (req, _res, next) => {
     const owner = req as AuthRequest;
-    owner.principal = { id: 'owner', handle: 'wadera' } as AuthRequest['principal'];
-    owner.userId = 'wadera';
+    owner.principal = { id: 'owner', handle: 'river' } as AuthRequest['principal'];
+    owner.userId = 'river';
     owner.authMethod = 'session';
     next();
   }, identityProvidersRouter);

@@ -6,7 +6,7 @@ The task dependency picker now uses server-backed search instead of loading the 
 
 The picker should return non-archived tasks other than the task currently being edited when the query matches any of:
 - task title, exact or fragment
-- short task ID, for example `1ad5375c`
+- short task ID, for example `4b7e90d1`
 - full UUID with hyphens
 - full UUID without hyphens
 - project name fragment

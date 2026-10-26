@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, act, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import '@testing-library/jest-dom/vitest';
@@ -9,6 +9,9 @@ import { authenticatedFetch } from '../utils/auth';
 import { CharterPage } from './CharterPage';
 
 vi.mock('../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
+vi.mock('../hooks/useWebSocket', () => ({
+  useWebSocket: () => ({ subscribe: () => () => undefined, connected: false }),
+}));
 
 const mockFetch = vi.mocked(authenticatedFetch);
 
@@ -125,7 +128,7 @@ describe('CharterPage', () => {
 
     mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
       const path = String(url);
-      if (init?.method === 'PUT') {
+      if (init?.method === 'POST') {
         return jsonResponse({ success: false, code: 'REVISION_MISMATCH' }, false, 412);
       }
       if (path.endsWith('/projects/p1/charter')) return jsonResponse({ success: true, charter: CHARTER });
@@ -134,7 +137,82 @@ describe('CharterPage', () => {
     });
 
     await userEvent.click(screen.getByRole('button', { name: /Edit/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Approve Charter' }));
     await screen.findByText(/changed since it was loaded/);
   });
+});
+
+test('approval sends the human approval action with observed revision and no privilege fields', async () => {
+  routeFetch();
+  renderPage();
+  await screen.findByRole('heading', { name: 'Authority Index' });
+  mockFetch.mockImplementation(async (_url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') return jsonResponse({ success: false }, false, 403);
+    return jsonResponse({ success: true, charter: CHARTER });
+  });
+  await userEvent.click(screen.getByRole('button', { name: /Edit/ }));
+  await userEvent.click(screen.getByRole('button', { name: 'Approve Charter' }));
+  await screen.findByText(/Sign in as this project’s owner/);
+  expect(mockFetch).toHaveBeenCalledWith(expect.stringMatching(/\/projects\/p1\/charter\/approve$/), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': CHARTER.revision },
+    body: JSON.stringify({ content: CHARTER.content }),
+  });
+});
+
+test('a stale successful Charter response cannot restore content after a later access denial', async () => {
+  routeFetch();
+  renderPage();
+  await screen.findByText('Governing docs live here.');
+  let resolveOld!: (value: Response) => void;
+  let charterCalls = 0;
+  mockFetch.mockImplementation(async url => {
+    if (String(url).endsWith('/charter')) {
+      charterCalls++;
+      if (charterCalls === 1) return new Promise<Response>(resolve => { resolveOld = resolve; });
+      return jsonResponse({ success: false, code: 'RESOURCE_NOT_FOUND' }, false, 404);
+    }
+    return jsonResponse({ success: true, project: { id: 'p1', name: 'Fixture' } });
+  });
+  act(() => window.dispatchEvent(new Event('focus')));
+  act(() => window.dispatchEvent(new Event('focus')));
+  await waitFor(() => expect(charterCalls).toBe(2));
+  await waitFor(() => expect(screen.queryByText('Governing docs live here.')).not.toBeInTheDocument());
+  await act(async () => { resolveOld(jsonResponse({ success: true, charter: CHARTER })); });
+  expect(screen.queryByText('Governing docs live here.')).not.toBeInTheDocument();
+});
+
+// LENSES-c gate (i) (card b5c83682): an owner of the Group that owns the
+// project is asked for a step-up by the board's challenge, confirms once, and
+// the approval is sent ONE more time with the token; administrators and person
+// owners are never asked (the test above sends no token).
+test('a Group owner answers the Charter step-up challenge once, and the approval is resent with the token', async () => {
+  routeFetch();
+  renderPage();
+  await screen.findByRole('heading', { name: 'Authority Index' });
+  const approvals: unknown[] = [];
+  mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+    const path = String(url);
+    if (path.endsWith('/auth/step-up/methods')) return jsonResponse({ success: true, methods: ['password'], preferred: 'password' });
+    if (path.endsWith('/auth/step-up')) return jsonResponse({ success: true, stepUpToken: 'rhsu_charter_token' });
+    if (init?.method === 'POST' && path.endsWith('/charter/approve')) {
+      const body = JSON.parse(String(init.body));
+      approvals.push(body);
+      if (!body.stepUpToken) {
+        return jsonResponse({
+          success: false, code: 'STEP_UP_REQUIRED', message: 'This act requires a live single-use step-up token',
+          stepUp: { error: 'insufficient_user_authentication', action: 'charter.approve', targetId: 'p1', max_age: 0, methods: ['password'] },
+        }, false, 403);
+      }
+      return jsonResponse({ success: true, charter: { ...CHARTER, version: 5 }, created: false, changed: true });
+    }
+    if (path.endsWith('/projects/p1/charter')) return jsonResponse({ success: true, charter: CHARTER });
+    return jsonResponse({ success: true, project: { id: 'p1', name: 'Fixture' } });
+  });
+  await userEvent.click(screen.getByRole('button', { name: /Edit/ }));
+  await userEvent.click(screen.getByRole('button', { name: 'Approve Charter' }));
+  const dialog = await screen.findByRole('dialog');
+  await userEvent.type(await within(dialog).findByLabelText('Password'), 'test-password');
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Continue' }));
+  await waitFor(() => expect(approvals).toHaveLength(2));
+  expect(approvals).toEqual([{ content: CHARTER.content }, { content: CHARTER.content, stepUpToken: 'rhsu_charter_token' }]);
 });

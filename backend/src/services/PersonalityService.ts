@@ -291,7 +291,9 @@ export class PersonalityService {
           name: 'task.updated', objectType: 'task', objectId: repointed.id,
           projectId: repointed.project_id ?? null,
           ownerPrincipalId: repointed.owner_principal_id ?? null,
-          payload: {},
+          // Card 5854f0d6: the field name; the duplicate retirement is a board
+          // maintenance act with no acting principal (TIMELINE_SYSTEM_EMITS).
+          payload: { fields: ['personalityId'] },
         });
       }
       await feedEventService.emit(client, {

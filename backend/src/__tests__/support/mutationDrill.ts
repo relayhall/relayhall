@@ -93,9 +93,14 @@ const OWN_ARM_COPY = [
   '',
 ].join('\n');
 
+// Site C as P2-D (card 80892045) left it: the shared arms are bound once and
+// pushed to both the predicate and its read-only provenance. Re-anchored by
+// name on the integration lane; the mutation still swaps them for the copy.
 const SHARED_ARMS = [
   "        if (action === 'read') {",
-  '          accountParts.push(...this.visibilityArms(resource));',
+  '          const visibility = this.visibilityArms(resource);',
+  '          accountParts.push(...visibility);',
+  "          chainSources.push(...visibility.map(sql => ({ basis: 'visibility', sql })));",
   '        }',
   '',
 ].join('\n');

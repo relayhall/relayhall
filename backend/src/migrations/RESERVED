@@ -62,3 +62,45 @@
 129 rh-590e88cc-scale 590e88cc
 130 rh-50493968-personality-versions 50493968
 131 fresh-install-cleanup c0c93382
+132 codex-plugin-migration-core-20260910 bedf50cc
+133 codex-relayhall-planning-mcp-20260925 979fa3a2
+134 codex-flat-task-review-20260927 f075e779
+135 codex-native-verifier-session-20260927 6b8af7d6
+136 codex-ordinary-native-correlation-20260927 6b8af7d6
+137 codex-pg-native-coordination-20261002 7384f058
+
+
+138 codex-task-report-workflow 2c1a34f2
+
+139 codex-owner-main-control-20261007 bfb32a61
+140 claude-track-a-batch4f-stepup-sso a3e76724
+141 claude-track-a-batch11-inbox-defaults b13e5ac9
+142 claude-track-a-p1b-access-requests 785e1eed
+143 claude-p2b-shortenable-expiry 785e1eed
+144 claude-hub-l2-l4-notification-read-state b1e3b16d
+145 claude-p1b2-credential-kind 785e1eed
+146 claude-az-a12-b1-group-principal 20f40e40
+147 claude-rb11-governor-v0-coredoor b796067e
+148 claude-az-a13-stage2-edit-in-place 1a38270d
+149 codex-p2b-az-a10-role-grants 785e1eed
+150 codex-e218-metrics-events-20261013 c84ac03b
+151 codex-retire-task-columns-20261013 68f9dffe
+152 claude-lenses-c1a-group-stewards 46cfbd1d
+153 claude-stepup-reauth-7a99d63e 7a99d63e
+154 parallel-lane-hold-by-41e24358 41e24358
+155 claude-default-verifier-41e24358 41e24358
+156 claude-aza12-b3-311229fd-20261015 311229fd
+157 claude-shared-writers-549cc51f 549cc51f
+158 claude-e309-change-requests-e97e65ea e97e65ea
+159 claude-ucr-t1-s2-502fb19e-20261018 502fb19e
+160 parallel-lane-hold-by-ab8f78e9 502fb19e
+161 claude-mcp-action-log-ab8f78e9-20261018 ab8f78e9
+162 parallel-lane-hold-by-2bc7b303 d67e6990
+163 parallel-lane-hold-by-2bc7b303 dac2ca71
+164 claude-mcp-subtask-create-2bc7b303-20261019 2bc7b303
+165 claude-map-reports-mode-742fae98-20261019 742fae98
+166 claude-plugin-availability-settings-e380-20261019 bedf50cc
+167 claude-notifications-timeline-a-5854f0d6-20261020 5854f0d6
+168 claude-n6-core-registration-08792425-20261021 08792425
+169 claude-action-center-e453-20261023 5854f0d6
+170 claude-connector-s4b-verification-modes-e462 5908f92c

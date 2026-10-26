@@ -69,35 +69,35 @@ See `DEPLOYMENT.md` for what a reverse proxy needs to know (preserve the
 
 There is **no execution runtime in the product**. Agents pull work from the
 board; the core never launches, binds to, steers, or kills an agent process.
-The spawn/steer/cancel machinery the codebase once carried was removed, and
-its design knowledge is recorded in
-[`docs/design-history/removed-spawn-runtime.md`](design-history/removed-spawn-runtime.md).
+The spawn/steer/cancel machinery the codebase once carried was removed.
 
-**And no observation runtime either — this claim is now TRUE end to end
-(P1.3, strategy §2.6.5/F11).** The board never connects to a gateway, watches
+**And no observation runtime either — this claim is now TRUE end to end.** The board never connects to a gateway, watches
 sessions files, reads transcripts, probes harness binaries, or reads
 harness-local memory/workspace files. The gateway connector, session
 ingesters, Hermes status probes, transcript-scraping audit/stats feeds, and
-the memory/workspace/agents observation routes were all retired in P1.3
-(recorded in
-[`docs/design-history/removed-observer-stack.md`](design-history/removed-observer-stack.md)).
+the memory/workspace/agents observation routes were all retired.
 What remains is evidence-based: tasks record attempts and sessions that
-agents report through the API, and session telemetry arrives only through
-the reporter-ingest seam (§5).
+agents report through the API, and session telemetry arrives through the
+reporter-ingest seam (§5) — or, for a Connector that declared a telemetry
+tier, from that Connector's own calls to the board's MCP server, which the
+board records as the caller's own telemetry (MCP-derived sessions; nothing
+outside the board's own surface is read).
 
-**Claim/lease surface and its policy bounds (card 590c638a, ruled
-2026-08-30).** Agents claim work through `POST /tasks/orchestration/:id/claim`
-and hold it under a lease. That surface is **always on**: there is no switch,
-because a board that cannot hand out work is not a product mode and a
-deployment must not be able to be born with the surface off. Capacity is the
-harnesses' concern under the pull-only doctrine; leases bound squatting and
-rate limits bound API abuse. Two **optional** estate-wide policy bounds
-remain, both unset by default (unset or empty = unlimited):
+**Claim/lease surface and its policy bounds.** Agents claim work through
+`POST /tasks/orchestration/:id/claim` and hold it under a lease. That surface is
+**always on**: there is no switch, because a board that cannot hand out work is
+not a product mode and a deployment must not be able to be born with the surface
+off. Capacity is the harnesses' concern under the pull-only doctrine; leases
+bound squatting and rate limits bound API abuse. Two **optional** estate-wide
+policy bounds remain, both unset by default (unset or empty = unlimited):
 
-- `CLAWBEAT_MAX_ACTIVE_GLOBAL` - at most this many active leases across the
+- `RELAYHALL_MAX_ACTIVE_GLOBAL` - at most this many active leases across the
   whole board (integer 1-64);
-- `CLAWBEAT_MAX_ACTIVE_PER_PROJECT` - at most this many active leases per
+- `RELAYHALL_MAX_ACTIVE_PER_PROJECT` - at most this many active leases per
   project (integer 1-64; may not exceed the global bound when both are set).
+
+The former `CLAWBEAT_MAX_ACTIVE_GLOBAL` and `CLAWBEAT_MAX_ACTIVE_PER_PROJECT` names
+still work; the backend then prints one notice at boot naming them.
 
 A claim refused by a bound answers `409` with `GLOBAL_CAPACITY_EXHAUSTED` or
 `PROJECT_CAPACITY_EXHAUSTED`. The **effective** configuration of a running
@@ -135,7 +135,7 @@ is set; the admissible probe paths are an enumerated set.
 Observability data enters the board through **reporters** — **outposts** that
 run next to an agent runtime and push session activity in; the board never
 fetches it. An outpost is not a plugin: a plugin installs into the board
-deployment, an outpost runs beside someone else's runtime (`b94dd86e`, D-14).
+deployment, an outpost runs beside someone else's runtime.
 This is a seam because each deployment chooses which reporters to run, per
 harness.
 
@@ -148,6 +148,7 @@ harness.
   (`backend/src/routes/reporterHealth.ts`) — `unknown`/empty with no
   reporters, per-adapter rows once reporters self-report health.
 - The Sessions and Stats pages are always-on core surfaces that render a
-  documented empty state until reporters feed them.
+  documented empty state until reporters feed them, or a telemetry-declaring
+  Connector works through the board's MCP server (MCP-derived sessions).
 
 See [`docs/observability.md`](observability.md) for the full model.

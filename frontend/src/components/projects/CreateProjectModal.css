@@ -181,3 +181,10 @@ form {
     width: 100%;
   }
 }
+
+.create-project-modal-hint {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  margin-top: var(--space-2);
+}

@@ -94,6 +94,7 @@ export function ThemeProvider({
   const [preferences, setPreferences] = useState<PrincipalPreferences>({
     theme: cached.theme,
     reducedMotion: cached.reducedMotion,
+    mapReportsMode: cached.mapReportsMode,
   });
   const [loading, setLoading] = useState(true);
   const [prefersLight, setPrefersLight] = useState(systemPrefersLight);

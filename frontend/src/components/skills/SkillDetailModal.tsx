@@ -1,16 +1,96 @@
+import { ContextPreview, ContextPreviewTrigger, ContextPreviewPanel } from '../BriefContextPreview';
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Save, Pencil, Globe, Tag, GraduationCap, Plus, AlertTriangle, Send, Check, Ban } from 'lucide-react';
 import { Skill, SkillProvenance, SkillVersion } from '../../types/skill';
+import type { PrincipalKind } from '../../types/task';
 import { authenticatedFetch } from '../../utils/auth';
+import { useMyPrincipal, usePrincipals } from '../../hooks/usePrincipals';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
 import { Button } from '../Button';
 import { IconButton } from '../ui/IconButton';
 import { Select } from '../ui/Select';
+import { administersSkills, skillOwnerLabel } from './skillOwner';
 import './SkillDetailModal.css';
 import { formatDateTime } from '../../utils/dateFormat';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
+/*
+ * Card f87776ad (owner ruling D37(d)). Provenance attests the KIND of the
+ * Principal that creates a Version: the server refuses human-authored from an
+ * agent or service and agent-drafted from a human (migration 083's insert
+ * trigger, named by SkillManager before it). A new draft is authored by THIS
+ * session, so its provenance starts at this session's default - never at the
+ * provenance of the Version the form was pre-filled from - and the option the
+ * session's kind can never record is not offered. While the session's kind is
+ * unresolved every option stays, and the server's refusal names the field.
+ */
+const PROVENANCE_LABELS: Record<SkillProvenance, string> = {
+  'human-authored': 'Human-authored', imported: 'Imported', 'agent-drafted': 'Agent-drafted',
+};
+function provenanceOptionsFor(kind: PrincipalKind | undefined): SkillProvenance[] {
+  if (kind === 'human') return ['human-authored', 'imported'];
+  if (kind === 'agent' || kind === 'service') return ['agent-drafted', 'imported'];
+  return ['human-authored', 'imported', 'agent-drafted'];
+}
+function defaultProvenanceFor(kind: PrincipalKind | undefined): SkillProvenance {
+  return kind === 'agent' || kind === 'service' ? 'agent-drafted' : 'human-authored';
+}
+
+/**
+ * Card d67e6990 (D24 part 1): the owner assignment, for a registry
+ * administrator only (rendered by the modal only then, so other sessions never
+ * load the directory). The server is the authority: PUT /skills/{id}/owner
+ * with the Skill's revision. This panel offers person Accounts; moving a Skill
+ * into or out of a Group is a step-up act (AZ-A12 clause 9(e)) that the panel
+ * does not perform.
+ */
+const SkillOwnerPanel: React.FC<{ skill: Skill; onSaved: () => void }> = ({ skill, onSaved }) => {
+  const { principals } = usePrincipals();
+  const accounts = principals.filter(principal => principal.kind === 'human'
+    && !principal.parentPrincipalId && principal.status === 'active');
+  const [target, setTarget] = useState(skill.owner_principal_id || '');
+  const [reason, setReason] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const save = useCallback(async () => {
+    if (!target || !reason.trim()) { setError('Choose an owner and give a reason'); return; }
+    setSaving(true); setError(null);
+    try {
+      const response = await authenticatedFetch(`${API_BASE_URL}/skills/${skill.id}/owner`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': skill.revision },
+        body: JSON.stringify({ ownerPrincipalId: target, reason: reason.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.error || 'Unable to change the owner');
+      onSaved();
+    } catch (err) { setError(err instanceof Error ? err.message : 'Unable to change the owner'); }
+    finally { setSaving(false); }
+  }, [skill, target, reason, onSaved]);
+  return (
+    <div className="skill-view-section">
+      <span className="view-label">Owner</span>
+      {error && <div className="skill-detail-error"><AlertTriangle size={16} /> {error}</div>}
+      <div className="form-row skill-detail-modal-form-row">
+        <div className="form-group"><label htmlFor="skill-owner-select">New owner</label>
+          <Select id="skill-owner-select" value={target} onChange={e => setTarget(e.target.value)}>
+            <option value="">Choose an Account</option>
+            {accounts.map(account => <option key={account.id} value={account.id}>{account.displayName || account.handle}</option>)}
+          </Select>
+        </div>
+        <div className="form-group"><label htmlFor="skill-owner-reason">Reason</label>
+          <input id="skill-owner-reason" className="form-input" value={reason} maxLength={2000}
+            onChange={e => setReason(e.target.value)} />
+        </div>
+      </div>
+      <div className="form-actions">
+        <Button variant="secondary" size="compact" onClick={save}
+          disabled={saving || !target || target === skill.owner_principal_id}>{saving ? 'Saving…' : 'Change owner'}</Button>
+      </div>
+    </div>
+  );
+};
 
 interface SkillDetailModalProps {
   skill: Skill | null;
@@ -37,7 +117,12 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
   const [configText, setConfigText] = useState(JSON.stringify(skill?.config || {}, null, 2));
   const [tags, setTags] = useState<string[]>(skill?.tags || []);
   const [tagInput, setTagInput] = useState('');
-  const [provenance, setProvenance] = useState<SkillProvenance>('human-authored');
+  const { me, scopes } = useMyPrincipal();
+  const administrator = administersSkills(scopes);
+  const provenanceOptions = provenanceOptionsFor(me?.kind);
+  const [provenanceChoice, setProvenanceChoice] = useState<SkillProvenance | null>(null);
+  const provenance = provenanceChoice && provenanceOptions.includes(provenanceChoice)
+    ? provenanceChoice : defaultProvenanceFor(me?.kind);
   const [sourceUri, setSourceUri] = useState('');
 
   const loadContent = useCallback(async (version: SkillVersion) => {
@@ -55,7 +140,6 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
       setDescription(full.description || '');
       setConfigText(JSON.stringify(full.config || {}, null, 2));
       setTags(full.tags || []);
-      setProvenance(full.provenance);
       setSourceUri(full.source_uri || '');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load Version content');
@@ -143,6 +227,7 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
   const formatDate = (value: string) => formatDateTime(value);
 
   return createPortal(
+    <ContextPreview kind="skill" elementId={skill?.id || ""} elementName={skill?.name}>
     <div className="modal-overlay" onClick={onClose}>
       <div
         className="skill-detail-modal"
@@ -164,7 +249,8 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
             )}
           </div>
           <div className="skill-detail-actions">
-            {!isCreate && !editing && <Button variant="secondary" size="compact" className="btn-edit-skill" icon={<Pencil size={16} />} onClick={() => setEditing(true)}>New draft</Button>}
+            {!isCreate && !editing && <ContextPreviewTrigger />}
+            {!isCreate && !editing && <Button variant="secondary" size="compact" className="btn-edit-skill" icon={<Pencil size={16} />} onClick={() => { setProvenanceChoice(null); setEditing(true); }}>New draft</Button>}
             <IconButton className="modal-close" variant="ghost" ariaLabel="Close" icon={<X size={24} />} onClick={onClose} />
           </div>
         </div>
@@ -172,6 +258,7 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
         {error && <div className="skill-detail-error"><AlertTriangle size={16} /> {error}</div>}
 
         <div className="skill-detail-content">
+          {!isCreate && !editing && <ContextPreviewPanel />}
           {editing ? (
             <div className="skill-form">
               <div className="form-group"><label htmlFor="skill-name">Agent Skills name *</label>
@@ -184,10 +271,8 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
                 </div>
                 <div className="form-group"><label htmlFor="skill-provenance">Provenance</label>
                   <Select id="skill-provenance" value={provenance}
-                    onChange={e => setProvenance(e.target.value as SkillProvenance)}>
-                    <option value="human-authored">Human-authored</option>
-                    <option value="imported">Imported</option>
-                    <option value="agent-drafted">Agent-drafted</option>
+                    onChange={e => setProvenanceChoice(e.target.value as SkillProvenance)}>
+                    {provenanceOptions.map(value => <option key={value} value={value}>{PROVENANCE_LABELS[value]}</option>)}
                   </Select>
                 </div>
               </div>
@@ -233,7 +318,9 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
                 <div className="meta-item"><span className="meta-label">Created</span><span className="meta-value">{formatDate(selectedVersion.created_at)}</span></div>
                 <div className="meta-item"><span className="meta-label">SHA-256</span><span className="meta-value">{selectedVersion.content_sha256.slice(0, 12)}…</span></div>
                 <div className="meta-item"><span className="meta-label">Provenance</span><span className="meta-value">{selectedVersion.provenance}</span></div>
+                <div className="meta-item"><span className="meta-label">Owner</span><span className="meta-value">{skillOwnerLabel(skill)}</span></div>
               </div>
+              {administrator && <SkillOwnerPanel skill={skill} onSaved={onSaved} />}
               <div className="form-actions">
                 {selectedVersion.status === 'draft' && <Button variant="primary" size="compact" icon={<Send size={16} />} onClick={() => lifecycle('submit-review')} disabled={!!action}>Submit for review</Button>}
                 {selectedVersion.status === 'review' && <><Button variant="secondary" size="compact" onClick={() => lifecycle('reject')} disabled={!!action}>Return to draft</Button>
@@ -245,6 +332,7 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({ skill, onClo
           ) : <div className="skills-empty">No Versions available.</div>}
         </div>
       </div>
-    </div>, document.body,
+    </div>
+    </ContextPreview>, document.body,
   );
 };

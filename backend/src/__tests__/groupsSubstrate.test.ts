@@ -143,6 +143,26 @@ describe('the /groups route surface (production router, pool mocked)', () => {
     expect((auditService.record as jest.Mock).mock.calls[0][0]).toMatchObject({ action: 'group.create' });
   });
 
+  // AZ-A12 build 1 (card 20f40e40): the writer inserts a principal row in the
+  // same statement, so a duplicate key is a NAME collision only when the
+  // index that raised it is ux_groups_name_ci.
+  it('create maps ONLY a ux_groups_name_ci collision to GROUP_NAME_EXISTS', async () => {
+    const raise = (constraint: string) => (text: string) => {
+      if (/INSERT INTO groups/.test(text)) {
+        throw Object.assign(new Error(`duplicate key value violates unique constraint "${constraint}"`), { constraint });
+      }
+      return null;
+    };
+    db.script.push(raise('ux_groups_name_ci'));
+    const named = await call('POST', '/groups', { name: 'ops' });
+    expect([named.status, named.json.code]).toEqual([409, 'GROUP_NAME_EXISTS']);
+    db.script.length = 0;
+    db.script.push(raise('principals_handle_key'));
+    const other = await call('POST', '/groups', { name: 'ops' });
+    expect(other.status).toBe(500);
+    expect(other.json.code).not.toBe('GROUP_NAME_EXISTS');
+  });
+
   it('refuses unknown body fields with UNKNOWN_FIELD', async () => {
     const { status, json } = await call('POST', '/groups', { name: 'ops', extra: 1 });
     expect(status).toBe(400);
@@ -200,10 +220,18 @@ describe('the /groups route surface (production router, pool mocked)', () => {
     db.script.push((text) => /COUNT\(\*\)::int AS n FROM group_members/.test(text) ? { rows: [{ n: 0 }] } : null);
     db.script.push((text) => /DELETE FROM grants WHERE grantee_type = 'group'/.test(text) ? { rows: [{ id: 'g1' }, { id: 'g2' }] } : null);
     db.script.push((text) => /DELETE FROM groups WHERE id/.test(text) ? { rows: [groupRow()] } : null);
+    // AZ-A12 build 1 (card 20f40e40, clause 2): the Group principal is
+    // terminated in the same transaction, AFTER the groups row is deleted.
+    db.script.push((text) => /UPDATE principals SET status = 'terminated', terminated_at = NOW\(\)/.test(text)
+      ? { rows: [{ id: GROUP_ID }] } : null);
     const { status } = await call('DELETE', `/groups/${GROUP_ID}`);
     expect(status).toBe(200);
     const grantDelete = db.queries.findIndex((q) => /DELETE FROM grants WHERE grantee_type = 'group'/.test(q.text));
     expect(grantDelete).toBeGreaterThan(-1);
+    const groupDelete = db.queries.findIndex((q) => /DELETE FROM groups WHERE id/.test(q.text));
+    const terminate = db.queries.findIndex((q) => /UPDATE principals SET status = 'terminated'/.test(q.text));
+    expect(terminate).toBeGreaterThan(groupDelete);
+    expect(groupDelete).toBeGreaterThan(grantDelete);
     expect((auditService.record as jest.Mock).mock.calls.some(
       (call_) => call_[0].action === 'group.delete' && call_[0].metadata.revokedGrantRows === 2,
     )).toBe(true);

@@ -34,6 +34,7 @@ const projects: Project[] = [1, 2].map((n) => ({
   name: `Helios Platform Migration ${n}`,
   description: 'Move the estate off the retired kiosk fleet.',
   status: 'active',
+  ownerPrincipalId: null,
   revision: 'rev-1',
   created_at: '2026-09-01T10:00:00.000Z',
   updated_at: '2026-09-02T10:00:00.000Z',
@@ -165,9 +166,11 @@ describe('walkthrough R8 - card titles do not skip a heading level', () => {
 
   test('a Skill card is an h2, and the grid it scrolls in is a named focus stop (R14)', async () => {
     const { container } = render(
-      <main>
-        <SkillsPage />
-      </main>
+      <MemoryRouter>
+        <main>
+          <SkillsPage />
+        </main>
+      </MemoryRouter>
     );
     await within(container).findByText('Terraform review 1');
     expect(within(container).getAllByRole('heading', { level: 2 })).toHaveLength(2);

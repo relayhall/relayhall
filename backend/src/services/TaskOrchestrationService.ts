@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import { pool as defaultPool } from '../db/connection';
-import { feedEventService } from './FeedEventService';
+import { feedEventService, feedActorFields } from './FeedEventService';
 import { syncTaskReadiness } from '../utils/taskReadiness';
 
 export type LeaseHarness = 'hermes' | 'openclaw';
@@ -327,9 +327,12 @@ export class TaskOrchestrationService {
         name: 'task.updated',
         objectType: 'task',
         objectId: input.taskId,
+        // Card 5854f0d6 (design sections 4.2 and 4.3): the claimant, when the
+        // caller resolved one (a scheduler claim has none), and the field names.
+        ...feedActorFields({ principalId: input.claimantPrincipalId ?? null }),
         projectId: moved.rows[0].project_id ?? null,
         ownerPrincipalId: moved.rows[0].owner_principal_id ?? null,
-        payload: { status: 'in-progress', previousStatus: 'todo' },
+        payload: { status: 'in-progress', previousStatus: 'todo', fields: ['status'] },
       });
 
       await client.query(

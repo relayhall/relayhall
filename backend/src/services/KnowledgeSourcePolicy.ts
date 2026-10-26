@@ -529,6 +529,11 @@ export interface KnowledgeOwnerPlane {
 /** The descriptor half: the §4.3 block of the CURRENT descriptor version. */
 export interface KnowledgeDescriptorBlock {
   compartments: string[];
+  protocol_version?: 2;
+  compartment_mode?: string;
+  categories?: string[];
+  /** RB-11 Governor v0: the declared write surface (`serviceDescriptor.ts`). */
+  write?: { protocol_version: number; kinds: string[] };
 }
 
 /**
@@ -560,7 +565,56 @@ export function isKnowledgeCapable(
   return (
     typeof service.knowledgeQueryEndpoint === 'string' &&
     service.knowledgeQueryEndpoint.length > 0 &&
-    Array.isArray(descriptorBlock?.compartments) &&
-    (descriptorBlock as KnowledgeDescriptorBlock).compartments.length > 0
+    ((descriptorBlock?.protocol_version === 2 && descriptorBlock.compartment_mode === 'dynamic-opaque' && Array.isArray(descriptorBlock.categories) && descriptorBlock.categories.length > 0) ||
+    (Array.isArray(descriptorBlock?.compartments) && (descriptorBlock as KnowledgeDescriptorBlock).compartments.length > 0))
+  );
+}
+
+// ─────────────────── the knowledge WRITE-capability predicate ───────────────
+
+/** The owner-plane half of the WRITE predicate, as stored on the Service row. */
+export interface KnowledgeWriteOwnerPlane extends KnowledgeOwnerPlane {
+  knowledgeWriteEndpoint: string | null;
+  knowledgeClaimsMode: string;
+}
+
+/**
+ * **The knowledge WRITE-capability predicate, stated ONCE** (RB-11 Governor
+ * v0, card `b796067e`; design C.12 and D-8/D-9).
+ *
+ * A Service accepts note writes through the door iff ALL hold:
+ *
+ *  - it is knowledge-capable (the read predicate above — a source that cannot
+ *    be read through the door cannot be written through it, and the read-back
+ *    of a committed note is a get on the same source);
+ *  - it is NOT the reserved board row (§9's exception is a READ exception;
+ *    the board is never a write target);
+ *  - its owner-plane `knowledgeWriteEndpoint` is set;
+ *  - it is in claims mode `asserted` — a write is attributed to a RelayHall
+ *    Account (C.4, C.15), and a `none`-mode source receives no assertion;
+ *  - its current descriptor is a v2 dynamic-opaque block carrying the
+ *    `write` block {protocol_version: 1, kinds: ['note']}.
+ *
+ * The owner-plane act, the descriptor-publish guard and the write arm
+ * evaluator all ask THIS function, and the read predicate is composed here,
+ * never restated, so the stated-once census over `isKnowledgeCapable` stays
+ * true.
+ */
+export function isKnowledgeWriteCapable(
+  service: KnowledgeWriteOwnerPlane,
+  descriptorBlock: KnowledgeDescriptorBlock | null | undefined,
+): boolean {
+  if (service.slug === KNOWLEDGE_BOARD_SOURCE_SLUG) return false;
+  if (!isKnowledgeCapable(service, descriptorBlock)) return false;
+  return (
+    typeof service.knowledgeWriteEndpoint === 'string'
+    && service.knowledgeWriteEndpoint.length > 0
+    && service.knowledgeClaimsMode === 'asserted'
+    && descriptorBlock?.protocol_version === 2
+    && descriptorBlock.compartment_mode === 'dynamic-opaque'
+    && descriptorBlock.write?.protocol_version === 1
+    && Array.isArray(descriptorBlock.write.kinds)
+    && descriptorBlock.write.kinds.length === 1
+    && descriptorBlock.write.kinds[0] === 'note'
   );
 }

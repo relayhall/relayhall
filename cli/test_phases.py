@@ -85,6 +85,9 @@ def phase_rest_fake(calls):
             return 200, json.dumps({"success": True, "phase": sample_phase()})
         if method == "DELETE":
             return 200, json.dumps({"success": True, "phase": sample_phase()})
+        # Card 41e24358: the Phase default Verifier (docs/phases.md documents it).
+        if method == "PUT" and base.endswith("/default-verifier"):
+            return 200, json.dumps({"success": True, "phase": sample_phase(defaultVerifierPrincipalId=(data or {}).get("principalId"))})
         raise AssertionError(f"unexpected resource_api call: {method} {path}")
     return fake_resource_api
 

@@ -151,6 +151,19 @@ export interface TaskTimelineEvent {
 export type PrincipalKind = 'human' | 'agent' | 'service';
 export type PrincipalStatus = 'active' | 'disabled';
 
+/** Card 41e24358: where a Task's Verifier came from (tasks.verifier_source). */
+export type VerifierSource = 'explicit' | 'inherited-phase' | 'inherited-project' | 'assigned';
+
+/** Card 41e24358: the arm of the usable-Verifier predicate that failed. */
+export type VerifierFailedArm = 'none' | 'principal' | 'chain' | 'scope' | 'independence';
+
+/** Card 41e24358: the server's live usable-Verifier predicate (GET /tasks/{id}). */
+export interface VerifierUsability {
+  usable: boolean;
+  failedArm?: VerifierFailedArm;
+  principalId: string | null;
+}
+
 export interface Principal {
   id: string;
   kind: PrincipalKind;
@@ -166,6 +179,17 @@ export interface Principal {
 }
 
 export interface Task {
+  /** Current server hint; owner disposition remains checked on each write. */
+  ownerControl?: boolean;
+  /** GET Task only: point-in-time locked Report WRITE policy; absent/error denies. */
+  reportMaintenanceAccess?: { allowed: boolean; reason: string | null };
+  /** Caller-scoped, current server decision; absent/error must fail closed. */
+  lifecycleAccess?: {
+    arm: { allowed: boolean; reason: string | null };
+    park: { allowed: boolean; reason: string | null };
+    claim: { allowed: boolean; reason: string | null; expectedAssignmentEpoch?: string };
+  };
+
   // Core fields
   id: string;
   title: string;
@@ -182,12 +206,9 @@ export interface Task {
   links: TaskLink[];
   
   // Audit trail
-  sessionRefs: string[];  // Session keys that touched this
   
   // Work tracking
-  autoCreated: boolean;   // Was this auto-detected?
   autoStart: boolean;     // Can bot auto-pick this up?
-  lastChecked?: string;   // When bot last reviewed it
   startedAt?: string;
   completedAt?: string;
   archivedAt?: string;
@@ -229,15 +250,13 @@ export interface Task {
   executionDescriptorVersion?: number;
   legacyExecutionProfile?: LegacyTaskExecutionProfile;
   successCriteria?: string | string[];
+  successCriteriaAccess?: { allowed: boolean };
   reviewHistory?: ReviewHistoryEntry[];
   maxRetries?: number;
   definitionOfDone?: string | string[];
   constraints?: string | string[];
-  acpSessionKey?: string | null;
   discordThreadId?: string | null;
   discordThreadUrl?: string | null;
-  activeAgent?: string | { name: string; sessionKey: string; harness?: TaskExecutionHarness; pid?: number; sourceTag?: string; logPath?: string; principalId?: string; spawnedByPrincipalId?: string } | null;
-  completedBy?: { name: string; sessionKey: string; harness?: TaskExecutionHarness; pid?: number; sourceTag?: string; logPath?: string; principalId?: string; spawnedByPrincipalId?: string } | null;
   /** tasks.owner_principal_id (migration 063); null on historical rows with no Assignee. */
   ownerPrincipalId?: string | null;
   /** tasks.creator_principal_id (migration 063); null on rows created before it. */
@@ -246,6 +265,14 @@ export interface Task {
   shepherdPrincipalId?: string | null;
   /** Server-written Verifier Task role; always different from the Assignee. */
   verifierPrincipalId?: string | null;
+  /** Card 41e24358: server-written source of the Verifier; null when unknown or none. */
+  verifierSource?: VerifierSource | null;
+  /** Owner ruling E462 S4b (design section 6.8): no verification; finish completes the Task. */
+  verificationNone?: boolean;
+  /** `none` (stored), else `human`/`service` derived from the Verifier, else `unassigned`. */
+  verificationMode?: 'human' | 'service' | 'none' | 'unassigned';
+  /** Card 41e24358: the live predicate, on the single-Task read only. */
+  verifierUsability?: VerifierUsability | null;
   needsReview?: boolean;  // Set when agent completes task
   
   // Thinking level (Phase 2)

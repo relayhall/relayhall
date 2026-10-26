@@ -20,6 +20,7 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 export function useMyConnections() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [instructions, setInstructions] = useState<BootstrapInstructions | null>(null);
+  const [mayLoosenCredentialTransport, setMayLoosenCredentialTransport] = useState(false);
   const [loading, setLoading] = useState(true);
   const [unavailable, setUnavailable] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -36,12 +37,14 @@ export function useMyConnections() {
     const settle = (next: {
       connections?: Connection[];
       instructions?: BootstrapInstructions | null;
+      mayLoosenCredentialTransport?: boolean;
       unavailable: boolean;
       failed: boolean;
     }) => {
       if (!mounted.current || seq !== requestSeq.current) return;
       if (next.connections) setConnections(next.connections);
       if (next.instructions !== undefined) setInstructions(next.instructions);
+      setMayLoosenCredentialTransport(next.mayLoosenCredentialTransport === true);
       setUnavailable(next.unavailable);
       setFailed(next.failed);
     };
@@ -63,6 +66,7 @@ export function useMyConnections() {
       settle({
         connections: Array.isArray(data?.connectors) ? data.connectors : [],
         instructions: data?.instructions ?? null,
+        mayLoosenCredentialTransport: data?.mayLoosenCredentialTransport === true,
         unavailable: false,
         failed: false,
       });
@@ -75,5 +79,5 @@ export function useMyConnections() {
 
   useEffect(() => { load(); }, [load]);
 
-  return { connections, instructions, loading, unavailable, failed, reload: load };
+  return { connections, instructions, mayLoosenCredentialTransport, loading, unavailable, failed, reload: load };
 }

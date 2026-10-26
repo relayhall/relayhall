@@ -405,3 +405,36 @@ describe('child binding conceals cross-project resources', () => {
     expect(state.mutations).toHaveLength(0);
   });
 });
+
+describe('bounded awareness projection', () => {
+  it('ranks available rows by kind and keeps only canonical typed fields', async () => {
+    const row = makeResourceRow({
+      kind: 'repository', agent_visibility: 'available', description: 'Primary source',
+      details: { url: 'https://example.test/repo', role: 'primary', defaultBranch: 'main', forbidden: 'NOT_EXPORTABLE' },
+      awareness_kind_rank: 1,
+    });
+    const query = jest.fn(async (sql: string) => {
+      if (sql.includes('SELECT id, status FROM projects')) return { rows: [{ id: PROJECT_ID, status: 'active' }] };
+      if (sql.includes('count(*)')) return { rows: [{ count: 25 }] };
+      if (sql.includes('row_number()')) return { rows: [row] };
+      return { rows: [] };
+    });
+    const release = jest.fn();
+    (pool.connect as jest.Mock).mockResolvedValue({ query, release });
+    const result = await new ProjectResourceService().awarenessContext(PROJECT_ID);
+    expect(result.availableTotal).toBe(25);
+    expect(result.resources[0]).toEqual({
+      id: RESOURCE_ID, kind: 'repository', name: 'docs', description: 'Primary source',
+      details: { url: 'https://example.test/repo', role: 'primary', defaultBranch: 'main' },
+    });
+    const selection = query.mock.calls.find(([sql]) => sql.includes('row_number()'))![0];
+    expect(selection).toContain('PARTITION BY kind');
+    expect(selection).toContain("details->>'role' = 'primary'");
+    expect(selection).toContain("state = 'active' AND agent_visibility = 'available'");
+    expect(selection).toContain("WHEN 'repository' THEN 0 WHEN 'environment' THEN 1");
+    expect(selection).toContain('normalized_name, id LIMIT 6');
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(result)).not.toContain('NOT_EXPORTABLE');
+    expect(JSON.stringify(result)).not.toContain('awareness_kind_rank');
+  });
+});

@@ -17,7 +17,7 @@
  *   6  exp/iat/nbf within clock skew
  *   7  nonce     equal to the pending row's nonce; an absent nonce is a refusal
  *   8  sub       present, non-empty, <= 255 bytes, opaque
- *   9  auth_time required and fresh whenever the request carried max_age
+ *   9  auth_time required and fresh whenever the pending row records max_age
  *  10  required_claims present with permitted values
  *  11  UserInfo, if consulted, returns the same sub
  *  12  token size and claim count bounded, refused BEFORE parsing
@@ -55,8 +55,25 @@ export const ID_TOKEN_REFUSALS = [
 ] as const;
 export type IdTokenRefusal = (typeof ID_TOKEN_REFUSALS)[number];
 
+/**
+ * Card 7a99d63e (SU-11): what refusal 9 SAW, so a stale step-up can be
+ * audited with its distance from the request. Set only by refusal 9, which
+ * runs after the signature (refusal 3), issuer, audience, time window, nonce
+ * and subject checks: these are the provider's signed claims, never an
+ * attacker's suggestion. Raw claim values; the auditing caller bounds them.
+ */
+export interface IdTokenRefusalDetail {
+  authTime: number | null;
+  acr: unknown;
+  amr: unknown;
+}
+
 export class IdTokenError extends Error {
-  constructor(public readonly code: IdTokenRefusal, message: string) {
+  constructor(
+    public readonly code: IdTokenRefusal,
+    message: string,
+    public readonly detail: IdTokenRefusalDetail | null = null,
+  ) {
     super(message);
     this.name = 'IdTokenError';
   }
@@ -65,8 +82,8 @@ export class IdTokenError extends Error {
 // The type annotation is on the VARIABLE, not just the arrow: TypeScript only
 // treats a call as control-flow-terminating when the callee is a const with an
 // explicit type annotation. Without it every refusal below would need a `!`.
-const refuse: (code: IdTokenRefusal, message: string) => never = (code, message) => {
-  throw new IdTokenError(code, message);
+const refuse: (code: IdTokenRefusal, message: string, detail?: IdTokenRefusalDetail) => never = (code, message, detail) => {
+  throw new IdTokenError(code, message, detail ?? null);
 };
 
 /**
@@ -315,11 +332,23 @@ export async function validateIdToken(input: IdTokenValidationInput): Promise<Va
     refuse('SUBJECT_INVALID', 'the ID token subject is absent, empty or over 255 bytes');
   }
 
-  // ── refusal 9: auth_time, whenever the request carried max_age ──────────
+  // ── refusal 9: auth_time, whenever the pending row records max_age ──────
+  //
+  // Card 7a99d63e (SU-9, a declared reinterpretation): the row's
+  // `max_age_requested` is the freshness RelayHall ENFORCES, not a parameter
+  // it put on the wire. Every step-up row records 0 whatever the provider's
+  // step-up policy sent (`max_age=0`, a positive `max_age`, or none at all
+  // with `prompt=login`), so this refusal runs for every step-up and no
+  // policy value can switch it off or widen it.
   if (input.maxAgeRequested !== null && input.maxAgeRequested !== undefined) {
     const authTime = seconds(claims.auth_time);
+    const detail: IdTokenRefusalDetail = {
+      authTime: authTime === null ? null : authTime / 1000,
+      acr: claims.acr,
+      amr: claims.amr,
+    };
     if (authTime === null) {
-      refuse('AUTH_TIME_STALE', 'the request carried max_age but the ID token has no auth_time');
+      refuse('AUTH_TIME_STALE', 'the request carried max_age but the ID token has no auth_time', detail);
     }
     // §8.3: compared against the instant the step-up was REQUESTED, not against
     // "now". An authentication that predates the request did not satisfy it —
@@ -334,7 +363,7 @@ export async function validateIdToken(input: IdTokenValidationInput): Promise<Va
     // before the token was issued. Adding skew to auth_time bought an attacker
     // a whole skew window of pre-request authentication.
     if (authTime < requestedAtMs) {
-      refuse('AUTH_TIME_STALE', 'the ID token auth_time predates the step-up request');
+      refuse('AUTH_TIME_STALE', 'the ID token auth_time predates the step-up request', detail);
     }
   }
 

@@ -23,6 +23,11 @@ vi.mock('../components/dashboard/NotificationsCard', () => ({ NotificationsCard:
 // evidence only while the page's children are not reading on their own behalf.
 // The day-one card has its own suite (components/dashboard/ConnectAgentCard.test.tsx).
 vi.mock('../components/dashboard/ConnectAgentCard', () => ({ ConnectAgentCard: () => null }));
+// Card b1e3b16d (lane L1). The decision notice reads the approval queue on its
+// own behalf, so it is stubbed for the same reason as the cards above; its
+// states are pinned in components/approvals/DecisionNotice.test.tsx, and its
+// place on this page by the test below.
+vi.mock('../components/approvals/DecisionNotice', () => ({ DecisionNotice: () => <div data-testid="decision-notice" /> }));
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -67,5 +72,13 @@ describe('DashboardPage lifecycle summary', () => {
   test('keeps the page-owned mobile grid out of the legacy six-column stylesheet', () => {
     expect(dashboardCss).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.dashboard-page-dashboard-stats-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,/);
     expect(legacyResponsiveCss).not.toContain('.dashboard-page-dashboard-stats-grid');
+  });
+
+  test('mounts the decision notice at the top of the page, before the lifecycle summary (b1e3b16d)', async () => {
+    const { container } = render(<MemoryRouter><DashboardPage /></MemoryRouter>);
+    await screen.findByRole('link', { name: /Review 4 awaiting verification/i });
+    const notice = screen.getByTestId('decision-notice');
+    const grid = container.querySelector('.dashboard-page-dashboard-stats-grid')!;
+    expect(notice.compareDocumentPosition(grid) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

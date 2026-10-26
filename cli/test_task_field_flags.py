@@ -129,6 +129,26 @@ def test_both_commands_declare_the_flag(field, flag, given, sent):
         assert flag in out, f"{command} does not declare {flag}"
 
 
+def test_create_without_phase_sends_no_phase_so_the_server_can_file_it_in_the_inbox(api_calls):
+    # Card b13e5ac9: an ABSENT phaseId is what lets the server apply the
+    # project's inbox phase; the CLI must not invent one (or a null).
+    out, err, code = run_main(["create", "t", "--no-subtasks"])
+    assert code in (None, 0), err
+    assert "phaseId" not in body_of(api_calls, "POST", "/tasks")
+
+
+def test_create_phase_null_sends_the_explicit_backlog(api_calls):
+    out, err, code = run_main(["create", "t", "--no-subtasks", "--phase", "null"])
+    assert code in (None, 0), err
+    body = body_of(api_calls, "POST", "/tasks")
+    assert "phaseId" in body and body["phaseId"] is None
+
+
+def test_create_help_states_the_inbox_default():
+    out, _err, _code = run_main(["create", "--help"])
+    assert "inbox phase" in " ".join(out.split())
+
+
 def test_the_help_scan_is_not_vacuous():
     # The control for the parity test above: `--help` must actually print the
     # flags, or "the flag is in the help text" is satisfied by nothing at all.

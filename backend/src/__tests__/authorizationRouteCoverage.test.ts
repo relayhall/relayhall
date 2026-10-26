@@ -35,6 +35,7 @@ import { POINT_RESOURCE_ROUTE_TYPES } from '../middleware/sharedAuthorization';
 import { PROTECTED_ROUTE_REGISTRATIONS } from '../routeRegistry';
 import { MCP_ROUTE_PATH } from '../mcp/httpRoute';
 import { OAUTH_ROUTE_PATH, OAUTH_WELL_KNOWN_ROUTE_PATH } from '../utils/oauthMetadata';
+import { PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH } from '../routes/pluginHost';
 
 const root = path.join(__dirname, '..');
 const server = fs.readFileSync(path.join(root, 'server.ts'), 'utf8');
@@ -122,7 +123,10 @@ const EXPECTED_MOUNTS: Mount[] = [
   { method: 'get', literal: '/health/functional', symbol: null, guards: ['<inline handler>'] },
   { method: 'get', literal: '/health', symbol: null, guards: ['healthHandler'] },
   { method: 'get', literal: '/health/orchestration', symbol: null, guards: ['orchestrationConfigurationHandler'] },
-  { method: 'get', literal: '/', symbol: null, guards: ['<inline handler>'] },
+  // Card 6d549392: the API root became a named handler so its body - the
+  // version and the backend build identity - is tested at the handler seam.
+  // Still public, still no guard: the mount itself did not change.
+  { method: 'get', literal: '/', symbol: null, guards: ['apiRootHandler'] },
   // THE shared funnel, inside `protectedRouter`.
   { method: 'use', literal: null, symbol: 'path', guards: ['authMiddleware', 'sharedAuthorizationMiddleware', '...handlers'] },
   { method: 'use', literal: '/auth', symbol: null, guards: ['authRoutes'] },
@@ -139,6 +143,10 @@ const EXPECTED_MOUNTS: Mount[] = [
   // takes no parameters, so it produces identical bytes for every caller.
   { method: 'use', literal: null, symbol: 'OAUTH_WELL_KNOWN_ROUTE_PATH', guards: ['knowledgeJwksRoutes'] },
   { method: 'use', literal: null, symbol: null, guards: ['createPluginProxy()'] },
+  // Card bedf50cc (E380, design section 9): the plugin backend's effective
+  // settings read, beside the proxy and before the funnel. It authenticates by
+  // the plugin assertion alone and carries no board authentication guard.
+  { method: 'get', literal: null, symbol: 'PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH', guards: ['pluginEffectiveSettingsHandler'] },
   { method: 'use', literal: '/plugins', symbol: null, guards: ['publicPluginThemeRoutes'] },
   { method: 'get', literal: '/openapi.json', symbol: null, guards: ['authMiddleware', 'sharedAuthorizationMiddleware', '<inline handler>'] },
   // The board's in-process MCP ingress: authenticated, but by itself.
@@ -212,6 +220,17 @@ export function classifyMounts(mounts: Mount[]): string[] {
         }
         continue;
       }
+      if (mount.symbol === 'PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH') {
+        // Card bedf50cc: checked against the ACTUAL mounted constant, and it
+        // may carry no board authentication guard (it reads no Authorization).
+        if (!(SELF_AUTHENTICATING_ROUTE_MOUNTS as readonly string[]).includes(PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH)) {
+          violations.push(`PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH resolves to '${PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH}', which no manifest declares self-authenticating`);
+        }
+        if (mount.guards.includes('authMiddleware') || mount.guards.includes('sharedAuthorizationMiddleware')) {
+          violations.push('PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH installs board authentication outside the shared funnel');
+        }
+        continue;
+      }
       if (mount.symbol === 'MCP_ROUTE_PATH') {
         // The manifest is checked against the ACTUAL mounted constant.
         if (!(SELF_AUTHENTICATING_ROUTE_MOUNTS as readonly string[]).includes(MCP_ROUTE_PATH)) {
@@ -272,7 +291,11 @@ describe('shared authorization route coverage', () => {
   });
 
   it('pins /mcp as the ONLY authenticated mount outside the shared funnel', () => {
-    expect([...SELF_AUTHENTICATING_ROUTE_MOUNTS]).toEqual(['/mcp']);
+    // Card bedf50cc (E380): the plugin backend's effective-settings read is the
+    // one other self-authenticating mount. It authenticates a plugin ASSERTION,
+    // never a board credential, and the census pins it to that constant.
+    expect([...SELF_AUTHENTICATING_ROUTE_MOUNTS]).toEqual(['/mcp', '/plugin-host/:name/settings/effective']);
+    expect(PLUGIN_EFFECTIVE_SETTINGS_ROUTE_PATH).toBe('/plugin-host/:name/settings/effective');
     // The manifest is compared to the ACTUAL mounted constant, not to itself.
     expect(MCP_ROUTE_PATH).toBe('/mcp');
     const censused = censusMounts(server);
@@ -408,5 +431,35 @@ describe('shared authorization route coverage', () => {
     const batchSource = fs.readFileSync(path.join(root, 'routes', 'tasksBatch.ts'), 'utf8');
     expect(batchSource).toContain('filterAuthorizedResources(');
     expect(batchSource).toContain("'write'");
+  });
+
+  // Card 5854f0d6 (Notifications and Timeline, R2-N4). `/notifications` owns no
+  // rows: it lists other families' rows, each narrowed IN the query by that
+  // family's own list scope and by the builders exported from their one home
+  // (the same record `/reports` keeps for ReportVisibility above). The route
+  // must reach the shared list-scope adapter for every type, and each builder
+  // must be exported by its home and imported, never re-typed, by its reader.
+  it('records the /notifications composition: the shared list scopes and the exported builders', () => {
+    expect(PROTECTED_ROUTE_MOUNTS).toContain('/notifications');
+    expect(ROW_AUTHORIZED_ROUTE_MOUNTS as readonly string[]).not.toContain('/notifications');
+    const route = fs.readFileSync(path.join(root, 'routes', 'notifications.ts'), 'utf8');
+    for (const type of ['task', 'report', 'phase', 'project', 'skill']) {
+      expect(`/notifications reaches the ${type} list scope: ${route.includes(`authorizedListScope(req, '${type}', 'read')`)}`)
+        .toBe(`/notifications reaches the ${type} list scope: true`);
+    }
+    const BUILDERS: Array<{ name: string; home: string; reader: string }> = [
+      { name: 'reportVisibilitySql', home: 'services/ReportVisibility.ts', reader: 'services/TimelineService.ts' },
+      { name: 'draftVisibilitySql', home: 'services/SkillManager.ts', reader: 'services/TimelineService.ts' },
+      { name: 'stuckActivityAtSql', home: 'services/TelemetryService.ts', reader: 'services/NotificationActionsService.ts' },
+    ];
+    for (const { name, home, reader } of BUILDERS) {
+      const homeSource = fs.readFileSync(path.join(root, ...home.split('/')), 'utf8');
+      const readerSource = fs.readFileSync(path.join(root, ...reader.split('/')), 'utf8');
+      expect(`${home} exports ${name}: ${homeSource.includes(`export function ${name}(`)}`)
+        .toBe(`${home} exports ${name}: true`);
+      const imported = new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from '\\./${path.basename(home, '.ts')}'`).test(readerSource);
+      expect(`${reader} imports ${name}: ${imported}`).toBe(`${reader} imports ${name}: true`);
+      expect(readerSource).not.toContain(`function ${name}(`);
+    }
   });
 });

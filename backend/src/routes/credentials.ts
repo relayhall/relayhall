@@ -10,17 +10,33 @@ import { Router, Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { principalService, isMissingRelationError, CredentialPolicyError } from '../services/PrincipalService';
 import { credentialLifecycleService, CredentialLifecycleError } from '../services/CredentialLifecycleService';
-import { StepUpError } from '../services/StepUpService';
+import { StepUpError, stepUpChallengeBody } from '../services/StepUpService';
 import { resolveActorRole } from '../utils/taskAutomationRole';
 import { resolveIssuerAuthority } from '../utils/credentialAuthority';
 import { auditActorFromRequest } from '../utils/auditActor';
 import { isBearerCredentialKind, isLoginSessionKind } from '../utils/administratorSession';
+import { authorityEditExecutor } from '../services/AuthorityEditExecutor';
+import {
+  canonicalObjectId, editorContext, editorStanding, editResponse, refuseStanding, requireEditSession,
+  sendAuthorityEditError, splitEditBody,
+} from './authorityEditRoute';
+import { isFullUuid, refuseMalformedPathId } from '../middleware/validate';
 
 const router = Router();
 
+/** Card bc847bd0: reveal, revoke and rotate read `principal_credentials.id`, a
+ * uuid column, and a malformed id reached that read and answered 500. Each
+ * refuses it by name after its own authority check and before any read. */
+function refuseMalformedCredentialId(req: AuthRequest, res: Response): boolean {
+  if (isFullUuid(req.params.id)) return false;
+  refuseMalformedPathId(res, 'INVALID_CREDENTIAL_ID', 'credential');
+  return true;
+}
+
 function sendCredentialLifecycleError(res: Response, err: unknown): boolean {
   if (err instanceof CredentialLifecycleError || err instanceof CredentialPolicyError || err instanceof StepUpError) {
-    res.status(err.status).json({ error: 'Refused', code: err.code, message: err.message });
+    // Card 7a99d63e (SU-14): what to step up for, on STEP_UP_REQUIRED.
+    res.status(err.status).json({ error: 'Refused', code: err.code, message: err.message, ...stepUpChallengeBody(err) });
     return true;
   }
   return false;
@@ -43,6 +59,7 @@ router.post('/:id/reveal', async (req: AuthRequest, res: Response): Promise<void
       res.status(403).json({ error: 'Forbidden', code: 'PRINCIPAL_REQUIRED', message: 'Reveal requires a resolved principal identity' });
       return;
     }
+    if (refuseMalformedCredentialId(req, res)) return;
     const revealed = await credentialLifecycleService.reveal(req.params.id, {
       principalId: req.principal.id,
       handle: req.principal.handle,
@@ -83,7 +100,12 @@ function requireManageAuthority(req: AuthRequest, res: Response) {
 // authenticateCbKey filters on revoked_at IS NULL per call with no caching.
 router.post('/:id/revoke', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const existing = await principalService.getCredentialWithPrincipal(req.params.id);
+    // Only a full UUID can name a credential, so only one is read for the
+    // lineage test below; a malformed id falls to the manage gate and is then
+    // refused by name (card bc847bd0).
+    const existing = isFullUuid(req.params.id)
+      ? await principalService.getCredentialWithPrincipal(req.params.id)
+      : null;
     // §9.2/§9.3 (RH-P3.AZ-S5): revocation is SELF-SERVICE inside the
     // caller's OWN DESCENDANT subtree — a bearer Connector retiring the
     // Agents it minted (relayhall_agent_revoke), or a session Account
@@ -99,6 +121,7 @@ router.post('/:id/revoke', async (req: AuthRequest, res: Response): Promise<void
       ? await credentialLifecycleService.isDescendant(req.principal.id, String(existing.principal.id))
       : false;
     if (!inSubtree && !requireManageAuthority(req, res)) return;
+    if (refuseMalformedCredentialId(req, res)) return;
     if (!existing) {
       res.status(404).json({ error: 'Not Found', message: 'Credential not found' });
       return;
@@ -127,6 +150,46 @@ router.post('/:id/revoke', async (req: AuthRequest, res: Response): Promise<void
   }
 });
 
+// PATCH /credentials/:id — AZ-A13 (ratified 2026-10-11, E95): edit a Connector
+// credential's scopes and transport pin IN PLACE (clauses 2, 4, 9). The row
+// keeps its id and its secret; the next request with the same token carries
+// the new authority (clause 12). Session-only (clause 4c): a bearer caller is
+// refused SESSION_ONLY with a durable audit before any lookup. The editor is
+// root, an administrator login session, or the owning Account (clause 4a). A
+// NARROWING saves at once; a WIDENING takes `lifetime` and a step-up bound to
+// ('credential.edit', id) and is applied as one approved authority-edit
+// (clause 4b); `narrowAgents: true` on a narrowing narrows every live Agent
+// under the Connector to the new scopes (clause 9h). The route ceiling is
+// 'authenticated' (scopeMap), on the reveal/revoke precedent.
+router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireEditSession(req, res, 'credential'))) return;
+  const id = canonicalObjectId(String(req.params.id ?? ''));
+  try {
+    const holder = await authorityEditExecutor.resolveHolder('credential', id);
+    const standing = await editorStanding(req, holder?.holderPrincipalId ?? null);
+    if (!standing) {
+      // The same answer whether or not the credential exists: nothing is disclosed.
+      await refuseStanding(req, res, 'credential', id);
+      return;
+    }
+    const { fields, controls } = splitEditBody(req.body);
+    const result = await authorityEditExecutor.editObject({
+      type: 'credential', id, fields, editor: editorContext(req, standing),
+      stepUpToken: controls.stepUpToken, lifetime: controls.lifetime, reason: controls.reason,
+      narrowAgents: controls.narrowAgents, acknowledgeDependents: controls.acknowledgeDependents,
+    }, auditActorFromRequest(req));
+    res.json(editResponse(result));
+  } catch (err) {
+    if (sendAuthorityEditError(res, err)) return;
+    if (isMissingRelationError(err)) {
+      res.status(503).json({ error: 'Service Unavailable', message: 'Identity substrate is not migrated yet' });
+      return;
+    }
+    const errorId = logCaughtFailure('[Credentials API] edit failed:', err);
+    res.status(500).json({ error: 'Internal Server Error', code: 'CREDENTIAL_EDIT_FAILED', message: 'Failed to edit the credential', errorId });
+  }
+});
+
 // POST /credentials/:id/rotate — mint a replacement with the same label and
 // scopes, and put the old key on a bounded grace window so an in-flight
 // consumer is not cut off mid-request.
@@ -136,7 +199,8 @@ router.post('/:id/rotate', async (req: AuthRequest, res: Response): Promise<void
   const auditRotateDenial = async (refusal: string): Promise<void> => {
     let principalId: string | null = null;
     try {
-      const found = await principalService.getCredentialWithPrincipal(req.params.id);
+      // Only a full UUID can name a credential (card bc847bd0).
+      const found = isFullUuid(req.params.id) ? await principalService.getCredentialWithPrincipal(req.params.id) : null;
       principalId = found?.principal.id ?? null;
     } catch { principalId = null; }
     await auditService.record({
@@ -145,17 +209,18 @@ router.post('/:id/rotate', async (req: AuthRequest, res: Response): Promise<void
       metadata: { refusal, chain: principalId ? await auditChainFor(pool, principalId) : [] },
     }).catch(() => undefined);
   };
-  // §7.3 (sol r2-F1): rotation is an EXACT COPY — a rotation request
+  // §7.3 (review r2-F1): rotation is an EXACT COPY — a rotation request
   // attempting ANY scope or transport change is refused.
   {
     const forbidden = ['scopes', 'transport', 'label'].filter((field) => req.body && field in req.body);
     if (forbidden.length > 0) {
       await auditRotateDenial('ROTATION_IS_EXACT_COPY');
-      res.status(422).json({ error: 'Unprocessable Entity', code: 'ROTATION_IS_EXACT_COPY', message: `Rotation inherits ${forbidden.join('/')} verbatim (design 4d961e37 §7.3) — narrowing happens through the principal-level own() expression` });
+      res.status(422).json({ error: 'Unprocessable Entity', code: 'ROTATION_IS_EXACT_COPY', message: `Rotation inherits ${forbidden.join('/')} verbatim (design 4d961e37 §7.3) — change a credential's scopes or transport with PATCH /credentials/:id (AZ-A13), or through the principal-level own() expression` });
       return;
     }
   }
   if (!requireManageAuthority(req, res)) return;
+  if (refuseMalformedCredentialId(req, res)) return;
   try {
     const existing = await principalService.getCredentialWithPrincipal(req.params.id);
     if (!existing) {

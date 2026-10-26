@@ -37,6 +37,7 @@
 import fs from 'fs';
 import path from 'path';
 import {
+  PROVENANCE_DOMAIN_CONSTRAINT,
   RATIFIED_PROVENANCE_VALUES,
   REQUIRED_ASSERTIONS,
   assertProvenanceCollisionAvoided,
@@ -79,6 +80,13 @@ const creatorGrant = (verb: string): GrantRow => ({
   resourceId: PROJECT, verb, origin: 'manual', provenance: null,
 });
 const creatorPair = (): GrantRow[] => [creatorGrant('read'), creatorGrant('write')];
+/** Owner ruling E407 item 2: the creator policy's own audit row per verb; a
+ * written row names its grant, a held one says so and names none. */
+const creatorAudit = (verb: string, held = false) => ({
+  action: 'project.creator_access', outcome: 'success',
+  metadata: { verb, granteePrincipalId: ROOT, grantId: held ? null : `grant-${verb}`, ...(held ? { alreadyHeld: true } : {}) },
+});
+const creatorAudits = (held = false) => [creatorAudit('read', held), creatorAudit('write', held)];
 
 const applied = (): Observation => ({
   assertion: 'apply:two-rows',
@@ -89,7 +97,7 @@ const applied = (): Observation => ({
   audits: [{
     action: 'project.access_default_apply', outcome: 'success',
     metadata: { projectId: PROJECT, groupId: GROUP, verbs: ['read', 'write'] },
-  }],
+  }, ...creatorAudits()],
 });
 
 /**
@@ -113,8 +121,30 @@ const skipped = (assertion: string, reason: string, actor?: Observation['actor']
   expectation: { kind: 'skip', reason: reason as any },
   projectId: PROJECT,
   grants: creatorPair(),
-  audits: [{ action: 'project.access_default_skip', outcome: 'success', metadata: { reason } }],
+  audits: [{ action: 'project.access_default_skip', outcome: 'success', metadata: { reason } }, ...creatorAudits()],
 });
+
+/** `099:57-59`, as `pg_get_constraintdef` renders it. */
+const PROVENANCE_DOMAIN_DEF =
+  "CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text, 'assignment:warrant'::text])))";
+
+/**
+ * `142:183-187` VERBATIM, as PostgreSQL 16 renders it on a database migrated
+ * through 142 (785e1eed P1-B correction). It MENTIONS provenance and is not
+ * its domain: it is the definition CI full tier run 5698 read as one.
+ */
+const APPROVAL_SHAPE_DEF =
+  "CHECK (((approval_id IS NULL) OR ((grantee_type = 'principal'::text) AND (origin = 'manual'::text)"
+  + ' AND (provenance IS NULL) AND (expires_at IS NOT NULL))))';
+
+/**
+ * The SAME constraint, by name, as migration 158 redefines it (card 502fb19e:
+ * a change request writes rows for a Group grantee too), rendered by
+ * PostgreSQL 16. It still mentions provenance and now names a third literal.
+ */
+const APPROVAL_SHAPE_DEF_158 =
+  "CHECK (((approval_id IS NULL) OR ((grantee_type = ANY (ARRAY['principal'::text, 'group'::text]))"
+  + " AND (origin = 'manual'::text) AND (provenance IS NULL) AND (expires_at IS NOT NULL))))";
 
 /** The GREEN baseline: every drill case as a correct build leaves it. */
 function greenInput(): DrillInput {
@@ -144,7 +174,13 @@ function greenInput(): DrillInput {
   return {
     cases,
     schema: {
-      provenanceCheckDefs: ["CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text, 'assignment:warrant'::text])))"],
+      // The domain AND a CHECK that only mentions provenance: every mutation
+      // below runs with 142's approval shape present, so "every other
+      // assertion stays green" is measured with the CI run 5698 trap in place.
+      grantsChecks: [
+        { name: PROVENANCE_DOMAIN_CONSTRAINT, definition: PROVENANCE_DOMAIN_DEF },
+        { name: 'grants_approval_shape', definition: APPROVAL_SHAPE_DEF },
+      ],
       originGroupOnly: true,
       nonManualRows: [grant('read'), grant('write')],
       arbitraryProvenanceRefused: true,
@@ -170,6 +206,13 @@ const caseNamed = (input: DrillInput, name: string): Observation => {
 
 const red = (result: Record<string, string[]>): string[] =>
   Object.entries(result).filter(([, failures]) => failures.length > 0).map(([name]) => name);
+
+/** Rewrite the provenance DOMAIN's definition; every other CHECK stays put. */
+const setDomain = (input: DrillInput, definition: string): void => {
+  const domain = input.schema.grantsChecks.find((check) => check.name === PROVENANCE_DOMAIN_CONSTRAINT);
+  if (!domain) throw new Error('the baseline lost the provenance domain CHECK');
+  domain.definition = definition;
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 0 · THE BASELINE IS GREEN, AND IT IS NOT GREEN BY BEING EMPTY
@@ -370,6 +413,31 @@ describe('3 · R-11-v1, atomicity and serialisation', () => {
     expect(red(result)).toEqual(['apply:two-rows']);
   });
 
+  it('E407 item 2: a creator pair the policy audited as already held, and wrote none of, is green', () => {
+    const result = mutate((input) => {
+      const applyCase = caseNamed(input, 'apply:two-rows');
+      applyCase.grants = [grant('read'), grant('write')];
+      applyCase.audits = [...applyCase.audits.filter((row) => row.action !== 'project.creator_access'), ...creatorAudits(true)];
+    });
+    expect(red(result)).toEqual([]);
+  });
+
+  it('E407 item 2: a build that audits a held creator verb and writes its row anyway reddens that case alone', () => {
+    const result = mutate((input) => {
+      const applyCase = caseNamed(input, 'apply:two-rows');
+      applyCase.audits = [...applyCase.audits.filter((row) => row.action !== 'project.creator_access'), ...creatorAudits(true)];
+    });
+    expect(red(result)).toEqual(['apply:two-rows']);
+  });
+
+  it('E407 item 2: a build that drops the creator audit rows reddens that case alone', () => {
+    const result = mutate((input) => {
+      const skipCase = caseNamed(input, 'skip:no_home_group');
+      skipCase.audits = skipCase.audits.filter((row) => row.action !== 'project.creator_access');
+    });
+    expect(red(result)).toEqual(['skip:no_home_group']);
+  });
+
   it('a build that dropped the creator pair on a SKIP case reddens that case alone', () => {
     // The skip is a statement about the home-group act only. A build that let
     // the skip suppress contract B as well would leave the pre-composition
@@ -423,9 +491,8 @@ describe('4 · R-7, the provenance collision', () => {
     // internal-writer reason ("provenance IS NOT NULL"), so a request path
     // declaring that reason could write one.
     const result = mutate((input) => {
-      input.schema.provenanceCheckDefs = [
-        "CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text, 'assignment:warrant'::text, 'creation-default'::text])))",
-      ];
+      setDomain(input,
+        "CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text, 'assignment:warrant'::text, 'creation-default'::text])))");
     });
     expect(red(result)).toEqual(['R-7:provenance']);
   });
@@ -438,21 +505,99 @@ describe('4 · R-7, the provenance collision', () => {
     // domain and compares it as a SET, because a forbidden list is always
     // satisfied by the next value nobody listed.
     const result = mutate((input) => {
-      input.schema.provenanceCheckDefs = [
+      setDomain(input,
         "CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text,"
-        + " 'assignment:warrant'::text, 'unexpected-third-value'::text])))",
-      ];
+        + " 'assignment:warrant'::text, 'unexpected-third-value'::text])))");
     });
     expect(red(result)).toEqual(['R-7:provenance']);
   });
 
   it('a NARROWING reddens R-7 too — the claim is EXACTLY two, not at least two', () => {
     const result = mutate((input) => {
-      input.schema.provenanceCheckDefs = [
-        "CHECK ((provenance IS NULL) OR (provenance = 'assignment:grant'::text))",
-      ];
+      setDomain(input, "CHECK ((provenance IS NULL) OR (provenance = 'assignment:grant'::text))");
     });
     expect(red(result)).toEqual(['R-7:provenance']);
+  });
+
+  // ── the domain is selected BY NAME (785e1eed P1-B correction) ──────────────
+
+  it('the CI run 5698 trap, reproduced verbatim: 142\'s approval shape is in the baseline and reddens NOTHING', () => {
+    // The baseline carries `grants_approval_shape` exactly as PostgreSQL
+    // renders it. It mentions provenance, so the selection that stood here
+    // (`def.includes('provenance')`) took it for a second domain and read its
+    // literals: the set below is what that selection reported, the red CI full
+    // tier run 5698 failed on. Selected by NAME, it is not the domain and R-7
+    // is green with it present.
+    const input = greenInput();
+    const mentioning = input.schema.grantsChecks.filter((check) => check.definition.includes('provenance'));
+    expect(mentioning.map((check) => check.name)).toEqual([PROVENANCE_DOMAIN_CONSTRAINT, 'grants_approval_shape']);
+    const misread = quotedLiterals(APPROVAL_SHAPE_DEF).filter((value) => value !== '').sort();
+    expect(misread).toEqual(['manual', 'principal']);
+    expect(red(assertionSet(input))).toEqual([]);
+    expect(assertProvenanceCollisionAvoided(input.schema)).toEqual([]);
+  });
+
+  it('...and its presence or absence changes nothing: R-7 does not read it', () => {
+    const without = mutate((input) => {
+      input.schema.grantsChecks = input.schema.grantsChecks
+        .filter((check) => check.name !== 'grants_approval_shape');
+    });
+    expect(red(without)).toEqual([]);
+  });
+
+  it('migration 158 widens grants_approval_shape to a Group grantee, and R-7 still reads only the domain, by name', () => {
+    // A substring selection would read THREE literals out of the head shape;
+    // selected by name, the shape is not the domain, and R-7 is green with it.
+    const input: DrillInput = JSON.parse(JSON.stringify(greenInput()));
+    input.schema.grantsChecks = input.schema.grantsChecks.map((check) => (check.name === 'grants_approval_shape'
+      ? { ...check, definition: APPROVAL_SHAPE_DEF_158 } : check));
+    expect(input.schema.grantsChecks.filter((check) => check.definition.includes('provenance')).map((check) => check.name))
+      .toEqual([PROVENANCE_DOMAIN_CONSTRAINT, 'grants_approval_shape']);
+    expect(quotedLiterals(APPROVAL_SHAPE_DEF_158).filter((value) => value !== '').sort()).toEqual(['group', 'manual', 'principal']);
+    expect(red(assertionSet(input))).toEqual([]);
+    expect(assertProvenanceCollisionAvoided(input.schema)).toEqual([]);
+  });
+
+  it('the domain widened WHILE 142\'s shape is present reddens R-7 alone, naming the third value', () => {
+    // Selection by name is not blindness: the widening is red with the trap in
+    // place, and the failure names the domain's own definition.
+    const input: DrillInput = JSON.parse(JSON.stringify(greenInput()));
+    setDomain(input,
+      "CHECK ((provenance IS NULL) OR (provenance = ANY (ARRAY['assignment:grant'::text,"
+      + " 'assignment:warrant'::text, 'lensb-third-value'::text])))");
+    expect(red(assertionSet(input))).toEqual(['R-7:provenance']);
+    const failures = assertProvenanceCollisionAvoided(input.schema);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain('admits {assignment:grant, assignment:warrant, lensb-third-value}');
+    expect(failures[0]).not.toContain('approval_id');
+  });
+
+  it('the domain DROPPED and re-added under another name reddens R-7 alone, as "gone"', () => {
+    // A replacement constraint is not the one 099 installed and 128 requires
+    // by name, whatever it says.
+    const result = mutate((input) => {
+      input.schema.grantsChecks = input.schema.grantsChecks.map((check) => (
+        check.name === PROVENANCE_DOMAIN_CONSTRAINT ? { ...check, name: 'grants_provenance_domain_v2' } : check));
+    });
+    expect(red(result)).toEqual(['R-7:provenance']);
+    expect(result['R-7:provenance']).toEqual([
+      `no CHECK named ${PROVENANCE_DOMAIN_CONSTRAINT} on grants: 099:55-59 is gone`]);
+  });
+
+  it('a separately-named CHECK that refuses a ratified value reddens R-7 through the PROBE', () => {
+    // The static half reads the domain by name and does not read this one: a
+    // separately-named CHECK can only narrow. The database's answer is what
+    // sees the narrowing, so the name selection costs the control nothing.
+    const result = mutate((input) => {
+      input.schema.grantsChecks.push({
+        name: 'lensb_extra_narrowing',
+        definition: "CHECK ((provenance IS DISTINCT FROM 'assignment:warrant'::text))",
+      });
+      input.schema.ratifiedProvenanceAccepted = ['assignment:grant'];
+    });
+    expect(red(result)).toEqual(['R-7:provenance']);
+    expect(result['R-7:provenance']).toEqual([
+      "PostgreSQL refused the ratified provenance value 'assignment:warrant'"]);
   });
 
   it('PostgreSQL ACCEPTING an unratified value reddens R-7 alone', () => {
@@ -622,7 +767,7 @@ describe('7 · the constraint-definition parser', () => {
     expect(quotedLiterals('CHECK (provenance IS NULL)')).toEqual([]);
     // ...which the oracle treats as a domain of {}, and {} is not the two.
     expect(assertProvenanceCollisionAvoided({
-      provenanceCheckDefs: ['CHECK (provenance IS NULL)'],
+      grantsChecks: [{ name: PROVENANCE_DOMAIN_CONSTRAINT, definition: 'CHECK (provenance IS NULL)' }],
       originGroupOnly: true,
       nonManualRows: [],
     })).not.toEqual([]);

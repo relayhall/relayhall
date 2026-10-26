@@ -1,5 +1,10 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { FileText, List, Maximize2, Minus, Plus } from 'lucide-react';
+import { MapConnection } from './MapConnection';
+import { MapViewportCard, containerCardInViewport, boundedHeaderStyle } from './MapViewportCard';
+import { useArchiveVisibility } from './useArchiveVisibility';
+import { recordMapMeasurements, type MapMeasurements } from './mapMeasurements';
+import { ArchiveMotionPlane } from './ArchiveMotionPlane';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { FileText, LayoutGrid, List, Maximize2, Minus, PanelBottom, Plus } from 'lucide-react';
 
 import { Button } from '../Button';
 import { IconButton } from '../ui/IconButton';
@@ -7,13 +12,19 @@ import { SegmentedControl, type SegmentedOption } from '../ui/SegmentedControl';
 import { TaskCard } from '../tasks/TaskCard';
 import type { Task } from '../../types/task';
 import type { MapGraphQuery } from './mapGraphApi';
+import type { MapPlaneJob } from './mapPlaneWorkerClient';
+import type { MapPlaneInput } from './computeMapPlane';
+import { useMapPlaneLayout } from './useMapPlaneLayout';
+import { useMapRoutes } from './useMapRoutes';
+import { SPLIT_SIZE_PROPERTY, useMapSplit } from './useMapSplit';
+import type { MapRouteRequest, MapRoutesInput } from './computeMapRoutes';
 import {
   DETAIL_MATRIX,
   detailBandFor,
   useMapData,
 } from './useMapData';
 import { useMapInteractions } from './useMapInteractions';
-import { clampScale, planeFitScale, SCALE_MIN, useMapViewState } from './useMapViewState';
+import { clampScale, planeFitScale, PLANE_SCALE_MIN, SCALE_MIN, useMapViewState } from './useMapViewState';
 import {
   buildTreeModel,
   aggregateChainState,
@@ -34,13 +45,10 @@ import {
   initialAltitude,
   layoutAtAltitude,
   rollUpEdges,
-  routeEdge,
-  routeFlowEdge,
   settleAltitude,
   type AggregateEdge,
   type InternalRollup,
   type Box,
-  type EdgeRoute,
   type AggregateFacts,
   type MapAltitude,
   type MapTaskNode,
@@ -48,7 +56,6 @@ import {
   type PlacedAggregateReport,
   type PlacedReportPill,
   type PlacedTile,
-  type SizeMap,
   containerMorphsFor,
   interpolateOutline,
   morphEase,
@@ -61,24 +68,37 @@ import {
 } from './mapGraphModel';
 import {
   FADE_EPSILON,
+  EMPTY_PLANE_ANCHORS,
   PLANE_CARD_PX,
   PLANE_METRICS,
   planeDetailBand,
+  planeContentBounds,
   dominantTier,
-  layoutContinuousPlane,
   organicPlaneGraph,
   organicPhasePath,
   ORGANIC_CORE,
   planeFade,
   projectPlaneAttention,
-  pruneAnchors,
-  readPlaneAnchors,
-  writePlaneAnchors,
+  clearStoredPlaneAnchors,
   type MapPlaneAnchors,
   type PlaneFade,
+  type PlaneLayoutResult,
   type PlaneTier,
 } from './mapPlaneModel';
+import { MapCardTitle } from './MapCardTitle';
 import { MapAggregateCard, type MapAggregateCardFacts } from './MapAggregateCard';
+import {
+  REPORT_PREVIEW_LIMIT,
+  graphForReportsMode,
+  groupReportsByTask,
+  isHeavyReportGroup,
+  reportGroupTitle,
+  taskOfReportGroup,
+} from './mapReportGroups';
+import { useTheme } from '../../contexts/ThemeContext';
+import type { MapReportsMode } from '../../utils/theme';
+import { useFocusScrollsRow } from '../ui/scrollRow';
+import { useLabelTips } from '../ui/LabelTip';
 import './MapView.css';
 
 /**
@@ -110,11 +130,38 @@ const ORGANIZATION_LABELS: Record<MapOrganization, string> = {
 };
 
 /**
+ * Card 742fae98: "Reports: Collapsed | Expanded", beside the organization
+ * switch. Collapsed draws one "Reports · N" node per task; Expanded draws every
+ * Report node inside a report area. The choice is the principal's own stored
+ * preference (the same row as the Theme), so it follows the user across
+ * reloads and devices.
+ */
+const REPORTS_MODE_OPTIONS: Array<SegmentedOption<MapReportsMode>> = [
+  { value: 'collapsed', label: 'Collapsed' },
+  { value: 'expanded', label: 'Expanded' },
+];
+
+/**
+ * The Expanded report area's margin around its Report nodes, in plane units.
+ * Half the narrowest gap a Report cell keeps from its neighbours and from its
+ * own task card (LAYOUT_METRICS.pillGapY = 4, pillGapX = 8), so the area
+ * frames the cells without ever reaching another element's ground.
+ */
+const REPORT_AREA_PAD = 2;
+
+/**
+ * Below the close band a "Reports · N" node and a report area show N alone,
+ * enlarged up to this factor against the zoom so the count stays readable as
+ * the plane shrinks, and never past the cell the layout reserved for it.
+ */
+const REPORT_COUNT_MAX_SCALE = 2.5;
+
+/**
  * A3 retires Radial into Organic. Persisted Radial views migrate to Organic;
  * the public switcher offers the three owner-ratified organizations.
  */
 const ORGANIZATION_OPTIONS: Array<SegmentedOption<MapOrganization>> = (
-  ['horizontal', 'vertical', 'organic'] as const
+  ['horizontal', 'vertical'] as const
 ).map(organization => ({
   value: organization,
   label: ORGANIZATION_LABELS[organization],
@@ -190,13 +237,59 @@ export const EDGE_DENSITY_THRESHOLD = 60;
  * suites — until their slices land (card 03acc0b2 subtasks 3 and 4).
  */
 export const CONTINUOUS_PLANE_ORGANIZATIONS: readonly MapOrganization[] = ['horizontal', 'vertical', 'radial', 'organic'];
+const EMPTY_GRAPH = { nodes: [], edges: [], phases: [], reports: [] };
+const EMPTY_LAYOUT: PlaneLayoutResult = { elements: [], width: 0, height: 0, anchors: EMPTY_PLANE_ANCHORS };
 
 export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenReport }) => {
-  const { graph, isLoading, error, pulsed, refetch } = useMapData(query);
+  const { graph: loadedGraph, authorityEpoch, authorityReady, isLoading, error, pulsed, refetch } = useMapData(query);
+  // ---- the Reports display mode (card 742fae98) ----------------------------
+  // The stored choice is the principal's preference; the local copy answers
+  // the click at once and survives a save the server refuses, for this visit.
+  const { preferences, updatePreferences } = useTheme();
+  const storedReportsMode = preferences.mapReportsMode;
+  const [reportsMode, setReportsMode] = useState<MapReportsMode>(storedReportsMode);
+  useEffect(() => { setReportsMode(storedReportsMode); }, [storedReportsMode]);
+  const [reportsModeStatus, setReportsModeStatus] = useState<string | null>(null);
+  const chooseReportsMode = useCallback((next: MapReportsMode) => {
+    setReportsMode(next);
+    setReportsModeStatus(null);
+    updatePreferences({ mapReportsMode: next }).catch(() => setReportsModeStatus(
+      'The Reports display could not be saved; it applies until you leave the Map.'));
+  }, [updatePreferences]);
+  // N counts exactly what the graph read lists: the server narrows `reports`
+  // Report by Report, so a viewer who may not read a Report is never sent it.
+  const reportGroups = useMemo(() => groupReportsByTask(loadedGraph.reports), [loadedGraph.reports]);
+  // Collapsed is a Report-layer substitution BEFORE layout: the plane reserves
+  // one cell per task for its "Reports · N" node, exactly as it reserves the
+  // cells of Report pills, and every pill behaviour follows the node.
+  const sourceGraph = useMemo(() => graphForReportsMode(loadedGraph, reportsMode, reportGroups),
+    [loadedGraph, reportsMode, reportGroups]);
+  const [previewTaskId, setPreviewTaskId] = useState<string | null>(null);
+  const [mountIdentity] = useState(() => crypto.randomUUID());
+  const authorityScope = JSON.stringify([mountIdentity, query, authorityEpoch]);
   const {
     view, setScaleFloor, zoomBy, panBy, applyView, applyFit, needsFit, requestRefit, refitNonce,
   } = useMapViewState();
   const [treeMode, setTreeMode] = useState(false);
+  // ---- the Map and list split (card cae8dfe1, RH-UI.17d) ------------------
+  // Element-as-state, like the canvas (§8): the split measures the section,
+  // its toolbar and the separator, so its effects must run when they exist.
+  const [sectionElement, setSectionElement] = useState<HTMLElement | null>(null);
+  const [toolbarElement, setToolbarElement] = useState<HTMLDivElement | null>(null);
+  // On a phone the toolbar is one line that scrolls sideways (E464): a control
+  // that takes focus is brought fully into view.
+  useFocusScrollsRow(toolbarElement);
+  // E469: a visible label for the icon-only toolbar buttons on a phone (long press, hover, focus).
+  const labelTip = useLabelTips(toolbarElement);
+  const [separatorElement, setSeparatorElement] = useState<HTMLDivElement | null>(null);
+  const split = useMapSplit({ section: sectionElement, toolbar: toolbarElement, separator: separatorElement });
+  /** "Show as list" still REPLACES the canvas (§6, round 2 B2); the split is the map WITH the list. */
+  const splitActive = split.open && !treeMode;
+  const listId = useId();
+  const rectangular = view.organization === 'horizontal' || view.organization === 'vertical';
+  useEffect(() => {
+    if (!rectangular) applyView(previous => ({ ...previous, organization: 'horizontal' }));
+  }, [rectangular, applyView]);
   /** §4: which tile the reader is pointing at, or has focused. Collapsed
    *  cross-lane edges are disclosed through this, so it must be state — those
    *  edges are not in the DOM for a stylesheet to reveal. */
@@ -205,34 +298,44 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   // ---- measurement: the SizeMap is the layout's only source of geometry ----
   // Tiles report their real box; the layout re-runs with measured values.
   // Nothing here guesses a height (diagnosis 7fa7e605 P3).
-  const [sizes, setSizes] = useState<SizeMap>({});
-  const sizesRef = useRef<SizeMap>({});
-  sizesRef.current = sizes;
-  const measure = useCallback((id: string, element: HTMLElement | null) => {
-    if (!element) return;
-    // offsetWidth/Height are LAYOUT dimensions: a CSS transform does not
-    // touch them, so these are already plane units. Deriving them from
-    // getBoundingClientRect and dividing by the scale made the stored size
-    // drift by a rounding step on every zoom, which re-laid out, which
-    // re-measured — a loop that only shows up once you zoom real content.
-    const w = element.offsetWidth;
-    const h = element.offsetHeight;
-    if (!w || !h) return;
-    const known = sizesRef.current[id];
-    if (known && known.w === w && known.h === h) return;
-    setSizes(previous => ({ ...previous, [id]: { w, h } }));
+  const [measurements, setMeasurements] = useState<MapMeasurements>({ sizes: {}, planeSizes: {} });
+  const { sizes, planeSizes } = measurements;
+  // Ref callbacks run among DOM mutations. Defer dimension reads until all
+  // refs for this commit have attached, rather than forcing layout per ref.
+  const pendingMeasurements = useRef(new Map<string, { element: HTMLElement; planeGeometry: boolean }>());
+  const measure = useCallback((id: string, element: HTMLElement | null, planeGeometry = false) => {
+    if (element) pendingMeasurements.current.set(id, { element, planeGeometry });
+    else pendingMeasurements.current.delete(id);
   }, []);
+  useLayoutEffect(() => {
+    if (!pendingMeasurements.current.size) return;
+    // offsetWidth/Height remain untransformed layout dimensions, in plane
+    // units. Read every attached element before publishing any state change.
+    const batch = [...pendingMeasurements.current].map(([id, { element, planeGeometry }]) => ({
+      id, w: element.offsetWidth, h: element.offsetHeight, planeGeometry,
+    }));
+    pendingMeasurements.current.clear();
+    setMeasurements(previous => recordMapMeasurements(previous, batch));
+  });
 
 
+  /** Reader navigation takes ownership from any earlier arrival/explicit Fit. */
+  const correctiveFitRef = useRef<CorrectiveFitState>(INITIAL_CORRECTIVE_FIT);
   const onZoom = useCallback((factor: number, anchor: { x: number; y: number }) => {
+    correctiveFitRef.current = INITIAL_CORRECTIVE_FIT;
     zoomBy(factor, anchor);
   }, [zoomBy]);
   const viewportRef = useRef({ width: 0, height: 0 });
   const onZoomCentre = useCallback((factor: number) => {
+    correctiveFitRef.current = INITIAL_CORRECTIVE_FIT;
     const { width, height } = viewportRef.current;
     zoomBy(factor, { x: width / 2, y: height / 2 });
   }, [zoomBy]);
-  const { canvasRef, viewport, isPanning } = useMapInteractions({ onZoom, onPan: panBy, onZoomCentre });
+  const onPan = useCallback((dx: number, dy: number) => {
+    correctiveFitRef.current = INITIAL_CORRECTIVE_FIT;
+    panBy(dx, dy);
+  }, [panBy]);
+  const { canvasRef, viewport, isPanning } = useMapInteractions({ onZoom, onPan: onPan, onZoomCentre });
   viewportRef.current = viewport;
 
   // The aggregate grid is built for the shape it will actually be read in, so
@@ -249,51 +352,87 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   const continuous = CONTINUOUS_PLANE_ORGANIZATIONS.includes(view.organization);
 
   /**
-   * The anchors are a REF, restored once from localStorage.
+   * The anchors are a REF, and they live for this session only.
+   *
+   * They hold the ORDER the session has given the plane — lane order,
+   * segment order and the slots of the cards shown — so a board update does
+   * not reshuffle what the reader is looking at. They hold no ground: the
+   * engine fits every area to what is shown (owner ruling E386), and nothing
+   * is restored from or written to the browser, so a reload starts from the
+   * data alone.
    *
    * They are deliberately not state. The engine is a FIXED POINT in them
    * (asserted in mapPlaneModel.test.ts), so writing back what a layout just
    * decided cannot change what that layout decided; making them state would
    * schedule a second render per layout for a picture identical to the
-   * first. The ref is read at layout time and written at layout time, and
-   * the effect below is the only thing that touches storage.
+   * first. The ref is read at layout time and written at layout time.
    */
   const anchorsRef = useRef<Partial<Record<MapOrganization, MapPlaneAnchors>>>({});
-  const planeLayout = useMemo(() => {
-    if (!continuous) return null;
-    const held = anchorsRef.current[view.organization] ?? readPlaneAnchors(view.organization);
-    const result = layoutContinuousPlane(graph, sizes, view.organization, held);
-    anchorsRef.current[view.organization] = result.anchors;
-    return result;
-  }, [continuous, graph, sizes, view.organization]);
-
+  const anchorEpoch = useRef(0);
+  if (continuous && !anchorsRef.current[view.organization]) {
+    anchorsRef.current[view.organization] = EMPTY_PLANE_ANCHORS;
+    anchorEpoch.current += 1;
+  }
+  // E386's one-time cleanup: earlier releases stored the layout record in the
+  // browser. It is never read; every copy is removed when the Map loads.
+  useEffect(() => { clearStoredPlaneAnchors(); }, []);
   /**
-   * Clause 6: "stability holds across sessions".
-   *
-   * DEBOUNCED, because the record is not small. Measured on the 5,023-task
-   * portal it serialises to 692 KB, and this effect re-runs on every
-   * measurement pass — tiles report their boxes in dribs as culling admits
-   * them, so an undebounced write would stringify most of a megabyte dozens
-   * of times while the reader is trying to pan. The layout does not depend on
-   * the write, so the last one wins and the ones in between were never
-   * needed.
+   * RE-PACK (E375, kept by E386): the reader's explicit "start again". The
+   * session's order for the current organization is discarded, and the plane
+   * is laid out afresh from what is shown now — lanes and phases in their
+   * declared order, cards by dependency rank — then fitted to the viewport.
    */
+  const [repackNonce, setRepackNonce] = useState(0);
+  const repackHintId = useId();
+  // E386: hiding archived work changes what is SHOWN, and the plane fits what
+  // is shown, so the toggle reaches the layout through the graph alone. (The
+  // density migration that used to ride on this input upgraded a record a
+  // released Map had stored; nothing is stored any more, so it is gone.)
+  const anchorGeneration = anchorEpoch.current;
+  const planeInput = useMemo<MapPlaneInput | null>(() => continuous && authorityReady && !error ? {
+    graph: sourceGraph, sizes: planeSizes, organization: view.organization,
+    anchors: anchorsRef.current[view.organization]!,
+  } : null, [continuous, authorityReady, error, sourceGraph, planeSizes, view.organization, anchorGeneration,
+    repackNonce]);
+  const acceptPlane = useCallback((input: MapPlaneInput, result: PlaneLayoutResult) => {
+    anchorsRef.current[input.organization] = result.anchors;
+  }, []);
+  const computation = useMapPlaneLayout(planeInput, authorityScope, acceptPlane);
+  const planeLayout = continuous ? computation.visible?.layout ?? EMPTY_LAYOUT : null;
+  // All downstream edges, counters, attention, tree and archive targets use
+  // this same display membership while a complete replacement is pending.
+  const graph = continuous ? computation.visible?.graph ?? EMPTY_GRAPH : sourceGraph;
+  const geometryComplete = !continuous || computation.complete;
+  const [switchStatus, setSwitchStatus] = useState<string | null>(null);
+  const switchContext = useMemo(() => ({ sourceGraph, planeSizes, viewport, view, refitNonce,
+    authorityScope, planeLayout, authorityReady }),
+  [sourceGraph, planeSizes, viewport, view, refitNonce, authorityScope, planeLayout, authorityReady]);
+  const switchTicket = useRef<{ controller: AbortController; job?: MapPlaneJob;
+    next: MapOrganization; context: typeof switchContext } | null>(null);
+  const restartSwitch = useRef<((next: MapOrganization) => void) | null>(null);
+  const currentSwitchContext = useRef(switchContext);
+  currentSwitchContext.current = switchContext;
+  const cancelSwitch = useCallback((message: string | null = null) => {
+    const ticket = switchTicket.current;
+    if (!ticket) return;
+    ticket.controller.abort(); ticket.job?.cancel(); switchTicket.current = null;
+    setSwitchStatus(message);
+  }, []);
   useEffect(() => {
-    if (!planeLayout) return undefined;
-    const timer = window.setTimeout(() => {
-      const landed = writePlaneAnchors(
-        pruneAnchors(planeLayout.anchors, new Set(graph.nodes.map(node => node.id))), view.organization);
-      // Round-1 finding 5: a refused write costs the reader the
-      // cross-session half of clause 6, and swallowing that silently is not
-      // good enough. The Map still works; the record does not.
-      if (!landed && import.meta.env.DEV) {
-        // eslint-disable-next-line no-console
-        console.warn('[Map] the layout record could not be stored; '
-          + 'positions will not survive this session');
-      }
-    }, 750);
-    return () => window.clearTimeout(timer);
-  }, [planeLayout, graph.nodes, view.organization]);
+    const ticket = switchTicket.current;
+    if (!ticket || ticket.context === switchContext) return;
+    const prior = ticket.context;
+    if (prior.authorityScope !== switchContext.authorityScope || !switchContext.authorityReady
+      || prior.view !== switchContext.view || prior.refitNonce !== switchContext.refitNonce
+      || prior.viewport !== switchContext.viewport) {
+      cancelSwitch('View changed; select the layout again.');
+    } else {
+      // A measurement/data completion retains the user's chosen target and
+      // deliberately recalculates it against the newest coherent snapshot.
+      restartSwitch.current?.(ticket.next);
+    }
+  }, [switchContext, cancelSwitch]);
+  useEffect(() => () => cancelSwitch(), [cancelSwitch]);
 
   /**
    * The container card's MEASURED CSS box (round-1 finding 4).
@@ -324,8 +463,11 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       ?? layoutAtAltitude(graph, sizes, view.altitude, aspect, view.organization),
     [planeLayout, graph, sizes, view.altitude, aspect, view.organization],
   );
+  const fitBounds = useMemo(() => continuous ? planeContentBounds(layout.elements, planeLayout?.organicRegions?.map(r=>r.box))
+    : { x: 0, y: 0, w: layout.width, h: layout.height }, [continuous, layout, planeLayout]);
 
-  const scaleFloor = continuous ? planeFitScale(layout, viewport) : SCALE_MIN;
+  // Fit is an explicit navigation action, not a limit on zooming out.
+  const scaleFloor = continuous ? PLANE_SCALE_MIN : SCALE_MIN;
   // Clamp restored views and resized planes before paint. All input paths use
   // this same floor through the view hook, including pinch and keyboard zoom.
   useLayoutEffect(() => {
@@ -462,6 +604,82 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     [layout],
   );
 
+  // ---- hover linking between the list and the map (card cae8dfe1, RH-UI.17e)
+  /**
+   * List to map. The list row the reader points at, or focuses, is marked on
+   * the plane by ONE ring placed over its tile's box, in the tiles' own hover
+   * ink (MapView.css) rather than a second highlight vocabulary.
+   *
+   * It is answered in the DOM, not in state: a pointer travelling down a long
+   * list must not re-render the plane once per row (the card's estate-scale
+   * rule). And because the ring is its own element above the tiles, the chain
+   * selection's lit and dim are neither changed nor hidden by it: a dimmed
+   * tile is still found, and the selection is exactly what it was.
+   */
+  const linkRingRef = useRef<HTMLDivElement | null>(null);
+  const listLinkRef = useRef<string | null>(null);
+  const tileByIdRef = useRef(tileById);
+  tileByIdRef.current = tileById;
+  const placeLinkRing = useCallback(() => {
+    const ring = linkRingRef.current;
+    if (!ring) return;
+    const id = listLinkRef.current;
+    const tile = id === null ? undefined : tileByIdRef.current.get(id);
+    if (id === null || !tile) {
+      ring.removeAttribute('data-active');
+      ring.removeAttribute('data-link-task');
+      return;
+    }
+    ring.style.left = `${tile.x}px`;
+    ring.style.top = `${tile.y}px`;
+    ring.style.width = `${tile.w}px`;
+    ring.style.height = `${tile.h}px`;
+    ring.setAttribute('data-link-task', id);
+    ring.setAttribute('data-active', '');
+  }, []);
+  // The plane can move under a held link (a board update, a re-pack), so
+  // every commit re-places the one ring: a single lookup.
+  useLayoutEffect(() => { placeLinkRing(); });
+  const linkFromList = useCallback((id: string) => {
+    listLinkRef.current = id;
+    placeLinkRing();
+  }, [placeLinkRing]);
+  const unlinkFromList = useCallback((id: string) => {
+    if (listLinkRef.current !== id) return;
+    listLinkRef.current = null;
+    placeLinkRing();
+  }, [placeLinkRing]);
+  useEffect(() => {
+    if (splitActive) return;
+    listLinkRef.current = null;
+    placeLinkRing();
+  }, [splitActive, placeLinkRing]);
+
+  /**
+   * Map to list. The tile the reader points at or focuses (§4's `hoveredId`,
+   * which tile focus already drives) marks its list row, and the list scrolls
+   * just far enough to show it when it is out of sight. The list scrolls
+   * itself only, never the page, and a row already in sight does not move.
+   */
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const linkedRowRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const list = listRef.current;
+    const id = splitActive && hoveredId !== null && tileById.has(hoveredId) ? hoveredId : null;
+    const row = id !== null && list
+      ? list.querySelector<HTMLElement>(`[data-list-task="${id.replace(/["\\]/g, '\\$&')}"]`)
+      : null;
+    const previous = linkedRowRef.current;
+    if (previous && previous !== row) previous.removeAttribute('data-map-linked');
+    linkedRowRef.current = row;
+    if (!row || !list) return;
+    row.setAttribute('data-map-linked', '');
+    const frame = list.getBoundingClientRect();
+    const box = row.getBoundingClientRect();
+    if (box.top < frame.top) list.scrollTop -= frame.top - box.top;
+    else if (box.bottom > frame.bottom) list.scrollTop += box.bottom - frame.bottom;
+  }, [hoveredId, splitActive, tileById]);
+
   // Chain selection (§4): focusing or clicking a Task lights its full
   // upstream AND downstream chain and dims everything else; empty canvas
   // clears it.
@@ -478,7 +696,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   const detail = DETAIL_MATRIX[band];
 
   // ---- viewport culling: bounded live DOM, tiles never "vanish" logically --
-  const visibleTiles = useMemo(() => {
+  const eligibleTiles = useMemo(() => {
     const tiles = layout.elements
       .filter((e): e is PlacedTile => e.kind === 'tile')
       // A tile its container has completely taken over carries no ink and no
@@ -490,15 +708,29 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       // stands down when the viewport has no size yet, and the cross-fade
       // must not stand down with it.
       .filter(tile => !fade || (fade.task.get(tile.id) ?? 0) > FADE_EPSILON);
-    if (!viewport.width || !viewport.height) return tiles;
-    const left = (-view.offsetX - CULL_MARGIN) / view.scale;
-    const top = (-view.offsetY - CULL_MARGIN) / view.scale;
-    const right = (viewport.width - view.offsetX + CULL_MARGIN) / view.scale;
-    const bottom = (viewport.height - view.offsetY + CULL_MARGIN) / view.scale;
-    return tiles.filter(tile =>
-      tile.x + tile.w >= left && tile.x <= right &&
-      tile.y + tile.h >= top && tile.y <= bottom);
-  }, [layout, viewport, view.offsetX, view.offsetY, view.scale, fade]);
+    return tiles;
+  }, [layout, fade]);
+  /** The plane rectangle culling admits, or null while the viewport has no size. */
+  const cullRect = useMemo(() => {
+    if (!viewport.width || !viewport.height) return null;
+    return {
+      left: (-view.offsetX - CULL_MARGIN) / view.scale,
+      top: (-view.offsetY - CULL_MARGIN) / view.scale,
+      right: (viewport.width - view.offsetX + CULL_MARGIN) / view.scale,
+      bottom: (viewport.height - view.offsetY + CULL_MARGIN) / view.scale,
+    };
+  }, [viewport, view.offsetX, view.offsetY, view.scale]);
+  const inCull = useCallback((box: Box) => !cullRect || (
+    box.x + box.w >= cullRect.left && box.x <= cullRect.right &&
+    box.y + box.h >= cullRect.top && box.y <= cullRect.bottom), [cullRect]);
+  const inViewport = useMemo(
+    () => new Set(eligibleTiles.filter(inCull).map(tile=>tile.id)),
+    [eligibleTiles, inCull]);
+  const pills = useMemo(
+    () => layout.elements.filter((e): e is PlacedReportPill => e.kind === 'pill'), [layout]);
+  const visibleTiles = useArchiveVisibility(eligibleTiles, inViewport, pills,
+    planeLayout?.archiveScales, JSON.stringify([authorityScope,view.organization]),
+    authorityReady && !error && view.organization === 'organic' && !treeMode);
 
 
   /** Chain state colours the edge (§4): red dammed, blue in flight, green satisfied. */
@@ -531,24 +763,23 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     () => graph.edges.filter(edge => tileById.has(edge.from) && tileById.has(edge.to)),
     [graph.edges, tileById],
   );
-  const laneOf = useCallback(
-    (taskId: string) => tileById.get(taskId)?.node.project ?? null,
-    [tileById],
-  );
+
 
   // §5: "the render-count is surfaced in dev builds". Culling exists to keep
   // the live DOM bounded, and the number that proves it is how many tiles are
   // actually mounted versus how many are in scope.
-  const pills = useMemo(
-    () => layout.elements.filter((e): e is PlacedReportPill => e.kind === 'pill'),
-    [layout],
-  );
-  // Culled with the same rule as tiles: a pill whose anchor is off-screen has
-  // nothing to sit beside.
+  // Culled by its OWN box, exactly as a tile is (card 2b6f21f6 (C), owner
+  // screenshots 07 vs 08): a Report cell inside the viewport is drawn even
+  // when the Task it stands beside is not, because a large Report grid
+  // reaches far past its Task. It still recedes with that Task — a pill is
+  // the Task's close-zoom ink, so a Task its container has taken over
+  // carries no pills — and a Task drawn for any other reason keeps its own.
   const visiblePills = useMemo(() => {
     const visibleIds = new Set(visibleTiles.map(tile => tile.id));
-    return pills.filter(pill => visibleIds.has(pill.taskId));
-  }, [pills, visibleTiles]);
+    const inkIds = new Set(eligibleTiles.map(tile => tile.id));
+    return pills.filter(pill => visibleIds.has(pill.taskId)
+      || (inkIds.has(pill.taskId) && inCull(pill)));
+  }, [pills, visibleTiles, eligibleTiles, inCull]);
   const asTask = (node: MapTaskNode) => node as unknown as Task;
 
   // ---- the aggregate altitudes (amendment §2/§5-A2) -----------------------
@@ -560,6 +791,57 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    * layer carries.
    */
   const isTaskAltitude = continuous || view.altitude === 'task';
+
+  /**
+   * The Report nodes this frame DRAWS (card 742fae98). An individual Report
+   * pill is the close band's ink, as before; a Collapsed "Reports · N" node is
+   * drawn wherever its task is, at every band, because the owner asked for N
+   * at every zoom. Both are culled by their OWN box (card 2b6f21f6 (C)).
+   */
+  const drawnPills = useMemo(
+    () => (isTaskAltitude
+      ? visiblePills.filter(pill => detail.reports || taskOfReportGroup(pill.reportId) !== null)
+      : []),
+    [isTaskAltitude, visiblePills, detail.reports],
+  );
+
+  /**
+   * Expanded's report area (card 742fae98): one per task, framing every
+   * Report cell the layout reserved for it, so it is sized by N exactly as
+   * the cells are and the task card stands beside it. Built from ALL placed
+   * cells, then culled by its own box like a pill — panning across a task's
+   * Reports keeps the area while the task card is off-screen.
+   */
+  const reportAreas = useMemo(() => {
+    const bounds = new Map<string, { x0: number; y0: number; x1: number; y1: number }>();
+    for (const pill of pills) {
+      if (taskOfReportGroup(pill.reportId) !== null) continue;
+      const held = bounds.get(pill.taskId);
+      if (!held) bounds.set(pill.taskId, { x0: pill.x, y0: pill.y, x1: pill.x + pill.w, y1: pill.y + pill.h });
+      else {
+        held.x0 = Math.min(held.x0, pill.x); held.y0 = Math.min(held.y0, pill.y);
+        held.x1 = Math.max(held.x1, pill.x + pill.w); held.y1 = Math.max(held.y1, pill.y + pill.h);
+      }
+    }
+    return [...bounds].map(([taskId, box]) => ({
+      id: `report-area:${taskId}`, taskId,
+      x: box.x0 - REPORT_AREA_PAD, y: box.y0 - REPORT_AREA_PAD,
+      w: box.x1 - box.x0 + 2 * REPORT_AREA_PAD, h: box.y1 - box.y0 + 2 * REPORT_AREA_PAD,
+    }));
+  }, [pills]);
+  const drawnReportAreas = useMemo(() => {
+    if (!isTaskAltitude) return [];
+    const visibleIds = new Set(visibleTiles.map(tile => tile.id));
+    const inkIds = new Set(eligibleTiles.map(tile => tile.id));
+    return reportAreas.filter(area => visibleIds.has(area.taskId) || (inkIds.has(area.taskId) && inCull(area)));
+  }, [isTaskAltitude, reportAreas, visibleTiles, eligibleTiles, inCull]);
+  /** N alone, enlarged against the zoom below the close band (never past its cell). */
+  const reportCountScale = Math.min(REPORT_COUNT_MAX_SCALE, Math.max(1, 1 / view.scale));
+  const previewPill = previewTaskId === null ? undefined
+    : drawnPills.find(pill => pill.taskId === previewTaskId && taskOfReportGroup(pill.reportId) !== null);
+  const previewGroup = previewPill ? reportGroups.get(previewPill.taskId) : undefined;
+  const previewId = `map-report-preview-${mountIdentity}`;
+
   const bandById = useMemo(
     () => new Map(layout.elements
       .filter((e): e is PlacedBand => e.kind === 'band').map(band => [band.id, band])),
@@ -682,20 +964,16 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    * came from, and the edges are drawn between the CONTAINER boxes — which
    * are the same regions the tiles were just in, not a second picture.
    *
-   * Computed only when a container tier actually shows: at reading zoom this
-   * is a memo that returns nulls.
+   * Membership is cached independently of zoom; opacity decides which tier
+   * paints the cached relationships.
    */
   const planeGraph = useMemo(() => view.organization === 'organic' ? organicPlaneGraph(graph) : graph, [graph, view.organization]);
-  const planeRollup = useMemo(() => {
-    if (!fade) return null;
-    const anyPhase = [...fade.phase.values()].some(alpha => alpha > FADE_EPSILON);
-    const anyProject = [...fade.project.values()].some(alpha => alpha > FADE_EPSILON);
-    if (!anyPhase && !anyProject) return null;
-    return {
-      phase: anyPhase ? rollUpEdges(planeGraph, 'phase') : null,
-      project: anyProject ? rollUpEdges(planeGraph, 'project') : null,
-    };
-  }, [fade, planeGraph]);
+  // Membership does not change during zoom. Do not rebuild both dependency
+  // graphs on every gesture frame merely because their opacity changed.
+  const planeRollup = useMemo(() => continuous ? {
+    phase: rollUpEdges(planeGraph, 'phase'),
+    project: rollUpEdges(planeGraph, 'project'),
+  } : null, [continuous, planeGraph]);
 
   /**
    * Container boxes keyed by the AGGREGATE key the roll-up speaks — rebuilt
@@ -755,10 +1033,11 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
           tier: 'phase',
           x: element.x, y: element.y, w: element.w, h: element.h,
           alpha,
-          // Reachable only when it is BOTH the layer in charge and big
-          // enough on screen to carry its card (see cardFits).
+          // The phase must own the ink and have a discernible region. Its
+          // caption can sit in a screen-space gutter, so a narrow phase
+          // need not fit the card itself to remain reachable at Fit.
           interactive: tierOf(element.id, element.laneId) === 'phase'
-            && element.w * view.scale >= 40 && element.h * view.scale >= 40,
+            && element.w * view.scale >= 8 && element.h * view.scale >= 8,
           facts: {
             ...element.facts,
             kind: 'phase',
@@ -792,6 +1071,68 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     return entries;
   }, [planeLayout, fade, tierOf, planeRollup, view.scale, cardBox]);
 
+  // Overview captions are screen-space annotations, not new world geometry.
+  // A tall phase can fit on screen while its ground is too narrow for a card.
+  // Place a concise name beside it, without changing persisted lane anchors.
+  const overviewCaptions = useMemo(() => {
+    const positions = new Map<string, { x: number; y: number }>();
+    if (rectangular) return positions;
+    const occupied: Box[] = [];
+    const width = 184;
+    const height = 56;
+    const gap = 8;
+    const intersects = (a: Box, b: Box) => a.x < b.x + b.w + gap
+      && a.x + a.w + gap > b.x && a.y < b.y + b.h + gap && a.y + a.h + gap > b.y;
+    const screenBox = (entry: PlaneContainerEntry): Box => ({
+      x: entry.x * view.scale + view.offsetX, y: entry.y * view.scale + view.offsetY,
+      w: entry.w * view.scale, h: entry.h * view.scale,
+    });
+    // Passive project headers still occupy screen space while phases own
+    // interaction. Reserve them too, or an annotation can cover the title.
+    for (const element of layout.elements) {
+      if (element.kind !== 'lane' || projectAlpha(element.id.slice('lane:'.length)) >= 0.5) continue;
+      occupied.push({ x: element.x * view.scale + view.offsetX,
+        y: element.y * view.scale + view.offsetY, w: cardBox.w, h: 120 });
+    }
+    for (const entry of planeContainers) {
+      if (!entry.interactive) continue;
+      const box = screenBox(entry);
+      if (box.w >= 160 && box.h >= 96) {
+        occupied.push({ ...box, w: Math.min(cardBox.w, box.w), h: 120 });
+      }
+    }
+    for (const entry of planeContainers) {
+      if (!entry.interactive) continue;
+      const box = screenBox(entry);
+      if (box.w >= 160 && box.h >= 96) continue;
+      if (box.x + box.w < 0 || box.y + box.h < 0
+        || box.x > viewport.width || box.y > viewport.height) continue;
+      if (viewport.width < width + gap * 2 || viewport.height < height + gap * 2) continue;
+      const clampX = (x: number) => Math.max(gap, Math.min(viewport.width - width - gap, x));
+      const clampY = (y: number) => Math.max(gap, Math.min(viewport.height - height - gap, y));
+      // Prefer the nearest free gutter. On dense views search other rows;
+      // never stack labels on top of each other or move the underlying work.
+      const xs = [clampX(box.x + box.w + gap), clampX(box.x - width - gap), clampX(box.x)];
+      let placed = false;
+      for (let row = 0; row < Math.ceil(viewport.height / (height + gap)) && !placed; row++) {
+        for (const direction of row ? [1, -1] : [1]) {
+          const y = clampY(box.y + direction * row * (height + gap));
+          for (const x of xs) {
+            const candidate = { x, y, w: width, h: height };
+            if (occupied.some(other => intersects(candidate, other))) continue;
+            positions.set(entry.id, { x: (x - view.offsetX) / view.scale,
+              y: (y - view.offsetY) / view.scale });
+            occupied.push(candidate);
+            placed = true;
+            break;
+          }
+          if (placed) break;
+        }
+      }
+    }
+    return positions;
+  }, [rectangular, planeContainers, layout, projectAlpha, view.scale, view.offsetX, view.offsetY, viewport, cardBox.w]);
+
   /**
    * §4's reveal at the container tiers (round-1 finding 2). Selection is
    * authoritative over hover while the selected container is still on the
@@ -823,18 +1164,10 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   const furnitureChain = continuous ? planeChain : null;
   const furnitureScale = (key: string) => chainScale(
     furnitureChain, furnitureChain?.has(key) ?? false, CHAIN_DIM.node);
-  const visibleEdges = useMemo(() => {
-    if (drawableEdges.length <= EDGE_DENSITY_THRESHOLD) return drawableEdges;
-    return drawableEdges.filter(edge => {
-      const crossLane = laneOf(edge.from) !== laneOf(edge.to);
-      if (!crossLane) return true;
-      // Cross-lane and dense: only the chain the reader has asked about, or
-      // the one they are pointing at, survives.
-      const revealed = paintedTaskChain?.has(edge.from) && paintedTaskChain?.has(edge.to);
-      const hovered = hoveredId === edge.from || hoveredId === edge.to;
-      return Boolean(revealed || hovered);
-    });
-  }, [drawableEdges, laneOf, paintedTaskChain, hoveredId]);
+  // Keep visible relationships discoverable; hover changes emphasis, not membership.
+  const visibleEdges = useMemo(() => drawableEdges.filter(edge =>
+    inViewport.has(edge.from) || inViewport.has(edge.to)), [drawableEdges, inViewport]);
+
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     // eslint-disable-next-line no-console
@@ -861,7 +1194,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   }, []);
   const planeEdges = useMemo(() => {
     const drawn: Array<{ tier: 'phase' | 'project'; edge: AggregateEdge }> = [];
-    if (!planeRollup) return drawn;
+    if (!planeRollup || visibleTiles.length > 0) return drawn;
     for (const tier of ['phase', 'project'] as const) {
       const rolled = tier === 'phase' ? planeRollup.phase : planeRollup.project;
       if (!rolled) continue;
@@ -880,7 +1213,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       for (const edge of visible) drawn.push({ tier, edge });
     }
     return drawn;
-  }, [planeRollup, activePlaneId, planeChain, planeLaneOfAggregate]);
+  }, [planeRollup, activePlaneId, planeChain, planeLaneOfAggregate, visibleTiles.length]);
 
   /** Reports drawn ONCE at an aggregate altitude (amendment §2/§5-A2.1). */
   const aggregateReports = useMemo(
@@ -897,7 +1230,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    */
   const visibleFurniture = useMemo<Box[]>(() => {
     if (!isTaskAltitude) return [];
-    const boxes: Box[] = [...visibleTiles, ...visiblePills];
+    const boxes: Box[] = [...visibleTiles, ...drawnPills];
     if (!viewport.width || !viewport.height) {
       return [...boxes, ...layout.elements.filter(
         e => e.kind === 'lane' || e.kind === 'chip')];
@@ -912,7 +1245,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
         && element.y + element.h >= top && element.y <= bottom) boxes.push(element);
     }
     return boxes;
-  }, [isTaskAltitude, visibleTiles, visiblePills, layout, viewport, view.offsetX, view.offsetY, view.scale]);
+  }, [isTaskAltitude, visibleTiles, drawnPills, layout, viewport, view.offsetX, view.offsetY, view.scale]);
 
   const edgeObstacles = useMemo(
     () => (planeLayout
@@ -937,68 +1270,48 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    * (round 3, B2) — obstacle-clear and still unfollowable.
    */
   const routeEnvelope = useMemo<Box>(
-    () => ({ x: 0, y: 0, w: layout.width, h: layout.height }),
-    [layout.width, layout.height],
+    () => planeLayout?.worldBounds ?? ({ x: 0, y: 0, w: layout.width, h: layout.height }),
+    [planeLayout, layout.width, layout.height],
   );
 
-  /**
-   * Routes are a property of the LAYOUT, not of the frame. Computing them
-   * inline in the render meant every pan and every zoom re-ran the corridor
-   * search for every visible edge - measured at 406ms for the phase altitude's
-   * rolled-up set, which is a stutter on every gesture rather than a cost paid
-   * once. They are memoised on the inputs that can actually change them.
-   */
-  // Selection and hover rebuild presentation entries without changing their
-  // geometry. Keep routing inputs stable so those interactions reuse routes.
-  const obstacleGeometry=JSON.stringify(edgeObstacles.map(({x,y,w,h})=>({x,y,w,h})));
-  const stableObstacles=useMemo<Box[]>(()=>JSON.parse(obstacleGeometry),[obstacleGeometry]);
-  const routeCache=useMemo(()=>new Map<string,EdgeRoute>(),
-    [continuous,stableObstacles,routeEnvelope,view.organization]);
-  const routeOnPlane = useCallback((source: Box, target: Box, report = false) => {
-    const key=[source.x,source.y,source.w,source.h,target.x,target.y,target.w,target.h,report].join(':');
-    const cached=routeCache.get(key);
-    if(cached)return cached;
-    // Containers are geography. The ground containing an endpoint must not
-    // block that endpoint's exit, and copied endpoint boxes are the endpoint,
-    // not a second obstacle. routeEdge still checks its shrunk endpoints.
-    const contains = (outer: Box, inner: Box) => outer.x <= inner.x && outer.y <= inner.y
-      && outer.x + outer.w >= inner.x + inner.w && outer.y + outer.h >= inner.y + inner.h;
-    const obstacles = continuous ? stableObstacles.filter(box =>
-      !contains(box, source) && !contains(box, target)
-      && !contains(source, box) && !contains(target, box)) : stableObstacles;
-    const route=continuous
-      ? routeFlowEdge(source, target, obstacles, routeEnvelope, view.organization, report)
-      : routeEdge(source, target, obstacles, routeEnvelope);
-    routeCache.set(key,route);
-    return route;
-  }, [continuous, stableObstacles, routeEnvelope, view.organization, routeCache]);
-
-  const taskRoutes = useMemo(() => {
-    const routes = new Map<string, EdgeRoute>();
-    if (!isTaskAltitude) return routes;
-    for (const edge of visibleEdges) {
-      const from = tileById.get(edge.from);
-      const to = tileById.get(edge.to);
-      if (!from || !to) continue;
-      routes.set(`${edge.kind}-${edge.from}-${edge.to}`,
-        routeOnPlane(to, from));
+  // Coarse zoom bands keep a readable screen-space halo without restarting
+  // the routing worker on every fractional wheel event.
+  const routeScale = view.scale >= 1 ? 1 : view.scale >= 0.5 ? 0.5 : view.scale >= 0.35 ? 0.35 : 0.2;
+  const routeInput = useMemo<MapRoutesInput | null>(() => {
+    if (!authorityReady || error) return null;
+    const requests: MapRouteRequest[] = [];
+    const mode = continuous ? 'flow' : 'plane-edge';
+    if (isTaskAltitude) {
+      for (const edge of visibleEdges) {
+        const source = tileById.get(edge.to), target = tileById.get(edge.from);
+        if (source && target && Math.min(taskAlpha(edge.from), taskAlpha(edge.to)) > FADE_EPSILON)
+          requests.push({ key: JSON.stringify(['task', edge.kind, edge.from, edge.to]), source, target, mode });
+      }
+    } else {
+      for (const edge of visibleAggregateEdges) {
+        const source = aggregateById.get(edge.to), target = aggregateById.get(edge.from);
+        if (source && target) requests.push({ key: JSON.stringify(['aggregate', edge.kind, edge.from, edge.to]), source, target, mode: 'legacy-edge' });
+      }
+      for (const report of aggregateReports) for (const id of report.aggregateIds) {
+        const target = aggregateById.get(id);
+        if (target) requests.push({ key: JSON.stringify(['aggregate-report', report.reportId, id]), source: report, target, mode, report: true });
+      }
     }
-    return routes;
-  }, [isTaskAltitude, visibleEdges, tileById, routeOnPlane]);
-
-  const aggregateRoutes = useMemo(() => {
-    const routes = new Map<string, EdgeRoute>();
-    if (isTaskAltitude) return routes;
-    for (const edge of visibleAggregateEdges) {
-      const source = aggregateById.get(edge.to);
-      const target = aggregateById.get(edge.from);
-      if (!source || !target) continue;
-      routes.set(`${edge.kind}-${edge.from}-${edge.to}`,
-        routeEdge(source, target, edgeObstacles, routeEnvelope));
+    for (const { tier, edge } of planeEdges) {
+      const source = planeAggregateBox.get(edge.to), target = planeAggregateBox.get(edge.from);
+      if (source && target && Math.min(source.alpha, target.alpha) > FADE_EPSILON)
+        requests.push({ key: JSON.stringify(['plane', tier, edge.kind, edge.from, edge.to]), source, target, mode });
     }
-    return routes;
-  }, [isTaskAltitude, visibleAggregateEdges, aggregateById, edgeObstacles, routeEnvelope]);
-
+    if (isTaskAltitude && detail.reports) for (const pill of visiblePills) {
+      const target = tileById.get(pill.taskId);
+      if (target) requests.push({ key: JSON.stringify(['report', pill.id]), source: pill, target, mode, report: true });
+    }
+    return { requests, obstacles: edgeObstacles, envelope: routeEnvelope, organization: view.organization, scale: routeScale };
+  }, [authorityReady, error, continuous, isTaskAltitude, visibleEdges, tileById, taskAlpha,
+    visibleAggregateEdges, aggregateById, aggregateReports, planeEdges, planeAggregateBox,
+    detail.reports, visiblePills, edgeObstacles, routeEnvelope, view.organization, routeScale]);
+  const routing = useMapRoutes(routeInput, authorityScope, sourceGraph);
+  const pendingRouteTitle = routing.error ? 'Connection calculation failed; retry connections' : 'Calculating connection…';
 
   // ---- the one-shot fit, consumed ONLY once measurement has CONVERGED ----
   // 232dc7b3 F2, carried verbatim into this card's brief: the fit was spent in
@@ -1033,9 +1346,14 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   // an estate sitting at the task altitude at scale 1.
   const mountedIds = useMemo(
     () => (isTaskAltitude
-      ? visibleTiles.map(tile => tile.id)
+      ? visibleTiles
+        // The phase-owned silhouette branch never measures its tiles. Only
+        // wait for the task cards that actually mount a measurement ref;
+        // otherwise Fit deadlocks during the partial cross-fade after zoom.
+        .filter(tile => tierOf(tile.bandId, tile.laneId) === 'task')
+        .map(tile => tile.id)
       : [...placedAggregates.map(a => a.id), ...aggregateReports.map(r => r.id)]),
-    [isTaskAltitude, visibleTiles, placedAggregates, aggregateReports],
+    [isTaskAltitude, visibleTiles, placedAggregates, aggregateReports, tierOf],
   );
   const measurementSettled = continuous
     // On the continuous plane a fully zoomed-out view mounts no tiles at
@@ -1051,12 +1369,10 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
   // an altitude to let it measure must terminate, and this bounds it to one
   // visit each rather than trusting the selection to converge.
   const fitVisitedRef = useRef<Set<MapAltitude>>(new Set());
-  /** The corrective-fit budget, as the explicit machine in the model. */
-  const correctiveFitRef = useRef<CorrectiveFitState>(INITIAL_CORRECTIVE_FIT);
 
   useEffect(() => {
     if (!needsFit()) return;
-    if (isLoading || graph.nodes.length === 0) return;
+    if (isLoading || !geometryComplete || graph.nodes.length === 0) return;
     if (!viewport.width || !viewport.height) return;
     if (!measurementSettled) return;
 
@@ -1064,15 +1380,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     // to arrive at, so there is no placeholder-geometry hazard to walk
     // around either: the plane on screen IS the plane being fitted.
     if (continuous) {
-      const planeScale = planeFitScale(layout, viewport);
+      const planeScale = planeFitScale({ width: fitBounds.w, height: fitBounds.h }, viewport);
       correctiveFitRef.current = onFitSpent(
         correctiveFitRef.current, { width: layout.width, height: layout.height });
       applyFit({
         organization: view.organization,
         altitude: 'task',
         scale: planeScale,
-        offsetX: (viewport.width - layout.width * planeScale) / 2,
-        offsetY: (viewport.height - layout.height * planeScale) / 2,
+        offsetX: (viewport.width - fitBounds.w * planeScale) / 2 - fitBounds.x * planeScale,
+        offsetY: (viewport.height - fitBounds.h * planeScale) / 2 - fitBounds.y * planeScale,
       });
       return;
     }
@@ -1120,8 +1436,8 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     });
   }, [
     continuous,
-    needsFit, isLoading, graph, sizes, viewport, applyFit, applyView,
-    view.organization, view.altitude, layout, measurementSettled, altitudeOptions,
+    needsFit, isLoading, geometryComplete, graph, sizes, viewport, applyFit, applyView,
+    view.organization, view.altitude, layout, fitBounds, measurementSettled, altitudeOptions,
     // Re-arming a fit must WAKE this effect; `needsFit` is a ref read and
     // changes nothing React can see (round 1, B3).
     refitNonce,
@@ -1136,12 +1452,13 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    * the reader's own zoom to make, and the Fit control is always there.
    */
   useEffect(() => {
+    if (!geometryComplete) return;
     if (needsFit()) return;
     const next = onExtentChanged(
       correctiveFitRef.current, { width: layout.width, height: layout.height });
     correctiveFitRef.current = next.state;
     if (next.refit) requestRefit();
-  }, [layout.width, layout.height, needsFit, requestRefit]);
+  }, [layout.width, layout.height, needsFit, requestRefit, geometryComplete]);
 
   const fitNow = useCallback(() => {
     requestRefit();
@@ -1160,6 +1477,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     graph, sizes, altitudeOptions, aspect,
   ]);
 
+  const repack = useCallback(() => {
+    if (!continuous) return;
+    cancelSwitch();
+    anchorsRef.current[view.organization] = EMPTY_PLANE_ANCHORS;
+    anchorEpoch.current += 1;
+    setRepackNonce(value => value + 1);
+    fitNow();
+  }, [continuous, cancelSwitch, view.organization, fitNow]);
+
   /**
    * §2: switching organizations recomputes targets and the elements TWEEN to
    * them (0.5s, cubic-bezier(.4,0,.2,1)) under the morph class; reduced
@@ -1172,6 +1498,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    */
   const [morphing, setMorphing] = useState(false);
   const morphTimer = useRef<number | null>(null);
+  const morphOwner = useRef<{ layout: PlaneLayoutResult; scope: string } | null>(null);
   useEffect(() => () => {
     if (morphTimer.current !== null) window.clearTimeout(morphTimer.current);
   }, []);
@@ -1188,6 +1515,14 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
    * overlay entirely — the swap is the committed re-render.
    */
   const [containerMorph, setContainerMorph] = useState<ContainerMorph[] | null>(null);
+  useLayoutEffect(() => {
+    const owner = morphOwner.current;
+    if (!owner || (owner.scope === authorityScope
+      && (!computation.supportsWorker || owner.layout === planeLayout))) return;
+    morphOwner.current = null;
+    if (morphTimer.current !== null) window.clearTimeout(morphTimer.current);
+    setMorphing(false); setContainerMorph(null);
+  }, [authorityScope, planeLayout, computation.supportsWorker]);
   const morphPathRefs = useRef(new Map<string, SVGPathElement>());
   useEffect(() => {
     if (!containerMorph) return undefined;
@@ -1212,20 +1547,13 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
   }, [containerMorph]);
-  const switchOrganization = useCallback((next: MapOrganization) => {
-    if (next === view.organization) return;
-    if (isLoading) {
-      applyView(current => ({ ...current, organization: next, altitude: 'task' }));
-      requestRefit();
-      return;
-    }
+  const commitOrganization = useCallback((next: MapOrganization, nextLayout: PlaneLayoutResult) => {
     // Arriving ON the continuous plane means arriving at ONE world: there is
     // no altitude to carry across, so the target is the plane itself.
     const nextContinuous = CONTINUOUS_PLANE_ORGANIZATIONS.includes(next);
     const nextAltitude: MapAltitude = nextContinuous ? 'task' : view.altitude;
-    const nextLayout = nextContinuous
-      ? layoutContinuousPlane(graph, sizes, next, anchorsRef.current[next] ?? readPlaneAnchors(next))
-      : layoutAtAltitude(graph, sizes, nextAltitude, aspect, next);
+    const nextBounds = nextContinuous ? planeContentBounds(nextLayout.elements, (nextLayout as PlaneLayoutResult).organicRegions?.map(r=>r.box))
+      : { x: 0, y: 0, w: nextLayout.width, h: nextLayout.height };
     // Commit the target organization and its fitted camera together.
     const planeCentre = {
       x: (viewport.width / 2 - view.offsetX) / view.scale,
@@ -1239,7 +1567,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
     // altitude for the plane keeps their APPARENT SIZE rather than their
     // number: whatever they were looking at stays the size it was.
     const from = focusedElement(layout, view.altitude, planeCentre);
-    const scale = nextContinuous && viewport.width > 0 && viewport.height > 0 ? planeFitScale(nextLayout, viewport)
+    const scale = nextContinuous && viewport.width > 0 && viewport.height > 0 ? planeFitScale({ width: nextBounds.w, height: nextBounds.h }, viewport)
       : (nextAltitude !== view.altitude && focus && from && focus.w > 0)
       ? clampScale(view.scale * (from.w / focus.w))
       : view.scale;
@@ -1247,12 +1575,16 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       organization: next,
       altitude: nextAltitude,
       scale,
-      offsetX: nextContinuous ? (viewport.width - nextLayout.width * scale) / 2 : viewport.width / 2 - targetX * scale,
-      offsetY: nextContinuous ? (viewport.height - nextLayout.height * scale) / 2 : viewport.height / 2 - targetY * scale,
+      offsetX: nextContinuous ? (viewport.width - nextBounds.w * scale) / 2 - nextBounds.x * scale : viewport.width / 2 - targetX * scale,
+      offsetY: nextContinuous ? (viewport.height - nextBounds.h * scale) / 2 - nextBounds.y * scale : viewport.height / 2 - targetY * scale,
     }));
     setMorphing(true);
+    const owner = { layout: nextLayout, scope: authorityScope };
+    morphOwner.current = owner;
     if (morphTimer.current !== null) window.clearTimeout(morphTimer.current);
-    morphTimer.current = window.setTimeout(() => setMorphing(false), 500);
+    morphTimer.current = window.setTimeout(() => {
+      if (morphOwner.current === owner) setMorphing(false);
+    }, 500);
     // Containers follow (B2): only transitions that involve a hull-bearing
     // form need the overlay — pipeline rectangles tween natively as divs.
     const hullBearing = (organization: MapOrganization) =>
@@ -1265,38 +1597,140 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       setContainerMorph(containerMorphsFor(layout, nextLayout));
     }
   }, [view.organization, view.altitude, view.scale, view.offsetX, view.offsetY,
-    layout, graph, sizes, aspect, viewport, applyView, isLoading, requestRefit]);
+    layout, graph, sizes, aspect, viewport, applyView, isLoading, requestRefit, authorityScope]);
 
+  const switchOrganization = useCallback((next: MapOrganization) => {
+    cancelSwitch();
+    if (next === view.organization) { setSwitchStatus(null); return; }
+    if (isLoading || !authorityReady) {
+      applyView(current => ({ ...current, organization: next, altitude: 'task' }));
+      requestRefit(); return;
+    }
+    const context = switchContext;
+    const held = anchorsRef.current[next] ?? EMPTY_PLANE_ANCHORS;
+    anchorsRef.current[next] = held;
+    const ticket: NonNullable<typeof switchTicket.current> = { controller: new AbortController(), next, context };
+    switchTicket.current = ticket;
+    const isCurrent = () => switchTicket.current === ticket && !ticket.controller.signal.aborted
+      && currentSwitchContext.current === context && anchorsRef.current[next] === held;
+    setSwitchStatus(`Preparing ${ORGANIZATION_LABELS[next]} layout…`);
+    void (async () => {
+      try {
+        const target: MapPlaneInput = { graph: sourceGraph, sizes: planeSizes, organization: next, anchors: held };
+        ticket.job = computation.requestTarget(target);
+        const result = await ticket.job.result;
+        if (!isCurrent()) return;
+        // Clear the ticket before the batched target layout, anchors and camera
+        // update changes the context that invalidates abandoned switches.
+        computation.adoptTarget(target, result);
+        switchTicket.current = null;
+        commitOrganization(next, result);
+        setSwitchStatus(null);
+      } catch (failure) {
+        if (switchTicket.current !== ticket) return;
+        switchTicket.current = null;
+        setSwitchStatus(failure instanceof Error && failure.name !== 'AbortError'
+          ? `Could not change layout: ${failure.message}` : 'View changed; select the layout again.');
+      }
+    })();
+  }, [cancelSwitch, view.organization, isLoading, authorityReady, applyView, requestRefit,
+    switchContext, sourceGraph, planeSizes, computation.requestTarget, computation.adoptTarget, commitOrganization]);
+  restartSwitch.current = switchOrganization;
+
+
+  // The list's height reaches the stylesheet as a custom property on the
+  // section, which is also where a drag writes it between commits.
+  const splitStyle = useMemo(() => (splitActive
+    ? { [SPLIT_SIZE_PROPERTY]: `${split.listSize}px` } as React.CSSProperties
+    : undefined), [splitActive, split.listSize]);
 
   return (
     <section
-      className={`map-view${treeMode ? ' map-view--list' : ''}`}
+      ref={setSectionElement}
+      className={`map-view${treeMode ? ' map-view--list' : ''}${splitActive ? ' map-view--split' : ''}`}
       aria-label="Task map"
+      style={splitStyle}
     >
-      <div className="map-toolbar">
+      <div className="map-toolbar" ref={setToolbarElement}>
         <div className="map-toolbar-group">
-          <IconButton icon={<Minus size={16} />} ariaLabel="Zoom out"
-            onClick={() => zoomBy(0.8)} />
-          <IconButton icon={<Plus size={16} />} ariaLabel="Zoom in"
-            onClick={() => zoomBy(1.25)} />
-          <IconButton icon={<Maximize2 size={16} />} ariaLabel="Fit view" onClick={fitNow} />
+          <IconButton icon={<Minus size={16} />} ariaLabel="Zoom out" labelTip
+            onClick={() => onZoomCentre(0.8)} />
+          <IconButton icon={<Plus size={16} />} ariaLabel="Zoom in" labelTip
+            onClick={() => onZoomCentre(1.25)} />
+          <IconButton icon={<Maximize2 size={16} />} ariaLabel="Fit view" labelTip onClick={fitNow} />
         </div>
+        {continuous ? (
+          <>
+            {/* E466: on a phone this button and the two below are icon-only
+                squares (MapView.css hides the words visually, never from the
+                accessible name); the title is the tooltip. The desktop toolbar
+                is unchanged. */}
+            <Button variant="secondary" size="compact"
+              className="map-toolbar-iconbtn"
+              labelTip
+              title="Re-pack layout"
+              icon={<LayoutGrid size={16} />}
+              ariaDescribedBy={repackHintId}
+              onClick={repack}>
+              Re-pack layout
+            </Button>
+            <span id={repackHintId} className="sr-only">
+              Discards the order this session has given the Map and lays it out afresh from what is shown.
+            </span>
+          </>
+        ) : null}
         <SegmentedControl
           ariaLabel="Map organization"
           options={ORGANIZATION_OPTIONS}
           value={view.organization}
           onChange={switchOrganization}
         />
+        <div className="map-toolbar-reports">
+          {/* The group's accessible name is "Reports display"; the visible
+              prefix reads the owner's wording, "Reports: Collapsed | Expanded". */}
+          <span className="map-toolbar-label" aria-hidden="true">Reports:</span>
+          <SegmentedControl
+            ariaLabel="Reports display"
+            options={REPORTS_MODE_OPTIONS}
+            value={reportsMode}
+            onChange={chooseReportsMode}
+          />
+        </div>
         <Button variant="secondary" size="compact"
+          className="map-toolbar-iconbtn"
+          labelTip
+          title={treeMode ? 'Show as map' : 'Show as list'}
           icon={<List size={16} />}
           ariaPressed={treeMode}
           onClick={() => setTreeMode(value => !value)}>
           {treeMode ? 'Show as map' : 'Show as list'}
         </Button>
+        {/* Card cae8dfe1 (RH-UI.17d): the map WITH the list below it, the
+            two divided by a separator the reader can drag or key. From the
+            list, it brings the map back above the list. */}
+        <Button variant="secondary" size="compact"
+          className="map-toolbar-iconbtn"
+          labelTip
+          title="Map and list"
+          icon={<PanelBottom size={16} />}
+          ariaPressed={splitActive}
+          onClick={() => {
+            if (treeMode) { setTreeMode(false); split.setOpen(true); }
+            else split.setOpen(!split.open);
+          }}>
+          Map and list
+        </Button>
         <span className="map-scope-count">
           {graph.nodes.length} task{graph.nodes.length === 1 ? '' : 's'} in view
         </span>
+        {continuous && authorityReady && !geometryComplete && !computation.error ?
+          <span role="status">Updating layout… {computation.visible?.pendingTaskCount ?? sourceGraph.nodes.length} tasks and {computation.visible?.pendingReportCount ?? sourceGraph.reports?.length ?? 0} reports pending.</span> : null}
+        {switchStatus ? <span role="status">{switchStatus}</span> : null}
+        {reportsModeStatus ? <span role="status">{reportsModeStatus}</span> : null}
+        {routing.pending ? <span role="status">Calculating connections…</span> : null}
       </div>
+
+      {labelTip}
 
       {/* The canvas is mounted unconditionally; status is an overlay. */}
       {/* The canvas is a focusable region: without a tab stop the whole
@@ -1341,20 +1775,41 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
           )) setSelectedId(null);
         }}
       >
-        <div
+        <ArchiveMotionPlane
+          motionEnabled={view.organization === 'organic'}
+          motionScale={view.scale}
+          motionTargets={isTaskAltitude ? [
+            ...visibleTiles.map(tile => ({ id: tile.id, owner: tile.id,
+              x: tile.x, y: tile.y, archived: tile.node.status === 'archived',
+              scale: tierOf(tile.bandId, tile.laneId) === 'task'
+                ? planeLayout?.archiveScales?.[tile.id] ?? 1 : 1 })),
+            ...drawnPills.map(pill => ({ id: pill.id, owner: pill.taskId,
+              x: pill.x, y: pill.y, archived: tileById.get(pill.taskId)?.node.status === 'archived',
+              scale: planeLayout?.archiveScales?.[pill.id] ?? 1 })),
+          ] : []}
           data-plane-lod={continuous ? planeBand : undefined}
-          className={`map-plane${(view.organization === 'organic' || view.organization === 'radial') ? ' map-plane--branched' : ''}${morphing ? ' map-plane--morphing' : ''}${containerMorph ? ' map-plane--container-morph' : ''}`}
+          data-fit-bounds={`${fitBounds.x},${fitBounds.y},${fitBounds.w},${fitBounds.h}`}
+          data-world-width={layout.width}
+          data-world-height={layout.height}
+          className={`map-plane${rectangular ? ' map-plane--rectangular' : ''}${(view.organization === 'organic' || view.organization === 'radial') ? ' map-plane--branched' : ''}${morphing ? ' map-plane--morphing' : ''}${containerMorph ? ' map-plane--container-morph' : ''}`}
           style={{
             transform: `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`,
-            width: layout.width,
-            height: layout.height,
+            width: 0,
+            height: 0,
             // The container cards ride this back out again, so a label keeps
             // its CSS size while the world it labels shrinks — the one thing
             // a map never scales.
             ['--map-plane-inverse-scale' as string]: 1 / view.scale,
           }}
         >
-          <svg className="map-edges" width={layout.width} height={layout.height} aria-hidden="true">
+          {/* Rasterize only the viewport, not a potentially 100,000px estate.
+              Cancel the HTML camera here, then apply it inside SVG so its
+              viewport clips paths before rasterization. */}
+          <svg className="map-edges" width={viewport.width} height={viewport.height}
+            style={{ left: -view.offsetX / view.scale, top: -view.offsetY / view.scale,
+              transform: `scale(${1 / view.scale})`, transformOrigin: 'top left',
+              overflow: 'hidden', ['--map-plane-inverse-scale' as string]: 1 }} aria-hidden="true">
+            <g transform={`translate(${view.offsetX} ${view.offsetY}) scale(${view.scale})`}>
             {/* Geography survives every caption/LOD fade and is always below
                 connections and task ink. Projects own phases; phases own tasks. */}
             {continuous && view.organization !== 'organic' && planeLayout?.elements
@@ -1396,6 +1851,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                   cx={region.box.x + region.box.w / 2} cy={region.box.y + region.box.h / 2}
                   rx={region.box.w / 2} ry={region.box.h / 2} /> : <>
                   <path data-project-ground={region.laneId} className="map-project-territory" d={region.outline} vectorEffect="non-scaling-stroke" />
+                  {/* Never conceal a relation or fill a clipped route as ground.
+                      This is explicitly degraded, matching existing edge policy. */}
+                  {region.blockedRoutes?.map((route,i)=><path key={`blocked:${i}`}
+                    data-project-branch={region.laneId} data-route-state="blocked"
+                    data-from={route.from.join(',')} data-to={route.to.join(',')}
+                    className="map-edge map-edge--unrouted" fill="none"
+                    vectorEffect="non-scaling-stroke" d={route.d}>
+                    <title>{`${region.laneId}: project branch could not be routed clear of other nodes`}</title>
+                  </path>)}
                   {region.clusters.filter(box=>box.phaseId).map((box,i) => <path
                     data-phase-ground={box.phaseId}
                     className={`map-hull${box.facts ? planeStateClass(box.facts) : ''}`}
@@ -1422,11 +1886,11 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                 The upstream end is `to` — the graph read emits
                 task_id → depends_on — so the curve runs upstream → downstream
                 and the arrow of the flow is preserved. */}
-            {isTaskAltitude && visibleEdges.map(edge => {
+            {isTaskAltitude && visibleEdges.map((edge, edgeIndex) => {
               const from = tileById.get(edge.from);
               const to = tileById.get(edge.to);
               if (!from || !to) return null;
-              const route = taskRoutes.get(`${edge.kind}-${edge.from}-${edge.to}`);
+              const route = routing.rows.get(JSON.stringify(['task', edge.kind, edge.from, edge.to]));
               if (!route) return null;
               // §4 holds at EVERY zoom, and on the plane an edge belongs to
               // the layer its endpoints are on: it recedes with them and the
@@ -1434,10 +1898,23 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               const edgeAlpha = Math.min(taskAlpha(edge.from), taskAlpha(edge.to));
               if (edgeAlpha <= FADE_EPSILON) return null;
               return (
-                <path
-                  key={`${edge.kind}-${edge.from}-${edge.to}`}
-                  className={`map-edge map-edge--${edge.kind} map-edge--${edgeState(edge.to)}${route.clipped ? ' map-edge--unrouted' : ''} ${paintedTaskChain ? (paintedTaskChain.has(edge.from) && paintedTaskChain.has(edge.to) ? 'map-edge--lit' : 'map-edge--dimmed') : ''}`}
+                <MapConnection
+                  pending={route.pending}
+                  animate={edgeIndex < 20 && !route.clipped}
+                  scale={view.scale}
+                  // One key per relationship identity (card cae8dfe1): the
+                  // graph's edges are unique by (kind, from, to) since
+                  // uniqueMapEdges, and a JSON tuple cannot collide where a
+                  // dash-joined string could.
+                  key={JSON.stringify([authorityScope, 'task', edge.kind, edge.from, edge.to])}
+                  className={`map-edge map-edge--${edge.kind} map-edge--${edgeState(edge.to)}${route.clipped ? ' map-edge--unrouted' : ''}${hoveredId === edge.from || hoveredId === edge.to ? ' map-edge--hovered' : ''} ${paintedTaskChain ? (paintedTaskChain.has(edge.from) && paintedTaskChain.has(edge.to) ? 'map-edge--lit' : 'map-edge--dimmed') : ''}`}
+                  data-edge-from={edge.from}
+                  data-edge-to={edge.to}
+                  onPointerEnter={() => setHoveredId(edge.from)}
+                  onPointerLeave={() => setHoveredId(null)}
                   d={route.d}
+                  data-route-state={route.pending ? (routing.error ? 'failed' : 'pending') : (route.clipped ? 'clipped' : 'ready')}
+                  strokeDasharray={route.pending ? '3 5' : undefined}
                   fill="none"
                   style={{
                     opacity: edgeAlpha * chainScale(
@@ -1448,8 +1925,8 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                   {/* A2 forbids silently dropping a relationship, so an
                       unrouted one is still drawn - but MARKED, never passed off
                       as a clean connection (round 2 B1, round 3 B1). */}
-                  {route.clipped ? <title>Could not be routed clear of other nodes</title> : null}
-                </path>
+                  {route.pending ? <title>{pendingRouteTitle}</title> : route.clipped ? <title>Could not be routed clear of other nodes</title> : null}
+                </MapConnection>
               );
             })}
 
@@ -1463,12 +1940,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               if (!source || !target) return null;
               const opacity = Math.min(source.alpha, target.alpha);
               if (opacity <= FADE_EPSILON) return null;
-              const route = routeOnPlane(source, target);
+              const route = routing.rows.get(JSON.stringify(['plane', tier, edge.kind, edge.from, edge.to]));
+              if (!route) return null;
               return (
                 <path
-                  key={`plane-${tier}-${edge.kind}-${edge.from}-${edge.to}`}
+                  key={JSON.stringify(['plane', tier, edge.kind, edge.from, edge.to])}
                   className={`map-edge map-edge--${edge.kind} map-edge--aggregate${route.clipped ? ' map-edge--unrouted' : ''}${planeChain ? (planeChain.has(edge.from) && planeChain.has(edge.to) ? ' map-edge--lit' : ' map-edge--dimmed') : ''}`}
                   d={route.d}
+                  data-route-state={route.pending ? (routing.error ? 'failed' : 'pending') : (route.clipped ? 'clipped' : 'ready')}
+                  strokeDasharray={route.pending ? '3 5' : undefined}
                   fill="none"
                   style={{
                     opacity: opacity * chainScale(
@@ -1482,7 +1962,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                     {(edge.multiplicity === 1
                       ? `1 ${edge.kind} link`
                       : `${edge.multiplicity} ${edge.kind} links`)
-                      + (route.clipped ? ', could not be routed clear of other nodes' : '')}
+                      + (route.pending ? ', ' + pendingRouteTitle : route.clipped ? ', could not be routed clear of other nodes' : '')}
                   </title>
                 </path>
               );
@@ -1498,13 +1978,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               const source = aggregateById.get(edge.to);
               const target = aggregateById.get(edge.from);
               if (!source || !target) return null;
-              const route = aggregateRoutes.get(`${edge.kind}-${edge.from}-${edge.to}`);
+              const route = routing.rows.get(JSON.stringify(['aggregate', edge.kind, edge.from, edge.to]));
               if (!route) return null;
               return (
                 <path
-                  key={`${edge.kind}-${edge.from}-${edge.to}`}
+                  key={JSON.stringify(['aggregate', edge.kind, edge.from, edge.to])}
                   className={`map-edge map-edge--${edge.kind} map-edge--aggregate map-edge--${aggregateEdgeState(edge.to)}${route.clipped ? ' map-edge--unrouted' : ''} ${aggregateChain ? (aggregateChain.has(edge.from) && aggregateChain.has(edge.to) ? 'map-edge--lit' : 'map-edge--dimmed') : ''}`}
                   d={route.d}
+                  data-route-state={route.pending ? (routing.error ? 'failed' : 'pending') : (route.clipped ? 'clipped' : 'ready')}
+                  strokeDasharray={route.pending ? '3 5' : undefined}
                   fill="none"
                   strokeWidth={Math.min(4, 1 + Math.log2(edge.multiplicity))}
                 >
@@ -1512,7 +1994,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                     {(edge.multiplicity === 1
                       ? `1 ${edge.kind} link`
                       : `${edge.multiplicity} ${edge.kind} links`)
-                      + (route.clipped ? ', could not be routed clear of other nodes' : '')}
+                      + (route.pending ? ', ' + pendingRouteTitle : route.clipped ? ', could not be routed clear of other nodes' : '')}
                   </title>
                 </path>
               );
@@ -1530,19 +2012,22 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                 // B3 from round 4: this caller alone still threw away
                 // `clipped`, so an unresolved Report route was drawn as an
                 // ordinary connection while every other surface marked it.
-                const route = routeOnPlane(report, target, true);
+                const route = routing.rows.get(JSON.stringify(['aggregate-report', report.reportId, aggregateId]));
+                if (!route) return null;
                 return (
                   <path
-                    key={`agg-report-${report.reportId}-${aggregateId}`}
+                    key={JSON.stringify(['aggregate-report', report.reportId, aggregateId])}
                     // Round 10 B2: §4's "everything else dims" includes this
                     // surface. Each converging line answers for the aggregate
                     // it cites, exactly like a dependency edge answers for its
                     // endpoints.
                     className={`map-edge map-edge--knowledge map-edge--report${route.clipped ? ' map-edge--unrouted' : ''}${aggregateChain ? (aggregateChain.has(aggregateId) ? ' map-edge--lit' : ' map-edge--dimmed') : ''}`}
                     d={route.d}
+                  data-route-state={route.pending ? (routing.error ? 'failed' : 'pending') : (route.clipped ? 'clipped' : 'ready')}
+                  strokeDasharray={route.pending ? '3 5' : undefined}
                     fill="none"
                   >
-                    {route.clipped
+                    {route.pending ? <title>{pendingRouteTitle}</title> : route.clipped
                       ? <title>Could not be routed clear of other nodes</title>
                       : null}
                   </path>
@@ -1558,7 +2043,8 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               // Round 7: this was a raw straight line that never went near the
               // router, so §3's short local Report link was the one edge on the
               // surface that could still be drawn through a node.
-              const route = routeOnPlane(pill, tile, true);
+              const route = routing.rows.get(JSON.stringify(['report', pill.id]));
+              if (!route) return null;
               return (
                 <path
                   key={`report-${pill.id}`}
@@ -1568,10 +2054,15 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                   // edge answers for the one Task it cites.
                   className={`map-edge map-edge--knowledge map-edge--report${route.clipped ? ' map-edge--unrouted' : ''}${paintedTaskChain ? (paintedTaskChain.has(pill.taskId) ? ' map-edge--lit' : ' map-edge--dimmed') : ''}`}
                   d={route.d}
+                  data-route-state={route.pending ? (routing.error ? 'failed' : 'pending') : (route.clipped ? 'clipped' : 'ready')}
+                  strokeDasharray={route.pending ? '3 5' : undefined}
                   fill="none"
-                />
+                >
+                  {route.pending ? <title>{pendingRouteTitle}</title> : route.clipped ? <title>Could not be routed clear of other nodes</title> : null}
+                </path>
               );
             })}
+            </g>
           </svg>
 
           {/* Report pills (§3). PLACED elements, not decorations hung off a
@@ -1581,21 +2072,99 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               task) pills and short local edges are the TASK altitude's
               behaviour, unchanged from the 1e0653e7 walkthrough. The
               draw-once converging form governs the aggregate altitudes. */}
-          {isTaskAltitude && detail.reports && visiblePills.map(pill => (
+          {/* Expanded's report area (card 742fae98): the Report colour family
+              behind a task's Report cells, sized by N because the cells are.
+              Zoomed in the Report nodes inside it are the controls; zoomed out
+              it says how many Reports the task has. Ink, not a control. */}
+          {drawnReportAreas.map(area => {
+            const count = reportGroups.get(area.taskId)?.count ?? 0;
+            return (
+              <div
+                key={area.id}
+                className="map-report-area"
+                data-report-task={area.taskId}
+                data-report-count={count}
+                aria-hidden="true"
+                style={{
+                  left: area.x, top: area.y, width: area.w, height: area.h,
+                  opacity: taskAlpha(area.taskId)
+                    * chainScale(paintedTaskChain, paintedTaskChain?.has(area.taskId) ?? false, CHAIN_DIM.node),
+                }}
+              >
+                {detail.reports ? null : (
+                  <span className="map-report-area-count" style={{ transform: `scale(${reportCountScale})` }}>
+                    {count}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Collapsed (card 742fae98): ONE "Reports · N" node per task, in the
+              cell the layout reserved for it. It is drawn at every band its
+              task is drawn at, carries the warning tint above about ten, and
+              previews the newest Reports on hover and keyboard focus without
+              moving anything. It opens the task, where every Report is listed. */}
+          {drawnPills.filter(pill => taskOfReportGroup(pill.reportId) !== null).map(pill => {
+            const group = reportGroups.get(pill.taskId);
+            const count = group?.count ?? 0;
+            const taskTitle = tileById.get(pill.taskId)?.node.title ?? 'this task';
+            const previewing = previewPill?.id === pill.id && Boolean(previewGroup) && !isPanning;
+            return (
+              <span
+                key={pill.id}
+                data-map-motion-id={pill.id}
+                data-report-task={pill.taskId}
+                className={`map-report-pill map-report-pill--group${view.organization==='organic'&&tileById.get(pill.taskId)?.node.status==='archived'?' map-archive-motion':''}${paintedTaskChain && !paintedTaskChain.has(pill.taskId) ? ' map-report-pill--dimmed' : ''}`}
+                style={{
+                  left: pill.x, top: pill.y,
+                  transform: planeLayout?.archiveScales?.[pill.id] ? `scale(${planeLayout.archiveScales[pill.id]})` : undefined,
+                  transformOrigin: 'top left',
+                  opacity: taskAlpha(pill.taskId)
+                    * chainScale(paintedTaskChain, paintedTaskChain?.has(pill.taskId) ?? false, CHAIN_DIM.node),
+                }}
+                ref={element => measure(pill.id, element, true)}
+                // A DRAG IS NOT A HOVER, as for every other node on the plane.
+                onPointerEnter={() => { if (!isPanning) setPreviewTaskId(pill.taskId); }}
+                onPointerLeave={() => setPreviewTaskId(current => (current === pill.taskId ? null : current))}
+                onFocus={() => setPreviewTaskId(pill.taskId)}
+                onBlur={() => setPreviewTaskId(current => (current === pill.taskId ? null : current))}
+              >
+                <Button
+                  variant="secondary"
+                  size="compact"
+                  className={`map-report-group${isHeavyReportGroup(count) ? ' map-report-group--many' : ''}`}
+                  ariaLabel={`${reportGroupTitle(count)}: open ${taskTitle} to read them`}
+                  ariaDescribedBy={previewing ? previewId : undefined}
+                  onClick={() => { if (!isPanning) onOpenTask(pill.taskId); }}
+                >
+                  {detail.reports
+                    ? <>Reports &middot; <span className="map-report-group-count">{count}</span></>
+                    : <span className="map-report-group-count" style={{ transform: `scale(${reportCountScale})` }}>{count}</span>}
+                </Button>
+              </span>
+            );
+          })}
+
+          {drawnPills.filter(pill => taskOfReportGroup(pill.reportId) === null).map(pill => (
             <span
               key={pill.id}
+              data-map-motion-id={pill.id}
+              data-report-task={pill.taskId}
               // Round 11 B2: the pill recedes with the Task it cites (§4) —
               // per-citation, because A2.1 makes the task altitude's Report
               // form per-(Report,Task), unlike the draw-once aggregate node.
-              className={`map-report-pill${paintedTaskChain && !paintedTaskChain.has(pill.taskId) ? ' map-report-pill--dimmed' : ''}`}
+              className={`map-report-pill${view.organization==='organic'&&tileById.get(pill.taskId)?.node.status==='archived'?' map-archive-motion':''}${paintedTaskChain && !paintedTaskChain.has(pill.taskId) ? ' map-report-pill--dimmed' : ''}`}
               // A pill recedes with the Task it cites — it is that Task's
               // close-zoom ink, and §4 keeps the two together.
               style={{
                 left: pill.x, top: pill.y,
+                transform: planeLayout?.archiveScales?.[pill.id] ? `scale(${planeLayout.archiveScales[pill.id]})` : undefined,
+                transformOrigin: 'top left',
                 opacity: taskAlpha(pill.taskId)
                   * chainScale(paintedTaskChain, paintedTaskChain?.has(pill.taskId) ?? false, CHAIN_DIM.node),
               }}
-              ref={element => measure(pill.id, element)}
+              ref={element => measure(pill.id, element, true)}
             >
               {/* A2 requires the Report to be OPENABLE from the Map, and the
                   altitude split in A2.1 changes only WHERE it is drawn, never
@@ -1647,12 +2216,13 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               // §5 detail band crossing then moved every segment to its
               // right (round 2, measured live at +95px).
               style={{
-                left: continuous && own ? own.x : chip.x, top: chip.y,
+                left: continuous && own ? own.x : chip.x, top: continuous && own ? own.y : chip.y,
                 maxInlineSize: continuous && own ? Math.min(220, own.w * view.scale) : (chip as any).w,
                 opacity: chipAlpha * furnitureScale(own ? phaseKeyOfBand(own) : ''),
+                ...(rectangular && own ? boundedHeaderStyle(own.w, view.scale) : {}),
               }}
               aria-hidden={chipAlpha < 0.5 || undefined}
-              ref={element => measure(chip.id, element)}>
+              ref={continuous ? undefined : element => measure(chip.id, element)}>
               {continuous && own?.facts ? (
                 <MapAggregateCard facts={{ ...own.facts, kind: 'phase', label: own.label,
                   laneLabel: own.laneLabel ?? own.laneId }}
@@ -1678,10 +2248,11 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
             return (
             <div key={lane.id} className="map-lane-header"
               style={{ left: lane.x, top: lane.y,
-                maxInlineSize: continuous && territory ? Math.min(220, territory.w * view.scale) : undefined,
-                opacity: headerAlpha * furnitureScale(`project:${laneKey}`) }}
+                maxInlineSize: continuous && territory ? 220 : undefined,
+                opacity: headerAlpha * furnitureScale(`project:${laneKey}`),
+                ...(rectangular && territory ? boundedHeaderStyle(territory.w, view.scale) : {}) }}
               aria-hidden={headerAlpha < 0.5 || undefined}
-              ref={element => measure(lane.id, element)}>
+              ref={continuous ? undefined : element => measure(lane.id, element)}>
               <MapAggregateCard
                 facts={{ ...((planeLayout?.elements.find(element =>
                   element.kind === 'container' && element.laneId === laneKey) as any)?.facts ?? lane),
@@ -1710,16 +2281,25 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
             // already has, so a tile becoming a shape reports nothing new
             // and the plane cannot move underneath the reader — the
             // composition-jump hazard b74ba787 B1 identified, one tier up.
-            if (tierOf(tile.bandId, tile.laneId) !== 'task') {
+            if (tierOf(tile.bandId, tile.laneId) !== 'task' || band === 'far') {
               return (
                 <div
                   key={tile.id}
-                  aria-hidden="true"
-                  className={`map-tile map-tile--shape${paintedTaskChain ? (paintedTaskChain.has(tile.id) ? ' map-tile--lit' : ' map-tile--dimmed') : ''}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Open task: ${tile.node.title}`}
+                  onPointerEnter={() => { if (!isPanning) setHoveredId(tile.id); }}
+                  onPointerLeave={() => setHoveredId(current => current === tile.id ? null : current)}
+                  onFocus={() => setHoveredId(tile.id)}
+                  onBlur={() => setHoveredId(current => current === tile.id ? null : current)}
+                  onClick={() => { if (!isPanning) onOpenTask(tile.id); }}
+                  onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpenTask(tile.id); } }}
+                  className={`map-tile map-tile--shape${view.organization === 'organic' && tile.node.status === 'archived' ? ' map-archive-motion' : ''}${paintedTaskChain ? (paintedTaskChain.has(tile.id) ? ' map-tile--lit' : ' map-tile--dimmed') : ''}`}
                   data-status={tile.node.status}
                   data-task={tile.id}
+                  data-map-motion-id={tile.id}
                   style={{
-                    left: tile.x, top: tile.y, height: tile.h,
+                    left: tile.x, top: tile.y, height: tile.h, width:tile.w,
                     opacity: alpha * chainScale(paintedTaskChain, paintedTaskChain?.has(tile.id) ?? false, CHAIN_DIM.node),
                   }}
                 >
@@ -1732,12 +2312,14 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
             return (
             <div
               key={tile.id}
-              onPointerEnter={() => setHoveredId(tile.id)}
+              onPointerEnter={() => { if (!isPanning) setHoveredId(tile.id); }}
               onPointerLeave={() => setHoveredId(current => (current === tile.id ? null : current))}
               onBlurCapture={() => setHoveredId(current => (current === tile.id ? null : current))}
-              className={`map-tile map-tile--${band} ${pulsed.has(tile.id) ? 'map-tile--pulsed' : ''} ${paintedTaskChain ? (paintedTaskChain.has(tile.id) ? 'map-tile--lit' : 'map-tile--dimmed') : ''}`}
+              className={`map-tile map-tile--${band}${view.organization==='organic'&&tile.node.status==='archived'?' map-archive-motion':''} ${pulsed.has(tile.id) ? 'map-tile--pulsed' : ''} ${paintedTaskChain ? (paintedTaskChain.has(tile.id) ? 'map-tile--lit' : 'map-tile--dimmed') : ''}`}
               style={{
                 left: tile.x, top: tile.y,
+                transform: planeLayout?.archiveScales?.[tile.id] ? `scale(${planeLayout.archiveScales[tile.id]})` : undefined,
+                transformOrigin: 'top left',
                 opacity: alpha * chainScale(paintedTaskChain, paintedTaskChain?.has(tile.id) ?? false,
                   CHAIN_DIM.node),
               }}
@@ -1749,8 +2331,9 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                 setHoveredId(tile.id);
               }}
               onClickCapture={() => setSelectedId(tile.id)}
-              ref={element => measure(tile.id, element)}
+              ref={element => measure(tile.id, element, true)}
               data-task={tile.id}
+              data-map-motion-id={tile.id}
             >
               {/* Board-only machinery the map never reaches: the density
                   early return leaves before any of it runs. */}
@@ -1779,7 +2362,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
           {planeContainers.map(entry => (entry.interactive ? (
             <div
               key={entry.id}
-              className={`map-container map-container--${entry.tier}${entry.core ? ' map-container--core' : ''}${planeStateClass(entry.facts)}${selectedId === entry.id ? ' map-container--selected' : ''}${planeChain ? (planeChain.has(entry.id) ? ' map-container--lit' : ' map-container--dimmed') : ''}`}
+              className={`map-container map-container--${entry.tier}${overviewCaptions.has(entry.id) ? ' map-container--annotated' : ''}${entry.core ? ' map-container--core' : ''}${planeStateClass(entry.facts)}${selectedId === entry.id ? ' map-container--selected' : ''}${planeChain ? (planeChain.has(entry.id) ? ' map-container--lit' : ' map-container--dimmed') : ''}`}
               style={{
                 left: entry.x, top: entry.y, width: entry.w, height: entry.h,
                 // The dominant caption is readable ink, not a half-transparent
@@ -1793,11 +2376,32 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               onPointerLeave={() => setHoveredId(
                 current => (current === entry.id ? null : current))}
             >
-              <div
-                className="map-container-card"
+              {overviewCaptions.has(entry.id) ? <>
+                <svg className="map-overview-leader" aria-hidden="true">
+                  <line x1={entry.w} y1={0}
+                    x2={overviewCaptions.get(entry.id)!.x - entry.x}
+                    y2={overviewCaptions.get(entry.id)!.y - entry.y}
+                    vectorEffect="non-scaling-stroke" />
+                </svg>
+                <div className="map-overview-caption"
+                  title={`${entry.facts.laneLabel ? `${entry.facts.laneLabel} — ` : ''}${entry.facts.label}`}
+                  style={{ left: overviewCaptions.get(entry.id)!.x - entry.x,
+                    top: overviewCaptions.get(entry.id)!.y - entry.y }}>
+                  <span className="map-overview-context" title={entry.facts.laneLabel}>
+                    {entry.tier === 'phase' ? entry.facts.laneLabel : 'Project'}
+                  </span>
+                  <MapCardTitle label={entry.facts.label}
+                    accessibleName={`Select ${entry.tier} ${entry.facts.label}${entry.tier === 'phase' ? ` of project ${entry.facts.laneLabel}` : ''}`}
+                    selected={selectedId === entry.id}
+                    onSelect={() => setSelectedId(selectedId === entry.id ? null : entry.id)} />
+                </div>
+              </> : <MapViewportCard
+                key={`${authorityScope}:${view.organization}:${entry.id}`}
+                admitted={containerCardInViewport(entry, view, viewport, CULL_MARGIN)}
                 style={{ width: Math.min(cardBox.w, entry.w * view.scale),
-                  maxHeight: entry.h * view.scale, overflow: 'hidden' }}
-                ref={element => measure(`card:${entry.id}`, element)}
+                  maxHeight: entry.h * view.scale, overflow: 'hidden',
+                  ...(rectangular ? boundedHeaderStyle(entry.w, view.scale) : {}) }}
+                measure={element => measure(`card:${entry.id}`, element)}
               >
                 <MapAggregateCard
                   facts={entry.facts}
@@ -1806,7 +2410,7 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                   onSelect={() => setSelectedId(
                     selectedId === entry.id ? null : entry.id)}
                 />
-              </div>
+              </MapViewportCard>}
             </div>
           ) : (
             <div
@@ -1892,16 +2496,64 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
               </Button>
             </div>
           ))}
-        </div>
+          {/* The list-to-map link (card cae8dfe1): one ring, placed in the DOM
+              by placeLinkRing, never a per-tile render. Ink, not a control. */}
+          <div ref={linkRingRef} className="map-link-ring" aria-hidden="true" />
+        </ArchiveMotionPlane>
+
+        {hoveredId && tileById.has(hoveredId) && !isPanning && (() => {
+          const tile = tileById.get(hoveredId)!;
+          const left = Math.max(8, Math.min(viewport.width - 276, (tile.x + tile.w) * view.scale + view.offsetX + 12));
+          const top = Math.max(8, Math.min(viewport.height - 110, tile.y * view.scale + view.offsetY));
+          return <div className="map-task-preview" role="tooltip" style={{ left, top }}>
+            <strong>{tile.node.title}</strong>
+            <span>{tile.node.status} · {tile.node.project || 'No project'}</span>
+            {tile.node.agent ? <span>{tile.node.agent}</span> : null}
+            <span>Click task to open details</span>
+          </div>;
+        })()}
+
+        {/* The Collapsed node's preview (card 742fae98): a screen-space
+            overlay like the task preview above, never measured and never laid
+            out, so a hover cannot move the plane (design 50b5e9c4). The newest
+            Reports first, as the graph read lists them. */}
+        {previewPill && previewGroup && !isPanning ? (
+          <div
+            className="map-task-preview"
+            role="tooltip"
+            id={previewId}
+            style={{
+              left: Math.max(8, Math.min(viewport.width - 276, previewPill.x * view.scale + view.offsetX)),
+              top: Math.max(8, Math.min(viewport.height - 180,
+                (previewPill.y + previewPill.h) * view.scale + view.offsetY + 8)),
+            }}
+          >
+            <strong>{reportGroupTitle(previewGroup.count)}</strong>
+            <ul className="map-report-preview-list">
+              {previewGroup.reports.slice(0, REPORT_PREVIEW_LIMIT).map(report => (
+                <li key={report.id}>{report.title}</li>
+              ))}
+            </ul>
+            {previewGroup.count > REPORT_PREVIEW_LIMIT ? (
+              <span>and {previewGroup.count - REPORT_PREVIEW_LIMIT} more; open the task to see every Report</span>
+            ) : null}
+          </div>
+        ) : null}
 
         {isLoading ? <div className="map-overlay" role="status">Loading the Map…</div> : null}
+        {routing.error ? <div className="map-overlay map-overlay--error" role="alert">
+          {routing.error.message}<Button variant="secondary" size="compact" onClick={routing.retry}>Retry connections</Button>
+        </div> : null}
+        {computation.error ? <div className="map-overlay map-overlay--error" role="alert">
+          {computation.error.message}<Button variant="secondary" size="compact" onClick={computation.retry}>Retry layout</Button>
+        </div> : null}
         {error ? (
           <div className="map-overlay map-overlay--error" role="alert">
             {error.message}
             <Button variant="secondary" size="compact" onClick={refetch}>Retry</Button>
           </div>
         ) : null}
-        {!isLoading && !error && graph.nodes.length === 0 ? (
+        {!isLoading && !error && geometryComplete && !computation.error && graph.nodes.length === 0 ? (
           <div className="map-overlay" role="status">No Tasks match the current filters.</div>
         ) : null}
       </div>
@@ -1909,8 +2561,33 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
       {/* The accessible alternative (§6): same scope, same grouping, same
           open contract — reachable from the toolbar, not a hidden fallback.
           Derived from graph membership, so it is complete at every altitude. */}
-      {treeMode ? (
-        <div className="map-tree">
+      {splitActive ? (
+        <div
+          ref={setSeparatorElement}
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize the list"
+          aria-controls={listId}
+          aria-valuenow={split.listSize}
+          aria-valuemin={split.bounds.min}
+          aria-valuemax={split.bounds.max}
+          tabIndex={0}
+          className="map-split-separator"
+          onKeyDown={split.onKeyDown}
+          onPointerDown={split.onPointerDown}
+          onPointerMove={split.onPointerMove}
+          onPointerUp={split.onPointerUp}
+          onPointerCancel={split.onPointerCancel}
+        />
+      ) : null}
+      {treeMode || splitActive ? (
+        <div
+          className="map-tree"
+          id={listId}
+          ref={listRef}
+          role={splitActive ? 'region' : undefined}
+          aria-label={splitActive ? 'Task list' : undefined}
+        >
           {tree.map(lane => (
             <section key={lane.laneId} aria-label={lane.laneLabel}>
               <h3>{lane.laneLabel}</h3>
@@ -1922,7 +2599,11 @@ export const MapView: React.FC<MapViewProps> = ({ query, onOpenTask, onOpenRepor
                   </h4>
                   <ul>
                     {bandGroup.nodes.map(node => (
-                      <li key={node.id}>
+                      <li key={node.id} data-list-task={node.id}
+                        onPointerEnter={splitActive ? () => linkFromList(node.id) : undefined}
+                        onPointerLeave={splitActive ? () => unlinkFromList(node.id) : undefined}
+                        onFocus={splitActive ? () => linkFromList(node.id) : undefined}
+                        onBlur={splitActive ? () => unlinkFromList(node.id) : undefined}>
                         <Button variant="secondary" size="compact" onClick={() => onOpenTask(node.id)}>
                           {node.title}
                         </Button>

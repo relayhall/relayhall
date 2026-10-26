@@ -95,6 +95,43 @@ def test_grant_list_filters(rest):
     assert rest[0][1] == f"/grants?granteeId={PRINCIPAL}&resourceType=task"
 
 
+def test_grant_list_page_flags_are_additive_query_parameters(rest):
+    """Card ff410dc4 (E407 item 1): one page, filtered, sorted and searched."""
+    out, err, code = run_main([
+        "grant", "list", "--limit", "25", "--made", "hand", "--verb", "write", "--expiry", "expiring",
+        "--target", "archived", "--q", "100% done", "--sort=-created", "--cursor", "gc1.next",
+    ])
+    assert code in (None, 0), err
+    path = rest[0][1]
+    assert path.startswith("/grants?")
+    from urllib.parse import parse_qs, urlsplit
+    assert parse_qs(urlsplit(path).query) == {
+        "verb": ["write"], "made": ["hand"], "expiry": ["expiring"], "target": ["archived"],
+        "q": ["100% done"], "sort": ["-created"], "limit": ["25"], "cursor": ["gc1.next"],
+    }
+
+
+def test_grant_list_prints_the_next_cursor_and_the_origin(monkeypatch):
+    calls = []
+    def fake(method, path, data=None, headers=None):
+        calls.append((method, path, data))
+        return 200, json.dumps({"success": True,
+            "grants": [sample_grant(madeBy={"class": "system", "via": "task-creator", "evidence": "audit"})],
+            "pagination": {"limit": 1, "sort": "-created", "returned": 1, "total": 9, "hasMore": True, "nextCursor": "gc1.abc"}})
+    monkeypatch.setattr(cli, "resource_api", fake)
+    out, err, code = run_main(["grant", "list", "--limit", "1"])
+    assert code in (None, 0), err
+    assert "Grants (1 of 9)" in out
+    assert "system/task-creator" in out
+    assert "more: --cursor gc1.abc --sort=-created" in out
+
+
+def test_grant_list_refuses_an_unknown_origin_before_any_request(rest):
+    out, err, code = run_main(["grant", "list", "--made", "person"])
+    assert code == 2
+    assert rest == []
+
+
 def test_grant_add_wildcard(rest):
     out, err, code = run_main(["grant", "add", PRINCIPAL, "report", "read"])
     assert code in (None, 0), err

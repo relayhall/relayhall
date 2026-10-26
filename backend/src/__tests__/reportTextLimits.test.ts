@@ -50,6 +50,34 @@ describe('report body length validation', () => {
     expect(errors.map(e => e.field).sort()).toEqual(['author', 'title']);
   });
 
+  // The columns (and POST /tasks) count CHARACTERS, i.e. code points. A string
+  // JS measures in UTF-16 units overstates an emoji as two, so a 500-character
+  // title of emoji was refused although the column holds it.
+  it('counts characters, not UTF-16 units: 500 emoji fit a 500-character field', () => {
+    const emoji = '\u{1F600}';
+    const body = { title: emoji.repeat(REPORT_TEXT_LIMITS.title), summary: emoji.repeat(REPORT_TEXT_LIMITS.summary) };
+    expect(body.title.length).toBe(REPORT_TEXT_LIMITS.title * 2);
+    expect(checkBody(body, reportSchema, { allowUnknown: true })).toEqual([]);
+  });
+
+  it('still refuses the 501st character, whatever its width', () => {
+    const emoji = '\u{1F600}';
+    for (const unit of ['x', emoji, '\u00e9', '\u4e2d']) {
+      const errors = checkBody({ title: unit.repeat(REPORT_TEXT_LIMITS.title + 1) }, reportSchema, { allowUnknown: true });
+      expect({ unit, fields: errors.map(e => e.field) }).toEqual({ unit, fields: ['title'] });
+      expect(errors[0].problem).toContain(String(REPORT_TEXT_LIMITS.title));
+    }
+    // a mixed string: 499 one-unit characters plus two emoji is 501 characters
+    const mixed = 'a'.repeat(REPORT_TEXT_LIMITS.title - 1) + '\u{1F600}\u{1F600}';
+    expect(checkBody({ title: mixed }, reportSchema, { allowUnknown: true }).map(e => e.field)).toEqual(['title']);
+  });
+
+  it('counts a lone surrogate as one character, as a string iterator does', () => {
+    const lone = '\ud83d';
+    expect(checkBody({ author: lone.repeat(REPORT_TEXT_LIMITS.author) }, reportSchema, { allowUnknown: true })).toEqual([]);
+    expect(checkBody({ author: lone.repeat(REPORT_TEXT_LIMITS.author + 1) }, reportSchema, { allowUnknown: true }).map(e => e.field)).toEqual(['author']);
+  });
+
   it('passes through the other report fields it does not govern', () => {
     const body = {
       title: 'ok',
@@ -133,6 +161,19 @@ describe('over-length report body over real HTTP', () => {
     expect(body.details[0].problem).toContain(String(REPORT_TEXT_LIMITS.summary));
     // The raw Postgres message must never reach the client.
     expect(JSON.stringify(body)).not.toContain('character varying');
+  });
+
+  it('accepts a 500-character emoji title and refuses 501, over the wire', async () => {
+    const post = (title: string) => fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, content: 'body' }),
+    });
+    expect((await post('\u{1F600}'.repeat(REPORT_TEXT_LIMITS.title))).status).toBe(201);
+    const refused = await post('\u{1F600}'.repeat(REPORT_TEXT_LIMITS.title + 1));
+    expect(refused.status).toBe(400);
+    const body = await refused.json() as { details: Array<{ field: string; problem: string }> };
+    expect(body.details.map(d => d.field)).toEqual(['title']);
   });
 
   it('still accepts a valid report body', async () => {

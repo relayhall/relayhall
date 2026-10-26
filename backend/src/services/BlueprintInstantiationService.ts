@@ -124,6 +124,8 @@ export class BlueprintInstantiationService {
           project: created.projectId, phaseId: task.phaseId ?? created.phases[task.phaseKey] ?? null, autoStart: false,
           tags: task.tags ?? [], thinking: task.thinking, model: task.defaults?.model, maxRetries: task.defaults?.maxRetries,
           personalityId: task.personalityId, // Execution defaults are staged; setup is a separate explicit act.
+          // Section 6.8 (E462 S4b): decided in the create's transaction for this caller.
+          ...(task.verificationNone ? { verificationNone: true } : {}),
           subtasks: (task.subtasks || []).map((subtask: Row, index: number) => ({ text: subtask.text, completed: false, status: 'empty', index })),
         }, caller.taskActor, projectTarget, transaction);
         created.tasks[task.key] = createdTask.id;
@@ -133,7 +135,7 @@ export class BlueprintInstantiationService {
         const assignments = { ...(task.roles.shepherdPrincipalId ? { shepherdPrincipalId: task.roles.shepherdPrincipalId } : {}),
           ...(task.roles.verifierPrincipalId ? { verifierPrincipalId: task.roles.verifierPrincipalId } : {}) };
         if (Object.keys(assignments).length) {
-          const outcome = await taskManagerDB.assignTaskRoles(created.tasks[task.key], assignments, caller.audit, transaction);
+          const outcome = await taskManagerDB.assignTaskRoles(created.tasks[task.key], assignments, caller.audit, transaction, caller.actor);
           if (outcome !== 'updated') throw new BlueprintError(422, 'BLUEPRINT_ROLE_ASSIGNMENT_REFUSED', 'Task role assignment could not be completed');
         }
         for (const reference of task.references || []) await taskElementService.createReference(created.tasks[task.key],
@@ -158,7 +160,7 @@ export class BlueprintInstantiationService {
       }));
       const response = { status: 201, instantiationId, ...created, blueprint: { key: parent.key, version: version.version },
         executionSetup: { required: executionDefaults.length > 0, taskCount: executionDefaults.length },
-        warnings: plan.references.filter(reference => reference.outcome === 'missing-optional') };
+        warnings: [...plan.references.filter(reference => reference.outcome === 'missing-optional'), ...(plan.warnings ?? [])] };
       const projection = Object.fromEntries(document.parameters.map(parameter => [parameter.key, { type: parameter.type, sha256: blueprintDigest(values[parameter.key] ?? null) }]));
       await client.query(`INSERT INTO blueprint_instantiations(id,blueprint_id,blueprint_version_id,root_project_id,actor_principal_id,parameter_values,parameter_projection,reference_outcomes,response_snapshot,execution_defaults)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [instantiationId,parent.id,version.id,created.projectId,caller.actor.principalId,values,projection,JSON.stringify(plan.references),response,JSON.stringify(executionDefaults)]);
@@ -167,7 +169,7 @@ export class BlueprintInstantiationService {
       await auditService.record({ action: 'blueprint.instantiate', actor: caller.audit, resourceType: 'blueprint', resourceId: parent.id,
         metadata: { version: version.version, instantiationId, counts: plan.counts } }, client);
       return response;
-    }, 'blueprint').catch(async error => {
+    }, 'blueprint', { dependencyGraphWrite: true }).catch(async error => {
       // This diagnostic survives the rolled-back creation transaction. It
       // carries no supplied values, partial object IDs or elevated identity.
       if (admittedBlueprintId && error instanceof BlueprintError && error.code === 'BLUEPRINT_AUTHORITY_REQUIRED') {

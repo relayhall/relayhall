@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Copy, Check, Terminal, ShieldAlert } from 'lucide-react';
+import { Copy, Check, Terminal, ShieldAlert, MessageSquareText } from 'lucide-react';
 import { SegmentedControl } from '../ui/SegmentedControl';
 import type { SegmentedOption } from '../ui/SegmentedControl';
 import {
@@ -35,6 +35,29 @@ import './connections.css';
  * is shown exactly once, so a person who landed there could not finish without
  * reading another tab. `tokenEnvBlock` below closes that, from the pack's own
  * `cliEnv` — see the note there.
+ *
+ * ONE INSTALL LINE FOR A HARNESS (E462 slice S1, design v1.5 section 3.1). A
+ * harness template passes `installLine`, and the pane then leads with it:
+ * `relayhall connector install --harness <h> --board <origin>`, with the token
+ * in a block of its own for the installer's hidden prompt (one-time pack only).
+ *
+ * THE MANUAL BLOCKS ARE DEMOTED (E462 slice S2). The installer now exists, so
+ * for a harness connection the per-client snippets — which put the token in
+ * the client's own configuration or environment — sit in a closed "Set up by
+ * hand instead" disclosure that says what it costs, rather than on the page
+ * beside the install line. They are kept, not removed, because the installer
+ * runs on Windows only in this version: on macOS and Linux they are still the
+ * way to finish. The copy under the install line says exactly what the
+ * installer does there (custody, the client's MCP entry, the sign-in task) and
+ * where it does not run. A pane without an install line is unchanged.
+ *
+ * ONE BOOTSTRAP PROMPT (card 94e8bb0b item 1). Under the configuration block
+ * sits the one copyable prompt a person pastes into a fresh session, and the
+ * secure configuration guidance beside it. Both are the pack's own text: the
+ * server composes them from the MCP endpoint alone, so neither can carry the
+ * credential, and they are the same in the one-time pack and on re-show. They
+ * are MCP instructions, so an `api`-pinned connection says so instead of
+ * offering a prompt its credential would be refused for.
  */
 
 export interface BootstrapPaneProps {
@@ -64,6 +87,20 @@ export interface BootstrapPaneProps {
    * authority must not compose advice about it.
    */
   recovery: string;
+  /** The pack's copyable bootstrap prompt (card 94e8bb0b). Credential-free by construction. */
+  bootstrapPrompt?: string;
+  /** The pack's secure configuration guidance, one sentence per entry. */
+  configurationGuidance?: string[];
+  /**
+   * E462 slice S1: the one install line a harness connection runs instead of
+   * pasting a configuration snippet
+   * (`relayhall connector install --harness <h> --board <origin>`). Present only
+   * for a harness template; it carries no credential by construction
+   * (`installLineFor`). Shown above the manual blocks, which then fold away.
+   */
+  installLine?: string | null;
+  /** What the installer does not do for this harness yet (`installNoteFor`). */
+  installNote?: string | null;
 }
 
 const TAB_ORDER: BootstrapTab[] = ['claudeCode', 'codex', 'generic', 'cli'];
@@ -136,6 +173,7 @@ const FILE_HINT: Record<BootstrapTab, string> = {
 export const BootstrapPane: React.FC<BootstrapPaneProps> = ({
   mcpConfig, cliEnv, bootstrapLine, boardEndpoint, transport,
   initialTab = 'claudeCode', carriesSecret, footer, recovery,
+  bootstrapPrompt, configurationGuidance, installLine, installNote,
 }) => {
   const admits = useMemo(
     () => TAB_ORDER.filter((tab) => tabAppliesToTransport(tab, transport)),
@@ -164,6 +202,9 @@ export const BootstrapPane: React.FC<BootstrapPaneProps> = ({
    *  the two JSON blocks carry it in an `Authorization` header. */
   const tokenValue = tokenValueFrom(cliEnv);
   const envBlock = tab === 'codex' && tokenValue ? tokenEnvBlock(tokenValue) : null;
+  /** The prompt and the guidance speak MCP; an `api` pin is refused there. */
+  const mcpAdmitted = tabAppliesToTransport('generic', transport);
+  const guidance = mcpAdmitted ? (configurationGuidance ?? []) : [];
 
   const copy = async (what: string, text: string) => {
     try {
@@ -176,10 +217,10 @@ export const BootstrapPane: React.FC<BootstrapPaneProps> = ({
     }
   };
 
-  return (
-    <div className="conn-bootstrap">
+  /** The per-client snippets. Folded away under the install line (E462 S2). */
+  const manualSetup = (
+    <>
       <p className="conn-bootstrap-lede">Paste this into your agent and let it configure itself.</p>
-
       <SegmentedControl
         options={options}
         value={tab}
@@ -190,7 +231,7 @@ export const BootstrapPane: React.FC<BootstrapPaneProps> = ({
 
       <p className="conn-bootstrap-hint">{FILE_HINT[tab]}</p>
 
-      <div className="conn-copyblock">
+      <div className="conn-copyblock" data-testid="tab-block">
         <div className="conn-copyblock-head">
           <span className="conn-copyblock-title">
             <Terminal size={16} aria-hidden="true" /> {TAB_LABELS[tab]}
@@ -233,6 +274,123 @@ export const BootstrapPane: React.FC<BootstrapPaneProps> = ({
             PowerShell — in the shell that starts Codex.
           </p>
         </div>
+      )}
+
+      {guidance.length > 0 && (
+        <div className="conn-bootstrap-line">
+          <span className="conn-bootstrap-line-label">Secure configuration</span>
+          <ul className="conn-bootstrap-guidance">
+            {guidance.map((line) => <li key={line}>{line}</li>)}
+          </ul>
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <div className="conn-bootstrap">
+      {installLine && (
+        <section className="conn-install" aria-labelledby="conn-install-title">
+          <div className="conn-copyblock">
+            <div className="conn-copyblock-head">
+              <span id="conn-install-title" className="conn-copyblock-title">
+                <Terminal size={16} aria-hidden="true" /> Install the connector
+              </span>
+              <button
+                type="button"
+                className="conn-copybtn"
+                onClick={() => copy('install', installLine)}
+                aria-label="Copy the install line"
+              >
+                {copied === 'install'
+                  ? <><Check size={16} aria-hidden="true" /> Copied</>
+                  : <><Copy size={16} aria-hidden="true" /> Copy</>}
+              </button>
+            </div>
+            <pre className="conn-install-body" data-testid="install-line"><code>{installLine}</code></pre>
+          </div>
+          {carriesSecret && tokenValue && (
+            <div className="conn-copyblock">
+              <div className="conn-copyblock-head">
+                <span className="conn-copyblock-title">
+                  <Terminal size={16} aria-hidden="true" /> Token for the installer
+                </span>
+                <button
+                  type="button"
+                  className="conn-copybtn"
+                  onClick={() => copy('installer-token', tokenValue)}
+                  aria-label="Copy the token for the installer"
+                >
+                  {copied === 'installer-token'
+                    ? <><Check size={16} aria-hidden="true" /> Copied</>
+                    : <><Copy size={16} aria-hidden="true" /> Copy</>}
+                </button>
+              </div>
+              <pre className="conn-install-body" data-testid="installer-token"><code>{tokenValue}</code></pre>
+            </div>
+          )}
+          <p className="conn-bootstrap-hint">
+            Run the line on the machine where this client runs, with the RelayHall CLI
+            (<code className="conn-inline-code">cli/relayhall</code> from the RelayHall repository) and
+            Python 3.10 or newer. It asks for the token at a hidden prompt: paste it there, never on the
+            command line.
+            {carriesSecret ? '' : ' The token was shown once, when the connection was made.'}
+          </p>
+          <p className="conn-bootstrap-hint" data-testid="install-what">
+            On Windows the installer keeps the token in Windows&rsquo; per-user protected storage (DPAPI),
+            points the client&rsquo;s MCP entry at the connector&rsquo;s local proxy so the client&rsquo;s
+            configuration never holds the token, and registers a task that starts the connector when you
+            sign in, without administrator rights. Then run{' '}
+            <code className="conn-inline-code">relayhall connector check</code>;{' '}
+            <code className="conn-inline-code">relayhall connector uninstall</code> removes what it added.
+          </p>
+          {installNote && <p className="conn-bootstrap-hint" data-testid="install-note">{installNote}</p>}
+          <p className="conn-bootstrap-hint">
+            The installer does not run on macOS or Linux yet. There, set the client up by hand below.
+          </p>
+        </section>
+      )}
+
+      {installLine ? (
+        <details className="conn-manual" data-testid="manual-setup">
+          <summary className="conn-manual-summary">Set up by hand instead</summary>
+          <p className="conn-warn" role="note">
+            <ShieldAlert size={16} aria-hidden="true" />
+            <span>
+              These blocks put the token in the client&rsquo;s own configuration or environment, which the
+              installer never does. Use them only where the installer cannot run yet.
+            </span>
+          </p>
+          {manualSetup}
+        </details>
+      ) : manualSetup}
+
+      {bootstrapPrompt && mcpAdmitted && (
+        <div className="conn-copyblock conn-bootstrap-prompt">
+          <div className="conn-copyblock-head">
+            <span className="conn-copyblock-title">
+              <MessageSquareText size={16} aria-hidden="true" /> Bootstrap prompt
+            </span>
+            <button
+              type="button"
+              className="conn-copybtn"
+              onClick={() => copy('prompt', bootstrapPrompt)}
+              aria-label="Copy the bootstrap prompt"
+            >
+              {copied === 'prompt'
+                ? <><Check size={16} aria-hidden="true" /> Copied</>
+                : <><Copy size={16} aria-hidden="true" /> Copy</>}
+            </button>
+          </div>
+          <pre className="conn-copyblock-body conn-copyblock-body--wrap" data-testid="bootstrap-prompt"><code>{bootstrapPrompt}</code></pre>
+        </div>
+      )}
+
+      {bootstrapPrompt && !mcpAdmitted && (
+        <p className="conn-note">
+          This connection is pinned to the {transport} transport, so the MCP bootstrap prompt does not
+          apply to it. Use the block above.
+        </p>
       )}
 
       <div className="conn-bootstrap-line">

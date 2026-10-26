@@ -1,6 +1,6 @@
 # Blueprint artifacts and acceptance
 
-These three portable documents implement the ratified example outlines in companion bb549028 §7. They are importable drafts, not installed or published registry entries. Their parameter prompts and plans are untrusted data rendered as text.
+These three portable documents implement the ratified example outlines in the companion design (§7). They are importable drafts, not installed or published registry entries. Their parameter prompts and plans are untrusted data rendered as text.
 
 - `project-design.json` uses an existing Project, separate author/verifier/ratifier references, and two parked ratification arms. The outline declares owning_project optional, but existing-project instantiation still needs an actual visible selection; omitting it yields the same unavailable-target refusal as any unresolvable binding.
 - `governed-deployment.json` includes an explicit go/no-go, required deployment-runbook Skill and optional Hermes execution Service.
@@ -30,7 +30,7 @@ Technical acceptance still includes adversarial documents, ordinary-resource par
 
 ## Imported version interpretation
 
-Design §2.2 permits changing only the key on explicit rename and includes version in both digest domains. The REST contract separately specifies version 1 for ordinary author-time create and draft-only import. An imported exported snapshot therefore preserves its positive source version N in a fresh parent, with no invented local versions 1 through N−1. The next authored version is N+1. This is the specific import contract's interpretation for formal verification, not a new owner ruling. Digests are recomputed; document provenance and every field other than an explicit key rename stay unchanged.
+Design §2.2 permits changing only the key on explicit rename and includes version in both digest domains. The REST contract separately specifies version 1 for ordinary author-time create and draft-only import. An imported exported snapshot therefore preserves its positive source version N in a fresh parent, with no invented local versions 1 through N−1. The next authored version is N+1. This is the specific import contract's interpretation for formal verification, not a new decision. Digests are recomputed; document provenance and every field other than an explicit key rename stay unchanged.
 
 Descriptor string options (design §2.4 and §3.3): parameters may fill direct option values only when the resolved Connector's immutable descriptor declares that option as `string`. Option names, enum members, numeric/boolean options, secret references and resource selectors cannot be interpolated. Inserted braces remain literal text. The plan validates the resulting options through the ordinary Connector option validator and shows the selected descriptor version without disclosing its body. Execution defaults remain staged until the separate setup confirmation described above; option preview does not itself assign or activate work.
 
@@ -42,6 +42,8 @@ Build a Phase and its Tasks with the ordinary editors, then choose **Save as Blu
 The initial version is 1, its status is draft and its author is the caller. Capture preserves Phase name/goal, Task text, structured definition of done, success criteria, constraints, notes, priority, tags, thinking, subtasks, internal dependencies, role expectations and safe execution defaults. A new Project is the default target; captured documents can also target an existing Project. IDs, timestamps, assignments, Warrants, sessions, attempts and completion state are never copied.
 
 The draft reuses the ordinary Task text editor. Beside each eligible captured field, choose **Fixed**, **Placeholder — required**, or **Placeholder — optional**, then supply its label and help text. Fixed is the default. Text uses single-pass substitution; role/capability fields use typed bindings. Priority/thinking placeholders restrict answers to their enum; retry placeholders retain integer bounds. Optional text and enum fields retain their captured defaults. A plan with no Tasks or human gates cannot enter review.
+
+`tasks.defaults.maxRetries` must be an integer from **1 through 10**, matching the Task storage constraint. A retry placeholder must declare integer `min` and `max` bounds within that range. Invalid literals or placeholder bounds return `BLUEPRINT_DOCUMENT_REFUSED` with field `maxRetries`; invalid answers return `PARAMETER_VALUE_REFUSED` with the parameter key. Preview and fresh instantiation revalidate the document, including older published versions, before any Project, Task or ledger write. Omitting the field retains the ordinary Task default of 3. A committed retry still returns its original receipt.
 
 ```sh
 relayhall blueprint capture --phase <phase-uuid> --name "Reusable delivery"

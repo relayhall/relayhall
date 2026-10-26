@@ -18,7 +18,7 @@
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { WEBHOOK_EVENTS, isRegistrableWebhookEvent } from '../services/WebhookService';
+import { WEBHOOK_EVENTS, isObservableEvent, isRegistrableWebhookEvent } from '../services/WebhookService';
 
 const SRC = join(__dirname, '..');
 
@@ -89,6 +89,15 @@ describe('C2 registrable event census', () => {
 
   test('task.ready is registrable — the name this candidate adds', () => {
     expect(isRegistrableWebhookEvent('task.ready')).toBe(true);
+  });
+
+  test('native review requests carry an ID-only feed name subscribers can observe', () => {
+    const source = readFileSync(join(SRC, 'services', 'NativeReviewService.ts'), 'utf8');
+    expect(source).toMatch(/name:\s*'task\.review_requested'/);
+    expect(source).toMatch(/payload:\s*\{\s*reviewId:\s*result\.rows\[0\]\.id,\s*serviceId\s*\}/);
+    expect(isRegistrableWebhookEvent('task.review_requested')).toBe(true);
+    expect(isObservableEvent('task.review_requested')).toBe(true);
+    expect(isObservableEvent('task.ready')).toBe(false);
   });
 });
 
@@ -265,6 +274,90 @@ describe('the C2 migration holds the next free forward slot', () => {
         '129_task_child_lookup_indexes.sql',
         '130_personality_versions.sql',
         '131_pristine_install_identity_cleanup.sql',
+        // P02: Account-scoped quota snapshots and observed service metrics.
+        '132_usage_quota_snapshots.sql',
+        // Planning MCP: credential-scoped Phase creation retry.
+        '133_operation_idempotency_phase_create.sql',
+        '134_flat_task_review_attempts.sql',
+        '135_native_verification_requests.sql',
+        '136_native_execution_correlation.sql',
+        '137_native_generation_coordination.sql',
+        '138_task_report_workflow.sql',
+      '139_account_resource_control.sql',
+        // Card a3e76724 - reserved slot 140: the pending relying-party row
+        // names the Account, action and target a step-up is for.
+        '140_sso_step_up_binding.sql',
+        // Card b13e5ac9 - reserved slot 141: the per-Project inbox phase.
+        '141_project_inbox_phase.sql',
+        // Card 785e1eed P1-B - reserved slot 142: AZ-A9 grant requests (the approvals kind).
+        '142_access_requests_grant_kind.sql',
+        // Card 785e1eed P2-B - reserved slot 143: AZ-A10 clause 6, the assignment grant rows' expiry.
+        '143_assignment_grant_expiry.sql',
+        // Card b1e3b16d (hub lane L2) - reserved slot 144: per-Account notification read state.
+        '144_notification_read_state.sql',
+        // Card 785e1eed P1-B-2 - reserved slot 145: AZ-A9 credential requests (clause 13).
+        '145_access_requests_credential_kind.sql',
+        // Card 20f40e40 (AZ-A12 build 1) - reserved slot 146: the Group principal kind.
+        '146_group_principal_kind.sql',
+        // Card b796067e (RB-11 Governor v0 core door) - reserved slot 147: the knowledge write door.
+        '147_knowledge_write_door.sql',
+        // Card 1a38270d (AZ-A13 stage 2) - reserved slot 148: edit in place, the authority-edit kind.
+        '148_authority_edit_in_place.sql',
+        '149_az_a10_role_grants.sql',
+        // Card c84ac03b - reserved slot 150: product metric completion events.
+        '150_product_metric_completion_events.sql',
+        // Card 68f9dffe (E108 3b) - reserved slot 151: the six writer-less Task columns retire.
+        '151_retire_writerless_task_columns.sql',
+        // Card 46cfbd1d (LENSES-c c1-A) - reserved slot 152 (149-151 are reserved to
+        // lanes not yet on this line): group_stewards, the Group roles relation.
+        '152_lenses_c_group_stewards.sql',
+        // Card 7a99d63e (step-up re-authentication) - reserved slot 153: the Identity provider's step_up_policy.
+        // 149-152 are other lanes' reservations; RESERVED is the authority on the gap.
+        '153_identity_provider_step_up_policy.sql',
+        // Card 41e24358 (default Verifier) - reserved slot 155 (154 is another lane's): the
+        // Project and Phase default Verifier and tasks.verifier_source.
+        '155_default_verifier.sql',
+        // Card 311229fd (AZ-A12 build 3) - reserved slot 156: the Group-owned create's own retry operation.
+        // 154 is a held slot (RESERVED is the authority on the gap); 155 is the default Verifier.
+        '156_project_group_owned_create_retry.sql',
+        // Card 549cc51f (shared-area writer list) - reserved slot 157: knowledge_shared_writers.
+        // 154 is a held slot (RESERVED is the authority on the gap); 155 and 156 precede it.
+        '157_knowledge_shared_writers.sql',
+        // Card 502fb19e (the universal change request, E325) - reserved slot 158: kind change,
+        // approval_change_objects and the core tables the lifecycle exporter reads.
+        '158_universal_change_requests.sql',
+        // Card 502fb19e (the universal change request, slice S2) - reserved slot 159: the session
+        // door's and the preview's route families join settings.access-manager.
+        '159_change_request_session_door.sql',
+        // Card ab8f78e9 (the MCP action log, E91) - reserved slot 161 (160 is held for a
+        // parallel lane; RESERVED is the authority on the gap): mcp_action_log.
+        '161_mcp_action_log.sql',
+        '162_skill_owner.sql',
+        // Card dac2ca71 (RH-TW1b slice 1) - reserved slot 163 (162 is held for the parallel
+        // lane d67e6990; RESERVED is the authority on the gap): the OTLP receiver-limit surfaces.
+        '163_telemetry_otlp_rate_surfaces.sql',
+        // Card 2bc7b303 (the MCP Subtask structure verbs, E374) - reserved slot 164 (162 and
+        // 163 are held for parallel lanes; RESERVED is the authority on the gap): the
+        // retry contract's closed operation set gains task.subtask.create/reorder/text.
+        '164_subtask_structure_retry.sql',
+        // Card 742fae98 (the Map's Reports display mode) - reserved slot 165: the
+        // per-principal Collapsed | Expanded choice on principal_preferences.
+        '165_principal_map_reports_mode.sql',
+        // Card bedf50cc (plugin availability and settings, E380) - reserved slot 166:
+        // plugin_policies, plugin_settings, plugin_account_choices and the retry
+        // contract's five plugin operations.
+        '166_plugin_availability_settings.sql',
+        // Card 5854f0d6 (Notifications and Timeline, E394) - reserved slot 167:
+        // the four Timeline indexes.
+        '167_notifications_timeline_indexes.sql',
+        // Card 08792425 (member N6, knowledge source registration) - reserved slot 168:
+        // knowledge_source_registrations.
+        '168_knowledge_source_registrations.sql',
+        // Owner ruling E455 (the Action Center, card 5854f0d6): per-caller seen marks
+        // on action items.
+        '169_notification_action_seen.sql',
+        // Owner ruling E462 S4b: the per-Task verification mode `none`.
+        '170_task_verification_none.sql',
       ]);
     // A forward migration is executed, never stamped: an entry in either
     // manifest would silently skip the whole C2 schema on a fresh install.

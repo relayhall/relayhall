@@ -214,7 +214,7 @@ async function sessionCallerFor(label: string, principalId: string): Promise<Cal
  * carrying an explicit `own_expression` (inheritance is never implicit), under
  * an Account whose role bounds the chain.
  */
-async function connectorCaller(label: string, accountId: string): Promise<Caller> {
+async function connectorCaller(label: string, accountId: string, scopes: string[] = SCOPES): Promise<Caller> {
   const handle = `parity-connector-${tag()}`;
   const principal = await pool.query(
     `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
@@ -224,7 +224,7 @@ async function connectorCaller(label: string, accountId: string): Promise<Caller
   );
   const principalId = String(principal.rows[0].id);
   const issued = await principalService.issueCredential(
-    { principalId, scopes: SCOPES, transport: 'any' }, SYSTEM_ACTOR);
+    { principalId, scopes, transport: 'any' }, SYSTEM_ACTOR);
   return { label, principalId, headers: { Authorization: `Bearer ${issued.fullKey}` } };
 }
 
@@ -251,8 +251,8 @@ async function makeTask(input: {
    * Project-scoped surfaces need: their own ceiling passes, and the Task list
    * inside them is the only thing narrowing. */
   restrictedAccess?: boolean;
-  /** `/projects/{id}/sessions` only emits a record for a Task that was
-   * actually started. */
+  /** Give this Task a lawful canonical implementation link, so session
+   * disclosure assertions remain positive and non-vacuous after retirement. */
   started?: boolean;
 }): Promise<Fixture> {
   const result = await pool.query(
@@ -279,6 +279,13 @@ async function makeTask(input: {
     projectId: input.projectId,
   };
   FIXTURES.push(fixture);
+  if (input.started) {
+    const attemptId=crypto.randomUUID();
+    await pool.query(`INSERT INTO session_attempts(attempt_id,harness,runtime_kind,first_observed_at,started_at,identity_confidence,identity_reason,created_by_adapter)
+      VALUES($1,'hermes','parity-fixture',NOW(),NOW(),'authoritative','fixture','parity-fixture')`,[attemptId]);
+    await pool.query(`INSERT INTO task_attempt_links(task_id,attempt_id,role,attempt_number,link_state,source,evidence_ref)
+      VALUES($1,$2,'implementation',1,'bound','operator','parity-fixture')`,[fixture.id,attemptId]);
+  }
   return fixture;
 }
 
@@ -671,6 +678,55 @@ describe('every Task list answers what the point route answers', () => {
   }
 
   /**
+   * The MCP arm of the graph surface: `relayhall_task_graph`'s real handler,
+   * through the real in-process ingress, against this real database, under
+   * the CONNECTOR's own bearer credential. Only the bearer caller can be
+   * driven: the MCP ingress refuses login-session cookies by design, so the
+   * session caller has no MCP arm to measure.
+   *
+   * Two equalities, both anchored outside the tool: the tool's disclosure
+   * equals the point-allowed set, AND equals what `GET /tasks/graph` disclosed
+   * to the same caller over REST — so a tool that quietly composed a wider or
+   * narrower read than the route would be red here even if its own set
+   * happened to look plausible.
+   */
+  it('relayhall_task_graph (MCP) discloses exactly what GET /tasks/graph and the point route disclose', async () => {
+    const { toolByName } = require('../mcp/registry');
+    const tool = toolByName('relayhall_task_graph');
+    expect(tool).toBeDefined();
+    const ctx = { authorization: CONNECTOR.headers.Authorization, toolName: 'relayhall_task_graph' };
+    const args = { statuses: BOARD_STATUSES, projects: FIXTURE_PROJECTS.split(','), response_format: 'detailed' };
+    const text: string = await tool.handler(args, ctx);
+    const mcp = JSON.parse(text);
+    const expected = idsOf(await pointAllowed(CONNECTOR));
+    expect(`mcp connector: ${disclosed(mcp).join(',')}`).toBe(`mcp connector: ${expected.join(',')}`);
+    const surface = surfaces().find((entry) => entry.name === 'GET /tasks/graph') as { name: string; path: string };
+    const rest = await call(CONNECTOR, 'GET', surface.path);
+    expect(rest.status).toBe(200);
+    expect(`rest connector: ${disclosed(rest.json).join(',')}`).toBe(`rest connector: ${disclosed(mcp).join(',')}`);
+    // The etag is the same validator the route emits, and it revalidates.
+    expect(typeof mcp.etag).toBe('string');
+    const revalidated: string = await tool.handler({ ...args, ifNoneMatch: mcp.etag }, ctx);
+    expect(revalidated).toContain('not modified');
+    // Non-vacuity: the connector reads SOMETHING through the tool, and not
+    // everything.
+    expect(expected.length).toBeGreaterThan(0);
+    expect(expected.length).toBeLessThan(FIXTURES.length);
+    // The concealed TITLES are absent from the tool's text, not only the ids.
+    const readable = new Set(expected);
+    for (const row of FIXTURES.filter((fixture) => !readable.has(fixture.id))) {
+      expect(`mcp leaked "${row.label}": ${text.includes(`parity ${row.label}`)}`)
+        .toBe(`mcp leaked "${row.label}": false`);
+    }
+  });
+
+  it('relayhall_task_graph (MCP) refuses unknown arguments before reaching the board', async () => {
+    const { toolByName } = require('../mcp/registry');
+    const ctx = { authorization: CONNECTOR.headers.Authorization, toolName: 'relayhall_task_graph' };
+    await expect(toolByName('relayhall_task_graph').handler({ limit: 10 }, ctx)).rejects.toThrow(/Unknown arguments: limit/);
+  });
+
+  /**
    * `/tasks/aggregates` is the one list surface that discloses no ids at all -
    * it answers in COUNTS. A count is a disclosure, so the property is the same
    * property, measured on the number.
@@ -962,7 +1018,7 @@ describe('the Project surfaces count and name only what the point route allows',
       const answer = await call(who, 'GET', `/projects/${SHARED_PROJECT}/sessions`);
       expect(answer.status).toBe(200);
       const shown = disclosed(answer.json);
-      // A session record is only emitted for a STARTED Task, so the disclosed
+      // A session record is only emitted for a canonically linked Task, so the disclosed
       // set is a subset of the expected one; what may never happen is a Task
       // outside it appearing.
       expect(`${who.label} beyond the allowed set: ${shown.filter((id) => !allowed.has(id)).join(',')}`)
@@ -1206,5 +1262,673 @@ describe('Report attribution survives the mirror collision', () => {
     // needs the raw provenance string still has it.
     const answer = await call(ROOT, 'GET', `/reports/${REST_ROW}`);
     expect(`provenance: ${answer.json.report.author_actor_id}`).toBe(`provenance: ${PLAIN_B}`);
+  });
+});
+
+/**
+ * -- THE MAP READ OVER MCP: A READABLE TASK GRANTS NOTHING ELSE --------------
+ *
+ * `GET /tasks/graph` narrows three collections on their own: Task rows,
+ * the Phases those rows reference, and the Reports linked to them. The mocked
+ * suite (`scaleReadContracts`) proves the tool inherits that narrowing through
+ * the in-process ingress; this block proves it against PostgreSQL, where the
+ * predicate is SQL and the mocked repository cannot stand in for it.
+ *
+ * The partition: one Task the CONNECTOR may read, placed in a Phase marked
+ * `restricted_access`, and cited by two Reports — one `default` (readable by
+ * every authenticated caller), one `private` (readable by its author, root,
+ * alone). Root over REST is the positive control: it sees the Phase and both
+ * Reports, so an empty answer would be red rather than green.
+ *
+ * The Task is readable through the EXACT-GRANT arm (`grantToChain`, the same
+ * pattern the count fixtures use), not through the shared Project. Measured
+ * against PostgreSQL, a Task inside a restricted Phase does NOT inherit the
+ * Project's visibility for this caller — `GET /tasks/{id}` answered 404 for a
+ * Project-inherited fixture — so the inherited arm cannot carry this
+ * partition. A grant names the Task alone: it says nothing about the Phase
+ * the Task sits in, nor about the Reports that cite it, which is exactly
+ * what the negatives below need — the Task is admitted by one explicit cause
+ * and the Phase and private Report still have none.
+ *
+ * Fixtures are built in THIS block's own `beforeAll`, after every count
+ * assertion above has run, because the new Task is deliberately outside
+ * `FIXTURES` and would otherwise move the Project-scoped equalities.
+ */
+describe('relayhall_task_graph (MCP) conceals restricted Phases and private Reports on readable Tasks', () => {
+  let PHASED_TASK: string;
+  let RESTRICTED_PHASE: string;
+  let OPEN_REPORT: string;
+  let PRIVATE_REPORT: string;
+  const PHASE_NAME = `parity sealed phase ${tag()}`;
+  const PHASE_GOAL = 'parity confidential goal';
+  const OPEN_TITLE = `parity open linked report ${tag()}`;
+  const PRIVATE_TITLE = `parity private linked report ${tag()}`;
+
+  /** A Report created through the production writer, so the Task link is the
+   * one the route's linked-report read follows, then re-addressed to the
+   * visibility the shared predicate reads (`sqlResource('report')`). */
+  const linkedReport = async (title: string, visibility: 'private' | 'default'): Promise<string> => {
+    const created = await call(ROOT, 'POST', '/reports', {
+      title, content: `body of ${title}`, task_ids: [PHASED_TASK],
+    });
+    expect(`create ${title}: ${created.status}`).toMatch(/^create .*: 20[01]$/);
+    const id = String(created.json.report?.id ?? created.json.id);
+    await pool.query('UPDATE reports SET visibility = $1, author_principal_id = $2 WHERE id = $3',
+      [visibility, ROOT_PRINCIPAL, id]);
+    return id;
+  };
+
+  beforeAll(async () => {
+    // Phases carry their own restricted-access policy (owner ruling 44ee41f2),
+    // the same column Tasks use.
+    const phase = await pool.query(
+      `INSERT INTO phases (project_id, name, goal, position, restricted_access)
+       VALUES ($1, $2, $3, 0, true) RETURNING id`,
+      [SHARED_PROJECT, PHASE_NAME, PHASE_GOAL],
+    );
+    RESTRICTED_PHASE = String(phase.rows[0].id);
+    PHASED_TASK = await makeUntrackedTask('phased and cited', 'todo', SHARED_PROJECT);
+    await pool.query('UPDATE tasks SET phase_id = $1 WHERE id = $2', [RESTRICTED_PHASE, PHASED_TASK]);
+    // The Task inside the restricted Phase is made readable to the connector
+    // by an explicit read grant on the Task — the fixture's ONE named cause.
+    // The grant is on the Task row only; the Phase and the Reports carry none.
+    await grantToChain(PHASED_TASK);
+    OPEN_REPORT = await linkedReport(OPEN_TITLE, 'default');
+    PRIVATE_REPORT = await linkedReport(PRIVATE_TITLE, 'private');
+  });
+
+  const graphArgs = () => ({
+    statuses: ['todo'], projects: [PROJECT_NAMES.find((name) => name.startsWith('parity-shared-')) as string],
+    response_format: 'detailed',
+  });
+
+  it('the partition is real: root sees the Phase and both Reports over REST (not vacuous)', async () => {
+    const answer = await call(ROOT, 'GET',
+      `/tasks/graph?statuses=todo&projects=${encodeURIComponent(graphArgs().projects[0])}`);
+    expect(answer.status).toBe(200);
+    expect(answer.json.nodes.map((n: any) => n.id)).toContain(PHASED_TASK);
+    expect(answer.json.phases.map((p: any) => p.id)).toContain(RESTRICTED_PHASE);
+    expect(answer.json.reports.map((r: any) => r.id).sort()).toEqual([OPEN_REPORT, PRIVATE_REPORT].sort());
+    // …and the connector may read the Task (by its grant) but NOT the Phase.
+    expect(`connector reads the granted task: ${(await call(CONNECTOR, 'GET', `/tasks/${PHASED_TASK}`)).status}`)
+      .toBe('connector reads the granted task: 200');
+    expect([403, 404]).toContain((await call(CONNECTOR, 'GET', `/phases/${RESTRICTED_PHASE}`)).status);
+    expect([403, 404]).toContain((await call(CONNECTOR, 'GET', `/reports/${PRIVATE_REPORT}`)).status);
+    expect((await call(CONNECTOR, 'GET', `/reports/${OPEN_REPORT}`)).status).toBe(200);
+  });
+
+  it('the connector reads the Task through the tool, with the open Report and WITHOUT the Phase or the private Report', async () => {
+    const { toolByName } = require('../mcp/registry');
+    const ctx = { authorization: CONNECTOR.headers.Authorization, toolName: 'relayhall_task_graph' };
+    const text: string = await toolByName('relayhall_task_graph').handler(graphArgs(), ctx);
+    const mcp = JSON.parse(text);
+    const node = mcp.nodes.find((n: any) => n.id === PHASED_TASK);
+    expect(`node present: ${Boolean(node)}`).toBe('node present: true');
+    // Allowed projection: the node keeps its phaseId (structure), the open
+    // Report arrives with its title.
+    expect(`phaseId: ${node.phaseId}`).toBe(`phaseId: ${RESTRICTED_PHASE}`);
+    expect(mcp.reports.map((r: any) => r.id)).toContain(OPEN_REPORT);
+    expect(text).toContain(OPEN_TITLE);
+    // Hidden projection: no Phase identity, no private Report — by id or by text.
+    expect(`restricted phase listed: ${mcp.phases.some((p: any) => p.id === RESTRICTED_PHASE)}`)
+      .toBe('restricted phase listed: false');
+    expect(`phase name leaked: ${text.includes(PHASE_NAME)}`).toBe('phase name leaked: false');
+    expect(`phase goal leaked: ${text.includes(PHASE_GOAL)}`).toBe('phase goal leaked: false');
+    expect(`private report listed: ${mcp.reports.some((r: any) => r.id === PRIVATE_REPORT)}`)
+      .toBe('private report listed: false');
+    expect(`private title leaked: ${text.includes(PRIVATE_TITLE)}`).toBe('private title leaked: false');
+    // The same answer the route gives the same caller over REST.
+    const rest = await call(CONNECTOR, 'GET',
+      `/tasks/graph?statuses=todo&projects=${encodeURIComponent(graphArgs().projects[0])}`);
+    expect(rest.status).toBe(200);
+    expect(rest.json.phases.map((p: any) => p.id).sort()).toEqual(mcp.phases.map((p: any) => p.id).sort());
+    expect(rest.json.reports.map((r: any) => r.id).sort()).toEqual(mcp.reports.map((r: any) => r.id).sort());
+    // The concise form prints counts only, so it cannot leak either.
+    const concise: string = await toolByName('relayhall_task_graph').handler({ ...graphArgs(), response_format: 'concise' }, ctx);
+    for (const secret of [PHASE_NAME, PHASE_GOAL, PRIVATE_TITLE, OPEN_TITLE]) {
+      expect(`concise carries "${secret}": ${concise.includes(secret)}`).toBe(`concise carries "${secret}": false`);
+    }
+  });
+});
+
+/**
+ * -- 1e0f3bd4: A PROJECT'S PHASE LIST ANSWERS WHAT THE PHASE POINT ROUTE ANSWERS
+ *
+ * `GET /projects/{id}/phases` reaches Phase rows through the Project route
+ * family, so its route ceiling is `projects:read` and its object stage proves
+ * the PROJECT. A Phase marked `restricted_access` suppresses what its Project
+ * lends (owner ruling 44ee41f2), so proving the Project proves nothing about
+ * such a Phase: the list has to ask the Phase read decision for every row,
+ * the decision `GET /phases` and `GET /phases/{id}` already ask.
+ *
+ * The outside anchor is the point route, as everywhere in this file: the
+ * expected set is the fixture Phases for which `GET /phases/{id}` answers 200
+ * to the same caller. The caller holds `phases:read`, so a refused point read
+ * is the object decision (the concealed 404), never the scope ceiling. Root is
+ * the positive control: it lists all three fixture Phases and reads each one.
+ *
+ * A caller WITHOUT `phases:read` cannot anchor on the point route (its point
+ * read stops at the scope ceiling), so for it the restricted rows are asserted
+ * absent and the unrestricted one present: the list keeps serving the
+ * ordinary Project disclosure the route family grants.
+ *
+ * Fixtures are built in this block's own `beforeAll` and sit in the SHARED
+ * Project, after every count assertion above has run.
+ */
+describe('GET /projects/{id}/phases lists only the Phases the Phase point route allows', () => {
+  let PHASE_READER: Caller;
+  let OPEN_PHASE: string;
+  let SEALED_PHASE: string;
+  let SEALED_ARCHIVED_PHASE: string;
+  let PHASE_WARRANT: string;
+  /** The positive arms the restriction preserves (card bdf7b876): an exact
+   * Phase grant on the sealed Phase, and the owner of a Project of its own. */
+  let PHASE_GRANTEE: Caller;
+  let PROJECT_OWNER: Caller;
+  let OWNED_PROJECT: string;
+  const OWNED_LABELS = new Map<string, string>();
+  const SEALED_NAME = `parity sealed list phase ${tag()}`;
+  const SEALED_GOAL = 'parity sealed list goal';
+  const LABELS = new Map<string, string>();
+
+  const makePhase = async (label: string, name: string, restricted: boolean, status: string): Promise<string> => {
+    const row = await pool.query(
+      `INSERT INTO phases (project_id, name, goal, position, restricted_access, status)
+       VALUES ($1, $2, $3, 50, $4, $5) RETURNING id`,
+      [SHARED_PROJECT, name, restricted ? SEALED_GOAL : 'parity open list goal', restricted, status],
+    );
+    const id = String(row.rows[0].id);
+    LABELS.set(id, label);
+    return id;
+  };
+
+  /** The fixture Phases one list answer carries, by label, sorted. */
+  const listedLabels = async (who: Caller, includeArchived: boolean): Promise<string[]> => {
+    const answer = await call(who, 'GET',
+      `/projects/${SHARED_PROJECT}/phases${includeArchived ? '?includeArchived=true' : ''}`);
+    expect(`${who.label} list status: ${answer.status}`).toBe(`${who.label} list status: 200`);
+    return (answer.json.phases as Array<{ id: string }>)
+      .map((phase) => LABELS.get(phase.id)).filter((label): label is string => Boolean(label)).sort();
+  };
+
+  /** The fixture Phases the point route reads for this caller, by label. */
+  const pointLabels = async (who: Caller, includeArchived: boolean): Promise<string[]> => {
+    const allowed: string[] = [];
+    for (const [id, label] of LABELS) {
+      if (!includeArchived && label === 'sealed-archived') continue;
+      const answer = await call(who, 'GET', `/phases/${id}`);
+      if (answer.status === 200) allowed.push(label);
+      else expect(`${who.label} point ${label}: ${answer.status}`).toBe(`${who.label} point ${label}: 404`);
+    }
+    return allowed.sort();
+  };
+
+  beforeAll(async () => {
+    PHASE_READER = await connectorCaller('phase reader', CONNECTOR_ACCOUNT, [...SCOPES, 'phases:read']);
+    OPEN_PHASE = await makePhase('open', `parity open list phase ${tag()}`, false, 'todo');
+    SEALED_PHASE = await makePhase('sealed', SEALED_NAME, true, 'todo');
+    SEALED_ARCHIVED_PHASE = await makePhase('sealed-archived', `${SEALED_NAME} archived`, true, 'archived');
+    // A Warrant the session caller HOLDS, anchored to the open and the sealed
+    // Phase: holding it reads neither (the review 302a338f B2 independence,
+    // for Phase anchors).
+    const warrant = await pool.query(
+      `INSERT INTO warrants (name, holder_principal_id, created_by_principal_id, ceiling_profile_version_id, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 day') RETURNING id`,
+      [`parity phase warrant ${tag()}`, SESSION_USER.principalId, ROOT_PRINCIPAL, await makeCeilingVersion()],
+    );
+    PHASE_WARRANT = String(warrant.rows[0].id);
+    for (const anchor of [OPEN_PHASE, SEALED_PHASE]) {
+      await pool.query(
+        `INSERT INTO warrant_anchors (warrant_id, anchor_type, anchor_id) VALUES ($1, 'phase', $2)`,
+        [PHASE_WARRANT, anchor],
+      );
+    }
+    // Restricted mode suppresses only the inherited Project arm: an exact
+    // Phase grant and the Project's owner still read the sealed Phase, so
+    // they must still list it. The grantee is a plain Account session; the
+    // owner's Project is SHARED, so a caller who neither owns it nor holds a
+    // grant reads that Project and is the negative control on the same rows.
+    PHASE_GRANTEE = await sessionCallerFor('phase grantee', await makeAccount('human', 'user'));
+    await pool.query(
+      `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+       VALUES ('principal', $1, 'phase', $2, 'read', $3)`,
+      [PHASE_GRANTEE.principalId, SEALED_PHASE, ROOT_PRINCIPAL],
+    );
+    PROJECT_OWNER = await sessionCallerFor('project owner', await makeAccount('human', 'user'));
+    const owned = await pool.query(
+      `INSERT INTO projects (name, status, visibility, owner_principal_id)
+       VALUES ($1, 'active', 'shared', $2) RETURNING id`,
+      [`parity owned phase project ${tag()}`, PROJECT_OWNER.principalId],
+    );
+    OWNED_PROJECT = String(owned.rows[0].id);
+    for (const [label, restricted] of [['open', false], ['sealed', true]] as Array<[string, boolean]>) {
+      const row = await pool.query(
+        `INSERT INTO phases (project_id, name, goal, position, restricted_access, status)
+         VALUES ($1, $2, $3, 50, $4, 'todo') RETURNING id`,
+        [OWNED_PROJECT, `parity owned ${label} phase ${tag()}`, `parity owned ${label} goal`, restricted],
+      );
+      OWNED_LABELS.set(String(row.rows[0].id), label);
+    }
+  });
+
+  it('the partition is real: root lists and reads all three, the phase reader reads only the open one (not vacuous)', async () => {
+    expect(await listedLabels(ROOT, true)).toEqual(['open', 'sealed', 'sealed-archived']);
+    expect(await pointLabels(ROOT, true)).toEqual(['open', 'sealed', 'sealed-archived']);
+    expect(`open point read: ${(await call(PHASE_READER, 'GET', `/phases/${OPEN_PHASE}`)).status}`)
+      .toBe('open point read: 200');
+    expect(`sealed point read: ${(await call(PHASE_READER, 'GET', `/phases/${SEALED_PHASE}`)).status}`)
+      .toBe('sealed point read: 404');
+    expect(`sealed archived point read: ${(await call(PHASE_READER, 'GET', `/phases/${SEALED_ARCHIVED_PHASE}`)).status}`)
+      .toBe('sealed archived point read: 404');
+  });
+
+  it('a Project reader holding phases:read lists exactly the Phases GET /phases/{id} answers', async () => {
+    for (const includeArchived of [false, true]) {
+      const listed = await listedLabels(PHASE_READER, includeArchived);
+      const allowed = await pointLabels(PHASE_READER, includeArchived);
+      const beyond = listed.filter((label) => !allowed.includes(label));
+      expect(`listed beyond the point-allowed set (includeArchived=${includeArchived}): ${beyond.join(',')}`)
+        .toBe(`listed beyond the point-allowed set (includeArchived=${includeArchived}): `);
+      expect(listed).toEqual(allowed);
+    }
+    // The same rows GET /phases lists for this caller, through the one predicate.
+    const flat = await call(PHASE_READER, 'GET', `/phases?projectId=${SHARED_PROJECT}&includeArchived=true`);
+    expect(flat.status).toBe(200);
+    const nested = await call(PHASE_READER, 'GET', `/projects/${SHARED_PROJECT}/phases?includeArchived=true`);
+    expect((nested.json.phases as Array<{ id: string }>).map((p) => p.id).sort())
+      .toEqual((flat.json.phases as Array<{ id: string }>).map((p) => p.id).sort());
+    const text = JSON.stringify(nested.json);
+    expect(`sealed name leaked: ${text.includes(SEALED_NAME)}`).toBe('sealed name leaked: false');
+    expect(`sealed goal leaked: ${text.includes(SEALED_GOAL)}`).toBe('sealed goal leaked: false');
+  });
+
+  it('a Project reader without phases:read still lists the open Phase and never a restricted one', async () => {
+    for (const who of CALLERS()) {
+      for (const includeArchived of [false, true]) {
+        const listed = await listedLabels(who, includeArchived);
+        expect(`${who.label} listed (includeArchived=${includeArchived}): ${listed.join(',')}`)
+          .toBe(`${who.label} listed (includeArchived=${includeArchived}): open`);
+      }
+    }
+  });
+
+  it('an exact Phase grantee lists the restricted Phase GET /phases/{id} answers it', async () => {
+    for (const includeArchived of [false, true]) {
+      const listed = await listedLabels(PHASE_GRANTEE, includeArchived);
+      const allowed = await pointLabels(PHASE_GRANTEE, includeArchived);
+      // Not vacuous: the grant reaches the sealed Phase through the restriction.
+      expect(`grantee reads sealed (includeArchived=${includeArchived}): ${allowed.includes('sealed')}`)
+        .toBe(`grantee reads sealed (includeArchived=${includeArchived}): true`);
+      expect(`grantee listed (includeArchived=${includeArchived}): ${listed.join(',')}`)
+        .toBe(`grantee listed (includeArchived=${includeArchived}): ${allowed.join(',')}`);
+    }
+  });
+
+  it('a Project owner lists the restricted Phase of its own Project, and a plain reader of it does not', async () => {
+    const ownedListed = async (who: Caller): Promise<string[]> => {
+      const answer = await call(who, 'GET', `/projects/${OWNED_PROJECT}/phases?includeArchived=true`);
+      expect(`${who.label} owned list status: ${answer.status}`).toBe(`${who.label} owned list status: 200`);
+      return (answer.json.phases as Array<{ id: string }>)
+        .map((phase) => OWNED_LABELS.get(phase.id)).filter((label): label is string => Boolean(label)).sort();
+    };
+    const ownedPoint = async (who: Caller): Promise<string[]> => {
+      const allowed: string[] = [];
+      for (const [id, label] of OWNED_LABELS) {
+        const answer = await call(who, 'GET', `/phases/${id}`);
+        if (answer.status === 200) allowed.push(label);
+        else expect(`${who.label} point owned ${label}: ${answer.status}`).toBe(`${who.label} point owned ${label}: 404`);
+      }
+      return allowed.sort();
+    };
+    expect(`owner reads: ${(await ownedPoint(PROJECT_OWNER)).join(',')}`).toBe('owner reads: open,sealed');
+    expect(`owner listed: ${(await ownedListed(PROJECT_OWNER)).join(',')}`)
+      .toBe(`owner listed: ${(await ownedPoint(PROJECT_OWNER)).join(',')}`);
+    // The negative control on the same rows: a reader of the shared Project
+    // who neither owns it nor holds a grant reads and lists only the open one.
+    expect(`plain reader reads: ${(await ownedPoint(SESSION_USER)).join(',')}`).toBe('plain reader reads: open');
+    expect(`plain reader listed: ${(await ownedListed(SESSION_USER)).join(',')}`)
+      .toBe(`plain reader listed: ${(await ownedPoint(SESSION_USER)).join(',')}`);
+  });
+
+  it('GET /warrants/{id}/linkage names an open Phase anchor and conceals a restricted one', async () => {
+    const answer = await call(SESSION_USER, 'GET', `/warrants/${PHASE_WARRANT}/linkage`);
+    expect(`linkage status: ${answer.status}`).toBe('linkage status: 200');
+    const byId = new Map((answer.json.anchors as Array<any>).map((row) => [row.anchorId, row]));
+    // Structure stays: both anchors keep their type and id.
+    expect(`anchors: ${[...byId.keys()].map((id) => LABELS.get(id)).sort().join(',')}`).toBe('anchors: open,sealed');
+    expect(`open anchor concealed: ${byId.get(OPEN_PHASE).concealed}`).toBe('open anchor concealed: false');
+    expect(`sealed anchor concealed: ${byId.get(SEALED_PHASE).concealed}`).toBe('sealed anchor concealed: true');
+    const text = JSON.stringify(answer.json);
+    expect(`sealed name leaked: ${text.includes(SEALED_NAME)}`).toBe('sealed name leaked: false');
+    expect(`open label: ${String(byId.get(OPEN_PHASE).label).startsWith('parity open list phase')}`).toBe('open label: true');
+  });
+});
+
+/**
+ * -- CARD bdf7b876: A WARRANT'S PROJECT ANCHORS ---------------------------------
+ *
+ * The Phase-anchor case above, for Project anchors. Holding a Warrant and
+ * reading the Project it is anchored to are independent: `WarrantService.create`
+ * validates that the anchor row EXISTS and nothing more (review 302a338f B2).
+ * The linkage therefore asks, for every Project anchor, the Project read
+ * decision `GET /projects` asks, keeps the anchor's type and id (the Warrant's
+ * own structure, which its holder is entitled to) and conceals the Project's
+ * name and status.
+ *
+ * The outside anchor is the point route: whether an anchor may be named is
+ * read from `GET /projects/{id}` for the same caller, never recomputed. The
+ * shared Project is the readable anchor; a private Project the holder reads
+ * nothing in is the sealed one. Fixtures are built in this block's own
+ * `beforeAll`, after every count assertion above has run.
+ */
+describe('a Warrant\'s Project anchors answer what the Project point route answers', () => {
+  let PROJECT_WARRANT: string;
+  let SEALED_PROJECT: string;
+  const SEALED_PROJECT_NAME = `parity sealed anchor project ${tag()}`;
+
+  /** Whether `GET /projects/{id}` answers 200 to this caller; a refusal is
+   * the concealed 404 and nothing else. */
+  const pointReads = async (who: Caller, projectId: string): Promise<boolean> => {
+    const answer = await call(who, 'GET', `/projects/${projectId}`);
+    if (answer.status !== 200) {
+      expect(`${who.label} project point read: ${answer.status}`).toBe(`${who.label} project point read: 404`);
+    }
+    return answer.status === 200;
+  };
+
+  beforeAll(async () => {
+    const sealed = await pool.query(
+      `INSERT INTO projects (name, status, visibility, owner_principal_id)
+       VALUES ($1, 'active', 'private', $2) RETURNING id`,
+      [SEALED_PROJECT_NAME, ROOT_PRINCIPAL],
+    );
+    SEALED_PROJECT = String(sealed.rows[0].id);
+    const warrant = await pool.query(
+      `INSERT INTO warrants (name, holder_principal_id, created_by_principal_id, ceiling_profile_version_id, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 day') RETURNING id`,
+      [`parity project warrant ${tag()}`, SESSION_USER.principalId, ROOT_PRINCIPAL, await makeCeilingVersion()],
+    );
+    PROJECT_WARRANT = String(warrant.rows[0].id);
+    for (const anchor of [SHARED_PROJECT, SEALED_PROJECT]) {
+      await pool.query(
+        `INSERT INTO warrant_anchors (warrant_id, anchor_type, anchor_id) VALUES ($1, 'project', $2)`,
+        [PROJECT_WARRANT, anchor],
+      );
+    }
+  });
+
+  it('the partition is real: root reads both Projects, the holder only the shared one (not vacuous)', async () => {
+    expect(`root reads shared: ${await pointReads(ROOT, SHARED_PROJECT)}`).toBe('root reads shared: true');
+    expect(`root reads sealed: ${await pointReads(ROOT, SEALED_PROJECT)}`).toBe('root reads sealed: true');
+    expect(`holder reads shared: ${await pointReads(SESSION_USER, SHARED_PROJECT)}`).toBe('holder reads shared: true');
+    expect(`holder reads sealed: ${await pointReads(SESSION_USER, SEALED_PROJECT)}`).toBe('holder reads sealed: false');
+  });
+
+  it('GET /warrants/{id}/linkage names a readable Project anchor and conceals an unreadable one', async () => {
+    const answer = await call(SESSION_USER, 'GET', `/warrants/${PROJECT_WARRANT}/linkage`);
+    expect(`linkage status: ${answer.status}`).toBe('linkage status: 200');
+    const byId = new Map((answer.json.anchors as Array<any>)
+      .filter((row) => row.anchorType === 'project')
+      .map((row) => [row.anchorId, row]));
+    // Structure stays: both anchors keep their type and id.
+    expect(`project anchors: ${[SHARED_PROJECT, SEALED_PROJECT].map((id) => byId.has(id)).join(',')}`)
+      .toBe('project anchors: true,true');
+    const sharedReadable = await pointReads(SESSION_USER, SHARED_PROJECT);
+    const sealedReadable = await pointReads(SESSION_USER, SEALED_PROJECT);
+    expect(`shared project anchor concealed: ${byId.get(SHARED_PROJECT).concealed}`)
+      .toBe(`shared project anchor concealed: ${!sharedReadable}`);
+    expect(`sealed project anchor concealed: ${byId.get(SEALED_PROJECT).concealed}`)
+      .toBe(`sealed project anchor concealed: ${!sealedReadable}`);
+    expect(`sealed project label: ${byId.get(SEALED_PROJECT).label}`).toBe('sealed project label: null');
+    expect(`sealed project status: ${byId.get(SEALED_PROJECT).status}`).toBe('sealed project status: null');
+    const text = JSON.stringify(answer.json);
+    expect(`sealed project name leaked: ${text.includes(SEALED_PROJECT_NAME)}`).toBe('sealed project name leaked: false');
+    // The readable anchor still carries the Project's own name and status.
+    const shared = await call(SESSION_USER, 'GET', `/projects/${SHARED_PROJECT}`);
+    expect(`shared project label: ${byId.get(SHARED_PROJECT).label}`)
+      .toBe(`shared project label: ${shared.json.project.name}`);
+    expect(`shared project status: ${byId.get(SHARED_PROJECT).status}`)
+      .toBe(`shared project status: ${shared.json.project.status}`);
+  });
+});
+
+/**
+ * -- OWNER RULING E338 (W62, option A): A TASK BRIEF SHOWS ITS PHASE ONLY TO A
+ *    CALLER THE PHASE POINT ROUTE ANSWERS ---------------------------------------
+ *
+ * A Task carries no goal of its own and inherits its Phase's, so a compiled
+ * Brief embeds the Phase's name, goal and description. Before E338 it did so
+ * for any caller who could read the Task, while the Phase lists, the Map and a
+ * Warrant's linkage concealed a Phase that caller could not read. The ruling:
+ * the Brief applies the same Phase read decision, and for a caller it refuses
+ * omits the name, goal and description and states only that the Task sits in
+ * a restricted Phase.
+ *
+ * The outside anchor is the point route, as everywhere in this file: whether a
+ * caller's Brief may show the Phase is read from `GET /phases/{id}` for that
+ * same caller, never recomputed. Every caller here holds `phases:read`, so the
+ * point route answers on object authority alone (200 or the concealed 404).
+ *
+ * The Phase is restricted and sits in the PRIVATE Project. Callers:
+ *  - a plain Account holding a read Grant on the Task only (the W62 case);
+ *  - a Connector whose chain holds the Task only, over REST and MCP;
+ *  - an Agent bound to a sibling Task, minted under a Warrant anchored to
+ *    that sibling, holding the Task by an explicit read rule, under a chain
+ *    that holds the Task only;
+ *  - a reader of the Project holding the Task too, at the task AND the
+ *    project altitude (reading the Project proves nothing about the Phase);
+ *  - the negative controls: an exact Phase grantee and root, who see the
+ *    Phase exactly as before; and an Agent BOUND to the Task under the same
+ *    Task-only chain. Its read defaults to its Task context - the bound Task,
+ *    that Task's Phase and its Project - on the acting identity alone (§8.2,
+ *    the `bound-task-context` arm of `sqlCondition`), so the Phase read
+ *    decision admits it: `GET /phases/{id}` answers it 200 and its Brief shows
+ *    the Phase. E338 applies the existing decision and adds no rule of its
+ *    own, so that is the asserted answer; whether the bound-task context
+ *    should stop at a restricted Phase is a separate question.
+ *
+ * Fixtures are built in this block's own `beforeAll`, after every count
+ * assertion above has run; the Task is untracked (outside `FIXTURES`).
+ */
+describe('a Task Brief shows its Phase only to a caller GET /phases/{id} answers (owner ruling E338)', () => {
+  const PHASE_NAME = `parity brief sealed phase ${tag()}`;
+  const PHASE_GOAL = `parity brief sealed goal ${tag()}`;
+  const PHASE_DESCRIPTION = `parity brief sealed description ${tag()}`;
+  const SECRETS = [PHASE_NAME, PHASE_GOAL, PHASE_DESCRIPTION];
+  const PHASE_SCOPES = [...SCOPES, 'phases:read'];
+  let SEALED: string;
+  let TASK: string;
+  let TASK_ONLY: Caller;
+  let TASK_CONNECTOR: Caller;
+  let SIBLING: string;
+  let RULE_AGENT: Caller;
+  let BOUND_AGENT: Caller;
+  let PROJECT_READER: Caller;
+  let PHASE_GRANTEE: Caller;
+
+  /** The sentence under test, read from the module that renders it. Required
+   * lazily so a build without it fails these cases, not the whole file. */
+  const notice = (): string => require('../utils/briefPhase').RESTRICTED_PHASE_NOTICE;
+
+  const grantRead = async (principalId: string, resourceType: 'task' | 'phase' | 'project', resourceId: string): Promise<void> => {
+    await pool.query(
+      `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+       VALUES ('principal', $1, $2, $3, 'read', $4)`,
+      [principalId, resourceType, resourceId, ROOT_PRINCIPAL],
+    );
+  };
+
+  /** A Warrant held by `holder`, anchored to `anchorTaskId`. */
+  const taskWarrant = async (holder: string, anchorTaskId: string): Promise<string> => {
+    const warrant = await pool.query(
+      `INSERT INTO warrants (name, holder_principal_id, created_by_principal_id, ceiling_profile_version_id, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 day') RETURNING id`,
+      [`parity brief warrant ${tag()}`, holder, ROOT_PRINCIPAL, await makeCeilingVersion()],
+    );
+    const id = String(warrant.rows[0].id);
+    await pool.query(`INSERT INTO warrant_anchors (warrant_id, anchor_type, anchor_id) VALUES ($1, 'task', $2)`, [id, anchorTaskId]);
+    return id;
+  };
+
+  /** An Agent as the mint writes it: bound to `boundTaskId`, parented by
+   * `connector`, carrying `objects` as its own object rules (none = the
+   * read-time bound-task default), minted under a Warrant its Account holds,
+   * anchored to the bound Task. */
+  const agentCaller = async (label: string, connector: Caller, accountId: string,
+    boundTaskId: string, objects: unknown[]): Promise<Caller> => {
+    const row = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, bound_task_id,
+                               own_expression, minted_under_warrant_id)
+       VALUES ('agent', $1, $1, 'active', $2, $3, $4::jsonb, $5) RETURNING id`,
+      [`parity-agent-${tag()}`, connector.principalId, boundTaskId,
+        JSON.stringify({ scopes: 'parent', objects }), await taskWarrant(accountId, boundTaskId)],
+    );
+    const principalId = String(row.rows[0].id);
+    const issued = await principalService.issueCredential({
+      principalId, scopes: ['tasks:read', 'phases:read'], transport: 'any',
+      expiresAt: new Date(Date.now() + 3600_000),
+    }, SYSTEM_ACTOR);
+    return { label, principalId, headers: { Authorization: `Bearer ${issued.fullKey}` } };
+  };
+
+  /** Whether `GET /phases/{id}` answers 200; a refusal is the concealed 404. */
+  const phasePointReads = async (who: Caller): Promise<boolean> => {
+    const answer = await call(who, 'GET', `/phases/${SEALED}`);
+    if (answer.status !== 200) {
+      expect(`${who.label} phase point read: ${answer.status}`).toBe(`${who.label} phase point read: 404`);
+    }
+    return answer.status === 200;
+  };
+
+  const leaked = (text: string): string => SECRETS.filter((secret) => text.includes(secret)).join(' | ');
+
+  const taskBrief = async (who: Caller, body: Record<string, unknown> = {}): Promise<Answer> => {
+    const answer = await call(who, 'POST', `/tasks/${TASK}/brief`, body);
+    expect(`${who.label} task brief: ${answer.status}`).toBe(`${who.label} task brief: 200`);
+    return answer;
+  };
+
+  /** One compiled Brief, judged against the point route for the same caller:
+   * shown in full when it reads the Phase, otherwise the sentence and the id
+   * and nothing of the name, goal or description, anywhere in the JSON. */
+  const expectPhaseAsPointRouteAnswers = async (who: Caller, answer: Answer, fields = SECRETS): Promise<void> => {
+    const readsPhase = await phasePointReads(who);
+    const text = JSON.stringify(answer.json);
+    const brief = String(answer.json?.brief ?? '');
+    if (readsPhase) {
+      expect(`${who.label} sees: ${fields.filter((secret) => brief.includes(secret)).length}`)
+        .toBe(`${who.label} sees: ${fields.length}`);
+      expect(`${who.label} told restricted: ${brief.includes(notice())}`).toBe(`${who.label} told restricted: false`);
+    } else {
+      expect(`${who.label} leaked: ${leaked(text)}`).toBe(`${who.label} leaked: `);
+      expect(`${who.label} told restricted: ${brief.includes(notice())}`).toBe(`${who.label} told restricted: true`);
+      expect(`${who.label} keeps the phase id: ${brief.includes(`"id": "${SEALED}"`) && brief.includes('"restricted": true')}`)
+        .toBe(`${who.label} keeps the phase id: true`);
+    }
+  };
+
+  beforeAll(async () => {
+    const phase = await pool.query(
+      `INSERT INTO phases (project_id, name, goal, description, position, restricted_access)
+       VALUES ($1, $2, $3, $4, 60, true) RETURNING id`,
+      [PRIVATE_PROJECT, PHASE_NAME, PHASE_GOAL, PHASE_DESCRIPTION],
+    );
+    SEALED = String(phase.rows[0].id);
+    TASK = await makeUntrackedTask('in the sealed brief phase', 'todo', PRIVATE_PROJECT);
+    await pool.query('UPDATE tasks SET phase_id = $1 WHERE id = $2', [SEALED, TASK]);
+
+    // W62 itself: a plain Account holding a read Grant on the Task and nothing else.
+    TASK_ONLY = await sessionCallerFor('task-only account', await makeAccount('human', 'user'));
+    await grantRead(TASK_ONLY.principalId, 'task', TASK);
+
+    // A Connector and two Agents whose chain holds the Task only. The Grant
+    // lands on both ends of the Connector chain (see `grantToChain`).
+    const taskAccount = await makeAccount('service', 'user');
+    TASK_CONNECTOR = await connectorCaller('task-only connector', taskAccount, PHASE_SCOPES);
+    for (const principalId of [taskAccount, TASK_CONNECTOR.principalId]) await grantRead(principalId, 'task', TASK);
+    SIBLING = await makeUntrackedTask('sibling outside the sealed phase', 'todo', PRIVATE_PROJECT);
+    RULE_AGENT = await agentCaller('agent holding the task by rule', TASK_CONNECTOR, taskAccount, SIBLING,
+      [{ resourceType: 'task', selectorForm: 'exact', selectorIds: [TASK], verbs: ['read'] }]);
+    BOUND_AGENT = await agentCaller('agent bound to the task', TASK_CONNECTOR, taskAccount, TASK, []);
+
+    // A reader of the private Project. The restricted Phase suppresses what
+    // the Project lends the Task too, so the Task needs its own Grant.
+    PROJECT_READER = await sessionCallerFor('project reader', await makeAccount('human', 'user'));
+    await grantRead(PROJECT_READER.principalId, 'project', PRIVATE_PROJECT);
+    await grantRead(PROJECT_READER.principalId, 'task', TASK);
+
+    // Negative control: an exact Phase grant reaches the restricted Phase.
+    PHASE_GRANTEE = await sessionCallerFor('phase grantee', await makeAccount('human', 'user'));
+    await grantRead(PHASE_GRANTEE.principalId, 'task', TASK);
+    await grantRead(PHASE_GRANTEE.principalId, 'phase', SEALED);
+  });
+
+  it('the partition is real: every caller reads the Task, and only the controls read the Phase (not vacuous)', async () => {
+    for (const who of [ROOT, TASK_ONLY, TASK_CONNECTOR, RULE_AGENT, PROJECT_READER, PHASE_GRANTEE, BOUND_AGENT]) {
+      expect(`${who.label} reads the task: ${(await call(who, 'GET', `/tasks/${TASK}`)).status}`)
+        .toBe(`${who.label} reads the task: 200`);
+    }
+    const reads = async (who: Caller): Promise<string> => `${who.label} reads the phase: ${await phasePointReads(who)}`;
+    for (const who of [ROOT, PHASE_GRANTEE, BOUND_AGENT]) expect(await reads(who)).toBe(`${who.label} reads the phase: true`);
+    for (const who of [TASK_ONLY, TASK_CONNECTOR, RULE_AGENT, PROJECT_READER]) {
+      expect(await reads(who)).toBe(`${who.label} reads the phase: false`);
+    }
+    expect(`project reader reads the project: ${(await call(PROJECT_READER, 'GET', `/projects/${PRIVATE_PROJECT}`)).status}`)
+      .toBe('project reader reads the project: 200');
+  });
+
+  it('POST /tasks/{id}/brief shows the Phase exactly when GET /phases/{id} answers the same caller', async () => {
+    for (const who of [TASK_ONLY, TASK_CONNECTOR, RULE_AGENT, PROJECT_READER, ROOT, PHASE_GRANTEE, BOUND_AGENT]) {
+      await expectPhaseAsPointRouteAnswers(who, await taskBrief(who));
+    }
+  });
+
+  it('the AGENTS.md shape conceals the same way', async () => {
+    for (const who of [TASK_ONLY, RULE_AGENT, ROOT]) {
+      await expectPhaseAsPointRouteAnswers(who, await taskBrief(who, { format: 'agentsmd' }));
+    }
+  });
+
+  it('relayhall_brief_compile (MCP, taskId) answers as the point route does for Connectors and Agents, in both formats', async () => {
+    const { toolByName } = require('../mcp/registry');
+    const tool = toolByName('relayhall_brief_compile');
+    for (const who of [TASK_CONNECTOR, RULE_AGENT, BOUND_AGENT]) {
+      const ctx = { authorization: who.headers.Authorization, toolName: 'relayhall_brief_compile' };
+      const readsPhase = await phasePointReads(who);
+      const detailed: string = await tool.handler({ taskId: TASK, response_format: 'detailed' }, ctx);
+      const concise: string = await tool.handler({ taskId: TASK }, ctx);
+      for (const [format, text] of [['detailed', detailed], ['concise', concise]]) {
+        if (readsPhase) {
+          expect(`${who.label} ${format} shows the name: ${text.includes(PHASE_NAME)}`)
+            .toBe(`${who.label} ${format} shows the name: true`);
+        } else {
+          expect(`${who.label} ${format} leaked: ${leaked(text)}`).toBe(`${who.label} ${format} leaked: `);
+          expect(`${who.label} ${format} told restricted: ${text.includes(notice())}`)
+            .toBe(`${who.label} ${format} told restricted: true`);
+        }
+      }
+    }
+  });
+
+  it('POST /projects/{id}/brief with the taskId conceals the Phase from a Project reader, and shows it to root', async () => {
+    for (const who of [PROJECT_READER, ROOT]) {
+      const answer = await call(who, 'POST', `/projects/${PRIVATE_PROJECT}/brief`, { taskId: TASK });
+      expect(`${who.label} project brief: ${answer.status}`).toBe(`${who.label} project brief: 200`);
+      // The project altitude renders the Phase's name and goal (never its description).
+      await expectPhaseAsPointRouteAnswers(who, answer, [PHASE_NAME, PHASE_GOAL]);
+      expect(`${who.label} project brief carries the description: ${JSON.stringify(answer.json).includes(PHASE_DESCRIPTION)}`)
+        .toBe(`${who.label} project brief carries the description: false`);
+    }
+  });
+
+  it('the session and phase altitudes carry nothing of the Phase to a caller who cannot read it', async () => {
+    const session = await call(RULE_AGENT, 'POST', '/principals/me/brief', {});
+    expect(`agent session brief: ${session.status}`).toBe('agent session brief: 200');
+    expect(`agent session brief leaked: ${leaked(JSON.stringify(session.json))}`).toBe('agent session brief leaked: ');
+    for (const who of [TASK_ONLY, RULE_AGENT]) {
+      const phaseBrief = await call(who, 'POST', `/phases/${SEALED}/brief`, {});
+      expect(`${who.label} phase brief: ${phaseBrief.status}`).toBe(`${who.label} phase brief: 404`);
+      expect(`${who.label} phase brief leaked: ${leaked(JSON.stringify(phaseBrief.json))}`).toBe(`${who.label} phase brief leaked: `);
+    }
   });
 });

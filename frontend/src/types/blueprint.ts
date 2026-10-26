@@ -36,6 +36,8 @@ export interface BlueprintPlanData {
   authority: { operation: string; scope: string; allowed: boolean; localKey?: string; resourceId?: string; principalIds?: string[] }[];
   humanGates: (Record<string, unknown> & { key: string; disposition: string; allParked: boolean })[];
   refusals: { code: string; error: string; field: string }[];
+  /** Owner ruling E462 S4b: present when no Task in the chain is verified. */
+  warnings?: { code: string; message: string }[];
   counts: Record<string, number>; parameterValues: Record<string, BlueprintValue>;
 }
 export interface BlueprintRequest {

@@ -37,8 +37,8 @@
  *
  * The DATABASE is written to and must be disposable — same contract as the gate
  * it drives (`src/__tests__/sessionTouchBurst.test.ts`). Every file it touches
- * is restored, including on failure. Developer tool, not a CI step: never point
- * it at a tree with uncommitted work you care about.
+ * is restored, including on failure. The full tier runs it in a throwaway checkout (job drill_controls, machinery queue 9b761f09);
+ * locally, never point it at a tree with uncommitted work you care about.
  */
 import { spawnSync } from 'child_process';
 import {
@@ -49,9 +49,28 @@ import {
   classifyJestRun,
   drillWith,
 } from '../src/__tests__/support/mutationDrill';
+import { databasePoolConfig } from '../src/db/connection';
 
 const WRITER = 'src/db/boundedPresenceWrites.ts';
 const SESSIONS = 'src/services/LoginSessionService.ts';
+
+/**
+ * M8's write delay, DERIVED from the acquisition deadline the gate runs with
+ * (machinery queue 9b761f09), never a literal. The 0.6 s it carried was
+ * measured against a 2 s deadline (0.2 s reddened 2 runs of 3, 0.6 s 4 of 4):
+ * a ratio of 0.3. Card 590e88cc raised the shipped deadline to 15 s, and 0.6 s
+ * stopped reaching the refusal (0 of 2 on 20 Oct 2026, and 2 s 0 of 2), while
+ * the same ratio (4.5 s) reddened it 2 of 2, so the drill now reads the
+ * deadline from the pool configuration and keeps the measured ratio.
+ */
+const M8_DEADLINE_RATIO = 0.3;
+const M8_SLEEP_SECONDS = (() => {
+  const deadline = Number(databasePoolConfig.connectionTimeoutMillis);
+  if (!Number.isFinite(deadline) || deadline <= 0) {
+    throw new Error('the pool configuration names no acquisition deadline: M8 has nothing to measure against');
+  }
+  return (M8_DEADLINE_RATIO * deadline) / 1000;
+})();
 const PASSWORDS = 'src/services/AccountPasswordService.ts';
 
 /** Both controls: the unit suite that measures the decisions, and the gate that
@@ -125,7 +144,8 @@ const MUTATIONS: Mutation[] = [
       + 'teeth while keeping the gate a contention test rather than a load test. THE DELAY WAS '
       + 'MEASURED, not guessed: at 0.2s the refusal appeared in 2 runs of 3, which is a flaky '
       + 'control and worth no more than no control at all; at 0.6s it appeared in 4 of 4. A red '
-      + 'proof that only sometimes goes red proves only that it sometimes goes red',
+      + 'proof that only sometimes goes red proves only that it sometimes goes red. The delay '
+      + 'is now that measured fraction of the SHIPPED acquisition deadline (M8_SLEEP_SECONDS)',
     file: SESSIONS,
     find: `    return presenceWriter.submit(
       \`session:\${sessionId}\`,
@@ -135,7 +155,7 @@ const MUTATIONS: Mutation[] = [
     replace: `    void sessionTouchThrottleMs();
     void presenceWriter;
     pool
-      .query('UPDATE auth_sessions SET last_seen_at = (SELECT now() FROM pg_sleep(0.6)) WHERE id = $1', [sessionId])
+      .query('UPDATE auth_sessions SET last_seen_at = (SELECT now() FROM pg_sleep(${M8_SLEEP_SECONDS})) WHERE id = $1', [sessionId])
       .catch(() => undefined);
     return true;`,
     expects: ['answers every request'],

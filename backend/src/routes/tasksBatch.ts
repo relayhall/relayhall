@@ -17,7 +17,9 @@ import { normalizeTaskNotesWrite, sendTaskFieldRefusal } from '../utils/taskWrit
 
 const router = Router();
 
-const ALLOWED_FIELDS = ['status', 'priority', 'project', 'autoStart', 'tags', 'notes', 'blockedReason'] as const;
+// Exported for the schema-wide Task column contract (card c3880767): every
+// batch field is a public request key.
+export const ALLOWED_FIELDS = ['status', 'priority', 'project', 'autoStart', 'tags', 'notes', 'blockedReason'] as const;
 
 const batchSchema = {
   ids: { type: 'array' as const, required: true, itemsType: 'string' as const },

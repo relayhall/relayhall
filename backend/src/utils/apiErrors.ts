@@ -15,6 +15,18 @@ export interface ApiErrorBody {
   details?: unknown;  // e.g. field-level validation errors
 }
 
+/**
+ * The `details` a refusal carries when the scope(s) it found missing are known:
+ * `{ requiredScopes }`, or `undefined` when the error names none. Handler-level
+ * scope refusals (a thrown error that carries `requiredScopes`) go through this
+ * so every route spells the field the same way as the route ceiling does.
+ */
+export function requiredScopesDetail(error: unknown): { requiredScopes: string[] } | undefined {
+  const scopes = (error as { requiredScopes?: unknown } | null | undefined)?.requiredScopes;
+  if (!Array.isArray(scopes) || scopes.length === 0) return undefined;
+  return { requiredScopes: scopes.filter((scope): scope is string => typeof scope === 'string') };
+}
+
 export function sendApiError(
   res: Response,
   status: number,

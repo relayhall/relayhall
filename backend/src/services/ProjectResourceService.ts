@@ -67,6 +67,9 @@ export class ResourceContractError extends Error {
     public readonly code: string,
     message: string,
     public readonly field?: string,
+    /** The scope(s) a missing-scope refusal found absent; the route serialises
+     * them as `details.requiredScopes`. Set by no other refusal. */
+    public readonly requiredScopes?: readonly string[],
   ) {
     super(message);
     this.name = 'ResourceContractError';
@@ -709,6 +712,48 @@ export class ProjectResourceService {
     } finally {
       client.release();
     }
+  }
+
+  /** Bounded orientation projection. Reuses the same typed detail allowlist
+   * as context(), but includes the description of available resources only.
+   * Round-robin by kind keeps a primary repository and an environment in the
+   * first window even when one kind has many alphabetically earlier rows. */
+  async awarenessContext(projectId: string): Promise<{
+    resources: Array<{ id: string; kind: ResourceKind; name: string; description: string | null; details: Record<string, unknown> }>;
+    availableTotal: number;
+  }> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const project = await client.query('SELECT id, status FROM projects WHERE id = $1 FOR SHARE', [projectId]);
+      if (!project.rows.length) throw err(404, 'PROJECT_NOT_FOUND', 'Project not found');
+      if (project.rows[0].status === 'archived') throw err(409, 'PROJECT_ARCHIVED', 'Archived projects generate no context');
+      const count = await client.query(
+        "SELECT count(*)::int AS count FROM project_resources WHERE project_id = $1 AND state = 'active' AND agent_visibility = 'available'", [projectId]);
+      const rows = await client.query(
+        `SELECT * FROM (
+          SELECT project_resources.*,
+            row_number() OVER (
+              PARTITION BY kind
+              ORDER BY CASE WHEN kind = 'repository' AND details->>'role' = 'primary' THEN 0 ELSE 1 END,
+                normalized_name, id
+            ) AS awareness_kind_rank
+          FROM project_resources
+          WHERE project_id = $1 AND state = 'active' AND agent_visibility = 'available'
+        ) ranked
+        ORDER BY awareness_kind_rank,
+          CASE kind WHEN 'repository' THEN 0 WHEN 'environment' THEN 1 WHEN 'workspace' THEN 2 ELSE 3 END,
+          normalized_name, id LIMIT 6`, [projectId]);
+      const resources = rows.rows.map((row: any) => {
+        const resource = mapRow(row);
+        return { id: resource.id, kind: resource.kind, name: resource.name, description: resource.description, details: this.projectDetails(resource) };
+      });
+      await client.query('COMMIT');
+      return { resources, availableTotal: Number(count.rows[0]?.count ?? 0) };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
   }
 
   /**

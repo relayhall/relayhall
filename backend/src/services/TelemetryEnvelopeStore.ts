@@ -44,6 +44,7 @@ import {
   type TelemetryAttributeProfile,
   type TelemetryPolicyOptions,
   type TelemetryRedactionCounts,
+  type TelemetryTier0Record,
 } from './TelemetryPolicyEngine';
 import {
   TELEMETRY_RAW_BLOB_CTE,
@@ -57,9 +58,16 @@ export type TelemetryEnvelopeStoreOutcome =
       duplicate: boolean;
       eventId: string | null;
       identityKey: string;
-      identityArm: 'event_id' | 'stream_sequence';
+      identityArm: 'event_id' | 'stream_sequence' | 'content_hash';
       sessionRef: string | null;
       counts: TelemetryRedactionCounts;
+      /**
+       * The record as STORED (or, for a duplicate, as it would have been
+       * stored). Returned so a caller can see what was actually carried — the
+       * OTLP receiver counts a producer attribute as carried only when the
+       * field it was mapped to is present HERE.
+       */
+      record: TelemetryTier0Record;
       /**
        * The §6.5.1 governed raw blob this call WROTE, or null when the event
        * was a duplicate and therefore stored none. Never the key of a blob
@@ -88,6 +96,57 @@ export interface TelemetryEnvelopeStoreOptions {
   observedAt?: Date;
   /** A certified adapter profile: key -> the value class it is certified for (§4.5). */
   attributeAllowlist?: TelemetryAttributeProfile;
+  /**
+   * `content_hash`: the record carries no source identity and its §4.3 key is
+   * derived from the record AS STORED, by `telemetryRecordIdentity`, AFTER the
+   * policy stage (the OTLP receivers, card `dac2ca71`). Absent: the native
+   * contract, unchanged.
+   */
+  identity?: 'source' | 'content_hash';
+}
+
+/**
+ * §4.3 CONTENT-HASH IDENTITY, derived from the BUILT RECORD and nothing else
+ * (the first terminating shape of evidence `aec6ab9f` §14).
+ *
+ * Three review rounds of TW1b candidate A found the same invariant broken three
+ * ways — a raw attribute map, a raw scope name, and raw enum numbers, each
+ * passed into the identity as a "structural part" while the translation
+ * dropped the value. Every one of them arrived through a PARAMETER. This
+ * function has no such parameter: it takes the Tier-0 record the policy engine
+ * BUILT — the very value that is serialized into `session_events.payload` — so
+ * a value the translation or the policy dropped is, by construction, not in
+ * its input. The invariant holds by the signature, not by every call site
+ * remembering it.
+ *
+ * WHAT IS EXCLUDED, AND WHY — the only four parts of the stored record that
+ * are not facts about the event:
+ *   - `observed_at`: the RECEIVER's clock; a re-sent record must dedupe;
+ *   - `event_id`: null on this arm (the store never invents a source id);
+ *   - `source.raw_ref`: the governed blob pointer, assigned after this key;
+ *   - `content.redactions` and `policy`: COUNTS of what was dropped and the
+ *     policy's own version/pepper id. The counts are derived from DROPPED
+ *     values, so including them would let a dropped value move the identity —
+ *     the exact defect this function exists to make unrepresentable.
+ *
+ * THE CAVEAT §4.3 NAMES, stated: two events whose STORED records are equal
+ * get one identity, and the second is reported as a duplicate. For spans that
+ * cannot happen in practice (their W3C trace and span ids are stored raw and
+ * are part of the record); for log records and metric points it means two
+ * records identical in every carried field — including their source timestamp —
+ * are counted once, as a duplicate, never lost silently.
+ */
+export function telemetryRecordIdentity(
+  connectorId: string,
+  record: TelemetryTier0Record,
+): { key: string; digest: string } {
+  const { observed_at: _observedAt, event_id: _eventId, policy: _policy, ...facts } = record;
+  const digest = canonicalPayloadHash({
+    ...facts,
+    source: { ...facts.source, raw_ref: null },
+    content: { ...facts.content, redactions: [] },
+  });
+  return { key: `rh.telemetry/1|${connectorId}|${record.source.product}|rec|${digest}`, digest };
 }
 
 export class TelemetryEnvelopeStore {
@@ -111,12 +170,16 @@ export class TelemetryEnvelopeStore {
     options: TelemetryEnvelopeStoreOptions = {},
   ): Promise<TelemetryEnvelopeStoreOutcome> {
     // 1 — VALIDATE
-    const validation = validateTelemetryEnvelope(input);
+    const contentHashIdentity = options.identity === 'content_hash';
+    const validation = validateTelemetryEnvelope(
+      input, { identity: contentHashIdentity ? 'content_hash' : 'source' });
     if (!validation.ok) return failure(validation);
     const envelope: TelemetryEnvelope = validation.envelope;
 
-    // 2 — DEDUPE KEY (connector-namespaced, §4.3)
-    const identity = telemetryEventIdentityKey(binding.connectorId, envelope);
+    // 2 — DEDUPE KEY (connector-namespaced, §4.3). The source arms key on the
+    // validated record, as TW1a froze them; the content-hash arm cannot be
+    // computed until the policy has BUILT the record, so it waits for step 3.
+    const sourceIdentity = contentHashIdentity ? null : telemetryEventIdentityKey(binding.connectorId, envelope);
 
     // 3 — REDACT (tier-gated; tiers 1 and 2 refuse, TS-5 / D9)
     const policyOptions: TelemetryPolicyOptions = {
@@ -132,6 +195,8 @@ export class TelemetryEnvelopeStore {
       }
       throw err;
     }
+    const identity = sourceIdentity
+      ?? { key: telemetryRecordIdentity(binding.connectorId, policy.record).key, arm: 'content_hash' as const };
 
     // 4 — CONTENT-ADDRESS THE REDACTED PAYLOAD (§6.5.1), THEN STORE, IN ONE
     // STATEMENT — with the EVENT deciding whether the blob is written at all.
@@ -215,6 +280,7 @@ export class TelemetryEnvelopeStore {
       identityArm: identity.arm,
       sessionRef: policy.sessionRef,
       counts: policy.counts,
+      record,
       rawRef: row.raw_ref,
     };
   }

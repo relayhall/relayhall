@@ -1,5 +1,10 @@
-import { filterAuthorizedResources, pointAuthorizationTarget } from '../middleware/sharedAuthorization';
+import {
+  evaluateSurfaceStage, filterAuthorizedResources, pointAuthorizationTarget, sharedAuthorizationMiddleware,
+} from '../middleware/sharedAuthorization';
 import { authorizationRepository } from '../services/AuthorizationRepository';
+import { authorizationService } from '../services/AuthorizationService';
+import { accessSurfaceService } from '../services/AccessSurfaceService';
+import { requiredScopeFor, scopesNamedByDenial } from '../utils/scopeMap';
 
 describe('pointAuthorizationTarget', () => {
   it('classifies point reads and mutations across grantable route families', () => {
@@ -137,5 +142,156 @@ describe('pointAuthorizationTarget', () => {
       'read',
     );
     authorizedIds.mockRestore();
+  });
+});
+
+/**
+ * Candidate A correction round (card f3b12d31, review of 24986997..8975606).
+ *
+ * The route ceiling refused with a bare FORBIDDEN for every cause, so the MCP
+ * layer could not tell a credential that lacks a scope from a caller refused for
+ * role or ownership - and a day-one credential without `principals:read` was no
+ * longer told which scope it lacked. The ceiling already KNOWS which it is
+ * (`authorizeRoute().denial`), so it now says so as data: `details.requiredScopes`
+ * on the SCOPE_CEILING refusal and on nothing else. Status, code and text are
+ * unchanged in every case.
+ */
+describe('the route ceiling names the scope it checked, and only when the scope is the reason', () => {
+  const BARE = 'This identity is not authorized for the requested operation';
+
+  afterEach(() => jest.restoreAllMocks());
+
+  function reply() {
+    const res: any = {
+      statusCode: null as number | null,
+      body: null as any,
+      status(code: number) { res.statusCode = code; return res; },
+      json(payload: unknown) { res.body = payload; return res; },
+    };
+    return res;
+  }
+
+  async function ask(method: string, path: string, who: { role: string; scopes: string[] | null }) {
+    const req: any = {
+      method, path, baseUrl: '', body: {}, userId: 'service-one', authMethod: 'api_key',
+      principal: { id: '88888888-8888-4888-8888-888888888888', role: who.role },
+      scopes: who.scopes,
+    };
+    const res = reply();
+    const next = jest.fn();
+    await sharedAuthorizationMiddleware(req, res, next);
+    return { res, next };
+  }
+
+  // The exemplar route was `POST /principals/me/brief` until card 1118fefa
+  // moved that ceiling to `authenticated`; from then on it is no example of a
+  // scope-gated route, and the controls below would pass for the wrong reason.
+  // `GET /principals` is the same family at the SAME unchanged ceiling.
+  it('answers a credential that lacks the route scope with the scope the ceiling checked', async () => {
+    // The premise, asserted rather than assumed: this is the route's own scope.
+    expect(requiredScopeFor('GET', '/principals')).toBe('principals:read');
+    const { res, next } = await ask('GET', '/principals', { role: 'agent', scopes: ['tasks:read'] });
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual({
+      success: false, error: BARE, code: 'FORBIDDEN', message: BARE,
+      details: { requiredScopes: ['principals:read'] },
+    });
+  });
+
+  it('names what the ROUTE needs, never what the credential holds', async () => {
+    const { res } = await ask('GET', '/principals', { role: 'agent', scopes: ['tasks:read', 'reports:read'] });
+    // Not vacuous: the request WAS refused, so there was a body to leak into.
+    expect(res.statusCode).toBe(403);
+    expect(JSON.stringify(res.body)).not.toMatch(/tasks:read|reports:read/);
+  });
+
+  it('names nothing when the credential holds the scope: the request moves on', async () => {
+    const { res, next } = await ask('GET', '/principals', { role: 'agent', scopes: ['principals:read'] });
+    expect(res.statusCode).toBeNull();
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('card 1118fefa: the SESSION brief is a self-identity ceiling - any credential reaches its own', async () => {
+    // The one moved row, pinned in both directions. A four-scope task worker
+    // and a credential with NO scopes both pass the ceiling for their OWN
+    // session brief (what the payload encloses is the compiler's decision,
+    // pinned in c4SessionBrief); the directory beside it still refuses them.
+    expect(requiredScopeFor('POST', '/principals/me/brief')).toBe('authenticated');
+    for (const scopes of [['tasks:read', 'tasks:write', 'reports:read', 'reports:write'], []]) {
+      const own = await ask('POST', '/principals/me/brief', { role: 'agent', scopes });
+      expect([scopes.join(','), own.res.statusCode, own.next.mock.calls.length]).toEqual([scopes.join(','), null, 1]);
+      const directory = await ask('GET', '/principals', { role: 'agent', scopes });
+      expect([scopes.join(','), directory.res.statusCode, directory.res.body?.details])
+        .toEqual([scopes.join(','), 403, { requiredScopes: ['principals:read'] }]);
+    }
+    // A missing scope set is still not an identity: it fails closed.
+    const unset = await ask('POST', '/principals/me/brief', { role: 'agent', scopes: null });
+    expect(unset.res.statusCode).toBe(403);
+    expect(unset.next).not.toHaveBeenCalled();
+  });
+
+  it('stays bare for a ROLE ceiling, even though the scope is also absent', async () => {
+    expect(requiredScopeFor('DELETE', '/tasks/abc12345')).toBe('tasks:admin');
+    const { res } = await ask('DELETE', '/tasks/abc12345', { role: 'agent', scopes: ['tasks:read'] });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual({ success: false, error: BARE, code: 'FORBIDDEN', message: BARE });
+  });
+
+  it('stays bare for an unmapped (root) route', async () => {
+    const unmapped = '/no-such-route-family';
+    expect(requiredScopeFor('GET', unmapped)).toBe('root');
+    jest.spyOn(accessSurfaceService, 'listSurfaces').mockResolvedValue([]);
+    const { res } = await ask('GET', unmapped, { role: 'admin', scopes: ['tasks:read'] });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual({ success: false, error: BARE, code: 'FORBIDDEN', message: BARE });
+  });
+
+  it('stays bare when the ceiling gave no reason (a caller that passes none)', async () => {
+    const req: any = { method: 'GET', path: '/principals', baseUrl: '', userId: 'service-one', scopes: [] };
+    const res = reply();
+    expect(await evaluateSurfaceStage(req, res, '/principals', 'principals:read')).toBe(false);
+    expect(res.body).toEqual({ success: false, error: BARE, code: 'FORBIDDEN', message: BARE });
+
+    jest.spyOn(authorizationService, 'authorizeRoute').mockReturnValue({ allowed: false });
+    const bare = await ask('GET', '/principals', { role: 'agent', scopes: ['tasks:read'] });
+    expect(bare.res.body).toEqual({ success: false, error: BARE, code: 'FORBIDDEN', message: BARE });
+  });
+
+  it('never names the sentinels: `authenticated` is not a scope a credential can carry', async () => {
+    const req: any = { method: 'GET', path: '/x', baseUrl: '', userId: 'service-one', scopes: null };
+    const res = reply();
+    expect(await evaluateSurfaceStage(req, res, '/x', 'authenticated', 'SCOPE_CEILING')).toBe(false);
+    expect(res.body).toEqual({ success: false, error: BARE, code: 'FORBIDDEN', message: BARE });
+  });
+});
+
+/**
+ * The rule the ceiling above and every handler-level scope refusal share
+ * (card fbeb86f1): a refusal may name a scope only when the absence of that
+ * scope is the whole reason, and what it names is the requirement.
+ */
+describe('scopesNamedByDenial: the one rule for when a refusal may name a scope', () => {
+  it('names the required scope for the scope-ceiling denial and nothing else', () => {
+    expect(scopesNamedByDenial('blueprints:use', 'SCOPE_CEILING')).toEqual(['blueprints:use']);
+    for (const denial of ['ROLE_CEILING', 'UNAUTHENTICATED', 'NO_AUTHORITY', 'NOT_FOUND', 'SOMETHING_ELSE', undefined]) {
+      expect(scopesNamedByDenial('blueprints:use', denial)).toBeUndefined();
+    }
+  });
+
+  it('never names the sentinels, whatever the denial says', () => {
+    expect(scopesNamedByDenial('root', 'SCOPE_CEILING')).toBeUndefined();
+    expect(scopesNamedByDenial('authenticated', 'SCOPE_CEILING')).toBeUndefined();
+  });
+
+  it('agrees with the authorizer on what is a scope-ceiling denial', () => {
+    const lacking: any = { principalId: 'p', handle: 'h', role: 'agent', scopes: ['tasks:read'], authenticated: true };
+    const decision = authorizationService.authorizeRoute(lacking, 'reports:read');
+    expect(decision.allowed).toBe(false);
+    expect(scopesNamedByDenial('reports:read', decision.denial)).toEqual(['reports:read']);
+    const viewer: any = { ...lacking, role: 'viewer', scopes: null };
+    const roleDecision = authorizationService.authorizeRoute(viewer, 'tasks:write');
+    expect(roleDecision.denial).toBe('ROLE_CEILING');
+    expect(scopesNamedByDenial('tasks:write', roleDecision.denial)).toBeUndefined();
   });
 });

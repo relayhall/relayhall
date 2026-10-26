@@ -38,7 +38,6 @@ RFC1918_FIXTURE_PATHS = {
     "backend/src/__tests__/loginRateLimit.test.ts",
     "backend/src/__tests__/pluginProxyAuthorization.test.ts",
     "backend/src/middleware/loginRateLimit.ts",
-    "docs/design-history/acp-integration-design.md",
     # This scanner's own generic RFC1918 range constants (nothing else in the
     # file is deployment-specific — the deployment pattern set is external).
     "scripts/check-public-residue.py",

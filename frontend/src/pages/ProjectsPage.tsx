@@ -1,8 +1,12 @@
 import { authenticatedFetch } from '../utils/auth';
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AlertTriangle, Folder, Lock, Plus, Search, SlidersHorizontal } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Project, CreateProjectInput } from '../types/project';
+import { Project, CreateProjectInput, OwnerGroupChoice } from '../types/project';
+import { useMyPrincipal } from '../hooks/usePrincipals';
+import { mayChangeRoles } from '../utils/administratorSession';
+import { useStepUpRetry } from '../components/access/useStepUpRetry';
+import { sendWithStepUpRetry } from '../utils/stepUpChallenge';
 import { ProjectCard } from '../components/projects/ProjectCard';
 import { CreateProjectModal } from '../components/projects/CreateProjectModal';
 import { ProjectDetailModal } from '../components/projects/ProjectDetailModal';
@@ -21,13 +25,23 @@ export const ProjectsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  // AZ-A12 clauses 10(b) and 12: the create form's Group owner selector, for
+  // root and administrator sessions only (the deciders of a Group transfer).
+  const { me, scopes } = useMyPrincipal();
+  const mayChooseGroupOwner = mayChangeRoles(me?.role ?? null, scopes);
+  const [ownerGroups, setOwnerGroups] = useState<OwnerGroupChoice[]>([]);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const { askForToken: askForOwnerToken, retryDialog: ownerStepUpDialog } = useStepUpRetry(
+    'Confirm it is you to create this Project owned by the selected Group.');
+  const { askForToken: askForRetryToken, retryDialog: retryStepUpDialog } = useStepUpRetry();
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const fetchGeneration = useRef(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<SortOption>('activity');
   const [showFilters, setShowFilters] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string[]>(['active']);
   const [showSecretProjects, setShowSecretProjects] = useState(false);
-  const { subscribe } = useWebSocket();
+  const { subscribe, connected } = useWebSocket();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   
@@ -74,25 +88,44 @@ export const ProjectsPage: React.FC = () => {
     }
   }, [projects, searchParams]);
   
-  const fetchProjects = async () => {
+  const fetchProjects = useCallback(async () => {
+    const generation = ++fetchGeneration.current;
     try {
       // includeArchived: the API's default listing excludes archived projects,
       // but this page has an "archived" status filter that must show them.
       const response = await authenticatedFetch(`${API_BASE_URL}/projects?includeStats=true&includeHidden=true&includeArchived=true`);
       const data = await response.json();
-      if (data.success) {
+      if (generation !== fetchGeneration.current) return;
+      if (data.success && Array.isArray(data.projects)) {
         setProjects(data.projects);
+        setSelectedProject(previous => previous
+          ? data.projects.find((item: Project) => item.id === previous.id) ?? null
+          : null);
         setError(null);
       } else {
+        setProjects([]);
+        setSelectedProject(null);
         setError(data.error || 'Failed to load projects');
       }
     } catch (err) {
+      if (generation !== fetchGeneration.current) return;
       if (!isIntentionalAbort(err)) console.error('Failed to fetch projects:', err);
+      setProjects([]);
+      setSelectedProject(null);
       setError('Failed to connect to server');
     } finally {
-      setLoading(false);
+      if (generation === fetchGeneration.current) setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribe('project.authority_changed', () => { void fetchProjects(); });
+    const onFocus = () => { void fetchProjects(); };
+    if (typeof window === 'undefined') return;
+    window.addEventListener('focus', onFocus);
+    return () => { unsubscribe(); window.removeEventListener('focus', onFocus); };
+  }, [subscribe, fetchProjects]);
+  useEffect(() => { if (connected) void fetchProjects(); }, [connected, fetchProjects]);
   
   // Filter and sort projects
   useEffect(() => {
@@ -143,17 +176,57 @@ export const ProjectsPage: React.FC = () => {
     setFilteredProjects(filtered);
   }, [projects, searchQuery, sortBy, statusFilter, showSecretProjects]);
   
+  useEffect(() => {
+    if (!showCreateModal || !mayChooseGroupOwner) { setOwnerGroups([]); return; }
+    let active = true;
+    (async () => {
+      try {
+        const response = await authenticatedFetch(`${API_BASE_URL}/groups`);
+        const data = await response.json().catch(() => null);
+        if (!active || !response.ok || !Array.isArray(data?.groups)) return;
+        const enabled = (data.groups as Array<{ id: string; name: string; featured?: boolean; ownershipStatus?: string | null }>)
+          .filter(group => group.ownershipStatus === 'active')
+          .map(group => ({ id: group.id, name: group.name, featured: Boolean(group.featured) }))
+          .sort((a, b) => Number(b.featured) - Number(a.featured) || a.name.localeCompare(b.name));
+        setOwnerGroups(enabled);
+      } catch {
+        if (active) setOwnerGroups([]);
+      }
+    })();
+    return () => { active = false; };
+  }, [showCreateModal, mayChooseGroupOwner]);
+
   const handleCreateProject = async (projectData: CreateProjectInput) => {
+    setCreateError(null);
     try {
-      const response = await authenticatedFetch(`${API_BASE_URL}/projects`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(projectData)
-      });
-      const data = await response.json();
-      if (data.success) {
+      const { ownerGroupId, ...fields } = projectData;
+      let data: any;
+      if (ownerGroupId) {
+        // AZ-A12 clause 10(b): create + transfer in one transaction, with a
+        // step-up bound to (ownership.transfer, the id allocated here).
+        const projectId = crypto.randomUUID();
+        const binding = { action: 'ownership.transfer', targetId: projectId };
+        const token = await askForOwnerToken(binding);
+        if (!token) return;
+        const send = (stepUpToken: string) => authenticatedFetch(`${API_BASE_URL}/projects`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...fields, ownerPrincipalId: ownerGroupId, projectId, stepUpToken }),
+        });
+        data = (await sendWithStepUpRetry(send, token, binding, askForRetryToken)).body;
+      } else {
+        const response = await authenticatedFetch(`${API_BASE_URL}/projects`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fields)
+        });
+        data = await response.json();
+      }
+      if (data?.success) {
         setProjects([...projects, data.project]);
         setShowCreateModal(false);
+      } else if (ownerGroupId) {
+        setCreateError(typeof data?.message === 'string' ? data.message : 'The Project could not be created.');
       }
     } catch (error) {
       console.error('Failed to create project:', error);
@@ -321,11 +394,15 @@ export const ProjectsPage: React.FC = () => {
       {/* Create Modal */}
       {showCreateModal && (
         <CreateProjectModal
-          onClose={() => setShowCreateModal(false)}
+          onClose={() => { setShowCreateModal(false); setCreateError(null); }}
           onCreate={handleCreateProject}
+          ownerGroups={ownerGroups}
+          submitError={createError}
         />
       )}
-      
+      {ownerStepUpDialog}
+      {retryStepUpDialog}
+
       {/* Detail Modal */}
       {selectedProject && (
         <ProjectDetailModal

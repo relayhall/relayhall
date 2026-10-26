@@ -74,13 +74,11 @@ expect them to move:
 - **Personality versions** — immutable versions so a Blueprint reference stays
   stable. A second review round is owed.
 
-**Planned, and not in this release.** The three lenses interface for delegated
-group administration; outbound telemetry export and OTLP receivers; the
-knowledge broker's federated fan-out query; the messaging gateway; Map hover
-linking, a resizable split and a project grouping layer; the settings matrix
-follow-on. The full list, with the identifier tracking each item, is in
-[What is in this beta](#what-is-in-this-beta) and in
-[CHANGELOG.md](CHANGELOG.md).
+**Planned, and not in this release.** Outbound telemetry export; the
+knowledge broker's federated fan-out query; the messaging gateway; a project
+grouping layer; the settings matrix follow-on. The full list, with the
+identifier tracking each item, is in [What is in this
+beta](#what-is-in-this-beta) and in [CHANGELOG.md](CHANGELOG.md).
 
 **Found a problem?** Open an issue at
 [github.com/relayhall/relayhall/issues](https://github.com/relayhall/relayhall/issues)
@@ -165,7 +163,9 @@ with their own credentials and security boundaries.
 - Brief compilation for external harnesses
 - Authenticated REST/OpenAPI and WebSocket surfaces
 - Sessions and Stats as always-on surfaces that render a documented empty
-  state: no reporter ships in core, and the board never reads harness state
+  state: no reporter ships in core, and the board never reads harness state —
+  a Connector that declared a telemetry tier and works through the board's
+  MCP server appears there from its own tool calls
 - PostgreSQL migrations, backup/restore helpers, and a self-contained Compose
   deployment
 
@@ -184,7 +184,7 @@ always written in full. See [docs/terminology.md](docs/terminology.md).
 ### Requirements
 
 - Linux host with Docker Engine
-- Docker Compose v2.20 or newer
+- Docker Compose v2.24 or newer
 - OpenSSL
 - Git
 - 2 GB RAM and one CPU core for a small installation
@@ -204,6 +204,32 @@ secret. It also asks for a break-glass dashboard password: it is read without
 echo, hashed immediately, and only the **hash** is written into `.env` — the
 plaintext is passed to the hashing container as an environment variable and is
 never persisted by the script.
+
+It also generates the backend's four key sets (credential secrets, telemetry
+pseudonyms, knowledge result links, knowledge assertions) into
+`relayhall.keys.env`, once: running it again never changes a key that exists.
+**Back up `relayhall.keys.env` with the database**, stored apart from the dumps;
+a database restored without its keys cannot read its credential secrets. See
+[Key sets](DEPLOYMENT.md#key-sets).
+
+It asks for the public address too: the host name, scheme and port people's
+browsers use (by default `localhost`, `http` and the frontend port). It writes
+`CORS_ORIGIN` from them and, for `https`, `RELAYHALL_PUBLIC_API_URL`, the
+address every agent's setup pack names. The stack listens on `127.0.0.1`
+only: another machine reaches it through a TLS reverse proxy, as
+[Domain and TLS](DEPLOYMENT.md#domain-and-tls) shows with a Caddy and an nginx
+example.
+
+The sign-in page and About link the source, licence, documentation and issue
+tracker in every build; no setting turns them off. A plain
+build identifies itself as `<version>+unreleased` with an unknown commit. Pass
+the provenance build arguments, as the
+[upgrade steps](DEPLOYMENT.md#an-ordinary-upgrade) do, to record the release
+and its commit; a source archive without `.git` has no commit to record.
+
+To run a second stack on the same Docker host, give it its own
+`COMPOSE_PROJECT_NAME` and ports first:
+[Running a second stack](DEPLOYMENT.md#running-a-second-stack-on-one-docker-host).
 
 Then open <http://localhost:8082/dashboard/>. Because the deployment has no
 administrator yet, the sign-in screen offers **Create the first administrator**:
@@ -229,7 +255,8 @@ says so on screen.
 > origin. `http://localhost:8082` is one. The same deployment reached over
 > plain HTTP at a LAN address or hostname is not, and the administrator you
 > just created will not be able to sign in there — only the deployment
-> password will. [DEPLOYMENT.md](DEPLOYMENT.md) covers putting TLS in front.
+> password will. The sign-in screen says so on such an origin.
+> [Domain and TLS](DEPLOYMENT.md#domain-and-tls) covers putting TLS in front.
 
 Single sign-on is optional and comes later: connect an identity provider when
 you want one, as described in [docs/oauth.md](docs/oauth.md) and
@@ -336,17 +363,20 @@ Named here rather than discovered later. Each is scheduled, not abandoned.
   before this tag.
 - **Telemetry stops at ingest.** Frames that reporters push in are stored,
   governed and retained, and the Sessions and Stats screens render the presence
-  projection built from them. Forwarding frames onward to an external
-  observability system, and receiving OpenTelemetry directly, are not part of
-  this release.
+  projection built from them, and OpenTelemetry arrives directly over OTLP/HTTP
+  and OTLP/gRPC. Forwarding frames onward to an external observability system
+  is not part of this release.
 - **The knowledge broker has no fan-out query.** Knowledge configuration, the
   outbound address policy, the assertion signer, published verification keys and
   sealed handles all ship. The federated fan-out query that uses them does not.
-- **Group administration is administered centrally.** Groups, grants and Access
+- **Group administration is mostly central.** Groups, grants and Access
   profiles are administered by the deployment's own authority, and directory
-  groups arrive over SCIM with a remote-group catalogue. The member, manager and
-  admin lenses — delegated group stewardship — are designed and deliberately
-  deferred.
+  groups arrive over SCIM with a remote-group catalogue. The member and admin
+  lenses and the manager lens ship and decide the navigation. Only a Group's
+  owners carry a few delegated acts: appointing managers, approving the Charter
+  of a Group-owned Project and moving owned objects, each on a signed-in
+  session with a step-up. A Group's managers get the edit tier on what the
+  Group owns, not these acts.
 - **Non-escalation is a rule, not yet an arm.** That an administrator cannot
   grant authority they do not themselves hold is enforced by the owner plane and
   by review; the automatic enforced arm on grants, groups and Access profiles is
@@ -363,14 +393,16 @@ Named here rather than discovered later. Each is scheduled, not abandoned.
   start works. The same deployment reached over plain HTTP at a LAN address
   or hostname does not: first run will create the administrator Account, and
   that Account will not be able to sign in — only the deployment password
-  will. Put TLS in front before anyone but you uses it, as
-  [DEPLOYMENT.md](DEPLOYMENT.md) says.
+  will. The sign-in and first-run screens warn on such an origin. Put TLS in
+  front before anyone but you uses it, as
+  [Domain and TLS](DEPLOYMENT.md#domain-and-tls) describes.
 - **No formal external accessibility audit.** The interface is built and gated
   to WCAG 2.2 AA, with automated checks in CI and every screen walked by hand;
   an independent audit is not part of v1.
 
-Every limitation above is tracked, and the release notes in
-[CHANGELOG.md](CHANGELOG.md) carry the identifier of the item tracking each one.
+Every limitation above is tracked; [CHANGELOG.md](CHANGELOG.md) records what each
+release changes.
+
 ## Using an external harness
 
 Give each client its own narrow credential. The CLI ships in the repository at
@@ -383,6 +415,11 @@ then authenticate once with `relayhall login` — the token is cached at
 `RELAYHALL_CONFIG_DIR`) and picked up automatically; `--token` and
 `RELAYHALL_TOKEN` take precedence over the cache.
 
+A new connection's one-time pack also carries a short bootstrap prompt for a
+fresh session, and `relayhall connection-skill install --harness claude-code`
+(or `--harness codex`) records a local pointer to the connection without the
+credential; see [Connector onboarding](docs/connector-onboarding.md).
+
 A typical pull loop is:
 
 ```bash
@@ -393,16 +430,17 @@ relayhall brief <task-id>
 # Update the task and attach a report containing evidence.
 ```
 
-`relayhall` is the CLI command. The estate-era entry point was removed with the
+`relayhall` is the CLI command.
 
-Capture existing work with `relayhall blueprint capture --phase <phase-uuid> --name "Reusable work"`. This saves a draft for independent review. See [Authoring and using Blueprints](docs/blueprints/README.md).
-
-vocabulary purge (D-9: no compatibility aliases).
+Capture existing work with
+`relayhall blueprint capture --phase <phase-uuid> --name "Reusable work"`. This
+saves a draft for independent review. See
+[Authoring and using Blueprints](docs/blueprints/README.md).
 
 Compiling a task Brief is a disclosure act gated by `tasks:read` (the former
 `tasks:prompt` scope retired into it). `POST /tasks/{id}/brief` produces text;
-it does not execute anything. The pre-A7 `/tasks/{id}/prompt` and
-`/tasks/{id}/spawn-prompt` spellings were removed in Phase 3, not aliased.
+it does not execute anything. The older `/tasks/{id}/prompt` and
+`/tasks/{id}/spawn-prompt` spellings were removed, not aliased.
 
 The current foundation exposes REST/OpenAPI, compare-and-set claim/lease routes,
 the bundled CLI, and an authenticated MCP surface served **in-process** —
@@ -438,8 +476,10 @@ boundary.
 ./database/restore.sh ./backups/relayhall_YYYYMMDD_HHMMSS.sql.gz
 ```
 
-Backups are written outside the database volume. Test restore procedures on a
-disposable deployment before relying on them for production recovery.
+Backups are written outside the database volume. They do not contain the key
+sets: keep a copy of `relayhall.keys.env` with them, stored apart from the
+dumps. Test restore procedures on a disposable deployment before relying on
+them for production recovery.
 
 ## Development and CI
 
@@ -498,8 +538,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Security notes
 
-- Never commit `.env`, credentials, private overlays, database dumps, or runtime
-  data.
+- Never commit `.env`, `relayhall.keys.env`, credentials, private overlays,
+  database dumps, or runtime data.
 - Give each Connector and each Agent its own credential, and grant only the
   scopes it needs.
 - Keep host bindings on loopback unless an intentional ingress protects them.

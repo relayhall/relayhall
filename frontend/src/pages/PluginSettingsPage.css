@@ -1,0 +1,7 @@
+.plugin-settings { min-width: 0; }
+.plugin-settings-list { display: flex; flex-wrap: wrap; gap: 8px; padding: 0; list-style: none; }
+.plugin-settings-list button { color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: 8px; padding: 12px; text-align: left; cursor: pointer; }
+.plugin-settings-list small { display: block; color: var(--text-secondary); margin-top: 4px; }
+.plugin-settings-list button[aria-pressed=true] { outline: 2px solid var(--accent-color); }
+.plugin-settings-detail { min-width: 0; }
+.plugin-settings-detail .plugin-frame-container { min-height: 400px; }

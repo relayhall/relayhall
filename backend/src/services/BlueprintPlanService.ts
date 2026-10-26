@@ -10,7 +10,7 @@ export interface BlueprintResolution {
   projectId?: string; serviceName?: string; pluginVersion?: string; tool?: string; descriptor?: ServiceDescriptor; serviceKind?: string;
 }
 export interface BlueprintAuthorityRequirement {
-  operation: 'project.create' | 'project.write' | 'project.read' | 'phase.create' | 'task.create' | 'task.roles' | 'report.create' | 'service.invoke' | 'skill.use' | 'personality.use';
+  operation: 'project.create' | 'project.write' | 'project.read' | 'phase.create' | 'task.create' | 'task.roles' | 'task.verification-none' | 'report.create' | 'service.invoke' | 'skill.use' | 'personality.use';
   scope: string; localKey?: string; resourceId?: string; principalIds?: string[]; shepherdPrincipalId?: string;
 }
 export interface BlueprintPlanContext {
@@ -25,6 +25,8 @@ export interface BlueprintPlan {
   authority: Array<BlueprintAuthorityRequirement & { allowed: boolean }>;
   humanGates: Row[]; counts: Row; parameterValues: Row;
   refusals: Array<{ code: string; error: string; field: string }>;
+  /** Section 6.8 (E462 S4b): present only when every Task is `verification: none`. */
+  warnings?: Array<{ code: string; message: string }>;
 }
 const descriptorKey = (id: string, version: number | string | undefined): string => `${id}:${version}`;
 const missing = (field: string): never => { throw new BlueprintError(422, 'BLUEPRINT_REFERENCE_MISSING', 'Required reference is unavailable', field); };
@@ -135,6 +137,8 @@ export async function buildBlueprintPlan(documentInput: unknown, parameterInput:
     const references = outcomes.filter(ref => (task.references || []).includes(ref.name) && ref.resolved).map(ref => ref.resolved);
     tasks.push({ ...task, ...(executionProfile ? { defaults: { ...task.defaults, executionProfile: { ...task.defaults.executionProfile, options: executionProfile.options } } } : {}), autoStart: false, phaseKey: parameterKey(task.phase) ? null : task.phase ?? null, phaseId,
       roles: { shepherdPrincipalId: shepherd?.id ?? null, verifierPrincipalId: verifier?.id ?? null, shepherdHandle: shepherd?.handle ?? null, verifierHandle: verifier?.handle ?? null },
+      // Section 6.8 (E462 S4b): shown per Task in the preview (the author is not the instantiator).
+      ...(task.verification === 'none' ? { verificationNone: true } : {}),
       personalityId: personality?.id ?? null, service, references,
       executionProfile });
   }
@@ -184,6 +188,13 @@ export async function buildBlueprintPlan(documentInput: unknown, parameterInput:
     requirements.push({ operation: 'task.create', scope: 'tasks:write', localKey: task.key, resourceId: context.target.projectId });
     const principalIds = [task.roles.shepherdPrincipalId, task.roles.verifierPrincipalId].filter(Boolean);
     if (principalIds.length) requirements.push({ operation: 'task.roles', scope: 'tasks:write', localKey: task.key, principalIds, ...(task.roles.shepherdPrincipalId ? { shepherdPrincipalId: task.roles.shepherdPrincipalId } : {}) });
+    // Section 6.8: `none` takes effect only when the instantiating caller may set it.
+    if (task.verificationNone) {
+      if (task.roles.verifierPrincipalId || (task.status ?? 'todo') !== 'todo') {
+        throw new BlueprintError(422, 'BLUEPRINT_INVALID', 'Verification none applies only to a Task created in To Do with no Verifier', `tasks.${task.key}.verification`);
+      }
+      requirements.push({ operation: 'task.verification-none', scope: 'tasks:write', localKey: task.key });
+    }
     if (task.service) requirements.push({ operation: 'service.invoke', scope: 'services:invoke', localKey: task.key, resourceId: task.service.id });
   }
   for (const report of materialized.reports) requirements.push({ operation: 'report.create', scope: 'reports:write', localKey: report.key });
@@ -192,6 +203,9 @@ export async function buildBlueprintPlan(documentInput: unknown, parameterInput:
   return { target: context.target, project: context.target.mode === 'new-project' ? materialized.target.project : null,
     phases: materialized.phases, tasks: ordered, reports: materialized.reports, dependencies, references: outcomes,
     authority, humanGates: gates, parameterValues: values,
+    // Section 6.8 (E462 S4b): a chain should end in a verified Task.
+    ...(ordered.length > 0 && ordered.every(task => task.verificationNone)
+      ? { warnings: [{ code: 'BLUEPRINT_CHAIN_UNVERIFIED', message: 'No Task in this chain is verified' }] } : {}),
     // Owner-approved A: resolving execution defaults does not assign Tasks.
     // Ordinary access effects belong to a later explicit setup transaction.
     refusals: outcomes.filter(reference=>reference.outcome !== 'resolved').map(reference=>({
@@ -209,7 +223,9 @@ export function enforceBlueprintPlan(plan: BlueprintPlan): void {
   if (requirement) {
     const error = requirement.operation === 'task.roles'
       ? 'Required task-role assignment authority: tasks:write and, where applicable, services:invoke'
-      : `Required scope: ${requirement.scope}`;
+      : requirement.operation === 'task.verification-none'
+        ? 'Verification none needs the Shepherd authority on the new Task, and never an Agent'
+        : `Required scope: ${requirement.scope}`;
     throw new BlueprintError(403, 'BLUEPRINT_AUTHORITY_REQUIRED', error, requirement.localKey);
   }
 }

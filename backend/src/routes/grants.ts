@@ -8,8 +8,18 @@ import { Router, Request, Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { sendApiError } from '../utils/apiErrors';
 import { grantService, GrantError, GrantRecord } from '../services/GrantService';
+import { grantListService, parseGrantListQuery } from '../services/GrantListService';
 import { principalService } from '../services/PrincipalService';
 import { auditActorFromRequest } from '../utils/auditActor';
+import { authorityEditExecutor } from '../services/AuthorityEditExecutor';
+import {
+  auditRouteRefusal, canonicalObjectId, editorContext, editResponse, requireEditSession, sendAuthorityEditError, splitEditBody,
+} from './authorityEditRoute';
+import { pool } from '../db/connection';
+import { StepUpError, stepUpChallengeBody, stepUpRequiredError, stepUpService } from '../services/StepUpService';
+import {
+  BULK_REVOKE_STEP_UP_ACTION, bulkRevokeIdSetHash, grantBulkRevokeService,
+} from '../services/GrantBulkRevokeService';
 
 const router = Router();
 
@@ -67,7 +77,7 @@ async function identitySummary(id: string | null): Promise<GrantIdentitySummary 
  * batched by the principal cache, and a grantee whose row is genuinely gone
  * still resolves to `null` — the surface then says so about a specific id
  * rather than about a name it could not find. */
-async function withIdentities(grants: GrantRecord[]): Promise<Array<GrantRecord & {
+async function withIdentities<T extends GrantRecord>(grants: T[]): Promise<Array<T & {
   grantee: GrantIdentitySummary | null;
   grantedBy: GrantIdentitySummary | null;
 }>> {
@@ -105,16 +115,29 @@ function checkQueryKeys(req: Request, res: Response, allowed: string[]): boolean
 }
 
 /**
- * GET /api/grants — list grants (owner plane). Filters: ?granteeId=, ?resourceType=.
+ * GET /api/grants — list grants (owner plane, root route ceiling, unchanged).
+ *
+ * Owner ruling E407 item 1 (card ff410dc4): every parameter is ADDITIVE.
+ * Without `limit` or `cursor` the answer is the legacy list of every matching
+ * grant in creation order; with either, it is ONE keyset page
+ * (`pagination.nextCursor`), newest first by default. Filters: `granteeId`,
+ * `resourceType`, `verb`, `made` (hand | system | unknown | all), `expiry`
+ * (any | none | live | expired | expiring), `target` (any | live | archived |
+ * missing | wildcard), `q` (search), `sort`. Each row carries `madeBy` (its
+ * origin, from data the board already keeps) and `target` (label and state).
+ * Every filter runs inside the one SQL statement, before its LIMIT.
  */
 router.get('/', async (req: Request, res: Response): Promise<void> => {
   try {
-    if (!checkQueryKeys(req, res, ['granteeId', 'resourceType'])) return;
-    const grants = await grantService.list({
-      granteeId: req.query.granteeId as string | undefined,
-      resourceType: req.query.resourceType as string | undefined,
-    });
-    res.json({ success: true, grants: await withIdentities(grants) });
+    if (!checkQueryKeys(req, res, ['granteeId', 'resourceType', 'verb', 'made', 'expiry', 'target', 'q', 'sort', 'limit', 'cursor'])) return;
+    const query = parseGrantListQuery(req.query as Record<string, unknown>);
+    const page = await grantListService.page(query);
+    const grants = await withIdentities(page.grants);
+    if (query.limit === null) {
+      res.json({ success: true, grants });
+      return;
+    }
+    res.json({ success: true, grants, pagination: page.pagination, ...(page.madeCounts ? { madeCounts: page.madeCounts } : {}) });
   } catch (e) {
     if (sendGrantError(res, e)) return;
     const errorId = logGrantRouteFailure('list grants', e);
@@ -137,7 +160,8 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
       }
     }
     const grant = await grantService.create(body, auditActorFromRequest(req));
-    res.status(201).json({ success: true, grant });
+    const [resolvedGrant] = await withIdentities([grant]);
+    res.status(201).json({ success: true, grant: resolvedGrant });
   } catch (e) {
     if (sendGrantError(res, e)) return;
     const errorId = logGrantRouteFailure('create grant', e);
@@ -146,15 +170,146 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
 });
 
 /**
- * DELETE /api/grants/{id} — revoke (owner plane). Revocation is deletion:
- * grants are live authority configuration, not history (070 doctrine).
+ * PATCH /api/grants/{id} — AZ-A13 clause 11 (ratified 2026-10-11, E95): the
+ * first edit route for grants. Edits `verb`, `expiresAt` (null = no expiry)
+ * and `resourceId` (null = every object of the type) IN PLACE: the row keeps
+ * its id. Under the unchanged `root` ceiling (scopeMap), and session-only
+ * inside the handler, so a pre-096 legacy root key cannot edit. A narrowing
+ * saves; a widening takes `lifetime` and a step-up bound to ('grant.edit', id)
+ * (clause 11b). Assignment-carried and act-made rows are refused (11c).
  */
-router.delete('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireEditSession(req, res, 'grant'))) return;
   try {
     if (!checkQueryKeys(req, res, [])) return;
-    const removed = await grantService.remove(req.params.id, auditActorFromRequest(req));
+    const id = canonicalObjectId(String(req.params.id ?? ''));
+    const { fields, controls } = splitEditBody(req.body);
+    const result = await authorityEditExecutor.editObject({
+      // The route ceiling admitted only a root session (clause 4a).
+      type: 'grant', id, fields, editor: editorContext(req, 'root'),
+      stepUpToken: controls.stepUpToken, lifetime: controls.lifetime, reason: controls.reason,
+      narrowAgents: controls.narrowAgents, acknowledgeDependents: controls.acknowledgeDependents,
+    }, auditActorFromRequest(req));
+    res.json(editResponse(result));
+  } catch (e) {
+    if (sendAuthorityEditError(res, e)) return;
+    if (sendGrantError(res, e)) return;
+    const errorId = logGrantRouteFailure('edit grant', e);
+    sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to edit the grant', undefined, { errorId });
+  }
+});
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REVOKE_STEP_UP_ACTION = 'grant.revoke';
+
+/** A refused step-up, answered as every step-up consumer answers it (403
+ * STEP_UP_REQUIRED with the SU-14 challenge) after a durable denied audit
+ * naming the act. Returns false for any other error. */
+async function sendStepUpRefusal(req: AuthRequest, res: Response, e: unknown, action: string, targetId: string,
+  detail: Record<string, unknown>): Promise<boolean> {
+  if (!(e instanceof StepUpError)) return false;
+  await auditRouteRefusal(req, 'grant', targetId, e.code, { ...detail, stepUpAction: action }, action);
+  res.status(e.status).json({ error: 'Refused', code: e.code, message: e.message, ...stepUpChallengeBody(e) });
+  return true;
+}
+
+/**
+ * POST /api/grants/bulk-revoke — owner ruling E413: revoke, in ONE audited
+ * batch, the grants that change nobody's access (checked by the authorization
+ * engine itself, owner ruling E407 item 3). Owner plane: the root ceiling of
+ * every /grants route, and session-only here, so every bearer (a root
+ * Connector included) and every MCP call is refused SESSION_ONLY. Not in the
+ * MCP registry. Body { ids (at most 500 grant ids), dryRun (default true),
+ * stepUpToken (required when dryRun is false: bound to ('grant.bulk_revoke',
+ * the id-set hash the dry run answers), single use) }. One call is one
+ * request for the rate limit.
+ */
+router.post('/bulk-revoke', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireEditSession(req, res, 'grant', {
+    action: 'grant.bulk_revoke',
+    message: 'The bulk grant revoke is a signed-in board act with a step-up (owner ruling E413): bearer credentials, root Connectors included, are refused',
+  }))) return;
+  let idSetHash = '';
+  try {
+    if (!checkQueryKeys(req, res, [])) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const allowed = ['ids', 'dryRun', 'stepUpToken'];
+    for (const key of Object.keys(body)) {
+      if (!allowed.includes(key)) {
+        sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown field '${key}' — accepted fields are: ${allowed.join(', ')}`);
+        return;
+      }
+    }
+    const input = {
+      ids: body.ids, dryRun: body.dryRun, stepUpToken: body.stepUpToken,
+      principalId: String(req.principal!.id), actor: auditActorFromRequest(req),
+    };
+    // The binding a refused step-up names: the act's own parser and hash.
+    idSetHash = bulkRevokeIdSetHash(grantBulkRevokeService.parse(input).ids);
+    const answer = await grantBulkRevokeService.run(input);
+    res.json({ success: true, ...answer });
+  } catch (e) {
+    if (await sendStepUpRefusal(req, res, e, BULK_REVOKE_STEP_UP_ACTION, idSetHash, { act: 'grant.bulk_revoke', rule: 'E413' })) return;
+    if (sendGrantError(res, e)) return;
+    if (e && typeof e === 'object' && (e as { code?: string }).code === '55P03') {
+      sendApiError(res, 409, 'GRANTS_BUSY', 'Another grant change holds the grants table; nothing was revoked. Try again in a moment');
+      return;
+    }
+    const errorId = logGrantRouteFailure('bulk revoke grants', e);
+    sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to run the bulk grant revoke; nothing was revoked', undefined, { errorId });
+  }
+});
+
+/**
+ * DELETE /api/grants/{id} — revoke (owner plane). Revocation is deletion:
+ * grants are live authority configuration, not history (070 doctrine).
+ * Owner ruling E418(b): the SAME login-session and step-up requirement as
+ * PATCH on this router. A bearer (a root Connector included) is refused
+ * SESSION_ONLY; a session without a live single-use step-up bound to
+ * ('grant.revoke', this grant id) is refused STEP_UP_REQUIRED; both are
+ * audited as denied. Body { stepUpToken }. The token is burned in the same
+ * transaction as the revoke, so a refused revoke never spends it.
+ */
+router.delete('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!(await requireEditSession(req, res, 'grant', {
+    action: 'grant.revoke',
+    message: 'Revoking a grant is a signed-in board act with a step-up (owner ruling E418(b)): bearer credentials, root Connectors included, are refused',
+  }))) return;
+  const id = canonicalObjectId(String(req.params.id ?? ''));
+  try {
+    if (!checkQueryKeys(req, res, [])) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    for (const key of Object.keys(body)) {
+      if (key !== 'stepUpToken') {
+        sendApiError(res, 400, 'UNKNOWN_FIELD', `Unknown field '${key}' — accepted fields are: stepUpToken`);
+        return;
+      }
+    }
+    if (!UUID_PATTERN.test(id)) throw new GrantError(400, 'INVALID_GRANT_ID', 'grant id must be a full UUID');
+    const token = typeof body.stepUpToken === 'string' ? body.stepUpToken : '';
+    if (!token) {
+      throw await stepUpRequiredError(String(req.principal!.id), REVOKE_STEP_UP_ACTION, id,
+        'Revoking a grant requires a live single-use step-up bound to (grant.revoke, this grant id) (owner ruling E418(b))');
+    }
+    const client = await pool.connect();
+    let removed: GrantRecord;
+    try {
+      await client.query('BEGIN');
+      const stepUp = await stepUpService.consume(client, {
+        token, principalId: String(req.principal!.id), action: REVOKE_STEP_UP_ACTION, targetId: id,
+      });
+      removed = await grantService.remove(id, auditActorFromRequest(req), client,
+        { stepUp: { tokenId: stepUp.tokenId, method: stepUp.method }, rule: 'E418(b)' });
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
     res.json({ success: true, grant: removed });
   } catch (e) {
+    if (await sendStepUpRefusal(req, res, e, REVOKE_STEP_UP_ACTION, id, { act: 'grant.revoke', rule: 'E418(b)' })) return;
     if (sendGrantError(res, e)) return;
     const errorId = logGrantRouteFailure('remove grant', e);
     sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to remove the grant', undefined, { errorId });

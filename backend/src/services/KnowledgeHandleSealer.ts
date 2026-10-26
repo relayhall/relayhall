@@ -35,6 +35,7 @@
 // `handle_key_retired` rather than a generic decode failure, because the
 // operator needs to tell "rotated" from "forged".
 import crypto from 'crypto';
+import { KnowledgeFilter, knowledgeFilterHash, validKnowledgeFilter, OPAQUE_COMPARTMENT_PATTERN } from './KnowledgeV2';
 
 export const KNOWLEDGE_HANDLE_VERSION = 1;
 
@@ -58,6 +59,11 @@ export interface KnowledgeHandlePayload {
   r: string;
   /** Mint time, seconds. Diagnostic only — a handle does not expire. */
   iat: number;
+  f?: KnowledgeFilter;
+  fh?: string;
+  domain?: 'continuation';
+  h?: string;
+  next?: number;
 }
 
 interface HandleKeyset {
@@ -128,7 +134,9 @@ export function sealKnowledgeHandle(payload: Omit<KnowledgeHandlePayload, 'v' | 
   const { keys, activeKeyId } = keyset();
   const key = keys.get(activeKeyId) as Buffer;
   const full: KnowledgeHandlePayload = {
-    v: KNOWLEDGE_HANDLE_VERSION,
+    v: payload.f ? 2 : KNOWLEDGE_HANDLE_VERSION,
+    ...(payload.f ? { f: payload.f, fh: knowledgeFilterHash(payload.f) } : {}),
+    ...(payload.domain ? { domain: payload.domain, h: payload.h, next: payload.next } : {}),
     s: payload.s,
     dv: payload.dv,
     c: payload.c,
@@ -147,7 +155,7 @@ export function sealKnowledgeHandle(payload: Omit<KnowledgeHandlePayload, 'v' | 
  * Unseal and verify. Every failure is a NAMED code, because the operator has
  * to be able to tell a rotated key from a forged handle from a wrong version.
  */
-export function unsealKnowledgeHandle(handle: unknown): KnowledgeHandlePayload {
+export function unsealKnowledgeHandle(handle: unknown, domain?: 'continuation'): KnowledgeHandlePayload {
   if (typeof handle !== 'string' || handle.length === 0 || handle.length > 8192) {
     throw new KnowledgeHandleError('handle_malformed', 'handle must be a non-empty string');
   }
@@ -200,13 +208,16 @@ export function unsealKnowledgeHandle(handle: unknown): KnowledgeHandlePayload {
   } catch {
     throw new KnowledgeHandleError('handle_tampered', 'handle payload is not JSON');
   }
-  if (parsed.v !== KNOWLEDGE_HANDLE_VERSION) {
+  if (parsed.v !== KNOWLEDGE_HANDLE_VERSION && parsed.v !== 2) {
     throw new KnowledgeHandleError('handle_version_unsupported', `handle version ${String(parsed.v)} is not supported`);
   }
   if (typeof parsed.s !== 'string' || typeof parsed.c !== 'string'
     || typeof parsed.r !== 'string' || typeof parsed.dv !== 'number') {
     throw new KnowledgeHandleError('handle_tampered', 'handle payload is not the §8.1 shape');
   }
+  if (parsed.domain !== domain) throw new KnowledgeHandleError('handle_tampered', 'wrong token domain');
+  if (parsed.v === 2 && (!validKnowledgeFilter(parsed.f) || parsed.fh !== knowledgeFilterHash(parsed.f) || !OPAQUE_COMPARTMENT_PATTERN.test(parsed.c))) throw new KnowledgeHandleError('handle_tampered', 'invalid v2 address');
+  if (domain && (typeof parsed.h !== 'string' || !/^[a-f0-9]{64}$/.test(parsed.h) || !Number.isSafeInteger(parsed.next) || (parsed.next ?? 0) <= 0)) throw new KnowledgeHandleError('handle_tampered', 'invalid continuation');
   return parsed;
 }
 

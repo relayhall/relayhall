@@ -51,7 +51,8 @@
   object-fit: contain;
 }
 
-/* NimOrb WebGL avatar on login page */
+/* WebGL avatar on the login page (the class is emitted by the identity-widget
+   plugin's own markup, so it stays as it is) */
 .login-logo .nim-orb-webgl {
   width: 100px;
   height: 100px;

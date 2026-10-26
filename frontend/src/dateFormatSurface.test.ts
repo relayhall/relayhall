@@ -45,7 +45,8 @@ const UTIL = path.join('utils', 'dateFormat.ts');
  */
 const CONCURRENT_LANE_FILES: Record<string, string> = {
   'pages/AccessManagerPage.tsx':
-    'FIX-B owns the Access manager password control; 4 sites, all bare toLocaleString()',
+    'FIX-B owns the Access manager password control; 3 sites, all bare toLocaleString() '
+    + '(the fourth was the approval queue; it moved to components/approvals and uses formatDateTime, b1e3b16d)',
   'pages/MyConnectionsPage.tsx':
     'FIX-B owns the connection surfaces; 1 site, bare toLocaleString()',
 };

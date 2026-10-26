@@ -24,6 +24,18 @@ export interface Project {
    *  with the phase goal, never an object of its own (vocabulary D-6). */
   goal?: string | null;
   status: ProjectStatus;
+  /** Explicit owner, separate from creator Grants and Task roles. */
+  ownerPrincipalId: string | null;
+  /** AZ-A12 clause 12: the owner's kind and name, joined by the server, so a
+   *  Group owner is named without listing Group principals (absent on an older server). */
+  ownerKind?: 'human' | 'group' | null;
+  ownerDisplayName?: string | null;
+  /** The inbox phase (card b13e5ac9): a Task created without an explicit
+   *  phase lands there with status Ideas. null = none. */
+  inboxPhaseId?: string | null;
+  /** The default Verifier (card 41e24358): new cards inherit it when neither
+   *  the request nor their landing Phase names one. null = none. */
+  defaultVerifierPrincipalId?: string | null;
   is_hidden?: boolean;
   /**
    * Opaque concurrency token. Rotates on every mutation; sent back as
@@ -45,4 +57,13 @@ export interface CreateProjectInput {
   description?: string;
   status?: ProjectStatus;
   is_hidden?: boolean;
+  /** AZ-A12 clause 10(b): a Group to own the new Project (root or administrator sessions only). */
+  ownerGroupId?: string;
+}
+
+/** A Group the create form's owner selector offers (AZ-A12 clauses 10(b), 12). */
+export interface OwnerGroupChoice {
+  id: string;
+  name: string;
+  featured: boolean;
 }

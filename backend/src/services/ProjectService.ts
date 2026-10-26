@@ -23,7 +23,10 @@ import {
   type CreationActor as HomeGroupCreationActor,
   type HomeGroupResolution,
 } from './HomeGroupService';
+import { ownerFactsOf, ownerFactsSql, type OwnerKind } from '../utils/ownerFacts';
 
+/** AZ-A12 clause 12: the owner fields' joins on the Project row (alias `p`). */
+const PROJECT_OWNER = ownerFactsSql('p.owner_principal_id', 'project_owner');
 
 /**
  * The canonical bounded Project record (contract 21a04c23 §3.1; review
@@ -42,6 +45,18 @@ export interface Project extends BlueprintProvenanceFields {
    *  compiled Briefs alongside the Phase goal (task-element design E-12). */
   goal?: string | null;
   status: 'active' | 'archived';
+  /** Explicitly assigned Project owner; creation deliberately leaves this null. */
+  ownerPrincipalId: string | null;
+  /** AZ-A12 clause 12: `human` or `group`; null without an owner (or for a legacy owner of another kind). */
+  ownerKind: OwnerKind | null;
+  /** AZ-A12 clause 12: the owner's name (a Group's name, else display name, else handle); null without an owner. */
+  ownerDisplayName: string | null;
+  /** The Project's inbox phase (migration 141, card b13e5ac9): a Task created
+   *  without an explicit phaseId lands there with status Ideas. null = none,
+   *  and creation behaves as it did before 141. Never seeded by a migration. */
+  inboxPhaseId: string | null;
+  /** Card 41e24358 (migration 155): the Verifier new cards inherit; written only by PUT /projects/:id/default-verifier. */
+  defaultVerifierPrincipalId: string | null;
   /** Opaque revision, rotated on every mutation; If-Match binds it. */
   revision: string;
   is_hidden?: boolean;
@@ -68,6 +83,8 @@ export interface UpdateProjectInput {
   goal?: string | null;
   status?: 'active' | 'archived';
   is_hidden?: boolean;
+  /** undefined leaves it unchanged; null clears it; a UUID names a Phase of THIS Project. */
+  inboxPhaseId?: string | null;
 }
 
 /**
@@ -108,14 +125,17 @@ export class ProjectService {
    * believes they can - a support ticket, not an exception. The grant rows,
    * the audit row and the project INSERT share one transaction.
    *
-   * -- WHAT IS NOT WRITTEN, AND IT IS DELIBERATE ------------------------
+   * -- THE OWNER COLUMN AT CREATE ---------------------------------------
    *
-   * `projects.owner_principal_id` (063:40, indexed :61) stays unwritten.
-   * `AuthorizationService`'s owner arm (:265-266 at this SHA) allows any
-   * non-`task` resource whose owner column equals the actor, so writing it
-   * at create would hand every creator an owner-arm authority they do not
-   * have today. Owner decision 6 OFFERS that as separable hardening with
-   * the consequence named; this composition retains that boundary; creator read/write use revocable Grants.
+   * `projects.owner_principal_id` IS written in the creating transaction:
+   * `GrantService.recordCreationAccount` records the human creator, or the
+   * chain-root human sponsor of a Connector or Agent creator, first-wins, and
+   * audits it as `project.account_ownership`. That owner value is what the
+   * evaluator's owner arm reads, so the creator holds the Project's owner
+   * standing from the start; the creator's read/write rows written by
+   * `createForProjectCreator` stay separate, revocable Grants, and a Group
+   * owner is set only by the ownership transfer act or the create form's
+   * Group selector (AZ-A12).
    */
   async create(input: CreateProjectInput, actor?: CreationActor, transaction?: CreationTransaction, allocatedId?: string): Promise<Project> {
     if (allocatedId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(allocatedId)) throw new Error('Invalid allocated Project id');
@@ -237,7 +257,9 @@ export class ProjectService {
       // itself a feed event, so downstream indexes see it. A grant written by
       // this act is the same class of ACL change `GrantService.create` emits for,
       // and it is emitted on the same terms - content-free, and with no
-      // `ownerPrincipalId` because the grantee is a Group and not a principal.
+      // `ownerPrincipalId`: the grantee is a Group GRANT (grantee_type 'group'),
+      // and a Group grant is never ownership (AZ-A12 clause 10(c)). A Group is
+      // also a principal since AZ-A12 clause 1, but this act names no owner.
       await feedEventService.emit(client as any, {
         name: 'project.acl_changed',
         objectType: 'project',
@@ -256,7 +278,7 @@ export class ProjectService {
    */
   async getById(id: string, queryable: Pick<import('pg').PoolClient, 'query'> = pool): Promise<Project> {
     const projectResult = await queryable.query(
-      'SELECT * FROM projects WHERE id = $1',
+      `SELECT p.*, ${PROJECT_OWNER.select} FROM projects p ${PROJECT_OWNER.join} WHERE p.id = $1`,
       [id]
     );
     
@@ -278,6 +300,11 @@ export class ProjectService {
       description: row.description,
       goal: row.goal ?? null,
       status: row.status,
+      ownerPrincipalId: row.owner_principal_id ?? null,
+      // AZ-A12 clause 12: the owner's kind and name, joined server-side.
+      ...ownerFactsOf(row, row.owner_principal_id ?? null),
+      inboxPhaseId: row.inbox_phase_id ?? null,
+      defaultVerifierPrincipalId: row.default_verifier_principal_id ?? null,
       revision: row.revision,
       is_hidden: row.is_hidden || false,
       created_at: row.created_at,
@@ -293,28 +320,28 @@ export class ProjectService {
     includeHidden: boolean = true,
     includeArchived: boolean = true,
   ): Promise<Project[]> {
-    let query = 'SELECT * FROM projects';
+    let query = `SELECT p.*, ${PROJECT_OWNER.select} FROM projects p ${PROJECT_OWNER.join}`;
     const params: any[] = [];
     const conditions: string[] = [];
-    
+
     if (status) {
-      conditions.push(`status = $${params.length + 1}`);
+      conditions.push(`p.status = $${params.length + 1}`);
       params.push(status);
     } else if (!includeArchived) {
       // Contract §2.2: the default collection excludes archived projects;
       // they are reachable only through an explicit archived view.
-      conditions.push(`status != 'archived'`);
+      conditions.push(`p.status != 'archived'`);
     }
-    
+
     if (!includeHidden) {
-      conditions.push(`is_hidden = FALSE`);
+      conditions.push(`p.is_hidden = FALSE`);
     }
-    
+
     if (conditions.length > 0) {
       query += ' WHERE ' + conditions.join(' AND ');
     }
-    
-    query += ' ORDER BY created_at DESC';
+
+    query += ' ORDER BY p.created_at DESC';
     
     const result = await pool.query(query, params);
     return result.rows.map((row) => this.mapRowToProject(row));
@@ -402,6 +429,34 @@ export class ProjectService {
       if (input.is_hidden !== undefined) {
         updates.push(`is_hidden = $${paramIndex++}`);
         params.push(input.is_hidden);
+      }
+
+      // The inbox phase (migration 141, card b13e5ac9). The composite FK
+      // projects_inbox_phase_fk already makes a Phase of another Project
+      // unstorable; the checks here turn that, and the two states the default
+      // would refuse to file into, into typed answers. One refusal for "no such
+      // Phase" and "a Phase of another Project", so the answer discloses
+      // nothing about Projects the caller was not asking about. The Phase row
+      // is held FOR SHARE until this commit, so it cannot be archived,
+      // restricted or deleted between the check and the write.
+      if (input.inboxPhaseId !== undefined) {
+        if (input.inboxPhaseId !== null) {
+          const phase = await client.query(
+            'SELECT id, project_id, status, restricted_access FROM phases WHERE id = $1 FOR SHARE',
+            [input.inboxPhaseId],
+          );
+          if (phase.rows.length === 0 || String(phase.rows[0].project_id) !== String(existing.id)) {
+            throw new ResourceContractError(422, 'INBOX_PHASE_NOT_IN_PROJECT', 'inboxPhaseId must name a Phase of this Project', 'inboxPhaseId');
+          }
+          if (phase.rows[0].status === 'archived') {
+            throw new ResourceContractError(409, 'PHASE_ARCHIVED', 'An archived Phase cannot be the inbox phase; restore it first or name another Phase', 'inboxPhaseId');
+          }
+          if (phase.rows[0].restricted_access) {
+            throw new ResourceContractError(409, 'INBOX_PHASE_RESTRICTED', 'A restricted Phase cannot be the inbox phase: new cards filed there would be hidden from the Project', 'inboxPhaseId');
+          }
+        }
+        updates.push(`inbox_phase_id = $${paramIndex++}`);
+        params.push(input.inboxPhaseId);
       }
 
       if (updates.length > 0) {

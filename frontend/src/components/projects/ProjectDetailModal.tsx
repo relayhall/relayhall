@@ -1,3 +1,4 @@
+import { ContextPreview, ContextPreviewTrigger, ContextPreviewPanel } from '../BriefContextPreview';
 import { authenticatedFetch } from '../../utils/auth';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { X, Clock, CheckCircle2, Circle, Cpu, Calendar, Globe, Plus, AlertTriangle, Lightbulb, Archive, Play, Clipboard, ScrollText, ArchiveRestore, GraduationCap, Search, BookOpen, Boxes, KeyRound, RefreshCw, Compass } from 'lucide-react';
@@ -10,6 +11,11 @@ import { IconButton } from '../ui/IconButton';
 import { Select } from '../ui/Select';
 
 import { ProjectResources } from './ProjectResources';
+import { ProjectOwnerPanel } from './ProjectOwnerPanel';
+import { RequestChangeButton } from '../approvals/RequestChangeDialog';
+import { ProjectInboxPhaseField } from './ProjectInboxPhaseField';
+import { DefaultVerifierField, canSetDefaultVerifier } from './DefaultVerifierField';
+import { useWebSocket } from '../../hooks/useWebSocket';
 import { ConfirmationModal } from '../ConfirmationModal';
 import { Project } from '../../types/project';
 import { Skill, ProjectSkillLink } from '../../types/skill';
@@ -54,7 +60,8 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
   const [showCreateTask, setShowCreateTask] = useState(false);
   const [newTask, setNewTask] = useState({ title: '', description: '', priority: 'normal' as string });
   const navigate = useNavigate();
-  const { scopes: blueprintScopes } = useMyPrincipal();
+  const { subscribe, connected } = useWebSocket();
+  const { me, scopes: blueprintScopes } = useMyPrincipal();
   const mayUseBlueprint = !!blueprintScopes && (blueprintScopes.includes('blueprints:use') || blueprintScopes.includes('*'));
   const modalRef = useRef<HTMLDivElement>(null);
   useFocusTrap(modalRef);
@@ -68,6 +75,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
   // mutation, and it is replaced by the record each mutation returns.
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [currentProject, setCurrentProject] = useState<Project>(project);
+  const reloadGeneration = useRef(0);
   // 412 REVISION_MISMATCH notice: the project changed since it was loaded.
   const [projectConflict, setProjectConflict] = useState(false);
   const [reloadingProject, setReloadingProject] = useState(false);
@@ -125,7 +133,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
     const total_tasks = tasks.length;
     const completed_tasks = tasks.filter(t => t.status === 'completed').length;
     const in_progress_tasks = tasks.filter(t => t.status === 'in-progress').length;
-    const active_agents = new Set(tasks.filter(t => t.activeAgent).map(t => typeof t.activeAgent === 'string' ? t.activeAgent : t.activeAgent!.name)).size;
+    const active_agents = project?.stats?.active_agents ?? 0;
     // Find last activity
     let last_activity: string | null = null;
     for (const t of tasks) {
@@ -267,7 +275,9 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
           description: newTask.description,
           priority: newTask.priority,
           project: project.name,
-          status: 'todo'
+          // Card b13e5ac9: no status and no phase - the server files the
+          // Task in this Project's inbox phase with status Ideas when it
+          // names one, and To-Do with no phase when it does not.
         })
       });
       const data = await response.json();
@@ -315,24 +325,40 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
   // in-progress description draft so the owner can re-apply and save again
   // against the fresh revision.
   const reloadProject = useCallback(async () => {
+    const generation = ++reloadGeneration.current;
     setReloadingProject(true);
     try {
       const response = await authenticatedFetch(`${API_BASE_URL}/projects/${project.id}`);
       const data = await response.json();
+      if (generation !== reloadGeneration.current) return;
       if (response.ok && data.success && data.project) {
         setCurrentProject(data.project);
         setEditedDescription(prev => (editingDescription ? prev : (data.project.description || '')));
         setProjectConflict(false);
+      } else if (response.status === 404) {
+        onClose();
       } else {
         showToast(data.message || data.error || 'Failed to reload the project');
       }
     } catch (error) {
+      if (generation !== reloadGeneration.current) return;
       if (!isIntentionalAbort(error)) console.error('Failed to reload project:', error);
       showToast('Failed to reload the project. Check your connection and try again.');
     } finally {
-      setReloadingProject(false);
+      if (generation === reloadGeneration.current) setReloadingProject(false);
     }
-  }, [project.id, editingDescription, showToast]);
+  }, [project.id, editingDescription, showToast, onClose]);
+
+  // A content-free owner notification has no Project identifier. Re-read
+  // this open detail under current authorization; 404 closes stale content.
+  useEffect(() => {
+    const unsubscribe = subscribe('project.authority_changed', () => { void reloadProject(); });
+    const onFocus = () => { void reloadProject(); };
+    if (typeof window === 'undefined') return;
+    window.addEventListener('focus', onFocus);
+    return () => { unsubscribe(); window.removeEventListener('focus', onFocus); };
+  }, [subscribe, reloadProject]);
+  useEffect(() => { if (connected) void reloadProject(); }, [connected, reloadProject]);
 
   const handleSecretToggle = useCallback(async () => {
     const newHidden = !isHidden;
@@ -541,6 +567,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
   );
 
   return (
+    <ContextPreview kind="project" elementId={project.id} elementName={project.name}>
     <div className="modal-overlay" onClick={onClose}>
       <div
         className="project-detail-modal"
@@ -584,6 +611,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
             </div>
           </div>
           <div className="project-detail-actions">
+            <ContextPreviewTrigger />
             <Button
               variant="secondary"
               size="compact"
@@ -604,6 +632,8 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
             />
           </div>
         </div>
+
+        <ContextPreviewPanel />
 
         {isArchived && (
           <div className="project-archived-banner" role="note">
@@ -816,6 +846,29 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
                   <span className="overview-fact-label">Visibility</span>
                   <span className="overview-fact-value">{isHidden ? 'Secret' : 'Visible'}</span>
                 </div>
+                {/* Card b13e5ac9: the project setting that decides where a new
+                    card without a phase lands (Charter v5 §6.1). */}
+                <ProjectInboxPhaseField
+                  project={currentProject}
+                  disabled={isArchived}
+                  onSaved={next => setCurrentProject(next)}
+                  onConflict={() => setProjectConflict(true)}
+                  onMessage={showToast}
+                />
+                {/* Card 41e24358: the Verifier new cards inherit. */}
+                <DefaultVerifierField
+                  target="projects"
+                  objectId={currentProject.id}
+                  projectId={currentProject.id}
+                  revision={currentProject.revision}
+                  value={currentProject.defaultVerifierPrincipalId}
+                  canEdit={!isArchived && canSetDefaultVerifier(me, blueprintScopes, currentProject.ownerPrincipalId)}
+                  emptyLabel="No default Verifier"
+                  onSaved={saved => setCurrentProject({ ...currentProject, revision: saved.revision,
+                    defaultVerifierPrincipalId: saved.defaultVerifierPrincipalId })}
+                  onConflict={() => setProjectConflict(true)}
+                  onMessage={showToast}
+                />
                 <div className="overview-fact">
                   <span className="overview-fact-label">Tasks</span>
                   <span className="overview-fact-value">{tasks.length}</span>
@@ -1162,6 +1215,12 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
           {/* Access & capabilities: exact governed Version assignments */}
           {activeSection === 'access' && (
             <div className="access-tab">
+              <ProjectOwnerPanel project={currentProject} onChanged={setCurrentProject}
+                onReload={() => { void reloadProject(); }} onUnavailable={onClose} />
+              {/* The universal change request (card 502fb19e, slice S3): ask for
+                  what this session cannot change itself; a person decides it. */}
+              <RequestChangeButton target={{ kind: 'project', projectId: currentProject.id, projectName: currentProject.name }}
+                intro="Need access you do not have, or access for someone else?" />
               <div className="skills-tab-header">
                 <div>
                   <h3 className="skills-tab-title">Access &amp; capabilities</h3>
@@ -1327,5 +1386,6 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({ project,
       )}
 
     </div>
+    </ContextPreview>
   );
 };

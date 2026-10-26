@@ -105,10 +105,14 @@ describe('G3 — the fourth check at the Agent mint seam', () => {
     // wrongly-ordered check goes silent — and the shipped check must still
     // answer with its own code.
     const narrowedScopeMap = loadMutatedModule<typeof import('../utils/scopeMap')>('utils/scopeMap.ts', [{
-      find: "  'telemetry:write',\n  'directory-provisioning:write',\n  'knowledge-contents:read',\n  'root',\n];\n\n/** `root` is the global sentinel",
-      replace: "  'telemetry:write',\n  'directory-provisioning:write',\n  'root',\n];\n\n/** `root` is the global sentinel",
+      // RB-11 Governor v0 (b796067e) put `knowledge-contents:write` after the
+      // read scope; the mutant keeps it and removes ONLY the read scope.
+      find: "  'telemetry:write',\n  'metrics:read',\n  'directory-provisioning:write',\n  'knowledge-contents:read',\n  'knowledge-contents:write',\n  'root',\n];\n\n/** `root` is the global sentinel",
+      replace: "  'telemetry:write',\n  'metrics:read',\n  'directory-provisioning:write',\n  'knowledge-contents:write',\n  'root',\n];\n\n/** `root` is the global sentinel",
     }]);
     expect(narrowedScopeMap.isMintableScope('knowledge-contents:read')).toBe(false);
+    // Exact: the narrowing removed one scope and nothing beside it.
+    expect(narrowedScopeMap.isMintableScope('knowledge-contents:write')).toBe(true);
 
     const mint = loadMutatedModule<typeof import('../services/AgentMintService')>(
       AGENT_MINT,

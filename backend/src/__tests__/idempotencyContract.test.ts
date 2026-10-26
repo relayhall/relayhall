@@ -50,7 +50,9 @@
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import os from 'os';
 import crypto from 'crypto';
+import ts from 'typescript';
 
 // ─────────────────────────── the database contract ───────────────────────────
 
@@ -80,6 +82,15 @@ process.env.DB_USER = decodeURIComponent(parsed.username);
 process.env.DB_PASSWORD = decodeURIComponent(parsed.password);
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'retry-contract-suite-secret-0123456789abcdef';
+// RB-11 Governor v0 (card b796067e): `knowledge.note.commit` joined the closed
+// set, so its 4.1.4 baseline fixture commits a real proposal through the door
+// to a STUB write source. Per-run assertion and handle keysets for that.
+process.env.RELAYHALL_KNOWLEDGE_ASSERTION_KEYS = JSON.stringify({
+  'retry-kw': (crypto.generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'der' }) as Buffer).toString('base64'),
+});
+process.env.RELAYHALL_KNOWLEDGE_ASSERTION_ACTIVE_KEY = 'retry-kw';
+process.env.RELAYHALL_KNOWLEDGE_HANDLE_KEYS = JSON.stringify({ 'retry-kh': crypto.randomBytes(32).toString('base64') });
+process.env.RELAYHALL_KNOWLEDGE_HANDLE_ACTIVE_KEY = 'retry-kh';
 
 const express = require('express');
 
@@ -99,6 +110,10 @@ const { RETRY_CONTRACT_SENTENCES, toolByName } = require('../mcp/registry');
 const { writersOf, derivedTableManifest } = require('./support/moduleClosure');
 const { stableJson } = require('../utils/stableJson');
 const mcpRoutes = require('../mcp/httpRoute');
+const { presenceWriter, PRESENCE_THROTTLE_MS } = require('../db/boundedPresenceWrites');
+const knowledgeDialClient = require('../services/KnowledgeDialClient');
+const { knowledgeAssertionJwks } = require('../services/KnowledgeAssertionSigner');
+const { KnowledgeWriteStubSource } = require('./support/knowledgeWriteStubSource');
 
 jest.setTimeout(180_000);
 
@@ -284,6 +299,20 @@ let PROJECT_ID: string;
  */
 let FIELD_GATE_SERVICE: string;
 let FIELD_GATE_TASK: string;
+/** Card 2bc7b303: the Subtask structure baselines' Tasks. The create baseline
+ *  adds Subtasks to its own Task; the reorder and text baselines share one
+ *  whose Subtask set never changes, so the same order stays a permutation. */
+let SUBTASK_CREATE_TASK: string;
+let SUBTASK_ORDER_TASK: string;
+let SUBTASK_ORDER_IDS: string[];
+/**
+ * RB-11 Governor v0 (card b796067e): an open proposal at a STUB write source,
+ * so the `knowledge.note.commit` baseline commits for real. The stub answers a
+ * repeated commit of a committed proposal with its stored commit (C.8 step 8),
+ * which is what the second credential's runs meet.
+ */
+const KNOWLEDGE_STUB = new KnowledgeWriteStubSource('retry-contract-write-stub');
+let KNOWLEDGE_PROPOSAL: { source: string; proposalId: string; previewDigest: string };
 
 const SCOPES = [
   'tasks:read', 'tasks:write', 'reports:read', 'reports:write',
@@ -293,6 +322,13 @@ const SCOPES = [
   // Service for exactly that act ("a role change must not become a covert
   // execution grant"). Without it the drill measures a 403 instead of the guard.
   'services:read', 'services:write', 'services:invoke',
+  // Planning slice: the Phase family. `phases:write` is the route ceiling of
+  // `POST /phases` (operation `phase.create`) and of the three revision-bound
+  // verbs measured below; `phases:read` is what the fixtures re-read with.
+  'phases:read', 'phases:write',
+  // RB-11 Governor v0 (card b796067e): the route ceiling of the three
+  // /knowledge-writes verbs; `knowledge.note.commit` is in the closed set.
+  'knowledge-contents:write',
 ];
 
 /**
@@ -489,6 +525,17 @@ beforeAll(async () => {
   OTHER_PRINCIPAL = await makeConnector('retry-other');
 
   server = buildApp().listen(0);
+  // 4a645aa9: the SERVER never ends an idle keep-alive connection; only the client
+  // does. Node's default server timeout (5 s) runs on the real clock, while
+  // fetch's pool times its idle sockets on a coarse clock that moves one fixed
+  // half-second step each time its timer runs, however long the event loop was
+  // blocked. A long synchronous phase (a whole-schema snapshot and its
+  // comparisons) therefore leaves the client holding a socket the server has just
+  // closed, and the next request on it is reset before any answer (`fetch
+  // failed` / `read ECONNRESET`). With 0 the client's idle timeout is the only
+  // one, and a client never writes on a socket it closed itself. No request and
+  // no assertion changes.
+  server.keepAliveTimeout = 0;
   await new Promise<void>((resolve) => server.once('listening', resolve));
   origin = `http://127.0.0.1:${(server.address() as any).port}`;
 
@@ -510,9 +557,63 @@ beforeAll(async () => {
 
   FIELD_GATE_SERVICE = (await publishedConnector()).serviceId;
   FIELD_GATE_TASK = await makeTask('field-gate baseline fixture');
+  SUBTASK_CREATE_TASK = await makeTask('subtask create baseline fixture');
+  SUBTASK_ORDER_TASK = await makeTask('subtask order baseline fixture');
+  SUBTASK_ORDER_IDS = [];
+  for (const [index, title] of ['first', 'second'].entries()) {
+    SUBTASK_ORDER_IDS.push(String((await pool.query(
+      'INSERT INTO subtasks (task_id, index, title, status) VALUES ($1, $2, $3, $4) RETURNING id',
+      [SUBTASK_ORDER_TASK, index, title, 'empty'])).rows[0].id));
+  }
+  KNOWLEDGE_PROPOSAL = await knowledgeProposalFixture();
 });
 
+/**
+ * A write-capable knowledge source dialing the stub, and one open proposal on
+ * it made by PRIMARY through the production route. The stub binds a private
+ * interface address (loopback is never admissible) and its certificate reaches
+ * the REAL dial through a spy, never through a route option.
+ */
+async function knowledgeProposalFixture(): Promise<{ source: string; proposalId: string; previewDigest: string }> {
+  let address: string | null = null;
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) if (!address && entry.family === 'IPv4' && !entry.internal) address = entry.address;
+  }
+  expect(address).not.toBeNull();
+  await KNOWLEDGE_STUB.start(address as string);
+  KNOWLEDGE_STUB.bearer = crypto.randomBytes(24).toString('base64url');
+  KNOWLEDGE_STUB.jwks = knowledgeAssertionJwks().keys;
+  process.env.RELAYHALL_KNOWLEDGE_SOURCE_CREDENTIALS = JSON.stringify({ 'retry-write-stub/core': { bearer: KNOWLEDGE_STUB.bearer } });
+  const realDial = knowledgeDialClient.dialKnowledgeSource;
+  jest.spyOn(knowledgeDialClient, 'dialKnowledgeSource')
+    .mockImplementation(async (options: any) => realDial({ ...options, trustAnchors: [KNOWLEDGE_STUB.certificate.cert] }));
+  const service = await pool.query(
+    `INSERT INTO services (slug, name, description, kind, status, runtime_mode,
+                           knowledge_query_endpoint, knowledge_write_endpoint, knowledge_claims_mode,
+                           knowledge_subject_mode, knowledge_allowed_networks, knowledge_core_credential_ref,
+                           current_descriptor_version)
+     VALUES ($1, $1, '', 'service', 'published', 'direct', $2, $3, 'asserted', 'pairwise', $4::text[],
+             'retry-write-stub/core', 1)
+     RETURNING id`,
+    [`retry-write-${tag()}`, KNOWLEDGE_STUB.url('/search'), KNOWLEDGE_STUB.url('/write'), [`${address}/32`]],
+  );
+  const source = String(service.rows[0].id);
+  KNOWLEDGE_STUB.sourceId = source;
+  const descriptor = { options: [], knowledgeSource: {
+    classes: [{ key: 'notes', content: 'docs' }], compartments: [], protocol_version: 2,
+    compartment_mode: 'dynamic-opaque', categories: ['notes:note'], write: { protocol_version: 1, kinds: ['note'] },
+  } };
+  await pool.query(
+    `INSERT INTO service_descriptor_versions (service_id, version, descriptor, content_hash) VALUES ($1, 1, $2::jsonb, $3)`,
+    [source, JSON.stringify(descriptor), crypto.createHash('sha256').update(JSON.stringify(descriptor)).digest('hex')],
+  );
+  const proposed = await call('POST', '/knowledge-writes/propose', { body: { title: `retry note ${tag()}`, content: 'retry fixture', source } });
+  expect({ status: proposed.status, why: proposed.status === 200 ? '' : proposed.text.slice(0, 200) }).toEqual({ status: 200, why: '' });
+  return { source, proposalId: String(proposed.json.result.proposal_id), previewDigest: String(proposed.json.result.preview_digest) };
+}
+
 afterAll(async () => {
+  await KNOWLEDGE_STUB.stop();
   if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
   await pool.end().catch(() => undefined);
 });
@@ -537,6 +638,26 @@ async function makeTask(title = `retry ${tag()}`): Promise<string> {
   await pool.query(
     `UPDATE tasks SET execution_profile = '{"options":{}}'::jsonb WHERE id = $1`, [taskId]);
   return taskId;
+}
+
+/**
+ * A Phase under the suite's Project, through the production route with a
+ * fresh key, returning the id AND the revision the revision-bound drills need.
+ */
+async function makePhase(name = `phase ${tag()}`): Promise<{ id: string; revision: string }> {
+  const answer = await call('POST', '/phases', {
+    body: { projectId: PROJECT_ID, name }, key: freshKey(),
+  });
+  expect({ status: answer.status, why: answer.status === 201 ? '' : answer.text.slice(0, 200) })
+    .toEqual({ status: 201, why: '' });
+  const phase = answer.json.phase;
+  return { id: String(phase.id), revision: String(phase.revision) };
+}
+
+async function phaseRevision(id: string): Promise<string> {
+  const rows = await pool.query('SELECT revision FROM phases WHERE id = $1', [id]);
+  expect(rows.rows).toHaveLength(1);
+  return String(rows.rows[0].revision);
 }
 
 async function recordCount(): Promise<number> {
@@ -672,6 +793,11 @@ describe('fb06c930 — the retry contract, on a real PostgreSQL', () => {
       expect({ operation, scope: (IDEMPOTENT_OPERATIONS as Record<string, any>)[operation].scope })
         .toEqual({ operation, scope: 'principal' });
     }
+    // …and an operation added AFTER the closed set was ratified takes ruling
+    // 3's DEFAULT, credential. `phase.create` also checks its parent Project
+    // inside the route, before replay, so the narrower scope stays required.
+    expect((IDEMPOTENT_OPERATIONS as Record<string, any>)['phase.create'])
+      .toEqual({ scope: 'credential', replay: 'return' });
 
     // 2 · the DATABASE: a wrong-scope row for a field-gated operation is not
     // writable at all, whatever the middleware believes.
@@ -778,7 +904,7 @@ describe('fb06c930 — the retry contract, on a real PostgreSQL', () => {
     expect({ policy: 'refuse', sql: inSql('refuse') }).toEqual({ policy: 'refuse', sql: declared('refuse') });
     // Not vacuous: the parse really found operations, and all ten are covered.
     expect(inSql('return').length + inSql('refuse').length).toBe(Object.keys(IDEMPOTENT_OPERATIONS).length);
-    expect(inSql('refuse')).toEqual(['agent.mint.collect', 'agent.mint.request']);
+    expect(inSql('refuse')).toEqual(['agent.mint.collect', 'agent.mint.request', 'task.report.save']);
   });
 
   // ═════════════════ 4.1.1 — a control per operation ═════════════════
@@ -870,6 +996,18 @@ describe('fb06c930 — the retry contract, on a real PostgreSQL', () => {
         [PROJECT_ID, `${name}%`])()).toBe(2);
     });
 
+    it('phase.create — the duplicate IS the control: two Phases', async () => {
+      // `PhaseService.create` applies no name uniqueness (position ties are
+      // legal by design, Phases may overlap), so an unkeyed exact retry is a
+      // second Phase — the shape the keyed contract exists to absorb.
+      const body = { projectId: PROJECT_ID, name: `unkeyed phase ${tag()}` };
+      const first = await call('POST', '/phases', { body });
+      const second = await call('POST', '/phases', { body });
+      expect([first.status, second.status]).toEqual([201, 201]);
+      expect(String(first.json.phase.id)).not.toBe(String(second.json.phase.id));
+      expect(await countOf('SELECT count(*)::int AS n FROM phases WHERE name = $1', [body.name])()).toBe(2);
+    });
+
     it('task.patch — one Task, the same values re-applied; the state oracle can see a change', async () => {
       const taskId = await makeTask();
       await call('PATCH', `/tasks/${taskId}`, { body: { priority: 'high' } });
@@ -914,6 +1052,28 @@ describe('fb06c930 — the retry contract, on a real PostgreSQL', () => {
       expect(second.text).toBe(first.text);
       expect(second.headers['retry-replayed']).toBe('true');
       expect(await countOf('SELECT count(*)::int AS n FROM reports WHERE title = $1', [body.title])()).toBe(1);
+    });
+
+    it('phase.create replays the exact bytes under Retry-Replayed, with ONE record and ONE Phase', async () => {
+      const key = freshKey();
+      // goal: null and position: 0 are VALUES on this route, and an exact
+      // retry must resend the same bytes (canonicalisation §3.4).
+      const body = { projectId: PROJECT_ID, name: `keyed phase ${tag()}`, goal: null, position: 0 };
+      const first = await call('POST', '/phases', { body, key });
+      const second = await call('POST', '/phases', { body, key });
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(201);
+      expect(second.text).toBe(first.text);
+      expect(second.headers['retry-replayed']).toBe('true');
+      expect(first.headers['retry-replayed']).toBeUndefined();
+      expect(second.headers['retry-request-id']).toBe(first.headers['retry-request-id']);
+      const rows = await rowsFor('phase.create', key);
+      expect(rows).toHaveLength(1);
+      // Credential-scoped by declaration, and the row the middleware wrote says so.
+      expect(String(rows[0].scope)).toBe(`cred:${PRIMARY.credentialId}`);
+      expect(await countOf('SELECT count(*)::int AS n FROM phases WHERE name = $1', [body.name])()).toBe(1);
+      // …and the stored answer really carries the route's defaults as values.
+      expect(first.json.phase).toMatchObject({ goal: null, position: 0, status: 'todo' });
     });
 
     it('the byte comparison is BYTE-level: a transposed-key body of the same value FAILS it', async () => {
@@ -1083,6 +1243,158 @@ interface BaselineFixture {
   as: () => Caller;
   /** The field-level authority `as()` lacks, where there is one. */
   fieldGate?: string;
+  /**
+   * The bearer the FIRST (committing) call runs as, where PRIMARY cannot
+   * commit it; absent = PRIMARY. The Group-owned create is a login-session act,
+   * so its first call is a dashboard login and `as()` is a bearer of the SAME
+   * principal.
+   */
+  first?: () => string;
+  /** Extra request headers every call of this case sends (the If-Match of a PUT). */
+  headers?: () => Record<string, string>;
+}
+
+/**
+ * AZ-A12 clause 10(b) (card 311229fd): `project.groupowned.create`. An admin
+ * Account signs in (a dashboard login, root), allocates a Project id and holds
+ * a step-up bound to (`ownership.transfer`, that id); the second credential is
+ * a bearer held by the SAME Account. The issuance policy never mints one
+ * (Accounts are keyless, A17.1), but the authenticator accepts a stored row for
+ * an Account, and the retry scope must not depend on the issuance policy
+ * holding: it is issued through the policy to a Connector and then rebound.
+ */
+let GROUP_CREATE: { login: string; bearer: Caller; groupId: string; projectId: string; stepUpToken: string; name: string };
+async function groupCreateFixture(): Promise<typeof GROUP_CREATE> {
+  const jwt = require('jsonwebtoken');
+  const { stepUpService } = require('../services/StepUpService');
+  const { insertGroupRow } = require('./support/groupRows');
+  const handle = `retry-group-admin-${tag()}`;
+  const admin = await pool.query(
+    `INSERT INTO principals (kind, handle, display_name, status, role) VALUES ('human', $1, $1, 'active', 'admin') RETURNING id`,
+    [handle]);
+  const adminId = String(admin.rows[0].id);
+  const carrier = await pool.query(
+    `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
+     VALUES ('service', $1, $1, 'active', $2, 'retry contract group-owned create carrier', $3::jsonb) RETURNING id`,
+    [`retry-group-carrier-${tag()}`, adminId, JSON.stringify({ scopes: 'parent', objects: 'parent' })]);
+  const issued = await principalService.issueCredential(
+    { principalId: String(carrier.rows[0].id), scopes: SCOPES, transport: 'any' }, SYSTEM_ACTOR);
+  await pool.query('UPDATE principal_credentials SET principal_id = $2 WHERE id = $1', [issued.credentialId, adminId]);
+  const projectId = crypto.randomUUID();
+  const minted = await stepUpService.mint(adminId, 'ownership.transfer', projectId, 'password');
+  return {
+    login: jwt.sign({ v: 2, sub: adminId, handle, kind: 'human' }, process.env.JWT_SECRET, { expiresIn: '30m' }),
+    bearer: { principalId: adminId, credentialId: issued.credentialId, fullKey: issued.fullKey, handle },
+    groupId: await insertGroupRow(pool, { name: `retry contract group ${tag()}`, description: 'retry contract', featured: false }),
+    projectId, stepUpToken: minted.token, name: `base group-owned ${tag()}`,
+  };
+}
+
+/**
+ * Card 549cc51f (E298, E299): `knowledge.sharedwriter.add` and
+ * `knowledge.sharedwriter.remove`. An admin Account signs in (a dashboard
+ * login, root) and holds one step-up per act bound to the target Account; the
+ * second credential is a bearer held by the SAME Account. The issuance policy
+ * never mints one (Accounts are keyless, A17.1), but the authenticator accepts
+ * a stored row for an Account, and the retry scope must not depend on the
+ * issuance policy holding: it is issued through the policy to a Connector and
+ * then rebound. The remove's target is listed in raw SQL first.
+ */
+let SHARED_WRITERS: {
+  login: string; bearer: Caller; source: string; addTarget: string; removeTarget: string;
+  addToken: string; removeToken: string;
+};
+async function sharedWritersFixture(): Promise<typeof SHARED_WRITERS> {
+  const jwt = require('jsonwebtoken');
+  const { stepUpService } = require('../services/StepUpService');
+  const handle = `retry-writers-admin-${tag()}`;
+  const admin = await pool.query(
+    `INSERT INTO principals (kind, handle, display_name, status, role) VALUES ('human', $1, $1, 'active', 'admin') RETURNING id`,
+    [handle]);
+  const adminId = String(admin.rows[0].id);
+  const carrier = await pool.query(
+    `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
+     VALUES ('service', $1, $1, 'active', $2, 'retry contract shared-writer carrier', $3::jsonb) RETURNING id`,
+    [`retry-writers-carrier-${tag()}`, adminId, JSON.stringify({ scopes: 'parent', objects: 'parent' })]);
+  const issued = await principalService.issueCredential(
+    { principalId: String(carrier.rows[0].id), scopes: SCOPES, transport: 'any' }, SYSTEM_ACTOR);
+  await pool.query('UPDATE principal_credentials SET principal_id = $2 WHERE id = $1', [issued.credentialId, adminId]);
+  const source = await pool.query(
+    `INSERT INTO services (slug, name, description, kind, status, runtime_mode, knowledge_query_endpoint,
+                           knowledge_claims_mode, knowledge_subject_mode, knowledge_core_credential_ref)
+     VALUES ($1, $1, '', 'service', 'published', 'direct', 'https://source.invalid/knowledge/search',
+             'asserted', 'pairwise', 'retry-contract/core') RETURNING id`, [`retry-writers-${tag()}`]);
+  const sourceId = String(source.rows[0].id);
+  const account = async (label: string): Promise<string> => String((await pool.query(
+    `INSERT INTO principals (kind, handle, display_name, status, role) VALUES ('human', $1, $1, 'active', 'editor') RETURNING id`,
+    [`retry-writers-${label}-${tag()}`])).rows[0].id);
+  const addTarget = await account('add');
+  const removeTarget = await account('remove');
+  await pool.query(
+    `INSERT INTO knowledge_shared_writers (source_id, scope, account_id, reason) VALUES ($1, 'organisation', $2, $3)`,
+    [sourceId, removeTarget, 'retry contract: listed for the remove baseline']);
+  return {
+    login: jwt.sign({ v: 2, sub: adminId, handle, kind: 'human' }, process.env.JWT_SECRET, { expiresIn: '30m' }),
+    bearer: { principalId: adminId, credentialId: issued.credentialId, fullKey: issued.fullKey, handle },
+    source: sourceId, addTarget, removeTarget,
+    addToken: (await stepUpService.mint(adminId, 'knowledge.shared-writer.add', addTarget, 'password')).token,
+    removeToken: (await stepUpService.mint(adminId, 'knowledge.shared-writer.remove', removeTarget, 'password')).token,
+  };
+}
+
+/**
+ * Card bedf50cc (E380): the five plugin operations. Each is a login-session
+ * act: the Account's own login for its choice and values, an admin Account's
+ * login with a step-up bound to (plugin.admin, the plugin) for the policy, the
+ * deployment values and the clean-up. The first call is a dashboard login
+ * (`user:<handle>` scope); the second credential is a bearer of the SAME
+ * Account (rebound as above), which every handler refuses SESSION_ONLY or
+ * PLUGIN_ADMIN_REQUIRES_SESSION on both runs: no cross-credential replay. The
+ * host loader is a one-plugin double (a v1 plugin every Account views), because
+ * this suite measures the retry seam, not plugin loading.
+ */
+const RETRY_PLUGIN = 'retry-plugin';
+let PLUGINS: { userLogin: string; userBearer: Caller; adminLogin: string; adminBearer: Caller;
+  policyToken: string; settingsToken: string; cleanupToken: string };
+async function pluginsFixture(): Promise<typeof PLUGINS> {
+  const jwt = require('jsonwebtoken');
+  const { stepUpService } = require('../services/StepUpService');
+  const { setPluginHostLoader } = require('../routes/pluginHost');
+  const plugin = {
+    name: RETRY_PLUGIN, healthy: true, lastHealthCheck: null,
+    config: { name: RETRY_PLUGIN, source: '.', enabled: true, access: { default: ['view'] } },
+    manifest: { schema_version: 'rh.plugin/1', name: RETRY_PLUGIN, version: '1.0.0', description: 'retry contract plugin',
+      ui: { enabled: true, settings_schema: [
+        { key: 'notes', label: 'Notes', type: 'string', scope: 'account' },
+        { key: 'level', label: 'Level', type: 'integer', scope: 'account_overridable', min: 0, max: 9 },
+      ] } },
+  };
+  setPluginHostLoader({ getPlugin: (name: string) => (name === RETRY_PLUGIN ? plugin : undefined), getAllPlugins: () => [plugin] } as any);
+  const person = async (role: string, label: string) => {
+    const handle = `retry-plugins-${label}-${tag()}`;
+    const id = String((await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, role) VALUES ('human', $1, $1, 'active', $2) RETURNING id`,
+      [handle, role])).rows[0].id);
+    const carrier = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
+       VALUES ('service', $1, $1, 'active', $2, 'retry contract plugin carrier', $3::jsonb) RETURNING id`,
+      [`retry-plugins-carrier-${tag()}`, id, JSON.stringify({ scopes: 'parent', objects: 'parent' })]);
+    const issued = await principalService.issueCredential(
+      { principalId: String(carrier.rows[0].id), scopes: SCOPES, transport: 'any' }, SYSTEM_ACTOR);
+    await pool.query('UPDATE principal_credentials SET principal_id = $2 WHERE id = $1', [issued.credentialId, id]);
+    return {
+      login: jwt.sign({ v: 2, sub: id, handle, kind: 'human' }, process.env.JWT_SECRET, { expiresIn: '30m' }),
+      bearer: { principalId: id, credentialId: issued.credentialId, fullKey: issued.fullKey, handle },
+    };
+  };
+  const user = await person('editor', 'user');
+  const admin = await person('admin', 'admin');
+  // The clean-up needs something stale to remove: a value the schema never declared.
+  await pool.query(`INSERT INTO plugin_settings (plugin_name, layer, account_principal_id, settings_values)
+    VALUES ($1, 'account', $2, '{"retired": true}'::jsonb)`, [RETRY_PLUGIN, admin.bearer.principalId]);
+  const token = async () => (await stepUpService.mint(admin.bearer.principalId, 'plugin.admin', RETRY_PLUGIN, 'password')).token;
+  return { userLogin: user.login, userBearer: user.bearer, adminLogin: admin.login, adminBearer: admin.bearer,
+    policyToken: await token(), settingsToken: await token(), cleanupToken: await token() };
 }
 
 const BASELINE_FIXTURES: Record<string, BaselineFixture> = {
@@ -1141,9 +1453,111 @@ const BASELINE_FIXTURES: Record<string, BaselineFixture> = {
     body: () => ({ kind: 'reference', name: `base-${tag()}`,
                    details: { url: 'https://example.invalid/res', category: 'documentation' } }),
   },
+  // ── the planning slice's create, credential-scoped by DEFAULT ──────────
+  // The Project-read target gate now precedes retry middleware. This case
+  // still uses a readable Project, so the baseline measures credential scope
+  // on a second credential of the same principal: the baseline
+  // says, rather than assumes, that credential scope yields two rows and no
+  // cross-credential replay for it.
+  'phase.create': {
+    method: 'POST', path: () => '/phases', as: () => SECOND_CREDENTIAL,
+    body: () => ({ projectId: PROJECT_ID, name: `base phase ${tag()}` }),
+  },
+  // ── RB-11 Governor v0 (card b796067e): the knowledge note commit ──────
+  // Credential-scoped by ruling 3's default. The second credential is the
+  // SAME principal, so the door's own proposal binding admits it and the
+  // stub answers the committed proposal with its stored commit: two 200s, no
+  // cross-credential replay — measured, not assumed.
+  // ── AZ-A12 clause 10(b) (card 311229fd): the Group-owned create ────────
+  // Credential-scoped because the handler applies the 9(e) standing test the
+  // guard chain does not: a login session, root or an administrator. Its
+  // second credential is a bearer of the SAME principal as the committing
+  // login, so under principal scope the two would share one record. No
+  // `fieldGate`: the identical body re-meets the Project's name and id first,
+  // so both of the bearer's runs answer 409 from the handler; the bearer's own
+  // standing refusal under the same key is measured in
+  // groupOwnershipTransferLive ("a same-key replay of a Group-owned create").
+  'project.groupowned.create': {
+    method: 'POST', path: () => '/projects', as: () => GROUP_CREATE.bearer,
+    first: () => GROUP_CREATE.login,
+    body: () => ({ name: GROUP_CREATE.name, ownerPrincipalId: GROUP_CREATE.groupId,
+                   projectId: GROUP_CREATE.projectId, stepUpToken: GROUP_CREATE.stepUpToken }),
+  },
+  'knowledge.note.commit': {
+    method: 'POST', path: () => '/knowledge-writes/commit', as: () => SECOND_CREDENTIAL,
+    body: () => ({ proposalId: KNOWLEDGE_PROPOSAL.proposalId, previewDigest: KNOWLEDGE_PROPOSAL.previewDigest,
+                   expectedRevision: 'absent', source: KNOWLEDGE_PROPOSAL.source }),
+  },
+  // ── Card 549cc51f (E298, E299): the shared-area writer list ──────────────
+  // Credential-scoped because the handler decides standing from the login
+  // session (root or an administrator) and burns a step-up, neither of which
+  // the guard chain does. The first call is the admin Account's dashboard
+  // login; the second credential is a bearer of the SAME Account, so under
+  // principal scope it would be served the login's answer. No `fieldGate`:
+  // both of the bearer's runs are refused SHARED_WRITER_REQUIRES_SESSION by
+  // the handler, which is the property itself; the same-key refusal is also
+  // measured in knowledgeSharedWritersLive.
+  'knowledge.sharedwriter.add': {
+    method: 'POST', path: () => '/knowledge-shared-writers', as: () => SHARED_WRITERS.bearer,
+    first: () => SHARED_WRITERS.login,
+    body: () => ({ source: SHARED_WRITERS.source, accountId: SHARED_WRITERS.addTarget,
+                   reason: 'retry contract: the add baseline row', stepUpToken: SHARED_WRITERS.addToken }),
+  },
+  'knowledge.sharedwriter.remove': {
+    method: 'POST', path: () => '/knowledge-shared-writers/remove', as: () => SHARED_WRITERS.bearer,
+    first: () => SHARED_WRITERS.login,
+    body: () => ({ source: SHARED_WRITERS.source, accountId: SHARED_WRITERS.removeTarget,
+                   reason: 'retry contract: the remove baseline row', stepUpToken: SHARED_WRITERS.removeToken }),
+  },
+  // ── Card 2bc7b303 (owner ruling E374): the Subtask structure verbs ────────
+  // Credential-scoped by ruling 3's default. No field-level check beyond the
+  // route scope and the Task write point stage, so the second credential of
+  // the SAME principal is admitted on both runs: two 2xx, no cross-credential
+  // replay - measured, not assumed. The reorder sends the same permutation of
+  // a Task whose set never changes, so every run is a valid order.
+  'task.subtask.create': {
+    method: 'POST', path: () => `/tasks/${SUBTASK_CREATE_TASK}/subtasks`, as: () => SECOND_CREDENTIAL,
+    body: () => ({ text: `base subtask ${tag()}` }),
+  },
+  'task.subtask.reorder': {
+    method: 'POST', path: () => `/tasks/${SUBTASK_ORDER_TASK}/subtasks/reorder`, as: () => SECOND_CREDENTIAL,
+    body: () => ({ order: [SUBTASK_ORDER_IDS[1], SUBTASK_ORDER_IDS[0]] }),
+  },
+  'task.subtask.text': {
+    method: 'PATCH', path: () => `/tasks/${SUBTASK_ORDER_TASK}/subtasks/by-id/${SUBTASK_ORDER_IDS[0]}/text`,
+    as: () => SECOND_CREDENTIAL,
+    body: () => ({ text: `base text ${tag()}` }),
+  },
+  // ── Card bedf50cc (E380): the five plugin operations (see pluginsFixture) ──
+  'plugin.choice.put': {
+    method: 'PUT', path: () => `/plugin-host/${RETRY_PLUGIN}/choice`, as: () => PLUGINS.userBearer,
+    first: () => PLUGINS.userLogin, headers: () => ({ 'If-Match': '0' }), body: () => ({ enabled: true }),
+  },
+  'plugin.settings.account.put': {
+    method: 'PUT', path: () => `/plugin-host/${RETRY_PLUGIN}/settings/account`, as: () => PLUGINS.userBearer,
+    first: () => PLUGINS.userLogin, headers: () => ({ 'If-Match': '0' }), body: () => ({ values: { notes: 'retry contract' } }),
+  },
+  'plugin.policy.put': {
+    method: 'PUT', path: () => `/plugin-admin/${RETRY_PLUGIN}/policy`, as: () => PLUGINS.adminBearer,
+    first: () => PLUGINS.adminLogin, headers: () => ({ 'If-Match': '0' }),
+    body: () => ({ availability: 'default_on', stepUpToken: PLUGINS.policyToken }),
+  },
+  'plugin.settings.deployment.put': {
+    method: 'PUT', path: () => `/plugin-admin/${RETRY_PLUGIN}/settings`, as: () => PLUGINS.adminBearer,
+    first: () => PLUGINS.adminLogin, headers: () => ({ 'If-Match': '0' }),
+    body: () => ({ values: { level: 3 }, lockedKeys: [], stepUpToken: PLUGINS.settingsToken }),
+  },
+  'plugin.settings.cleanup': {
+    method: 'POST', path: () => `/plugin-admin/${RETRY_PLUGIN}/settings/cleanup`, as: () => PLUGINS.adminBearer,
+    first: () => PLUGINS.adminLogin, body: () => ({ stepUpToken: PLUGINS.cleanupToken }),
+  },
 };
 
 describe('4.1.4 — the replay identity is (scope, operation, key), measured', () => {
+  beforeAll(async () => { GROUP_CREATE = await groupCreateFixture(); });
+  beforeAll(async () => { SHARED_WRITERS = await sharedWritersFixture(); });
+  beforeAll(async () => { PLUGINS = await pluginsFixture(); });
+
   it('a principal-scoped operation: two credentials of the SAME principal share one record', async () => {
     const key = freshKey();
     const body = { title: `same-principal ${tag()}`, content: 'x' };
@@ -1249,7 +1663,13 @@ describe('4.1.4 — the replay identity is (scope, operation, key), measured', (
     // must cover them exactly — no gaps, and nothing here that the declaration
     // does not name.
     expect(Object.keys(BASELINE_FIXTURES).sort()).toEqual(RETURN_OPERATIONS);
-    expect(RETURN_OPERATIONS.length).toBe(8);
+    // Eight at card fb06c930; nine with the planning slice's `phase.create`;
+    // ten with RB-11 Governor v0's `knowledge.note.commit` (card b796067e);
+    // eleven with AZ-A12's `project.groupowned.create` (card 311229fd);
+    // thirteen with the shared-area writer list's add and remove (card 549cc51f);
+    // sixteen with the Subtask structure verbs (card 2bc7b303);
+    // twenty-one with the five plugin operations (card bedf50cc).
+    expect(RETURN_OPERATIONS.length).toBe(21);
     // WHICH refusals count. The violation this measures is an AUTHORIZATION
     // one: a replay served where the handler's own binding would have denied
     // the caller (401/403, or a 404-concealed foreign target). A 409 uniqueness
@@ -1270,7 +1690,7 @@ describe('4.1.4 — the replay identity is (scope, operation, key), measured', (
       const path = probe.path();
       // The FIRST call is made by the full-authority credential, so a row really
       // is committed and there really is something to replay.
-      const first = await call(probe.method, path, { body, key });
+      const first = await call(probe.method, path, { body, key, token: probe.first?.(), headers: probe.headers?.() });
       expect({ operation, first: first.status < 400,
                why: first.status < 400 ? '' : first.text.slice(0, 200) })
         .toEqual({ operation, first: true, why: '' });
@@ -1295,9 +1715,9 @@ describe('4.1.4 — the replay identity is (scope, operation, key), measured', (
         [key]);
       expect({ operation, reached: anchor.rows.map((row: any) => String(row.operation)) })
         .toEqual({ operation, reached: [operation] });
-      const withRow = await call(probe.method, path, { body, key, token: probe.as().fullKey });
+      const withRow = await call(probe.method, path, { body, key, token: probe.as().fullKey, headers: probe.headers?.() });
       await pool.query('DELETE FROM operation_idempotency_records WHERE idempotency_key = $1', [key]);
-      const noRow = await call(probe.method, path, { body, key: freshKey(), token: probe.as().fullKey });
+      const noRow = await call(probe.method, path, { body, key: freshKey(), token: probe.as().fullKey, headers: probe.headers?.() });
       observed.push({ operation, withRow: withRow.status, noRow: noRow.status });
       if (probe.fieldGate && AUTHORIZATION_REFUSALS.includes(noRow.status)) {
         reachedAGate.push(operation);
@@ -2019,6 +2439,59 @@ const TOOL_CASES: ToolCase[] = [
     allowance: { feed_events: 1 },
     secondAnswer: (first, second) => { expect(first.status).toBe(200); expect(second.status).toBe(200); },
   },
+  // ── the planning slice's three revision-bound Phase verbs ──────────────
+  // MEASURED, not delegated: `PhaseService.withPhaseLock` proves the revision
+  // BEFORE any state check and rolls back on mismatch, so the exact retry —
+  // the same OLD revision in the body — is refused with the change already
+  // applied and writes nothing: no row moves, no feed event lands. Hence NO
+  // exemptions and NO allowance, and (a)+(b) measure that claim over the
+  // whole schema rather than taking the sentence's word for it.
+  {
+    tool: 'relayhall_phase_update',
+    setup: async () => {
+      const phase = await makePhase();
+      return { method: 'PATCH', path: `/phases/${phase.id}`, body: { revision: phase.revision, goal: 'converged', position: 0 } };
+    },
+    exempt: [],
+    allowance: {},
+    secondAnswer: (first, second) => {
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(409);
+      expect(String(second.json?.code ?? second.text)).toContain('REVISION_MISMATCH');
+    },
+  },
+  {
+    tool: 'relayhall_phase_archive',
+    setup: async () => {
+      const phase = await makePhase();
+      return { method: 'POST', path: `/phases/${phase.id}/archive`, body: { revision: phase.revision } };
+    },
+    exempt: [],
+    allowance: {},
+    secondAnswer: (first, second) => {
+      expect(first.status).toBe(200);
+      expect(String(first.json?.phase?.status)).toBe('archived');
+      expect(second.status).toBe(409);
+      expect(String(second.json?.code ?? second.text)).toContain('REVISION_MISMATCH');
+    },
+  },
+  {
+    tool: 'relayhall_phase_restore',
+    setup: async () => {
+      const phase = await makePhase();
+      const archived = await call('POST', `/phases/${phase.id}/archive`, { body: { revision: phase.revision } });
+      expect(archived.status).toBe(200);
+      return { method: 'POST', path: `/phases/${phase.id}/unarchive`, body: { revision: String(archived.json.phase.revision) } };
+    },
+    exempt: [],
+    allowance: {},
+    secondAnswer: (first, second) => {
+      expect(first.status).toBe(200);
+      expect(String(first.json?.phase?.status)).toBe('todo');
+      expect(second.status).toBe(409);
+      expect(String(second.json?.code ?? second.text)).toContain('REVISION_MISMATCH');
+    },
+  },
 ];
 
 /** (e1) and (e2): the pins, by value, so widening one reddens the PIN. */
@@ -2056,13 +2529,51 @@ const EXPECTED_ALLOWANCES: Array<[string, string, number]> = ([
 
 const exemptionsFired = new Map<string, number>();
 
+/**
+ * a7700971 — the presence writer's window, made part of every whole-schema
+ * comparison instead of being left to the wall clock.
+ *
+ * Every authenticated request offers two liveness writes to the shared
+ * `presenceWriter` (`db/boundedPresenceWrites.ts`): `principals.last_seen_at`
+ * (`middleware/auth.ts` → `PrincipalService.bumpLastSeen`) and
+ * `principal_credentials.last_used_at` (`PrincipalService.bumpCredentialLastUsed`),
+ * each coalesced per key for `PRESENCE_THROTTLE_MS` from the moment its last
+ * write STARTED. Left alone, the PRIMARY credential's stamp dates from whatever
+ * request last found it expired, so on a slow run its expiry can fall between
+ * snapshot two and the exact retry; the retry is then the request that writes
+ * both rows, and the comparison reports two in-place changes that the retried
+ * handler never made.
+ *
+ * So each window OPENS the writer: `reset()` immediately before the window's
+ * first act, so that act's bump is the write (it lands before snapshot two,
+ * which waits for the database to go quiet) and the retry, on the same keys,
+ * is coalesced. That holds only while the retry starts inside
+ * `PRESENCE_THROTTLE_MS` of the opening, so the retry first asserts exactly
+ * that: a window that runs too long fails BY NAME (`insidePresenceWindow`),
+ * never as a phantom diff. Neither column is exempted: an exemption that fires
+ * only by timing would break "every declared exemption was OBSERVED to fire"
+ * below, and it would hide a genuine retry write to either column.
+ */
+function openPresenceWindow(): number {
+  presenceWriter.reset();
+  return Date.now();
+}
+
+function assertInsidePresenceWindow(windowStart: number, where: string): void {
+  const elapsedMs = Date.now() - windowStart;
+  expect({ where, insidePresenceWindow: elapsedMs < PRESENCE_THROTTLE_MS, elapsedMs, limitMs: PRESENCE_THROTTLE_MS })
+    .toEqual({ where, insidePresenceWindow: true, elapsedMs, limitMs: PRESENCE_THROTTLE_MS });
+}
+
 async function runOracle(probe: ToolCase): Promise<void> {
+  const windowStart = openPresenceWindow();
   const request = await probe.setup();
   const exempt = new Set(probe.exempt);
   const make = (): Promise<Answer> => call(request.method, request.path, { body: request.body, headers: request.headers });
 
   const first = await make();
   const two = await snapshot();
+  assertInsidePresenceWindow(windowStart, probe.tool);
   const second = await make();
   const three = await snapshot();
 
@@ -2102,10 +2613,13 @@ describe('4.2 — the documented-convergent set, MEASURED over the whole schema'
     relayhall_task_update: 'Retry contract: an exact retry re-applies the same values and the Task ends in the same state; each call refreshes the Task\'s updated timestamp and emits one task.updated event.',
     relayhall_task_move: 'Retry contract: without feedback, an exact retry re-applies the same status and the Task ends in the same state (each call refreshes the updated timestamp and emits one task.updated event). With feedback the call requires an idempotencyKey, and an exact retry carrying the same key records the note once.',
     relayhall_subtask_set: 'Retry contract: an exact retry re-applies the same state, or is refused with that state already in place; each call refreshes the updated timestamps and emits one task.updated event.',
-    relayhall_task_claim: 'Retry contract: an exact retry by the same identity is accepted and the Task ends in the same state; each call emits one task.updated event.',
+    relayhall_task_claim: 'Retry contract: an exact retry by the same identity is accepted and the Task ends in the same state; each legacy call emits one task.updated event. Epoch-bound assigned-Connector retries emit none; admission requires the current assignment epoch from Task.lifecycleAccess.claim.',
     relayhall_task_release: 'Retry contract: an exact retry after a successful release leaves the Task released and unchanged, and answers with that same released Task.',
     relayhall_task_finish: 'Retry contract: after a successful finish an exact retry is refused (TASK_NOT_FINISHABLE) with the Task already in Review; read the Task for the Report it created.',
     relayhall_report_update: 'Retry contract: an exact retry re-applies the same values and the Report ends in the same state; each call refreshes the Report\'s updated timestamp and emits one report.updated event.',
+    relayhall_phase_update: 'Retry contract: revision-bound — after a successful change an exact retry carrying the old revision is refused (REVISION_MISMATCH) with the change already applied; re-read for the new revision.',
+    relayhall_phase_archive: 'Retry contract: revision-bound — after a successful archive an exact retry carrying the old revision is refused (REVISION_MISMATCH) with the Phase already archived; re-read for the new revision.',
+    relayhall_phase_restore: 'Retry contract: revision-bound — after a successful restore an exact retry carrying the old revision is refused (REVISION_MISMATCH) with the Phase already restored to todo; re-read for the new revision.',
   };
 
   it('(d) the sentence in the LIVE registry is the sentence these cases were written against', () => {
@@ -2254,6 +2768,10 @@ describe('4.2 — the documented-convergent set, MEASURED over the whole schema'
     // are repaired — and the remaining entries are DELEGATIONS, named as such,
     // not claims that a fixture is impossible.
     const NOT_MEASURED: Record<string, string> = {
+      relayhall_task_report_save: 'DELEGATED: mounted REST keyed refusal, exact reconciliation, middleware completion failure and same-key takeover are measured against disposable PostgreSQL in taskReportAcceptanceLive. MCP forwarding is measured in taskReportWorkflow; this generic unkeyed-repeat oracle cannot create without the mandatory logical key.',
+      relayhall_task_arm: 'NOT measured by this generic oracle. The real MCP Arm/Park block below measures same-key replay of the original receipt after a later park, without rearming, and conflicting-key refusal.',
+      relayhall_task_park: 'NOT measured by this generic oracle. The real MCP Arm/Park block below measures same-key park replay after a later arm, without parking again, and conflicting-key refusal.',
+      relayhall_phase_create: 'NOT measured by this generic oracle, whose second call is an unkeyed repeat. The real MCP Phase block below measures same-key replay of the original receipt with ONE Phase and ONE record, the changed-body IDEMPOTENCY_KEY_REUSED refusal, the missing-token refusal, and the archived-parent and concealed-parent refusals; 4.1.2 above measures the byte-identical replay over REST.',
       relayhall_task_recover:
         'NOT measured by this oracle. Its convergence IS drilled end to end in the B-1 block below — a real melted-down Task, a genuine recovery, then the SAME act retried with an UPPER-CASE Warrant, asserting outcome replayed and a schema-wide no-change. What the oracle does not do is run it through the generic two-call harness, because the second call is a REPLAY rather than a repeat of the first write.',
       relayhall_blueprint_instantiate:
@@ -2273,6 +2791,15 @@ describe('4.2 — the documented-convergent set, MEASURED over the whole schema'
       relayhall_project_resource_update: 'DELEGATED, and reachable here: revision-bound, same suite.',
       relayhall_project_resource_archive: 'DELEGATED, and reachable here: revision-bound, same suite.',
       relayhall_project_resource_restore: 'DELEGATED, and reachable here: revision-bound, same suite.',
+      relayhall_subtask_create: 'DELEGATED: keyed on the shared retry middleware (task.subtask.create, return); the same-key receipt with the same subtaskId and no second Subtask, and the changed-request refusal, are asserted against a real PostgreSQL through the MCP ingress in subtaskStructureLive, and its cross-credential baseline in 4.1.4 here.',
+      relayhall_subtask_reorder: 'DELEGATED: keyed on the shared retry middleware (task.subtask.reorder, return); one record per exact retry is asserted in subtaskStructureLive, and its cross-credential baseline in 4.1.4 here.',
+      relayhall_subtask_update_text: 'DELEGATED: keyed on the shared retry middleware (task.subtask.text, return); one record per exact retry is asserted in subtaskStructureLive, and its cross-credential baseline in 4.1.4 here.',
+      relayhall_knowledge_note_commit: 'DELEGATED: keyed on the shared retry middleware (knowledge.note.commit, return); its same-key replay with no second dial and its receipt contents are asserted against a real PostgreSQL and a stub source in knowledgeWriteDoorLive, and its cross-credential baseline in 4.1.4 here.',
+      // P2-B archive parity (ec62cfea). Measured here, both refuse this suite's
+      // Connector caller before any write (403, and a NOT_FOUND bulk row):
+      // archive is a human or owner/Main act, which this suite does not build.
+      relayhall_task_archive: 'DELEGATED: archive needs human or owner/Main archive authority, which this suite\'s Connector caller does not hold (measured: 403). The repeat that answers the current receipt without a second note or disposition change is asserted in archivePolicy ("archiving an already-archived task is an idempotent no-op"), and through this tool against a real PostgreSQL by backend/scripts/test-archive-mcp-live.js, run in the full CI tier as `npm run test:archive-mcp-live`.',
+      relayhall_task_archive_bulk: 'DELEGATED: the same authority precondition (measured: the row answers archived false). The repeat reporting ALREADY_ARCHIVED per Task is asserted in archiveBulkUnarchive ("per-Task results are honest"), and through this tool against a real PostgreSQL by backend/scripts/test-archive-mcp-live.js, run in the full CI tier as `npm run test:archive-mcp-live`.',
     };
     // Every unmeasured entry says WHICH it is. A reason that claims a fixture is
     // impossible when it is merely unbuilt is worse than an admitted gap, so no
@@ -2457,6 +2984,8 @@ describe('B-1 — an UPPER-CASE Warrant UUID retry recovers ONCE (verdict f2de4e
     };
 
     // ── CALL 1: a genuine recovery ──────────────────────────────────────
+    // The whole-schema window opens here (a7700971, `openPresenceWindow`).
+    const windowStart = openPresenceWindow();
     const first = await call('POST', `/tasks/${fixture.taskId}/recover`, { body });
     if (first.status !== 200) throw new Error(`recovery call 1 refused: ${first.status} ${first.text}`);
     expect({ status: first.status, outcome: first.json?.recovery?.outcome })
@@ -2503,6 +3032,7 @@ describe('B-1 — an UPPER-CASE Warrant UUID retry recovers ONCE (verdict f2de4e
     // RECOVERED A SECOND TIME.
     const upper = { ...body, executionWarrantId: warrantId.toUpperCase() };
     expect(upper.executionWarrantId).not.toBe(body.executionWarrantId);
+    assertInsidePresenceWindow(windowStart, 'B-1 upper-case recover retry');
     const second = await call('POST', `/tasks/${fixture.taskId}/recover`, { body: upper });
 
     expect({ status: second.status, outcome: second.json?.recovery?.outcome })
@@ -2558,9 +3088,17 @@ describe('B-1 — an UPPER-CASE Warrant UUID retry recovers ONCE (verdict f2de4e
   it('the source pins that carry the repair, beside the behaviour that proves it', async () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'services', 'TaskManagerDB.ts'), 'utf8');
     expect(source).toMatch(/const nextWarrant = input\.executionWarrantId\s*\n\s*\?\s*await canonicalWarrantId\(/);
-    const guard = /const alreadyRecovered = previousStatus === 'todo'[\s\S]{0,400}?previousWarrant === nextWarrant;/.exec(source);
+    const guard = /const alreadyRecovered = ([^;]+);/.exec(source);
     expect(guard).not.toBeNull();
-    expect((guard as RegExpExecArray)[0].split('&&').length).toBe(5);
+    expect((guard as RegExpExecArray)[1].split('&&').map(term => term.trim())).toEqual([
+      "previousStatus === 'todo'",
+      'previousClaimant === null',
+      'activeLeases.rows.length === 0',
+      'previousAssignee === nextAssignee',
+      'previousWarrant === nextWarrant',
+      'task.execution_descriptor_version === (input.executionDescriptorVersion ?? null)',
+      'isDeepStrictEqual(task.execution_profile ?? null, input.executionProfile ?? null)',
+    ]);
     // The route still ACCEPTS an upper-case spelling: the repair is in the
     // COMPARISON and must not change the wire contract.
     const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'tasks.ts'), 'utf8');
@@ -2575,7 +3113,10 @@ describe('B-1 — an UPPER-CASE Warrant UUID retry recovers ONCE (verdict f2de4e
 // ═════════ 4.3 — the MCP surface and the closed-set census ═════════
 
 describe('4.3 — the closed set, in BOTH directions, and the enforcement that is not the schema', () => {
-  const ROUTE_FILES = ['routes/tasks.ts', 'routes/reports.ts', 'routes/projects.ts', 'routes/delegation.ts'];
+  // RB-11 Governor v0 (card b796067e) mounts `knowledge.note.commit` in the
+  // knowledge module.
+  const ROUTE_FILES = ['routes/tasks.ts', 'routes/reports.ts', 'routes/projects.ts', 'routes/delegation.ts', 'routes/phases.ts', 'routes/knowledge.ts',
+    'routes/knowledgeSharedWriters.ts', 'routes/pluginHost.ts', 'routes/pluginAdmin.ts'];
 
   const mountedOperations = (): string[] => {
     const found: string[] = [];
@@ -2592,33 +3133,107 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
     const mounted = mountedOperations();
     expect(mounted.length).toBe(new Set(mounted).size);          // exactly once each
     expect([...mounted].sort()).toEqual(Object.keys(IDEMPOTENT_OPERATIONS).sort());
-    // Not vacuous: the scan really found the mounts.
-    expect(mounted.length).toBe(10);
+    // Not vacuous: the scan really found the mounts. Ten at card fb06c930;
+    // eleven with `phase.create` mounted on POST /phases; thirteen with
+    // `knowledge.note.commit` on POST /knowledge-writes/commit (b796067e);
+    // fourteen with `project.groupowned.create` on POST /projects (311229fd);
+    // sixteen with the shared-area writer list's two POSTs (549cc51f);
+    // nineteen with the Subtask structure verbs on routes/tasks.ts (2bc7b303);
+    // twenty-four with the five plugin operations (bedf50cc).
+    expect(mounted.length).toBe(24);
+    expect(mounted).toContain('phase.create');
+    expect(mounted).toContain('knowledge.note.commit');
+    expect(mounted).toContain('project.groupowned.create');
+    expect(mounted).toContain('knowledge.sharedwriter.add');
+    expect(mounted).toContain('knowledge.sharedwriter.remove');
+    expect(mounted).toContain('task.subtask.create');
+    expect(mounted).toContain('task.subtask.reorder');
+    expect(mounted).toContain('task.subtask.text');
+    for (const operation of ['plugin.settings.account.put', 'plugin.choice.put', 'plugin.policy.put',
+      'plugin.settings.deployment.put', 'plugin.settings.cleanup']) expect(mounted).toContain(operation);
   });
 
-  it('the scope-declaration census: no principal-scoped operation lives in a file that reads req.credentialId', () => {
-    // The static half of 4.1.4's measured half. A wrongly credential-scoped
-    // operation merely creates two records after a rotation; a wrongly
-    // principal-scoped one could serve a replay to a second credential, so the
-    // direction of this check is the direction that matters.
-    const credentialBoundFiles = ROUTE_FILES.filter((relative) =>
-      /req\.credentialId/.test(fs.readFileSync(path.join(__dirname, '..', relative), 'utf8')));
-    expect(credentialBoundFiles).toEqual(['routes/delegation.ts']);
+  it('the scope-declaration census: credential-bound keyed handlers declare credential scope', () => {
+    // Inspect each route, not its whole file: an unrelated, unkeyed owner
+    // handler must not change the replay scope of project.create.
+    const credentialRoutes: string[] = [];
+    const unkeyedCredentialRoutes: string[] = [];
     const violations: string[] = [];
-    for (const relative of credentialBoundFiles) {
+    for (const relative of ROUTE_FILES) {
       const source = fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
-      const pattern = /idempotent\('([a-z.]+)'\)/g;
-      let match = pattern.exec(source);
-      while (match !== null) {
-        const declaration = (IDEMPOTENT_OPERATIONS as Record<string, any>)[match[1]];
-        if (declaration.scope !== 'credential') violations.push(`${match[1]} is principal-scoped in ${relative}`);
-        match = pattern.exec(source);
-      }
+      const tree = ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true);
+      let accountedReads = 0;
+      const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+          && node.expression.expression.getText(tree) === 'router'
+          && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) {
+          const text = node.getText(tree);
+          const reads = text.match(/req\.credentialId/g) || [];
+          if (reads.length) {
+            accountedReads += reads.length;
+            const route = `${relative} ${node.expression.name.text} ${node.arguments[0].text}`;
+            credentialRoutes.push(route);
+            const keys = [...text.matchAll(/idempotent\('([a-z.]+)'\)/g)].map(match => match[1]);
+            for (const key of keys) {
+              if ((IDEMPOTENT_OPERATIONS as Record<string, any>)[key]?.scope !== 'credential') {
+                violations.push(`${key} is principal-scoped in ${route}`);
+              }
+            }
+            if (!keys.length) unkeyedCredentialRoutes.push(route);
+            if (route === 'routes/projects.ts put /:id/owner') {
+              expect(text).toContain('projectOwnershipService.change(');
+              expect(text).toContain('ifMatchRevision(req)');
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(tree);
+      // A future read in shared middleware/helper cannot silently escape the census.
+      expect(accountedReads).toBe((source.match(/req\.credentialId/g) || []).length);
     }
+    expect(credentialRoutes).toEqual([
+      // AZ-A12 clause 10(b) (card 311229fd): the Group-owned create shape of
+      // POST /projects reads the credential and session (the 9(e) standing
+      // test and its step-up), so it is keyed as its OWN credential-scoped
+      // operation, project.groupowned.create. The plain create on the same
+      // path is a separate route keyed project.create, principal-scoped, and
+      // reads no credential, so it is not listed.
+      'routes/projects.ts post /',
+      'routes/projects.ts get /:id/owner-access',
+      'routes/projects.ts get /:id/owner-candidates',
+      'routes/projects.ts put /:id/owner',
+      'routes/delegation.ts post /agent-mints',
+      'routes/delegation.ts post /agent-mints/:approvalId/collect',
+      // AZ-A9 clause 9 (card 785e1eed P1-B): filing a grant request binds the
+      // Approval to the EXACT credential that files it (AZ-31c). The route is
+      // not a retry-keyed operation: a repeated filing is a second request,
+      // and the tool's description says so.
+      'routes/delegation.ts post /access-requests',
+      // Card 502fb19e slice S2 (change-request design section 4.3): the bearer's
+      // "what may I request here" reads the presenting credential, because the
+      // filing standing it previews is that exact credential's (AZ-31c, and
+      // section 4.1 row 5's intersection). A GET that writes nothing: not keyed.
+      'routes/delegation.ts get /access-requests/preview',
+      // AZ-A9 clause 13 (card 785e1eed P1-B-2): collecting a credential
+      // request is bound to the SAME credential that filed it (§6.1's collect
+      // contract). It is not retry-keyed either: the single-use lifecycle
+      // answers a repeat APPROVAL_NOT_COLLECTABLE, and the one-time key is
+      // never stored, so there is nothing a replay could return.
+      'routes/delegation.ts post /access-requests/:approvalId/collect',
+    ]);
+    expect(unkeyedCredentialRoutes).toEqual([
+      'routes/projects.ts get /:id/owner-access',
+      'routes/projects.ts get /:id/owner-candidates',
+      'routes/projects.ts put /:id/owner',
+      'routes/delegation.ts post /access-requests',
+      'routes/delegation.ts get /access-requests/preview',
+      'routes/delegation.ts post /access-requests/:approvalId/collect',
+    ]);
     expect(violations).toEqual([]);
-    // Red proof 4's target, proven able to fire: were `agent.mint.collect`
-    // declared principal-scoped, this census is what would catch it.
-    expect((IDEMPOTENT_OPERATIONS as Record<string, any>)['agent.mint.collect'].scope).toBe('credential');
+    expect(IDEMPOTENT_OPERATIONS['task.report.save'].scope).toBe('credential');
+    expect(IDEMPOTENT_OPERATIONS['task.patch'].scope).toBe('credential');
+    expect(IDEMPOTENT_OPERATIONS['agent.mint.collect'].scope).toBe('credential');
   });
 
   it('the requirement is enforced in the HANDLER, not by the schema (census C-1)', async () => {
@@ -2626,8 +3241,14 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
       'relayhall_task_create', 'relayhall_task_stream_append', 'relayhall_task_reference_create',
       'relayhall_report_create', 'relayhall_project_create', 'relayhall_project_resource_create',
       'relayhall_agent_mint', 'relayhall_project_resource_replace',
+      'relayhall_task_arm', 'relayhall_task_park',
+      'relayhall_phase_create',
+      // RB-11 Governor v0 (card b796067e).
+      'relayhall_knowledge_note_commit',
+      // Card 2bc7b303 (owner ruling E374): the Subtask structure verbs.
+      'relayhall_subtask_create', 'relayhall_subtask_reorder', 'relayhall_subtask_update_text',
     ];
-    expect(REQUIRED).toHaveLength(8);
+    expect(REQUIRED).toHaveLength(15);
     for (const name of REQUIRED) {
       const tool = toolByName(name);
       expect({ name, found: Boolean(tool) }).toEqual({ name, found: true });
@@ -2647,7 +3268,8 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
         revision: '44444444-4444-4444-8444-222222222222',
         action: 'request', details: {},
       };
-      await expect(tool.handler(otherArgs, { authorization: 'Bearer x', toolName: name }))
+      await expect(tool.handler(name === 'relayhall_task_arm' || name === 'relayhall_task_park'
+        ? { task: otherArgs.task } : otherArgs, { authorization: 'Bearer x', toolName: name }))
         .rejects.toThrow(/idempotencyKey/);
     }
     // The schema says so too, for clients that read schemas — asserted
@@ -2749,8 +3371,18 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
       body: { name: `forward-${tag()}` }, key: freshKey(),
     })).json.project.id);
     const taskId = await makeTask();
+    // Card 2bc7b303: a Task with two Subtasks for the reorder and text tools.
+    const subtaskTask = await makeTask();
+    const subtaskIds: string[] = [];
+    for (const [index, title] of ['one', 'two'].entries()) {
+      subtaskIds.push(String((await pool.query(
+        'INSERT INTO subtasks (task_id, index, title, status) VALUES ($1, $2, $3, $4) RETURNING id',
+        [subtaskTask, index, title, 'empty'])).rows[0].id));
+    }
 
     const cases: Array<{ tool: string; args: Record<string, unknown>; operation: string }> = [
+      { tool: 'relayhall_task_arm', operation: 'task.patch', args: { task: taskId } },
+      { tool: 'relayhall_task_park', operation: 'task.patch', args: { task: taskId } },
       { tool: 'relayhall_task_create', operation: 'task.create',
         args: { title: `fwd ${tag()}`, status: 'todo', project } },
       { tool: 'relayhall_task_stream_append', operation: 'task.stream.append',
@@ -2766,6 +3398,14 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
                 details: { url: 'https://example.invalid/r', category: 'documentation' } } },
       { tool: 'relayhall_agent_mint', operation: 'agent.mint.request',
         args: { action: 'request', task: taskId, requestedScopes: ['tasks:read'], via: 'approval' } },
+      { tool: 'relayhall_phase_create', operation: 'phase.create',
+        args: { projectId: project, name: `fwd phase ${tag()}` } },
+      { tool: 'relayhall_subtask_create', operation: 'task.subtask.create',
+        args: { task: taskId, text: `fwd ${tag()}` } },
+      { tool: 'relayhall_subtask_reorder', operation: 'task.subtask.reorder',
+        args: { task: subtaskTask, order: [subtaskIds[1], subtaskIds[0]] } },
+      { tool: 'relayhall_subtask_update_text', operation: 'task.subtask.text',
+        args: { task: subtaskTask, subtaskId: subtaskIds[0], text: `fwd ${tag()}` } },
     ];
 
     const missing: string[] = [];
@@ -2779,10 +3419,10 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
     }
     expect(missing).toEqual([]);
 
-    // `relayhall_project_resource_replace` is the EIGHTH required tool and was
-    // keyed before this candidate (067's own contract, its own table), so its
-    // forwarding is asserted where that contract lives; naming it here keeps the
-    // set of eight honest rather than silently seven.
+    // `relayhall_project_resource_replace` has its own keyed contract and table
+    // (067), so its forwarding is asserted where that contract lives. The other
+    // ten required tools, including Arm/Park and the Phase create, are
+    // measured above.
     const replace = toolByName('relayhall_project_resource_replace');
     expect(String((replace.inputSchema as any).oneOf[0].required)).toContain('idempotencyKey');
     expect(fs.readFileSync(path.join(__dirname, '..', 'mcp', 'registry.ts'), 'utf8'))
@@ -2836,5 +3476,561 @@ describe('4.3 — the closed set, in BOTH directions, and the enforcement that i
     expect(derived.length).toBeGreaterThan(30);
     expect(derived).toContain('tasks');
     expect(derived).not.toContain('task_execution_profiles');
+  });
+});
+
+
+// ═════════ the planning slice — MCP Phase writers over the real /mcp door ═════════
+
+/**
+ * The four Phase tools driven through the REAL `/mcp` route with a real
+ * credential against the real `/phases` router: what the TOOL sends, not what
+ * its handler does with its arguments. Create is keyed (`phase.create`,
+ * credential-scoped, replay return); update, archive and restore are
+ * revision-bound and the revision travels in the BODY. Every refusal below is
+ * asserted BY NAME against the route's own codes.
+ */
+describe('MCP Phase writers — real credential, database, retry record and revision guard', () => {
+  const phaseRow = async (id: string): Promise<any> => (await pool.query(
+    'SELECT name, goal, status, position, revision FROM phases WHERE id = $1', [id])).rows[0];
+
+  it('create: same key and request replay the original receipt with ONE Phase and ONE record; a changed body is refused', async () => {
+    const key = freshKey();
+    const name = `mcp phase ${tag()}`;
+    const args = { idempotencyKey: key, projectId: PROJECT_ID, name, goal: null, position: 0 };
+    const first = await toolCall('relayhall_phase_create', args);
+    const second = await toolCall('relayhall_phase_create', args);
+    expect({ first: first.isError, second: second.isError, why: first.isError ? first.content.slice(0, 200) : '' })
+      .toEqual({ first: false, second: false, why: '' });
+    expect(second.content).toBe(first.content);
+    const rows = await rowsFor('phase.create', key);
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0].scope)).toBe(`cred:${PRIMARY.credentialId}`);
+    expect(await countOf('SELECT count(*)::int AS n FROM phases WHERE name = $1', [name])()).toBe(1);
+    // The receipt hands back the full id, and the row carries the values the
+    // tool forwarded: null goal, position 0, the default status.
+    const created = await pool.query('SELECT id, goal, status, position FROM phases WHERE name = $1', [name]);
+    expect(first.content).toContain(`full id: ${String(created.rows[0].id)}`);
+    expect(created.rows[0]).toMatchObject({ goal: null, status: 'todo', position: 0 });
+    // A DIFFERENT request under the same key is refused, and nothing is created.
+    const changed = await toolCall('relayhall_phase_create', { ...args, name: `${name} changed` });
+    expect(changed.isError).toBe(true);
+    expect(changed.content).toContain('IDEMPOTENCY_KEY_REUSED');
+    expect(await countOf('SELECT count(*)::int AS n FROM phases WHERE name LIKE $1', [`${name}%`])()).toBe(1);
+    // …and the requirement is enforced ON THE RUNNING SURFACE (C-1).
+    const unkeyed = await toolCall('relayhall_phase_create', { projectId: PROJECT_ID, name: `no token ${tag()}` });
+    expect(unkeyed.isError).toBe(true);
+    expect(unkeyed.content).toContain('idempotencyKey');
+  }, 120_000);
+
+  it('create: an archived parent refuses by name, and a parent that does not exist is concealed', async () => {
+    const project = await call('POST', '/projects', { body: { name: `phase-parent-${tag()}` }, key: freshKey() });
+    expect(project.status).toBe(201);
+    const projectId = String(project.json.project.id);
+    const revision = String(project.json.project.revision);
+    const archived = await call('POST', `/projects/${projectId}/archive`, { headers: { 'If-Match': revision } });
+    expect({ status: archived.status, why: archived.status === 200 ? '' : archived.text.slice(0, 200) })
+      .toEqual({ status: 200, why: '' });
+    const key = freshKey();
+    const refused = await toolCall('relayhall_phase_create', { idempotencyKey: key, projectId, name: `under archived ${tag()}` });
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain('PROJECT_ARCHIVED');
+    // A refused first attempt leaves no reservation behind (§4.1.7), so the
+    // same key is free for a later act.
+    expect(await rowsFor('phase.create', key)).toHaveLength(0);
+    const concealed = await toolCall('relayhall_phase_create', {
+      idempotencyKey: freshKey(), projectId: '0f0f0f0f-1111-4111-8111-222222222222', name: `orphan ${tag()}`,
+    });
+    expect(concealed.isError).toBe(true);
+    expect(concealed.content).toContain('PROJECT_NOT_FOUND');
+  }, 120_000);
+
+  it('create enforces the parent Project read decision before REST and MCP retries', async () => {
+    const handle = `phase-outsider-${tag()}`;
+    const account = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, role, purpose)
+       VALUES ('service', $1, $2, 'active', 'user', 'phase authorization gate') RETURNING id`,
+      [handle, handle],
+    );
+    const outsiderAccountId = String(account.rows[0].id);
+    const connector = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
+       VALUES ('service', $1, $2, 'active', $3, 'phase authorization connector', $4::jsonb) RETURNING id`,
+      [`${handle}-connector`, `${handle} connector`, outsiderAccountId,
+        JSON.stringify({ scopes: 'parent', objects: 'parent' })],
+    );
+    const outsiderId = String(connector.rows[0].id);
+    const issued = await principalService.issueCredential({
+      principalId: outsiderId,
+      scopes: ['phases:read', 'phases:write', 'projects:read', 'principals:read'],
+      transport: 'any',
+    }, SYSTEM_ACTOR);
+    const token = issued.fullKey;
+    expect((await call('POST', '/principals/me/brief', { body: {}, token })).status).toBe(200);
+
+    const project = async (visibility: 'private' | 'shared'): Promise<string> => {
+      const row = await pool.query(
+        `INSERT INTO projects (name, status, visibility, owner_principal_id)
+         VALUES ($1, 'active', $2, $3) RETURNING id`,
+        [`phase-${visibility}-${tag()}`, visibility, ACCOUNT],
+      );
+      return String(row.rows[0].id);
+    };
+    const privateId = await project('private');
+    const sharedId = await project('shared');
+    const absentId = crypto.randomUUID();
+    expect((await pool.query('SELECT id FROM projects WHERE id = $1', [absentId])).rows).toHaveLength(0);
+    const context = (id: string) => call('GET', `/projects/${id}/context`, { token });
+    expect((await context(privateId)).status).toBe(404);
+    expect((await context(sharedId)).status).toBe(200);
+    expect((await context(absentId)).status).toBe(404);
+    const countPrivate = () => countOf('SELECT count(*)::int AS n FROM phases WHERE project_id = $1', [privateId])();
+    const feedPrivate = () => countOf(
+      `SELECT count(*)::int AS n FROM feed_events WHERE project_id = $1 AND name = 'phase.created'`, [privateId])();
+    const before = { phases: await countPrivate(), feed: await feedPrivate() };
+
+    const restKey = freshKey();
+    const mcpKey = freshKey();
+    const name = `unreachable phase ${tag()}`;
+    const hiddenRest = await call('POST', '/phases', { body: { projectId: privateId, name }, key: restKey, token });
+    const absentRest = await call('POST', '/phases', { body: { projectId: absentId, name }, key: freshKey(), token });
+    expect({ status: hiddenRest.status, body: hiddenRest.json })
+      .toEqual({ status: absentRest.status, body: absentRest.json });
+    expect({ status: hiddenRest.status, code: hiddenRest.json.code })
+      .toEqual({ status: 404, code: 'PROJECT_NOT_FOUND' });
+    const hiddenMcp = await toolCall('relayhall_phase_create',
+      { idempotencyKey: mcpKey, projectId: privateId, name }, token);
+    const absentMcp = await toolCall('relayhall_phase_create',
+      { idempotencyKey: freshKey(), projectId: absentId, name }, token);
+    expect(hiddenMcp.isError).toBe(true);
+    expect(hiddenMcp.content).toBe(absentMcp.content);
+    expect(hiddenMcp.content).toContain('PROJECT_NOT_FOUND');
+    expect(await countPrivate()).toBe(before.phases);
+    expect(await feedPrivate()).toBe(before.feed);
+    expect(await rowsFor('phase.create', restKey)).toHaveLength(0);
+    expect(await rowsFor('phase.create', mcpKey)).toHaveLength(0);
+
+    const grant = async (verb: 'read' | 'write'): Promise<void> => {
+      await pool.query(
+        `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+         VALUES ('principal', $1, 'project', $2, $3, $4)`,
+        [outsiderAccountId, privateId, verb, ACCOUNT],
+      );
+    };
+    await grant('read');
+    expect((await context(privateId)).status).toBe(200);
+    const restBody = { projectId: privateId, name: `granted REST phase ${tag()}` };
+    const mcpArgs = { idempotencyKey: mcpKey, projectId: privateId, name: `granted MCP phase ${tag()}` };
+    const restSuccess = await call('POST', '/phases', { body: restBody, key: restKey, token });
+    expect(restSuccess.status).toBe(201);
+    const mcpSuccess = await toolCall('relayhall_phase_create', mcpArgs, token);
+    expect({ error: mcpSuccess.isError, why: mcpSuccess.isError ? mcpSuccess.content.slice(0, 200) : '' })
+      .toEqual({ error: false, why: '' });
+    expect(await countPrivate()).toBe(before.phases + 2);
+    expect(await feedPrivate()).toBe(before.feed + 2);
+    expect(await rowsFor('phase.create', restKey)).toHaveLength(1);
+    expect(await rowsFor('phase.create', mcpKey)).toHaveLength(1);
+    const phaseId = String(restSuccess.json.phase.id);
+    const revision = String(restSuccess.json.phase.revision);
+
+    await pool.query(
+      `DELETE FROM grants WHERE grantee_type = 'principal' AND grantee_id = $1
+         AND resource_type = 'project' AND resource_id = $2 AND verb = 'read'`,
+      [outsiderAccountId, privateId],
+    );
+    expect((await context(privateId)).status).toBe(404);
+    const restRetry = await call('POST', '/phases', { body: restBody, key: restKey, token });
+    expect({ status: restRetry.status, body: restRetry.json })
+      .toEqual({ status: 404, body: hiddenRest.json });
+    expect(restRetry.headers['retry-replayed']).toBeUndefined();
+    const mcpRetry = await toolCall('relayhall_phase_create', mcpArgs, token);
+    expect(mcpRetry.isError).toBe(true);
+    expect(mcpRetry.content).toContain('PROJECT_NOT_FOUND');
+    expect(mcpRetry.content).not.toBe(mcpSuccess.content);
+    expect(await countPrivate()).toBe(before.phases + 2);
+    expect(await feedPrivate()).toBe(before.feed + 2);
+    expect(await rowsFor('phase.create', restKey)).toHaveLength(1);
+    expect(await rowsFor('phase.create', mcpKey)).toHaveLength(1);
+
+    // Readability of a shared Project is enough to create there, even with no
+    // Project grant. A Project write grant never becomes Phase write authority.
+    const sharedRest = await call('POST', '/phases', {
+      body: { projectId: sharedId, name: `shared REST phase ${tag()}` }, key: freshKey(), token,
+    });
+    expect(sharedRest.status).toBe(201);
+    const sharedMcp = await toolCall('relayhall_phase_create', {
+      idempotencyKey: freshKey(), projectId: sharedId, name: `shared MCP phase ${tag()}`,
+    }, token);
+    expect(sharedMcp.isError).toBe(false);
+
+    await grant('read');
+    await grant('write');
+    // A private Phase is concealed without its own read grant. Give exactly
+    // that read grant so the following 403 proves lack of Phase WRITE, rather
+    // than merely proving the unreadable-object concealment rule.
+    await pool.query(
+      `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+       VALUES ('principal', $1, 'phase', $2, 'read', $3)`,
+      [outsiderAccountId, phaseId, ACCOUNT],
+    );
+    expect((await context(privateId)).status).toBe(200);
+    expect((await call('GET', `/phases/${phaseId}`, { token })).status).toBe(200);
+    const deniedUpdate = await call('PATCH', `/phases/${phaseId}`, {
+      body: { revision, name: `forbidden edit ${tag()}` }, token,
+    });
+    const deniedArchive = await call('POST', `/phases/${phaseId}/archive`, {
+      body: { revision }, token,
+    });
+    expect([deniedUpdate.status, deniedArchive.status]).toEqual([403, 403]);
+    const mcpUpdate = await toolCall('relayhall_phase_update',
+      { phaseId, revision, name: `forbidden MCP edit ${tag()}` }, token);
+    const mcpArchive = await toolCall('relayhall_phase_archive', { phaseId, revision }, token);
+    expect([mcpUpdate.isError, mcpArchive.isError]).toEqual([true, true]);
+    expect((await phaseRow(phaseId)).revision).toBe(revision);
+    const rootArchive = await call('POST', `/phases/${phaseId}/archive`, { body: { revision } });
+    expect(rootArchive.status).toBe(200);
+    const archivedRevision = String(rootArchive.json.phase.revision);
+    const deniedRestore = await call('POST', `/phases/${phaseId}/unarchive`, {
+      body: { revision: archivedRevision }, token,
+    });
+    const mcpRestore = await toolCall('relayhall_phase_restore',
+      { phaseId, revision: archivedRevision }, token);
+    expect(deniedRestore.status).toBe(403);
+    expect(mcpRestore.isError).toBe(true);
+    expect((await phaseRow(phaseId)).status).toBe('archived');
+  }, 120_000);
+
+  it('create resolves only the exact Project UUID through REST and MCP', async () => {
+    const actual = await pool.query(
+      `INSERT INTO projects (name, status, visibility, owner_principal_id)
+       VALUES ($1, 'active', 'shared', $2) RETURNING id`,
+      [`uuid-target-${tag()}`, ACCOUNT],
+    );
+    const actualId = String(actual.rows[0].id);
+    // This readable Project's NAME is another Project's real id. A name-or-id
+    // helper would return two rows and conceal the valid target as ambiguous.
+    await pool.query(
+      `INSERT INTO projects (name, status, visibility, owner_principal_id)
+       VALUES ($1, 'active', 'shared', $2)`, [actualId, ACCOUNT],
+    );
+    for (const projectId of [actualId, actualId.toUpperCase()]) {
+      const restName = `uuid exact REST ${tag()}`;
+      const rest = await call('POST', '/phases', {
+        body: { projectId, name: restName }, key: freshKey(),
+      });
+      expect(rest.status).toBe(201);
+      expect(String(rest.json.phase.projectId)).toBe(actualId);
+      const mcpName = `uuid exact MCP ${tag()}`;
+      const mcp = await toolCall('relayhall_phase_create', {
+        idempotencyKey: freshKey(), projectId, name: mcpName,
+      });
+      expect({ error: mcp.isError, why: mcp.isError ? mcp.content.slice(0, 200) : '' })
+        .toEqual({ error: false, why: '' });
+      const row = await pool.query('SELECT project_id::text AS project_id FROM phases WHERE name = $1', [mcpName]);
+      expect(row.rows.map((item: any) => String(item.project_id))).toEqual([actualId]);
+    }
+
+    const absentId = crypto.randomUUID();
+    const alias = await pool.query(
+      `INSERT INTO projects (name, status, visibility, owner_principal_id)
+       VALUES ($1, 'active', 'shared', $2) RETURNING id`, [absentId, ACCOUNT],
+    );
+    const aliasId = String(alias.rows[0].id);
+    const before = await countOf('SELECT count(*)::int AS n FROM phases WHERE project_id = $1', [aliasId])();
+    const restKey = freshKey();
+    const rest = await call('POST', '/phases', {
+      body: { projectId: absentId, name: `uuid name REST ${tag()}` }, key: restKey,
+    });
+    const mcpKey = freshKey();
+    const mcp = await toolCall('relayhall_phase_create', {
+      idempotencyKey: mcpKey, projectId: absentId, name: `uuid name MCP ${tag()}`,
+    });
+    expect({ status: rest.status, code: rest.json.code }).toEqual({ status: 404, code: 'PROJECT_NOT_FOUND' });
+    expect(mcp.isError).toBe(true);
+    expect(mcp.content).toContain('PROJECT_NOT_FOUND');
+    expect(await countOf('SELECT count(*)::int AS n FROM phases WHERE project_id = $1', [aliasId])()).toBe(before);
+    expect(await rowsFor('phase.create', restKey)).toHaveLength(0);
+    expect(await rowsFor('phase.create', mcpKey)).toHaveLength(0);
+  }, 120_000);
+
+  it('a non-root exact Phase grant and connector selector govern update, order, archive and restore', async () => {
+    const first = await makePhase(`selector first ${tag()}`);
+    const second = await makePhase(`selector second ${tag()}`);
+    const restricted = await pool.query(
+      `INSERT INTO phases (project_id, name, restricted_access)
+       VALUES ($1, $2, TRUE) RETURNING id, revision`,
+      [PROJECT_ID, `selector restricted ${tag()}`],
+    );
+    const restrictedId = String(restricted.rows[0].id);
+    const handle = `phase-selector-${tag()}`;
+    const account = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, role, purpose)
+       VALUES ('service', $1, $2, 'active', 'user', 'phase selector fixture') RETURNING id`,
+      [handle, handle],
+    );
+    const accountId = String(account.rows[0].id);
+    for (const id of [first.id, second.id]) {
+      await pool.query(
+        `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id)
+         VALUES ('principal', $1, 'phase', $2, 'write', $3)`,
+        [accountId, id, ACCOUNT],
+      );
+    }
+    const ownExpression = {
+      scopes: 'parent',
+      objects: [
+        { resourceType: 'phase', selectorForm: 'exact', selectorIds: [first.id], verbs: ['read', 'write'] },
+        { resourceType: 'phase', selectorForm: 'exact', selectorIds: [second.id], verbs: ['read'] },
+      ],
+    };
+    const connector = await pool.query(
+      `INSERT INTO principals (kind, handle, display_name, status, parent_principal_id, purpose, own_expression)
+       VALUES ('service', $1, $2, 'active', $3, 'phase selector connector', $4::jsonb) RETURNING id`,
+      [`${handle}-connector`, `${handle} connector`, accountId, JSON.stringify(ownExpression)],
+    );
+    const issued = await principalService.issueCredential({
+      principalId: String(connector.rows[0].id),
+      scopes: ['phases:read', 'phases:write', 'principals:read'],
+      transport: 'any',
+    }, SYSTEM_ACTOR);
+    const token = issued.fullKey;
+    expect((await call('POST', '/principals/me/brief', { body: {}, token })).status).toBe(200);
+    expect((await call('GET', `/phases/${first.id}`, { token })).status).toBe(200);
+    expect((await call('GET', `/phases/${second.id}`, { token })).status).toBe(200);
+    expect((await call('GET', `/phases/${restrictedId}`, { token })).status).toBe(404);
+
+    const updated = await toolCall('relayhall_phase_update', {
+      phaseId: first.id, revision: first.revision, goal: 'selector goal',
+      status: 'in-progress', position: 5,
+    }, token);
+    expect({ error: updated.isError, why: updated.isError ? updated.content.slice(0, 200) : '' })
+      .toEqual({ error: false, why: '' });
+    expect(await phaseRow(first.id)).toMatchObject({ goal: 'selector goal', status: 'in-progress', position: 5 });
+    const listed = await call('GET', `/phases?projectId=${PROJECT_ID}`, { token });
+    expect(listed.status).toBe(200);
+    expect((listed.json.phases as any[]).map((phase) => String(phase.id)))
+      .toEqual([second.id, first.id]);
+
+    const deniedRest = await call('PATCH', `/phases/${second.id}`, {
+      body: { revision: second.revision, name: 'selector denied' }, token,
+    });
+    const deniedMcp = await toolCall('relayhall_phase_update', {
+      phaseId: second.id, revision: second.revision, name: 'selector denied',
+    }, token);
+    expect(deniedRest.status).toBe(403);
+    expect(deniedMcp.isError).toBe(true);
+    expect((await phaseRow(second.id)).revision).toBe(second.revision);
+    const restrictedWrite = await call('PATCH', `/phases/${restrictedId}`, {
+      body: { revision: String(restricted.rows[0].revision), name: 'restricted denied' }, token,
+    });
+    expect(restrictedWrite.status).toBe(404);
+
+    const archive = await toolCall('relayhall_phase_archive', {
+      phaseId: first.id, revision: await phaseRevision(first.id),
+    }, token);
+    expect(archive.isError).toBe(false);
+    expect((await phaseRow(first.id)).status).toBe('archived');
+    const restore = await toolCall('relayhall_phase_restore', {
+      phaseId: first.id, revision: await phaseRevision(first.id),
+    }, token);
+    expect(restore.isError).toBe(false);
+    expect((await phaseRow(first.id)).status).toBe('todo');
+  }, 120_000);
+
+  it('update: goal null, position 0 and a settable status land as values; the old revision is then stale', async () => {
+    const phase = await makePhase();
+    const seeded = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: phase.revision, goal: 'first goal', position: 5, status: 'in-progress' });
+    expect({ isError: seeded.isError, why: seeded.isError ? seeded.content.slice(0, 200) : '' }).toEqual({ isError: false, why: '' });
+    expect(await phaseRow(phase.id)).toMatchObject({ goal: 'first goal', position: 5, status: 'in-progress' });
+    // The revision rotated: the SAME call again is REVISION_MISMATCH and changes nothing.
+    const stale = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: phase.revision, goal: 'first goal', position: 5, status: 'in-progress' });
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('REVISION_MISMATCH');
+    expect(await phaseRow(phase.id)).toMatchObject({ goal: 'first goal', position: 5, status: 'in-progress' });
+    // With the fresh revision: null clears the goal and 0 is a real position.
+    const cleared = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: await phaseRevision(phase.id), goal: null, position: 0 });
+    expect({ isError: cleared.isError, why: cleared.isError ? cleared.content.slice(0, 200) : '' }).toEqual({ isError: false, why: '' });
+    expect(await phaseRow(phase.id)).toMatchObject({ goal: null, position: 0, status: 'in-progress' });
+    // Omitting goal leaves it alone (still null), and the receipt names the
+    // fields that were sent and the new revision.
+    const renamed = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: await phaseRevision(phase.id), name: `renamed ${tag()}` });
+    expect(renamed.isError).toBe(false);
+    expect(renamed.content).toContain('fields: name');
+    expect(renamed.content).toContain(`revision: ${await phaseRevision(phase.id)}`);
+    expect((await phaseRow(phase.id)).goal).toBeNull();
+    // archived is never a settable status here — the route says so, by name.
+    const archivedByEdit = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: await phaseRevision(phase.id), status: 'archived' });
+    expect(archivedByEdit.isError).toBe(true);
+    expect(archivedByEdit.content).toContain('INVALID_PHASE_VALUE');
+    expect((await phaseRow(phase.id)).status).toBe('in-progress');
+  }, 120_000);
+
+  it('archive and restore: revision-bound, an archived Phase refuses edits, and each exact retry is refused with the state already applied', async () => {
+    const phase = await makePhase();
+    const archived = await toolCall('relayhall_phase_archive', { phaseId: phase.id, revision: phase.revision });
+    expect({ isError: archived.isError, why: archived.isError ? archived.content.slice(0, 200) : '' }).toEqual({ isError: false, why: '' });
+    expect((await phaseRow(phase.id)).status).toBe('archived');
+    // The exact retry: old revision → REVISION_MISMATCH, still archived once.
+    const archiveAgain = await toolCall('relayhall_phase_archive', { phaseId: phase.id, revision: phase.revision });
+    expect(archiveAgain.isError).toBe(true);
+    expect(archiveAgain.content).toContain('REVISION_MISMATCH');
+    // With the CURRENT revision the state guard answers instead.
+    const alreadyArchived = await toolCall('relayhall_phase_archive', { phaseId: phase.id, revision: await phaseRevision(phase.id) });
+    expect(alreadyArchived.isError).toBe(true);
+    expect(alreadyArchived.content).toContain('PHASE_ALREADY_ARCHIVED');
+    // Archived is read-only for content.
+    const editArchived = await toolCall('relayhall_phase_update', { phaseId: phase.id, revision: await phaseRevision(phase.id), name: 'x' });
+    expect(editArchived.isError).toBe(true);
+    expect(editArchived.content).toContain('PHASE_ARCHIVED');
+    // Restore returns it to todo; the exact retry is stale; a second restore
+    // with the current revision is refused by state.
+    const restoreRevision = await phaseRevision(phase.id);
+    const restored = await toolCall('relayhall_phase_restore', { phaseId: phase.id, revision: restoreRevision });
+    expect({ isError: restored.isError, why: restored.isError ? restored.content.slice(0, 200) : '' }).toEqual({ isError: false, why: '' });
+    expect((await phaseRow(phase.id)).status).toBe('todo');
+    const restoreAgain = await toolCall('relayhall_phase_restore', { phaseId: phase.id, revision: restoreRevision });
+    expect(restoreAgain.isError).toBe(true);
+    expect(restoreAgain.content).toContain('REVISION_MISMATCH');
+    const notArchived = await toolCall('relayhall_phase_restore', { phaseId: phase.id, revision: await phaseRevision(phase.id) });
+    expect(notArchived.isError).toBe(true);
+    expect(notArchived.content).toContain('PHASE_NOT_ARCHIVED');
+    expect((await phaseRow(phase.id)).status).toBe('todo');
+    // No retry record for any of the revision-bound verbs: they are not keyed.
+    const keyed = await pool.query(
+      `SELECT count(*)::int AS n FROM operation_idempotency_records WHERE operation <> 'phase.create' AND operation LIKE 'phase.%'`);
+    expect(keyed.rows[0].n).toBe(0);
+  }, 120_000);
+
+  it('a phases:read-only credential is refused every Phase write by scope, and writes nothing', async () => {
+    const reader = await (async (): Promise<Caller> => {
+      const issued = await principalService.issueCredential(
+        { principalId: PRIMARY.principalId, scopes: ['phases:read', 'principals:read'], transport: 'any' }, SYSTEM_ACTOR);
+      const caller = { ...PRIMARY, credentialId: issued.credentialId, fullKey: issued.fullKey };
+      expect((await call('POST', '/principals/me/brief', { body: {}, token: caller.fullKey })).status).toBe(200);
+      return caller;
+    })();
+    const phase = await makePhase();
+    const before = await phaseRow(phase.id);
+    const key = freshKey();
+    const create = await toolCall('relayhall_phase_create', { idempotencyKey: key, projectId: PROJECT_ID, name: `denied ${tag()}` }, reader.fullKey);
+    expect({ denied: create.isError, names: create.content.includes('phases:write') }).toEqual({ denied: true, names: true });
+    expect(await rowsFor('phase.create', key)).toHaveLength(0);
+    for (const [name, args] of [
+      ['relayhall_phase_update', { phaseId: phase.id, revision: phase.revision, name: 'x' }],
+      ['relayhall_phase_archive', { phaseId: phase.id, revision: phase.revision }],
+      ['relayhall_phase_restore', { phaseId: phase.id, revision: phase.revision }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const result = await toolCall(name, args, reader.fullKey);
+      expect({ name, denied: result.isError, names: result.content.includes('phases:write') })
+        .toEqual({ name, denied: true, names: true });
+    }
+    expect(await phaseRow(phase.id)).toEqual(before);
+  }, 120_000);
+});
+
+// MCP Arm/Park uses the canonical PATCH authorization and retry boundary.
+describe('MCP Arm/Park — real credential, database and lifecycle', () => {
+  const state = async (taskId: string): Promise<any> => (await pool.query(
+    'SELECT t.auto_start, t.status, a.claimant_principal_id FROM tasks t JOIN task_assignments a ON a.task_id = t.id WHERE t.id = $1', [taskId],
+  )).rows[0];
+
+  async function narrowCaller(scopes = ['tasks:read', 'tasks:write', 'principals:read']): Promise<Caller> {
+    const account = await principalService.createPrincipal({
+      handle: `arm-park-account-${tag()}`, kind: 'service', role: 'user', purpose: 'Arm/Park authorization fixture',
+    });
+    const row = await pool.query(
+      `INSERT INTO principals(kind,handle,display_name,status,role,parent_principal_id,purpose,own_expression)
+       VALUES('service',$1,$1,'active','user',$2,'Arm/Park connector',$3::jsonb) RETURNING id, handle`,
+      [`arm-park-connector-${tag()}`, account.id, JSON.stringify({ scopes: 'parent', objects: 'parent' })]);
+    const principal = row.rows[0];
+    const issued = await principalService.issueCredential(
+      { principalId: principal.id, scopes, transport: 'any' }, SYSTEM_ACTOR);
+    const caller = { principalId: String(principal.id), credentialId: issued.credentialId,
+      fullKey: issued.fullKey, handle: principal.handle };
+    expect((await call('POST', '/principals/me/brief', { body: {}, token: caller.fullKey })).status).toBe(200);
+    return caller;
+  }
+
+  async function grantTask(caller: Caller, taskId: string, verb: string): Promise<void> {
+    await pool.query(
+      `INSERT INTO grants(grantee_type,grantee_id,resource_type,resource_id,verb)
+       SELECT 'principal', id, 'task', $2, $3 FROM principals
+       WHERE id = $1 OR id = (SELECT parent_principal_id FROM principals WHERE id = $1)`,
+      [caller.principalId, taskId, verb]);
+  }
+
+  it('arms without claiming or moving; claim, move and finish remain separate MCP acts', async () => {
+    const taskId = await makeTask();
+    expect((await toolCall('relayhall_task_park', { task: taskId, idempotencyKey: freshKey() })).isError).toBe(false);
+    expect(await state(taskId)).toEqual({ auto_start: false, status: 'todo', claimant_principal_id: null });
+    const parkedClaim = await toolCall('relayhall_task_claim', { task: taskId });
+    expect(parkedClaim.isError).toBe(true);
+    expect(parkedClaim.content).toContain('TASK_NOT_ARMED');
+    expect((await toolCall('relayhall_task_arm', { task: taskId, idempotencyKey: freshKey() })).isError).toBe(false);
+    expect(await state(taskId)).toEqual({ auto_start: true, status: 'todo', claimant_principal_id: null });
+    expect((await toolCall('relayhall_task_claim', { task: taskId })).isError).toBe(false);
+    expect(await state(taskId)).toEqual({ auto_start: true, status: 'todo', claimant_principal_id: PRIMARY.principalId });
+    expect((await toolCall('relayhall_task_move', { task: taskId, status: 'in-progress' })).isError).toBe(false);
+    const finish = await toolCall('relayhall_task_finish', {
+      task: taskId, handover: 'Arm/Park MCP acceptance',
+      report: { title: `Arm/Park ${tag()}`, content: 'Real MCP lifecycle completed.', summary: 'Acceptance evidence' },
+    });
+    expect({ isError: finish.isError, content: finish.isError ? finish.content : '' }).toEqual({ isError: false, content: '' });
+    expect((await state(taskId)).status).toBe('review');
+    const beforePark = await state(taskId);
+    expect((await toolCall('relayhall_task_park', { task: taskId, idempotencyKey: freshKey() })).isError).toBe(false);
+    expect(await state(taskId)).toEqual({ ...beforePark, auto_start: false });
+  });
+
+  it.each([
+    ['relayhall_task_arm', 'relayhall_task_park', false],
+    ['relayhall_task_park', 'relayhall_task_arm', true],
+  ])('%s retry returns its original receipt without undoing a later opposite act', async (tool, opposite, finalArmed) => {
+    const taskId = await makeTask();
+    const key = freshKey();
+    const first = await toolCall(String(tool), { task: taskId, idempotencyKey: key });
+    expect(first.isError).toBe(false);
+    expect((await toolCall(String(opposite), { task: taskId, idempotencyKey: freshKey() })).isError).toBe(false);
+    const before = await state(taskId);
+    expect(before.auto_start).toBe(finalArmed);
+    const retry = await toolCall(String(tool), { task: taskId, idempotencyKey: key });
+    expect(retry.isError).toBe(false);
+    expect(retry.content).toBe(first.content);
+    expect(await state(taskId)).toEqual(before);
+    expect(await rowsFor('task.patch', key)).toHaveLength(1);
+    const conflict = await toolCall(String(opposite), { task: taskId, idempotencyKey: key });
+    expect(conflict.isError).toBe(true);
+    expect(conflict.content).toContain('IDEMPOTENCY_KEY_REUSED');
+    expect(await state(taskId)).toEqual(before);
+  });
+
+  it('preserves writer arm, writer-or-Shepherd park, and scope/object denials', async () => {
+    const taskId = await makeTask();
+    const writer = await narrowCaller();
+    const shepherd = await narrowCaller();
+    const outsider = await narrowCaller();
+    const reader = await narrowCaller(['tasks:read', 'principals:read']);
+    await grantTask(writer, taskId, 'write');
+    await pool.query('UPDATE tasks SET shepherd_principal_id = $1 WHERE id = $2', [shepherd.principalId, taskId]);
+    await grantTask(reader, taskId, 'write'); // Object write alone cannot supply credential scope.
+    for (const name of ['relayhall_task_park', 'relayhall_task_arm']) {
+      const result = await toolCall(name, { task: taskId, idempotencyKey: freshKey() }, writer.fullKey);
+      expect({ name, isError: result.isError, error: result.isError ? result.content : '' })
+        .toEqual({ name, isError: false, error: '' });
+    }
+    expect((await toolCall('relayhall_task_park', { task: taskId, idempotencyKey: freshKey() }, shepherd.fullKey)).isError).toBe(false);
+    for (const [name, caller] of [
+      ['relayhall_task_arm', shepherd],
+      ['relayhall_task_arm', outsider], ['relayhall_task_park', outsider],
+      ['relayhall_task_arm', reader], ['relayhall_task_park', reader],
+    ] as Array<[string, Caller]>) {
+      const before = await state(taskId);
+      const key = freshKey();
+      const result = await toolCall(name, { task: taskId, idempotencyKey: key }, caller.fullKey);
+      expect({ name, principal: caller.principalId, denied: result.isError })
+        .toEqual({ name, principal: caller.principalId, denied: true });
+      expect(await state(taskId)).toEqual(before);
+      expect(await rowsFor('task.patch', key)).toHaveLength(0);
+    }
   });
 });

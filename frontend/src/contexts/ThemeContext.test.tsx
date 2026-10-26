@@ -44,7 +44,7 @@ beforeEach(() => {
   localStorage.clear();
   document.documentElement.removeAttribute('data-theme');
   document.documentElement.removeAttribute('data-reduced-motion');
-  mockFetch.mockResolvedValue({ theme: 'relay-light', reducedMotion: 'reduce' });
+  mockFetch.mockResolvedValue({ theme: 'relay-light', reducedMotion: 'reduce', mapReportsMode: 'collapsed' });
 });
 afterEach(cleanup);
 
@@ -84,7 +84,7 @@ describe('the authentication transition', () => {
     // The boot cache exists to avoid a flash. It must not decide what the
     // signed-in principal sees: the fetched row always wins.
     writeCachedPreferences({
-      theme: 'high-contrast', reducedMotion: 'system', deploymentTheme: null,
+      theme: 'high-contrast', reducedMotion: 'system', mapReportsMode: 'collapsed', deploymentTheme: null,
     });
     render(<App authenticated />);
     await waitFor(() =>
@@ -96,7 +96,7 @@ describe('the authentication transition', () => {
     // show the next person to sign in on this browser the previous person's
     // Theme until their own row arrived.
     writeCachedPreferences({
-      theme: 'high-contrast', reducedMotion: 'reduce', deploymentTheme: null,
+      theme: 'high-contrast', reducedMotion: 'reduce', mapReportsMode: 'collapsed', deploymentTheme: null,
     });
     expect(localStorage.getItem(preferencesCacheKey())).not.toBeNull();
     auth.clearToken();

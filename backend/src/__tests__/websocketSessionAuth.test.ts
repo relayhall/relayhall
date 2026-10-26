@@ -24,7 +24,7 @@ jest.mock('../services/LoginSessionService', () => ({
   loginSessionService: { resolve: (...args: unknown[]) => sessionResolve(...args) },
 }));
 jest.mock('../services/PrincipalService', () => ({
-  principalService: { getPrincipalById: (...args: unknown[]) => getPrincipalById(...args) },
+  principalService: { getPrincipalById: (...args: unknown[]) => getPrincipalById(...args), getPrincipalByIdStrict: (...args: unknown[]) => getPrincipalById(...args) },
 }));
 jest.mock('../utils/dashboardToken', () => ({
   verifyActiveDashboardToken: (...args: unknown[]) => verifyActiveDashboardToken(...args),
@@ -98,6 +98,15 @@ function connect(headers: Record<string, string> = {}, query = ''): Promise<stri
   });
 }
 
+async function openListening(headers: Record<string, string> = {}, query = ''): Promise<{ socket: WebSocket; messages: Array<{ type: string }> }> {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws${query}`, { headers });
+  opened.push(socket);
+  const messages: Array<{ type: string }> = [];
+  socket.on('message', (data) => messages.push(JSON.parse(data.toString())));
+  await new Promise<void>((resolve, reject) => { socket.once('open', () => resolve()); socket.once('error', reject); });
+  return { socket, messages };
+}
+
 const liveSession = () => {
   sessionResolve.mockResolvedValue({ sessionId: 'sess-1', principalId: 'p-1', roleSnapshot: null });
   getPrincipalById.mockResolvedValue({ id: 'p-1', handle: 'ada', status: 'active', kind: 'human', role: 'operator' });
@@ -137,6 +146,35 @@ describe('the stream upgrade', () => {
     liveSession();
     expect(await connect({ Cookie: 'relayhall_session=opaque' })).toBe('401');
     expect(sessionResolve).not.toHaveBeenCalled();
+  });
+
+  it('sends content-free owner invalidations only to the authenticated principals', async () => {
+    sessionResolve.mockImplementation(async (token: string) => ({
+      sessionId: token, principalId: token === 'first' ? 'p-1' : 'p-2', roleSnapshot: null,
+    }));
+    getPrincipalById.mockImplementation(async (id: string) => ({
+      id, handle: id, status: 'active', kind: 'human', role: 'operator',
+    }));
+    verifyActiveDashboardToken.mockResolvedValue({ userId: 'dashboard_user', principalId: 'p-3' });
+    const [first, second, dashboard] = await Promise.all([
+      openListening({ Cookie: 'relayhall_session=first' }),
+      openListening({ Cookie: 'relayhall_session=second' }),
+      openListening({}, '?token=good'),
+    ]);
+    service.broadcastToPrincipals(['p-1', 'p-3'], { type: 'project-owner-changed' });
+    const deadline = Date.now() + 1000;
+    while ((first.messages.filter((m) => m.type === 'project-owner-changed').length === 0 ||
+            dashboard.messages.filter((m) => m.type === 'project-owner-changed').length === 0) && Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(first.messages.filter((m) => m.type === 'project-owner-changed')).toEqual([{ type: 'project-owner-changed' }]);
+    expect(dashboard.messages.filter((m) => m.type === 'project-owner-changed')).toEqual([{ type: 'project-owner-changed' }]);
+    expect(second.messages.filter((m) => m.type === 'project-owner-changed')).toEqual([]);
+    await Promise.all([first.socket, second.socket, dashboard.socket].map((socket) => new Promise<void>((resolve) => {
+      socket.once('close', () => resolve());
+      socket.close();
+    })));
   });
 
   it('falls through to the cookie when the token is present but bad', async () => {

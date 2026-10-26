@@ -22,6 +22,7 @@ jest.mock('../services/ReportManager', () => {
 
 import reportsRoutes from '../routes/reports';
 import { reportManager } from '../services/ReportManager';
+import * as reportVisibility from '../services/ReportVisibility';
 
 const manager = reportManager as jest.Mocked<typeof reportManager>;
 const { ReportManager } = jest.requireActual('../services/ReportManager');
@@ -133,7 +134,7 @@ describe('GET /reports route validation (updated_since + sort)', () => {
         updated_since: '2026-07-01T00:00:00Z',
         sort: 'updated_at',
         order: 'asc',
-      }));
+      }), expect.any(Function));
     });
   });
 
@@ -143,7 +144,100 @@ describe('GET /reports route validation (updated_since + sort)', () => {
       expect(res.status).toBe(200);
       expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({
         updated_since: undefined, sort: undefined, order: undefined,
-      }));
+      }), expect.any(Function));
     });
   });
+});
+
+
+describe('visibility before report pagination', () => {
+  it('counts and pages only readable ids, including rows beyond a hidden first page', async () => {
+    const candidates = Array.from({ length: 35 }, (_, index) => ({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      auto_promoted: index % 2 === 0,
+      source_task_id: null,
+      source_outpost_visibility_tier: null,
+    }));
+    const visible = candidates.slice(15); // Entire first source page hidden.
+    const queries: Array<{ text: string; params: any[] }> = [];
+    const pool = { query: jest.fn(async (text: string, params: any[] = []) => {
+      // Capture values now; the manager adds its visibility binding later.
+      queries.push({ text, params: [...params] });
+      if (text.includes('COUNT(*)')) return { rows: [{ total: String(visible.length) }] };
+      if (text.includes('LIMIT')) {
+        const allowed = new Set(params[params.length - 3]);
+        const [limit, offset] = params.slice(-2);
+        return { rows: candidates.filter(row => allowed.has(row.id)).slice(offset, offset + limit) };
+      }
+      return { rows: candidates };
+    }) };
+    const narrow = jest.fn(async () => visible);
+    const mgr = new ReportManager(pool as never);
+    const first = await mgr.list({ limit: 10, tags: ['selected'] }, narrow);
+    expect(first.reports.map((row: { id: string }) => row.id)).toEqual(visible.slice(0, 10).map(row => row.id));
+    expect(first.total).toBe(20);
+    expect(first.hasMore).toBe(true);
+    expect(narrow).toHaveBeenCalledWith(candidates);
+    expect(queries[0].text).not.toContain('r.*');
+    expect(queries[0].text).toContain('r.tags @> $1::text[]');
+    expect(queries[0].params).toEqual([['selected']]);
+    for (const query of queries.slice(1)) {
+      expect(query.text).toContain('r.id = ANY($2::uuid[])');
+      expect(query.params[1]).toEqual(visible.map(row => row.id));
+    }
+    expect(queries[2].text).toContain('ORDER BY r.pinned DESC, r.created_at DESC, r.id DESC');
+    const last = await mgr.list({ limit: 10, offset: 10 }, narrow);
+    expect(last.reports.map((row: { id: string }) => row.id)).toEqual(visible.slice(10).map(row => row.id));
+    expect(last.hasMore).toBe(false);
+  });
+
+  it('binds an empty allowlist when every matching report is hidden', async () => {
+    const pool = fakePool();
+    const narrow = jest.fn(async () => []);
+    const result = await new ReportManager(pool as never).list({}, narrow);
+    expect(result).toEqual({ reports: [], total: 0, hasMore: false });
+    expect(pool.queries[1].text).toContain('r.id = ANY($1::uuid[])');
+    expect(pool.queries[1].params).toEqual([[]]);
+  });
+
+  it('preserves all shared visibility restrictions and returns the visible total and next page', async () => {
+    const rows = [{ id: 'allowed' }, { id: 'hidden' }];
+    const filter = jest.spyOn(reportVisibility, 'filterVisibleReports').mockResolvedValue([rows[0]]);
+    manager.list.mockImplementationOnce(async (_opts, narrow) => {
+      expect(narrow).toBeDefined();
+      const allowed = await narrow!(rows as never);
+      expect(allowed).toEqual([rows[0]]);
+      return { reports: [rows[0]] as never, total: 123, hasMore: true };
+    });
+    try {
+      await withServer(async base => {
+        const res = await fetch(`${base}/reports?limit=10&offset=10`);
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ success: true, reports: [rows[0]], total: 123, hasMore: true });
+      });
+      expect(filter).toHaveBeenCalledTimes(2);
+    } finally {
+      filter.mockRestore();
+    }
+  });
+  it('excludes content that became private after candidate authorization without rewriting the earlier total', async () => {
+    const candidate = { id: 'changed', visibility: 'shared' };
+    const fetched = { id: 'changed', visibility: 'private', content: 'new private content' };
+    const filter = jest.spyOn(reportVisibility, 'filterVisibleReports')
+      .mockResolvedValueOnce([candidate] as never)
+      .mockResolvedValueOnce([]);
+    manager.list.mockImplementationOnce(async (_opts, narrow) => {
+      expect(await narrow!([candidate] as never)).toEqual([candidate]);
+      return { reports: [fetched] as never, total: 1, hasMore: false };
+    });
+    try {
+      await withServer(async base => {
+        const res = await fetch(`${base}/reports`);
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ success: true, reports: [], total: 1, hasMore: false });
+      });
+      expect(filter).toHaveBeenNthCalledWith(2, expect.anything(), [fetched]);
+    } finally { filter.mockRestore(); }
+  });
+
 });

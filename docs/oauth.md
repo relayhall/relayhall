@@ -108,7 +108,7 @@ GET https://<your-board>/api/oauth/authorize
   ?response_type=code
   &client_id=https%3A%2F%2Fyour-app.example.com%2F.well-known%2Foauth-client
   &redirect_uri=https%3A%2F%2Fyour-app.example.com%2Foauth%2Fcallback
-  &scope=principals%3Aread%20tasks%3Aread%20tasks%3Awrite%20reports%3Awrite
+  &scope=tasks%3Aread%20tasks%3Awrite%20reports%3Awrite
   &state=<your opaque value>
   &code_challenge=<base64url(sha256(verifier))>
   &code_challenge_method=S256
@@ -119,11 +119,12 @@ GET https://<your-board>/api/oauth/authorize
 `resource` indicator is optional; if you send one it must be this board's MCP
 endpoint, because that is the only resource this server issues tokens for.
 
-**Ask for `principals:read`.** The bootstrap call compiles your SESSION brief,
-which is a principals-plane read — and until a credential has bootstrapped,
-every tool that changes board state is refused. A token without
-`principals:read` can read, but it can never bootstrap and therefore can never
-write.
+**Bootstrapping needs no particular scope.** The bootstrap call compiles your
+SESSION brief, and any authenticated token may compile its own — until it has,
+every tool that changes board state is refused. Ask for `tasks:read` if the
+brief should carry your Task, Report and Skill context; without it (or
+`principals:read`) the brief carries your identity and the board's doctrine
+only. Ask for `principals:read` only if your client reads other principals.
 
 The board validates the request, then sends the browser to its own consent
 page. The person signs in if they are not signed in already, reads what your

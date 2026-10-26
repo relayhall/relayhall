@@ -1,10 +1,19 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Search, X, Filter, ChevronDown, ChevronUp, UserCheck } from 'lucide-react';
+import React, { useState, useEffect, useId, useLayoutEffect, useMemo, useRef } from 'react';
+import { Search, X, Filter, ChevronDown, ChevronUp, UserCheck, ShieldAlert } from 'lucide-react';
 import { Task, TaskPriority, TaskStatus } from '../../types/task';
-import { authenticatedFetch } from '../../utils/auth';
 import { Select } from '../ui/Select';
 import { Button } from '../Button';
 import { IconButton } from '../ui/IconButton';
+import {
+  BACKLOG_PHASE_FILTER,
+  groupPhasesByProject,
+  phaseFilterLabel,
+  phaseMatchesQuery,
+  phasesInScope,
+  selectedProjectIds,
+  type PhaseFilterOption,
+  type PhaseFilterProject,
+} from './phaseFilterScope';
 import './FilterBar.css';
 
 export interface TaskFilters {
@@ -22,6 +31,8 @@ export interface TaskFilters {
   mine?: boolean;
   owner?: string | null;
   unassigned?: boolean;
+  /** Card 41e24358: only Tasks without a usable Verifier (server-side). */
+  verifierUnusable?: boolean;
 }
 
 interface FilterBarProps {
@@ -34,56 +45,270 @@ interface FilterBarProps {
   availableOwners?: string[];
   /** False until the caller resolves a principal — "Mine" is meaningless then. */
   canFilterMine?: boolean;
+  /** Every Phase the board can filter by (RH-P2.4), from the board page's
+   *  Phase catalog — not from the loaded page of tasks: a Phase whose tasks
+   *  are all on a later page must still be filterable. Empty hides the
+   *  control: an always-empty Phase filter reads as broken, not as empty. */
+  availablePhases?: PhaseFilterOption[];
+  /** The Project directory naming those Phases' Projects (card 096fda30).
+   *  Null while unknown: the Phase list is then neither scoped nor grouped. */
+  phaseProjects?: PhaseFilterProject[] | null;
+  /** Said once the board clears Phases the Project selection excludes. */
+  phaseScopeNotice?: string | null;
+  onDismissPhaseScopeNotice?: () => void;
 }
 
-export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersChange, availableTags: availableTagsProp, availableProjects: availableProjectsProp, availableOwners = [], canFilterMine = false }) => {
-  const [searchInput, setSearchInput] = useState(filters.searchQuery);
-  const [showPriorityDropdown, setShowPriorityDropdown] = useState(false);
-  const [showStatusDropdown, setShowStatusDropdown] = useState(false);
-  const [showTagsDropdown, setShowTagsDropdown] = useState(false);
-  const [showProjectsDropdown, setShowProjectsDropdown] = useState(false);
-  const [filtersExpanded, setFiltersExpanded] = useState(false);
-  const [tagSearchQuery, setTagSearchQuery] = useState('');
-  const [projectSearchQuery, setProjectSearchQuery] = useState('');
-  // Phase options (RH-P2.4) come from the board's own phases, not from the
-  // loaded page of tasks: a phase whose tasks are all on a later page must
-  // still be filterable, or the filter would silently narrow with pagination.
-  const [showPhasesDropdown, setShowPhasesDropdown] = useState(false);
-  const [availablePhases, setAvailablePhases] = useState<Array<{ id: string; name: string; position: number }>>([]);
-  const tagSearchInputRef = useRef<HTMLInputElement>(null);
-  const projectSearchInputRef = useRef<HTMLInputElement>(null);
+const NO_PHASES: PhaseFilterOption[] = [];
 
-  // Debounced search
+/** The five list filters, which all render through FilterDropdown. */
+type ListFilterKey = 'priorities' | 'statuses' | 'tags' | 'projects' | 'phases';
+
+/** One item of a multi-select filter list. */
+interface FilterOption {
+  value: string;
+  /** The item's visible text, which is also its checkbox's accessible name. */
+  label: string;
+  /** Drawn before the label (the Priority dot). */
+  adornment?: React.ReactNode;
+  /** Does the filter's search query keep this item? Absent: the label is
+   *  matched as a case-insensitive substring of the trimmed query. */
+  matches?: (query: string) => boolean;
+}
+
+const optionMatches = (option: FilterOption, query: string) => {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  return option.matches ? option.matches(query) : option.label.toLowerCase().includes(needle);
+};
+
+interface FilterDropdownProps {
+  /** The filter's visible name on its button; the clear controls are named
+   *  "Clear <name> filter". */
+  name: string;
+  /** The items the filter offers, in their list order. */
+  options: FilterOption[];
+  selected: readonly string[];
+  onToggle: (value: string) => void;
+  /** Empty THIS filter: exactly what unticking every selected item does. */
+  onClear: () => void;
+  open: boolean;
+  onOpenChange: () => void;
+  disabled?: boolean;
+  search?: { placeholder: string; ariaLabel: string; clearLabel: string };
+  menuClassName?: string;
+  /** Said when the search leaves nothing in either group. */
+  emptyText?: string;
+  /** Lays out the unselected items (the Phase filter groups them by Project).
+   *  Receives the items the search kept and the current query. */
+  renderRest?: (rest: FilterOption[], renderOption: (option: FilterOption) => React.ReactNode, query: string) => React.ReactNode;
+}
+
+/**
+ * One multi-select filter of the Tasks board (owner ruling E395). Every list
+ * filter — Priority, Status, Tags, Project, Phase — renders through this one
+ * component, so they cannot drift apart:
+ *
+ *  - the selected items lead the list in a "Selected" group (a role=group
+ *    named by its visible label), in list order, above the rest; the search
+ *    box narrows both groups. The order is taken when the list opens and
+ *    holds while it is open, so a tick never moves an item (or its focus);
+ *    the next opening, or a clear, sorts it again;
+ *  - while the filter has a selection it carries two clear controls, both
+ *    named "Clear <name> filter": an x BESIDE its button (a sibling, never
+ *    nested, so the button keeps its own activation) and a "Clear" action at
+ *    the top of its dropdown. Either empties this filter only.
+ *
+ * Focus after a clear: the x hands focus to the filter's button (the x itself
+ * is gone); the in-menu Clear keeps the dropdown open and hands focus to its
+ * search box, or to the first item where the filter has no search.
+ */
+const FilterDropdown: React.FC<FilterDropdownProps> = ({
+  name, options, selected, onToggle, onClear, open, onOpenChange, disabled = false,
+  search, menuClassName = '', emptyText, renderRest,
+}) => {
+  const [query, setQuery] = useState('');
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const focusFirstItemAfterClear = useRef(false);
+  const selectedLabelId = useId();
+
+  // The search box takes focus when the dropdown opens and is emptied when it
+  // closes (the behaviour the Tags, Project and Phase searches always had).
+  // Keyed on whether there IS a search, not on the props object: a new object
+  // each render must not pull focus back to the box after every tick.
+  const searchable = search !== undefined;
+  useEffect(() => {
+    if (open && searchable) {
+      const timer = setTimeout(() => searchInputRef.current?.focus(), 10);
+      return () => clearTimeout(timer);
+    }
+    if (!open) setQuery('');
+    return undefined;
+  }, [open, searchable]);
+
+  // The in-menu Clear unmounts with the selection it cleared; on a filter
+  // with no search box, focus goes to the first item once the list is redrawn.
+  useEffect(() => {
+    if (!focusFirstItemAfterClear.current) return;
+    focusFirstItemAfterClear.current = false;
+    rootRef.current?.querySelector<HTMLInputElement>('.filter-dropdown-menu input[type="checkbox"]')?.focus();
+  });
+
+  // The order is decided when the list OPENS: the items selected then lead
+  // it. Ticking or unticking while it is open moves nothing, so an item never
+  // jumps away from the pointer and its checkbox keeps keyboard focus (a moved
+  // checkbox would be a new element). Reopening the list, or clearing the
+  // filter, sorts it again.
+  const [pinned, setPinned] = useState<readonly string[] | null>(null);
+  if (open && pinned === null) setPinned([...selected]);
+  if (!open && pinned !== null) setPinned(null);
+  const leading = new Set(pinned ?? selected);
+
+  const chosen = new Set(selected);
+  const kept = options.filter(option => optionMatches(option, query));
+  const selectedOptions = kept.filter(option => leading.has(option.value));
+  const restOptions = kept.filter(option => !leading.has(option.value));
+  const hasSelection = selected.length > 0;
+
+  const renderOption = (option: FilterOption) => (
+    <label key={option.value} className="filter-dropdown-item">
+      <input
+        type="checkbox"
+        checked={chosen.has(option.value)}
+        onChange={() => onToggle(option.value)}
+      />
+      {option.adornment}
+      <span>{option.label}</span>
+    </label>
+  );
+
+  const clearFromButton = () => {
+    onClear();
+    if (open) setPinned([]);
+    rootRef.current?.querySelector<HTMLButtonElement>('.filter-dropdown-button')?.focus();
+  };
+
+  const clearFromMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    onClear();
+    setPinned([]);
+    if (search) searchInputRef.current?.focus();
+    else focusFirstItemAfterClear.current = true;
+  };
+
+  const selectedGroup = selectedOptions.length > 0 ? (
+    <div className="filter-dropdown-group filter-dropdown-selected" role="group" aria-labelledby={selectedLabelId}>
+      <div id={selectedLabelId} className="filter-dropdown-group-label">Selected</div>
+      {selectedOptions.map(renderOption)}
+    </div>
+  ) : null;
+  const restList = renderRest ? renderRest(restOptions, renderOption, query) : restOptions.map(renderOption);
+
+  return (
+    <div className="filter-dropdown" ref={rootRef}>
+      <Button
+        variant="secondary"
+        size="compact"
+        ariaExpanded={open}
+        ariaHaspopup="true"
+        onClick={onOpenChange}
+        className={`filter-dropdown-button ${hasSelection ? 'filter-dropdown-button--active' : ''} ${hasSelection ? 'filter-dropdown-button--clearable' : ''}`}
+        disabled={disabled}
+      >
+        <Filter size={16} />
+        {name}
+        {hasSelection && (
+          <span className="filter-badge">{selected.length}</span>
+        )}
+      </Button>
+      {hasSelection && (
+        <IconButton
+          className="filter-dropdown-clear-x"
+          variant="secondary"
+          ariaLabel={`Clear ${name} filter`}
+          icon={<X size={16} />}
+          onClick={clearFromButton}
+        />
+      )}
+      {open && !disabled && (
+        <div className={`filter-dropdown-menu ${search ? 'filter-dropdown-menu-with-search' : ''} ${menuClassName}`}>
+          {search && (
+            <div className="filter-dropdown-search">
+              <Search size={16} className="filter-dropdown-search-icon" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                aria-label={search.ariaLabel}
+                placeholder={search.placeholder}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="filter-dropdown-search-input"
+                onClick={(e) => e.stopPropagation()}
+              />
+              {query && (
+                <IconButton
+                  className="filter-dropdown-search-clear"
+                  variant="ghost"
+                  ariaLabel={search.clearLabel}
+                  icon={<X size={16} />}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setQuery('');
+                    searchInputRef.current?.focus();
+                  }}
+                />
+              )}
+            </div>
+          )}
+          {hasSelection && (
+            <div className="filter-dropdown-actions">
+              <Button variant="secondary" size="compact" ariaLabel={`Clear ${name} filter`} onClick={clearFromMenu}>
+                Clear
+              </Button>
+            </div>
+          )}
+          <div className="filter-dropdown-items">
+            {selectedGroup}
+            {restList}
+            {emptyText && kept.length === 0 && (
+              <div className="filter-dropdown-empty">
+                {emptyText}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const FilterBar: React.FC<FilterBarProps> = ({
+  tasks, filters, onFiltersChange, availableTags: availableTagsProp, availableProjects: availableProjectsProp,
+  availableOwners = [], canFilterMine = false,
+  availablePhases = NO_PHASES, phaseProjects = null, phaseScopeNotice = null, onDismissPhaseScopeNotice,
+}) => {
+  const [searchInput, setSearchInput] = useState(filters.searchQuery);
+  /** At most one list filter's dropdown is open at a time. */
+  const [openFilter, setOpenFilter] = useState<ListFilterKey | null>(null);
+  const [filtersExpanded, setFiltersExpanded] = useState(false);
+  const phaseGroupIdPrefix = useId();
+
+  // Search changes only the query. Keep newer selections when its timer fires,
+  // without restarting the typing delay when another filter changes.
+  const latestFilters = useRef({ filters, onFiltersChange });
+  useLayoutEffect(() => {
+    latestFilters.current = { filters, onFiltersChange };
+  }, [filters, onFiltersChange]);
+
   useEffect(() => {
     const timer = setTimeout(() => {
-      onFiltersChange({ ...filters, searchQuery: searchInput });
+      const { filters: current, onFiltersChange: change } = latestFilters.current;
+      if (current.searchQuery !== searchInput) {
+        change({ ...current, searchQuery: searchInput });
+      }
     }, 300);
     return () => clearTimeout(timer);
   }, [searchInput]);
-
-  // Auto-focus tag search input when dropdown opens, clear when it closes
-  useEffect(() => {
-    if (showTagsDropdown) {
-      // Small delay to ensure the input is rendered
-      setTimeout(() => {
-        tagSearchInputRef.current?.focus();
-      }, 10);
-    } else {
-      // Clear search when dropdown closes
-      setTagSearchQuery('');
-    }
-  }, [showTagsDropdown]);
-
-  // Auto-focus project search input when dropdown opens, clear when it closes
-  useEffect(() => {
-    if (showProjectsDropdown) {
-      setTimeout(() => {
-        projectSearchInputRef.current?.focus();
-      }, 10);
-    } else {
-      setProjectSearchQuery('');
-    }
-  }, [showProjectsDropdown]);
 
   // Extract unique values from all tasks
   const availableTags = useMemo(() => {
@@ -95,15 +320,6 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
     return Array.from(tagSet).sort();
   }, [tasks, availableTagsProp]);
 
-  // Filter tags based on search query
-  const filteredTags = useMemo(() => {
-    if (!tagSearchQuery.trim()) {
-      return availableTags;
-    }
-    const query = tagSearchQuery.toLowerCase().trim();
-    return availableTags.filter(tag => tag.toLowerCase().includes(query));
-  }, [availableTags, tagSearchQuery]);
-
   const availableProjects = useMemo(() => {
     if (availableProjectsProp && availableProjectsProp.length > 0) return [...availableProjectsProp].sort();
     const projectSet = new Set<string>();
@@ -113,13 +329,19 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
     return Array.from(projectSet).sort();
   }, [tasks, availableProjectsProp]);
 
-  const filteredProjects = useMemo(() => {
-    if (!projectSearchQuery.trim()) {
-      return availableProjects;
-    }
-    const query = projectSearchQuery.toLowerCase().trim();
-    return availableProjects.filter(project => project.toLowerCase().includes(query));
-  }, [availableProjects, projectSearchQuery]);
+  // The Phase list follows the Project filter (card 096fda30): with Projects
+  // selected it offers only their Phases; with none it offers every Phase,
+  // grouped under its Project. Clearing a selected Phase the Projects exclude
+  // is the board page's job (reconcilePhaseFilter), so a link and a click are
+  // treated the same way.
+  const phaseScope = useMemo(
+    () => selectedProjectIds(filters.projects, phaseProjects),
+    [filters.projects, phaseProjects],
+  );
+  const scopedPhases = useMemo(
+    () => phasesInScope(availablePhases, phaseScope),
+    [availablePhases, phaseScope],
+  );
 
   const priorities: TaskPriority[] = ['urgent', 'high', 'normal', 'low', 'someday'];
 
@@ -134,6 +356,30 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
     { value: 'archived', label: 'Archived' },
   ];
 
+  const priorityOptions: FilterOption[] = priorities.map(priority => ({
+    value: priority,
+    label: priority,
+    adornment: <span className={`filter-priority-dot priority-dot-${priority}`}></span>,
+  }));
+  const statusFilterOptions: FilterOption[] = statusOptions.map(option => ({ value: option.value, label: option.label }));
+  const tagOptions: FilterOption[] = availableTags.map(tag => ({ value: tag, label: tag }));
+  // The '#' is presentation: the search matches the Project's name.
+  const projectOptions: FilterOption[] = availableProjects.map(project => ({
+    value: project,
+    label: `#${project}`,
+    matches: query => project.toLowerCase().includes(query.trim().toLowerCase()),
+  }));
+  // The backlog is not a Phase of any Project: always offered, never searched.
+  const phaseById = new Map(scopedPhases.map(phase => [phase.id, phase]));
+  const phaseOptions: FilterOption[] = [
+    { value: BACKLOG_PHASE_FILTER, label: 'Backlog (no phase)', matches: () => true },
+    ...scopedPhases.map(phase => ({
+      value: phase.id,
+      label: phaseFilterLabel(phase),
+      matches: (query: string) => phaseMatchesQuery(phase, query),
+    })),
+  ];
+
   const activeFilterCount =
     (filters.searchQuery ? 1 : 0) +
     filters.priorities.length +
@@ -143,7 +389,8 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
     filters.statuses.length +
     (filters.mine ? 1 : 0) +
     (filters.owner ? 1 : 0) +
-    (filters.unassigned ? 1 : 0);
+    (filters.unassigned ? 1 : 0) +
+    (filters.verifierUnusable ? 1 : 0);
 
   const clearAllFilters = () => {
     setSearchInput('');
@@ -156,9 +403,14 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
       statuses: [],
       mine: false,
       owner: null,
-      unassigned: false
+      unassigned: false,
+      verifierUnusable: false
     });
   };
+
+  /** One list filter's own clear (owner ruling E395): the state unticking
+   *  each of its selected items leaves, and nothing else changes. */
+  const clearListFilter = (key: ListFilterKey) => onFiltersChange({ ...filters, [key]: [] });
 
   /** The three Assignee filters are mutually exclusive server-side, so
    *  selecting one clears the others rather than sending a contradiction. */
@@ -166,56 +418,55 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
     onFiltersChange({ ...filters, mine: false, owner: null, unassigned: false, ...next });
   };
 
-  const togglePriority = (priority: TaskPriority) => {
-    const newPriorities = filters.priorities.includes(priority)
-      ? filters.priorities.filter(p => p !== priority)
-      : [...filters.priorities, priority];
-    onFiltersChange({ ...filters, priorities: newPriorities });
+  /** Tick or untick one item of one list filter. Only the enumerated values
+   *  are ever offered for Priority and Status, so the list keeps its type. */
+  const toggleIn = (key: ListFilterKey, value: string) => {
+    const list: readonly string[] = filters[key];
+    const next = list.includes(value) ? list.filter(item => item !== value) : [...list, value];
+    onFiltersChange({ ...filters, [key]: next });
   };
+  const toggleTag = (tag: string) => toggleIn('tags', tag);
 
-  const toggleStatus = (status: TaskStatus) => {
-    const newStatuses = filters.statuses.includes(status)
-      ? filters.statuses.filter(s => s !== status)
-      : [...filters.statuses, status];
-    onFiltersChange({ ...filters, statuses: newStatuses });
-  };
+  const dropdownState = (key: ListFilterKey) => ({
+    open: openFilter === key,
+    onOpenChange: () => setOpenFilter(current => (current === key ? null : key)),
+    onClear: () => clearListFilter(key),
+  });
 
-  const toggleTag = (tag: string) => {
-    const newTags = filters.tags.includes(tag)
-      ? filters.tags.filter(t => t !== tag)
-      : [...filters.tags, tag];
-    onFiltersChange({ ...filters, tags: newTags });
-  };
-
-  useEffect(() => {
-    const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
-    let cancelled = false;
-    authenticatedFetch(`${API_BASE_URL}/phases`)
-      .then(r => r.json())
-      .then(data => {
-        if (cancelled) return;
-        if (data?.success && Array.isArray(data.phases)) {
-          setAvailablePhases(data.phases.map((p: { id: string; name: string; position: number }) => ({
-            id: p.id, name: p.name, position: p.position,
-          })));
-        }
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
-
-  const togglePhase = (phaseId: string) => {
-    const next = filters.phases.includes(phaseId)
-      ? filters.phases.filter(p => p !== phaseId)
-      : [...filters.phases, phaseId];
-    onFiltersChange({ ...filters, phases: next });
-  };
-
-  const toggleProject = (project: string) => {
-    const newProjects = filters.projects.includes(project)
-      ? filters.projects.filter(p => p !== project)
-      : [...filters.projects, project];
-    onFiltersChange({ ...filters, projects: newProjects });
+  // The unselected Phases, grouped under their Project when the directory is
+  // known; the backlog, when not selected, leads them outside any group.
+  const renderPhaseRest = (
+    rest: FilterOption[],
+    renderOption: (option: FilterOption) => React.ReactNode,
+    query: string,
+  ) => {
+    const backlog = rest.filter(option => option.value === BACKLOG_PHASE_FILTER);
+    const restPhases = rest
+      .map(option => phaseById.get(option.value))
+      .filter((phase): phase is PhaseFilterOption => phase !== undefined);
+    const anyPhaseMatches = scopedPhases.some(phase => phaseMatchesQuery(phase, query));
+    const optionOf = (phase: PhaseFilterOption) => rest.find(option => option.value === phase.id)!;
+    let phasesBlock: React.ReactNode = null;
+    if (!anyPhaseMatches) {
+      phasesBlock = (
+        <div className="filter-dropdown-empty">
+          {scopedPhases.length === 0 ? 'No phases in the selected projects' : 'No phases found'}
+        </div>
+      );
+    } else if (phaseProjects === null) {
+      phasesBlock = restPhases.map(phase => renderOption(optionOf(phase)));
+    } else {
+      phasesBlock = groupPhasesByProject(restPhases, phaseProjects).map(group => {
+        const labelId = `${phaseGroupIdPrefix}-phase-group-${group.key || 'other'}`;
+        return (
+          <div key={group.key || 'other'} className="filter-dropdown-group" role="group" aria-labelledby={labelId}>
+            <div id={labelId} className="filter-dropdown-group-label">{group.label}</div>
+            {group.phases.map(phase => renderOption(optionOf(phase)))}
+          </div>
+        );
+      });
+    }
+    return <>{backlog.map(renderOption)}{phasesBlock}</>;
   };
 
   const hasActiveTagFilter = filters.tags.length > 0;
@@ -285,274 +536,61 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
       </Button>
 
       <div className={`filter-bar-filters ${filtersExpanded ? 'filter-bar-filters-expanded' : ''}`}>
-        {/* Priority Filter */}
-        <div className="filter-dropdown">
-          <Button
-            variant="secondary"
-            size="compact"
-            ariaExpanded={showPriorityDropdown}
-            ariaHaspopup="true"
-            onClick={() => {
-              setShowPriorityDropdown(!showPriorityDropdown);
-              setShowStatusDropdown(false);
-              setShowTagsDropdown(false);
-              setShowProjectsDropdown(false);
-            }}
-            className={`filter-dropdown-button ${filters.priorities.length > 0 ? 'filter-dropdown-button--active' : ''}`}
-          >
-            <Filter size={16} />
-            Priority
-            {filters.priorities.length > 0 && (
-              <span className="filter-badge">{filters.priorities.length}</span>
-            )}
-          </Button>
-          {showPriorityDropdown && (
-            <div className="filter-dropdown-menu">
-              {priorities.map(priority => (
-                <label key={priority} className="filter-dropdown-item">
-                  <input
-                    type="checkbox"
-                    checked={filters.priorities.includes(priority)}
-                    onChange={() => togglePriority(priority)}
-                  />
-                  <span className={`filter-priority-dot priority-dot-${priority}`}></span>
-                  <span>{priority}</span>
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
+        <FilterDropdown
+          name="Priority"
+          options={priorityOptions}
+          selected={filters.priorities}
+          onToggle={value => toggleIn('priorities', value as TaskPriority)}
+          {...dropdownState('priorities')}
+        />
 
         {/* Status filter (design 986be411 §3): narrows the board to the
             selected columns; the enumerated seven states only. */}
-        <div className="filter-dropdown">
-          <Button
-            variant="secondary"
-            size="compact"
-            ariaExpanded={showStatusDropdown}
-            ariaHaspopup="true"
-            onClick={() => {
-              setShowStatusDropdown(!showStatusDropdown);
-              setShowPriorityDropdown(false);
-              setShowTagsDropdown(false);
-              setShowProjectsDropdown(false);
-              setShowPhasesDropdown(false);
-            }}
-            className={`filter-dropdown-button ${filters.statuses.length > 0 ? 'filter-dropdown-button--active' : ''}`}
-          >
-            <Filter size={16} />
-            Status
-            {filters.statuses.length > 0 && (
-              <span className="filter-badge">{filters.statuses.length}</span>
-            )}
-          </Button>
-          {showStatusDropdown && (
-            <div className="filter-dropdown-menu">
-              {statusOptions.map(option => (
-                <label key={option.value} className="filter-dropdown-item">
-                  <input
-                    type="checkbox"
-                    checked={filters.statuses.includes(option.value)}
-                    onChange={() => toggleStatus(option.value)}
-                  />
-                  <span>{option.label}</span>
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
+        <FilterDropdown
+          name="Status"
+          options={statusFilterOptions}
+          selected={filters.statuses}
+          onToggle={value => toggleIn('statuses', value as TaskStatus)}
+          {...dropdownState('statuses')}
+        />
 
-        {/* Tags Filter */}
-        <div className="filter-dropdown">
-          <Button
-            variant="secondary"
-            size="compact"
-            ariaExpanded={showTagsDropdown}
-            ariaHaspopup="true"
-            onClick={() => {
-              setShowTagsDropdown(!showTagsDropdown);
-              setShowPriorityDropdown(false);
-              setShowStatusDropdown(false);
-              setShowProjectsDropdown(false);
-            }}
-            className={`filter-dropdown-button ${filters.tags.length > 0 ? 'filter-dropdown-button--active' : ''}`}
-            disabled={availableTags.length === 0}
-          >
-            <Filter size={16} />
-            Tags
-            {filters.tags.length > 0 && (
-              <span className="filter-badge">{filters.tags.length}</span>
-            )}
-          </Button>
-          {showTagsDropdown && availableTags.length > 0 && (
-            <div className="filter-dropdown-menu filter-dropdown-menu-with-search">
-              <div className="filter-dropdown-search">
-                <Search size={16} className="filter-dropdown-search-icon" />
-                <input
-                  ref={tagSearchInputRef}
-                  type="text"
-                  placeholder="Search tags..."
-                  value={tagSearchQuery}
-                  onChange={(e) => setTagSearchQuery(e.target.value)}
-                  className="filter-dropdown-search-input"
-                  onClick={(e) => e.stopPropagation()}
-                />
-                {tagSearchQuery && (
-                  <IconButton
-                    className="filter-dropdown-search-clear"
-                    variant="ghost"
-                    ariaLabel="Clear search"
-                    icon={<X size={16} />}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setTagSearchQuery('');
-                      tagSearchInputRef.current?.focus();
-                    }}
-                  />
-                )}
-              </div>
-              <div className="filter-dropdown-items">
-                {filteredTags.length > 0 ? (
-                  filteredTags.map(tag => (
-                    <label key={tag} className="filter-dropdown-item">
-                      <input
-                        type="checkbox"
-                        checked={filters.tags.includes(tag)}
-                        onChange={() => toggleTag(tag)}
-                      />
-                      <span>{tag}</span>
-                    </label>
-                  ))
-                ) : (
-                  <div className="filter-dropdown-empty">
-                    No tags found
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
+        <FilterDropdown
+          name="Tags"
+          options={tagOptions}
+          selected={filters.tags}
+          onToggle={toggleTag}
+          disabled={availableTags.length === 0}
+          search={{ placeholder: 'Search tags...', ariaLabel: 'Search tags', clearLabel: 'Clear search' }}
+          emptyText="No tags found"
+          {...dropdownState('tags')}
+        />
 
-        {/* Projects Filter */}
-        <div className="filter-dropdown">
-          <Button
-            variant="secondary"
-            size="compact"
-            ariaExpanded={showProjectsDropdown}
-            ariaHaspopup="true"
-            onClick={() => {
-              setShowProjectsDropdown(!showProjectsDropdown);
-              setShowPriorityDropdown(false);
-              setShowStatusDropdown(false);
-              setShowTagsDropdown(false);
-            }}
-            className={`filter-dropdown-button ${filters.projects.length > 0 ? 'filter-dropdown-button--active' : ''}`}
-            disabled={availableProjects.length === 0}
-          >
-            <Filter size={16} />
-            Project
-            {filters.projects.length > 0 && (
-              <span className="filter-badge">{filters.projects.length}</span>
-            )}
-          </Button>
-          {showProjectsDropdown && availableProjects.length > 0 && (
-            <div className="filter-dropdown-menu filter-dropdown-menu-with-search">
-              <div className="filter-dropdown-search">
-                <Search size={16} className="filter-dropdown-search-icon" />
-                <input
-                  ref={projectSearchInputRef}
-                  type="text"
-                  placeholder="Search projects..."
-                  value={projectSearchQuery}
-                  onChange={(e) => setProjectSearchQuery(e.target.value)}
-                  className="filter-dropdown-search-input"
-                  onClick={(e) => e.stopPropagation()}
-                />
-                {projectSearchQuery && (
-                  <IconButton
-                    className="filter-dropdown-search-clear"
-                    variant="ghost"
-                    ariaLabel="Clear search"
-                    icon={<X size={16} />}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setProjectSearchQuery('');
-                      projectSearchInputRef.current?.focus();
-                    }}
-                  />
-                )}
-              </div>
-              <div className="filter-dropdown-items">
-                {filteredProjects.length > 0 ? (
-                  filteredProjects.map(project => (
-                    <label key={project} className="filter-dropdown-item">
-                      <input
-                        type="checkbox"
-                        checked={filters.projects.includes(project)}
-                        onChange={() => toggleProject(project)}
-                      />
-                      <span>#{project}</span>
-                    </label>
-                  ))
-                ) : (
-                  <div className="filter-dropdown-empty">
-                    No projects found
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
+        <FilterDropdown
+          name="Project"
+          options={projectOptions}
+          selected={filters.projects}
+          onToggle={value => toggleIn('projects', value)}
+          disabled={availableProjects.length === 0}
+          search={{ placeholder: 'Search projects...', ariaLabel: 'Search projects', clearLabel: 'Clear search' }}
+          emptyText="No projects found"
+          {...dropdownState('projects')}
+        />
 
         {/* Phase filter (RH-P2.4). Hidden entirely when the deployment has no
-            phases: an always-empty control reads as broken, not as empty. */}
+            phases: an always-empty control reads as broken, not as empty.
+            The same search box, keyboard behaviour and focus order as the
+            Project search, with an explicit accessible name (card 096fda30). */}
         {availablePhases.length > 0 && (
-          <div className="filter-dropdown">
-            <Button
-              variant="secondary"
-              size="compact"
-              ariaExpanded={showPhasesDropdown}
-              ariaHaspopup="true"
-              onClick={() => {
-                setShowPhasesDropdown(!showPhasesDropdown);
-                setShowPriorityDropdown(false);
-                setShowStatusDropdown(false);
-                setShowTagsDropdown(false);
-                setShowProjectsDropdown(false);
-              }}
-              className={`filter-dropdown-button ${filters.phases.length > 0 ? 'filter-dropdown-button--active' : ''}`}
-            >
-              <Filter size={16} />
-              Phase
-              {filters.phases.length > 0 && (
-                <span className="filter-badge">{filters.phases.length}</span>
-              )}
-            </Button>
-            {showPhasesDropdown && (
-              <div className="filter-dropdown-menu">
-                <div className="filter-dropdown-items">
-                  <label className="filter-dropdown-item">
-                    <input
-                      type="checkbox"
-                      checked={filters.phases.includes('null')}
-                      onChange={() => togglePhase('null')}
-                    />
-                    <span>Backlog (no phase)</span>
-                  </label>
-                  {availablePhases.map(phase => (
-                    <label key={phase.id} className="filter-dropdown-item">
-                      <input
-                        type="checkbox"
-                        checked={filters.phases.includes(phase.id)}
-                        onChange={() => togglePhase(phase.id)}
-                      />
-                      <span>#{phase.position} {phase.name}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
+          <FilterDropdown
+            name="Phase"
+            options={phaseOptions}
+            selected={filters.phases}
+            onToggle={value => toggleIn('phases', value)}
+            search={{ placeholder: 'Search phases...', ariaLabel: 'Search phases', clearLabel: 'Clear phase search' }}
+            menuClassName="filter-dropdown-menu-phases"
+            renderRest={renderPhaseRest}
+            {...dropdownState('phases')}
+          />
         )}
 
         {/* Assignee filters (card 60558599). Rendered only once identity is
@@ -595,6 +633,20 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
           </Select>
         )}
 
+        {/* Card 41e24358: the morning census is this filter over To-Do and
+            Review. Decided by the server's usable-Verifier predicate. */}
+        <Button
+          variant="secondary"
+          size="compact"
+          className={`filter-ownership-toggle ${filters.verifierUnusable ? 'filter-ownership-toggle--active' : ''}`}
+          icon={<ShieldAlert size={16} />}
+          ariaPressed={Boolean(filters.verifierUnusable)}
+          title="Only tasks without a usable Verifier"
+          onClick={() => onFiltersChange({ ...filters, verifierUnusable: !filters.verifierUnusable })}
+        >
+          Without a usable Verifier
+        </Button>
+
         {/* Clear All Button */}
         {activeFilterCount > 0 && (
           <Button
@@ -607,6 +659,27 @@ export const FilterBar: React.FC<FilterBarProps> = ({ tasks, filters, onFiltersC
           >
             Clear All ({activeFilterCount})
           </Button>
+        )}
+      </div>
+
+      {/* Phase scope notice (card 096fda30): the board says when it clears a
+          Phase the selected Projects exclude, rather than changing the filter
+          silently. The live region stays mounted so a clearing that lands
+          after the bar is on screen is announced; empty, it takes no room. */}
+      <div className="filter-bar-notice" role="status">
+        {phaseScopeNotice && (
+          <>
+            <span className="filter-bar-notice-text">{phaseScopeNotice}</span>
+            {onDismissPhaseScopeNotice && (
+              <IconButton
+                className="filter-bar-notice-dismiss"
+                variant="ghost"
+                ariaLabel="Dismiss notice"
+                icon={<X size={16} />}
+                onClick={onDismissPhaseScopeNotice}
+              />
+            )}
+          </>
         )}
       </div>
     </div>

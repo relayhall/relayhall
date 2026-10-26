@@ -486,7 +486,6 @@ const SINGLETON = 'loginSessionService';
 const PERMITTED_SINGLETON_IMPORTERS: Array<{ module: string; because: string }> = [
   { module: 'src/middleware/auth.ts', because: 'the REST ingress resolves the login-session cookie and touches liveness' },
   { module: 'src/routes/auth.ts', because: 'the local login and logout routes mint, revoke and list login sessions' },
-  { module: 'src/routes/sso.ts', because: 'the federated callback resolves the login-session cookie it has just set' },
   { module: 'src/server.ts', because: 'boot schedules the retained-token disposal sweep (SSO-R16)' },
   { module: 'src/services/identity/SsoAuthenticationService.ts', because: 'an admitted federated login mints the login session' },
   { module: 'src/services/identity/SsoLogoutService.ts', because: 'back-channel logout revokes the named login session' },
@@ -494,7 +493,7 @@ const PERMITTED_SINGLETON_IMPORTERS: Array<{ module: string; because: string }> 
   // Account and revokes its login sessions with disabled_user, so the retained
   // ID token is disposed with them (SSO-R16). It mints nothing.
   { module: 'src/services/identity/ScimProvisioningService.ts', because: 'the SCIM deprovision signal revokes the login sessions of the Account it disabled' },
-  { module: 'src/services/websocket.ts', because: 'the socket upgrade authenticates from the login-session cookie' },
+  { module: 'src/services/sessionAuthentication.ts', because: 'the shared session authentication boundary resolves login-session cookies for REST, SSO and WebSocket' },
 ];
 
 /**
@@ -1073,7 +1072,7 @@ describe('SS-9 · the loginSessionService importer and re-export census', () => 
     expect(refused).toEqual([]);
   });
 
-  test('the module-evaluation scan is SATISFIABLE: it sees the eight imports it admits', () => {
+  test('the module-evaluation scan is SATISFIABLE: it sees the imports it admits', () => {
     // The positive control. Without it the rule above could pass by observing
     // nothing at all — a traversal that never reaches module-evaluation level
     // refuses an empty population and looks identical to a clean tree.

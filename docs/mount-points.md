@@ -55,5 +55,4 @@ the container cannot read a mounted path, e.g. `./data:/data:rw,z`.
 
 Earlier versions mounted one harness's session/config/workspace/media
 directories read-only so the board could observe it. Those mounts were retired
-with the observer stack — see
-[design-history/removed-observer-stack.md](design-history/removed-observer-stack.md).
+with the observer stack.

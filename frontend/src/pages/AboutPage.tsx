@@ -2,15 +2,29 @@ import { useEffect, useMemo, useState } from 'react';
 import { ExternalLink, Github } from 'lucide-react';
 import { Wordmark } from '../components/Wordmark';
 import { loadAppearanceInfo, type AppearanceInfo, type AppearanceLink } from '../services/appearance';
-import { DOCS_URL, IS_PUBLIC_BUILD, LICENSE_URL, PROBLEM_URL, PRODUCT_URL, SOURCE_LABEL, SOURCE_URL } from '../utils/build';
-import { loadApiInfo, loadReleaseManifest, RELAYHALL_VERSION, type ApiInfo, type ReleaseManifest } from '../utils/releaseInfo';
+import { BLUEPRINT_GUIDE_URL, DOCS_URL, LICENSE_URL, PROBLEM_URL, PRODUCT_URL, SOURCE_LABEL, SOURCE_URL } from '../utils/build';
+import {
+  builtAtInstant,
+  isUnreleasedVersion,
+  loadApiInfo,
+  loadReleaseManifest,
+  type ApiInfo,
+  type BuildIdentity,
+} from '../utils/releaseInfo';
 import { renderMarkdownSafe } from '../utils/renderMarkdown';
 import './AboutPage.css';
 
 interface AboutFacts {
-  manifest: ReleaseManifest | null;
+  manifest: BuildIdentity | null;
   api: ApiInfo | null;
   appearance: AppearanceInfo | null;
+}
+
+const UNAVAILABLE = 'Unavailable';
+
+/** 'A', 'A and B', 'A, B and C'. */
+function listPhrase(items: string[]): string {
+  return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 function nonBlank(value: string | null | undefined): string {
@@ -32,11 +46,59 @@ function safeHttpLink(link: AppearanceLink): AppearanceLink | null {
 }
 
 function ProductLink({ href, children }: { href: string; children: React.ReactNode }) {
-  return IS_PUBLIC_BUILD ? (
+  return (
     <a href={href} target="_blank" rel="noreferrer noopener">
       {children}<ExternalLink size={16} aria-hidden="true" />
     </a>
-  ) : <span>{children}</span>;
+  );
+}
+
+/**
+ * A version exactly as the artefact reported it. There is deliberately no
+ * fallback: a version the artefact did not report is Unavailable, never the
+ * bundled package version passed off as what is deployed.
+ */
+function VersionValue({ version }: { version: string | null | undefined }) {
+  if (!version) return <>{UNAVAILABLE}</>;
+  return (
+    <>
+      {version}
+      {isUnreleasedVersion(version) && <span className="about-page__qualifier"> (unreleased build)</span>}
+    </>
+  );
+}
+
+function BuildFacts({ heading, headingId, identity }: { heading: string; headingId: string; identity: BuildIdentity | null }) {
+  const instant = identity?.builtAt ? builtAtInstant(identity.builtAt) : null;
+  return (
+    <section className="about-page__build" aria-labelledby={headingId}>
+      <h3 id={headingId}>{heading}</h3>
+      <dl className="about-page__facts">
+        <div><dt>Build SHA</dt><dd>{identity?.sha ? <code>{identity.sha}</code> : UNAVAILABLE}</dd></div>
+        <div><dt>Dirty</dt><dd>{identity?.dirty ? <code>{identity.dirty}</code> : UNAVAILABLE}</dd></div>
+        <div><dt>Build context</dt><dd>{identity?.buildContext ? <code>{identity.buildContext}</code> : UNAVAILABLE}</dd></div>
+        <div>
+          <dt>Built at</dt>
+          <dd>{identity?.builtAt && instant ? <time dateTime={instant}>{identity.builtAt}</time> : UNAVAILABLE}</dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+/** What the two artefacts report differently, when both report it. */
+function identityConflicts(frontend: BuildIdentity | null, api: ApiInfo | null): string[] {
+  const conflicts: string[] = [];
+  if (frontend?.version && api?.version && frontend.version !== api.version) conflicts.push('version');
+  if (frontend?.sha && api?.build?.sha && frontend.sha !== api.build.sha) conflicts.push('build SHA');
+  return conflicts;
+}
+
+function identityIncomplete(frontend: BuildIdentity | null, api: ApiInfo | null): boolean {
+  const complete = (identity: BuildIdentity | null | undefined) => Boolean(
+    identity && identity.version && identity.sha && identity.dirty && identity.buildContext && identity.builtAt,
+  );
+  return !complete(frontend) || !api?.version || !complete(api.build);
 }
 
 export function AboutPage() {
@@ -75,6 +137,8 @@ export function AboutPage() {
     };
   }, [attempt]);
 
+  const retry = () => setAttempt(current => current + 1);
+
   const deployment = useMemo(() => {
     if (!facts.appearance) return null;
     const displayName = nonBlank(facts.appearance.displayName);
@@ -85,6 +149,9 @@ export function AboutPage() {
     return { displayName, description, teamMarkdown, links };
   }, [facts.appearance]);
 
+  const conflicts = identityConflicts(facts.manifest, facts.api);
+  const incomplete = !loading && failures.length === 0 && identityIncomplete(facts.manifest, facts.api);
+
   return (
     <div className="about-page">
       <header className="about-page__header">
@@ -94,8 +161,14 @@ export function AboutPage() {
 
       {failures.length > 0 && (
         <div className="about-page__error" role="alert">
-          <span>{failures.join(', ')} {failures.length === 1 ? 'is' : 'are'} unavailable.</span>
-          <button type="button" onClick={() => setAttempt(current => current + 1)}>Retry</button>
+          <span>{listPhrase(failures)} {failures.length === 1 ? 'is' : 'are'} unavailable.</span>
+          <button type="button" onClick={retry}>Retry</button>
+        </div>
+      )}
+      {incomplete && (
+        <div className="about-page__notice">
+          <span>Some build identity fields are unavailable: the build did not record them, or they could not be read.</span>
+          <button type="button" onClick={retry}>Retry</button>
         </div>
       )}
       {loading && <p className="about-page__loading" role="status">Loading release information…</p>}
@@ -108,20 +181,28 @@ export function AboutPage() {
               <h2 id="about-product-heading">Product</h2>
             </div>
             <dl className="about-page__facts">
-              <div><dt>Version</dt><dd>{RELAYHALL_VERSION}</dd></div>
-              <div><dt>API version</dt><dd>{facts.api?.version ?? 'Unavailable'}</dd></div>
-              <div><dt>Build SHA</dt><dd>{facts.manifest ? <code>{facts.manifest.sha}</code> : 'Unavailable'}</dd></div>
-              <div><dt>Dirty</dt><dd>{facts.manifest ? <code>{facts.manifest.dirty}</code> : 'Unavailable'}</dd></div>
-              <div><dt>Build context</dt><dd>{facts.manifest?.buildContext ?? 'Unavailable'}</dd></div>
-              <div><dt>Built at</dt><dd>{facts.manifest ? <time dateTime={facts.manifest.builtAt}>{facts.manifest.builtAt}</time> : 'Unavailable'}</dd></div>
+              <div><dt>Version</dt><dd><VersionValue version={facts.manifest?.version} /></dd></div>
+              <div><dt>API version</dt><dd><VersionValue version={facts.api?.version} /></dd></div>
             </dl>
             <nav className="about-page__links" aria-label="RelayHall product links">
               <ProductLink href={LICENSE_URL}>MIT licence</ProductLink>
               <ProductLink href={SOURCE_URL}>{SOURCE_LABEL}</ProductLink>
               <ProductLink href={DOCS_URL}>Documentation</ProductLink>
-              <ProductLink href={SOURCE_URL+'/blob/main/docs/blueprints/README.md'}>Blueprint authoring and use guide</ProductLink>
+              <ProductLink href={BLUEPRINT_GUIDE_URL}>Blueprint authoring and use guide</ProductLink>
               <ProductLink href={PROBLEM_URL}>Report a problem</ProductLink>
             </nav>
+          </section>
+
+          <section className="about-page__card" aria-labelledby="about-build-heading">
+            <h2 id="about-build-heading">Build identity</h2>
+            <p>Read from what each deployed artefact recorded when it was built.</p>
+            {conflicts.length > 0 && (
+              <p className="about-page__conflict" role="status" aria-labelledby="about-conflict-heading">
+                <strong id="about-conflict-heading">Frontend and backend identities differ</strong>: {listPhrase(conflicts)}.
+              </p>
+            )}
+            <BuildFacts heading="Frontend build" headingId="about-frontend-build-heading" identity={facts.manifest} />
+            <BuildFacts heading="Backend build" headingId="about-backend-build-heading" identity={facts.api?.build ?? null} />
           </section>
 
           {deployment && (
@@ -155,13 +236,9 @@ export function AboutPage() {
         <a href={PRODUCT_URL} target="_blank" rel="noreferrer noopener">
           relayhall.com<ExternalLink size={16} aria-hidden="true" />
         </a>
-        {IS_PUBLIC_BUILD ? (
-          <a href={SOURCE_URL} target="_blank" rel="noreferrer noopener">
-            <Github size={16} aria-hidden="true" />GitHub
-          </a>
-        ) : (
-          <span><Github size={16} aria-hidden="true" />GitHub: linked once published</span>
-        )}
+        <a href={SOURCE_URL} target="_blank" rel="noreferrer noopener">
+          <Github size={16} aria-hidden="true" />GitHub
+        </a>
       </footer>
     </div>
   );

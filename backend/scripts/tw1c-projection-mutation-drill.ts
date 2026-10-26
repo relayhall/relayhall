@@ -1,7 +1,7 @@
 /**
  * RH-TW1c (card `50e74c1d`) — the RED PROOF for the projection's controls.
  *
- * THIRTEEN mutations, each reintroducing a DIFFERENT defect this card's
+ * TWENTY-ONE mutations, each reintroducing a DIFFERENT defect this card's
  * controls exist to catch, and each required to redden the assertion NAMED FOR
  * IT. A control that stays green under the defect it was written for is
  * decoration, and the only way to know which of the two it is, is to break the
@@ -22,6 +22,24 @@
  *   M11  `account_id` back into the session key   -> the re-parented-Connector row
  *   M12  a read written OUTSIDE `envelopeRead`    -> the one-read structural control
  *   M13  the route stops asking the product grammar -> the malformed-key refusal
+ *
+ * M14-M21 are card `0ac41d40` (owner ruling E89 (b)): the Sessions list hides
+ * SHORT sessions server-side before the row limit, counts them, and gains a
+ * reporter/product filter and offset paging. One mutation per way that can go
+ * wrong, each against the live fixture built for it:
+ *
+ *   M14  the short filter withdrawn from the page    -> hidden by default, before the LIMIT
+ *   M15  "at most three events" becomes "fewer than three" -> the 3-event fixtures
+ *   M16  "under two minutes" becomes "two minutes or less" -> the exactly-120 s boundary
+ *   M17  the tokens condition dropped                -> the tokens-only fixture
+ *   M18  the model condition dropped                 -> the model-only fixture
+ *   M19  hiddenCount forced to zero                  -> the exact count
+ *   M20  the reporter/product filter ignored         -> the filter cases
+ *   M21  the requested offset never reaches the SQL  -> the paging walk
+ *
+ * M11 was RE-ANCHORED for the same card: the session key's GROUP BY moved
+ * into the one renderer the list and the Stats split share, and is now
+ * followed by the CTE that classifies it rather than by an ORDER BY.
  *
  * M8 and M9 were RE-ANCHORED for the repair, and how they had to change is
  * itself the measurement. M8 used to delete `AND e.account_id = g.account_id`
@@ -232,12 +250,17 @@ const MUTATIONS: Mutation[] = [
       + 're-parented Connector’s ONE advertised triple became two list rows nothing '
       + 'public could tell apart and the totals counted it once',
     file: PROJECTION,
+    // Re-anchored for card `0ac41d40`: the key's GROUP BY now lives in the
+    // one renderer the list and the Stats split share, followed by the CTE
+    // that classifies it.
     find:
       '          GROUP BY e.session_ref, e.connector_id, e.source_product\n'
-      + '          ORDER BY MAX(e.observed_at) DESC',
+      + '       ),\n'
+      + '       classified AS (',
     replace:
       '          GROUP BY e.session_ref, e.connector_id, e.account_id, e.source_product\n'
-      + '          ORDER BY MAX(e.observed_at) DESC',
+      + '       ),\n'
+      + '       classified AS (',
     expects: [
       'a RE-PARENTED Connector is ONE row, addressable, and agrees with the totals',
       'the Account is in no GROUP BY of any statement',
@@ -280,6 +303,91 @@ const MUTATIONS: Mutation[] = [
       '  if (!connectorId || !isValidTaskId(connectorId) || !sourceProduct'
       + ' || !(PRODUCT_RE.test(sourceProduct) || sourceProduct.length <= 256)) {',
     expects: ['an INCOMPLETE or MALFORMED key is refused before any row is read'],
+  },
+  // ── card 0ac41d40: short sessions, the reporter filter and paging ─────────
+  {
+    id: 'M14-short-filter-withdrawn',
+    reintroduces:
+      'the page stops dropping short sessions — the empty MCP sessions crowd the '
+      + 'fifty rows again, which is the defect owner ruling E89 (b) exists to end',
+    file: PROJECTION,
+    find: '          WHERE ${includeParam} OR NOT c.is_short\n          ORDER BY',
+    replace: '          WHERE TRUE\n          ORDER BY',
+    expects: [
+      'HIDDEN BY DEFAULT',
+      'BEFORE THE LIMIT',
+      'the short filter sits in the PAGE',
+    ],
+  },
+  {
+    id: 'M15-event-threshold-narrowed',
+    reintroduces:
+      '"at most three events" read as "fewer than three" — the three-event MCP '
+      + 'bootstrap/heartbeat/completed shape is listed again',
+    file: PROJECTION,
+    find: '(g.event_count <= ${TELEMETRY_SHORT_SESSION_MAX_EVENTS}',
+    replace: '(g.event_count < ${TELEMETRY_SHORT_SESSION_MAX_EVENTS}',
+    expects: ['HIDDEN BY DEFAULT', 'BOUNDARIES'],
+  },
+  {
+    id: 'M16-duration-boundary-moved',
+    reintroduces:
+      '"under two minutes" read as "two minutes or less" — a session of exactly two '
+      + 'minutes is hidden, against the stated boundary',
+    file: PROJECTION,
+    find: 'AND g.last_seen_at - g.started_at < INTERVAL',
+    replace: 'AND g.last_seen_at - g.started_at <= INTERVAL',
+    expects: ['HIDDEN BY DEFAULT', 'BOUNDARIES'],
+  },
+  {
+    id: 'M17-tokens-condition-dropped',
+    reintroduces:
+      'a session that spent tokens counted as short — real work with no named model '
+      + 'disappears from the page',
+    file: PROJECTION,
+    find: '\n                 AND g.input_tokens = 0\n                 AND g.output_tokens = 0)',
+    replace: ')',
+    expects: ['HIDDEN BY DEFAULT', 'BOUNDARIES'],
+  },
+  {
+    id: 'M18-model-condition-dropped',
+    reintroduces:
+      'a session that called a model counted as short — a Claude Code or Codex session '
+      + 'with one model call and no usage block disappears from the page',
+    file: PROJECTION,
+    find: '\n                 AND NOT g.has_model',
+    replace: '',
+    expects: ['HIDDEN BY DEFAULT', 'BOUNDARIES'],
+  },
+  {
+    id: 'M19-hidden-count-dropped',
+    reintroduces:
+      'the list hides sessions and says it hid none — "Show N short sessions" reads 0 '
+      + 'while rows are withheld',
+    file: PROJECTION,
+    find: '      hiddenCount: includeShort ? 0 : shortCount,',
+    replace: '      hiddenCount: 0,',
+    expects: ['HIDDEN BY DEFAULT', 'an EMPTY page still reports its counts'],
+  },
+  {
+    id: 'M20-filter-ignored',
+    reintroduces:
+      'the reporter and product filter accepted and then ignored — the page shows every '
+      + 'reporter while saying it shows one',
+    file: PROJECTION,
+    find: '      if (value) {\n        params.push(value);',
+    replace: '      if (value && false) {\n        params.push(value);',
+    expects: ['the REPORTER and PRODUCT filter', 'the filters bind as PARAMETERS'],
+  },
+  {
+    id: 'M21-offset-ignored',
+    reintroduces:
+      'the requested offset never reaches the statement — "Load more" returns the first '
+      + 'page again',
+    file: PROJECTION,
+    find: '    params.push(offset);\n',
+    replace: '    params.push(0);\n',
+    expects: ['PAGING', 'an offset is a whole number of rows or 0'],
   },
 ];
 

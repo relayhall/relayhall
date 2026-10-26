@@ -12,6 +12,7 @@ interface SubtaskListProps {
   onReorder?: (subtaskId: string, direction: 'up' | 'down') => void;
   compact?: boolean;
   readOnly?: boolean;
+  ownerControl?: boolean;
 }
 
 // Helper to get effective status (handles legacy field and old status names)
@@ -35,7 +36,8 @@ export const SubtaskList: React.FC<SubtaskListProps> = ({
   onEditText,
   onReorder,
   compact = false,
-  readOnly = false
+  readOnly = false,
+  ownerControl = false
 }) => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
@@ -191,17 +193,19 @@ export const SubtaskList: React.FC<SubtaskListProps> = ({
             style={{ width: `${(stuck / total) * 100}%`, left: `${((completed + skipped + review + inProgress) / total) * 100}%` }}
           />
         </div>
+        {/* E388: each count carries its word for a screen reader; the icons
+            stay decorative, so "2 1 2" became "2 completed 1 in progress…". */}
         <span className="subtask-progress-text">
           {compact ? (
             `${done}/${total}`
           ) : (
             <>
-              {completed > 0 && <span className="progress-completed"><CheckCircle2 size={16} aria-hidden="true" />{completed}</span>}
-              {skipped > 0 && <span className="progress-skipped"><SkipForward size={16} aria-hidden="true" />{skipped}</span>}
-              {review > 0 && <span className="progress-review"><Circle size={16} aria-hidden="true" />{review}</span>}
-              {inProgress > 0 && <span className="progress-in-progress"><RefreshCw size={16} aria-hidden="true" />{inProgress}</span>}
-              {stuck > 0 && <span className="progress-blocked"><AlertCircle size={16} aria-hidden="true" />{stuck}</span>}
-              {empty > 0 && <span className="progress-empty"><Square size={16} aria-hidden="true" />{empty}</span>}
+              {completed > 0 && <span className="progress-completed"><CheckCircle2 size={16} aria-hidden="true" />{completed}<span className="sr-only"> completed</span></span>}
+              {skipped > 0 && <span className="progress-skipped"><SkipForward size={16} aria-hidden="true" />{skipped}<span className="sr-only"> skipped</span></span>}
+              {review > 0 && <span className="progress-review"><Circle size={16} aria-hidden="true" />{review}<span className="sr-only"> to be reviewed</span></span>}
+              {inProgress > 0 && <span className="progress-in-progress"><RefreshCw size={16} aria-hidden="true" />{inProgress}<span className="sr-only"> in progress</span></span>}
+              {stuck > 0 && <span className="progress-blocked"><AlertCircle size={16} aria-hidden="true" />{stuck}<span className="sr-only"> stuck</span></span>}
+              {empty > 0 && <span className="progress-empty"><Square size={16} aria-hidden="true" />{empty}<span className="sr-only"> not started</span></span>}
             </>
           )}
         </span>
@@ -227,6 +231,7 @@ export const SubtaskList: React.FC<SubtaskListProps> = ({
             {!readOnly && onStatusChange ? (
               <SubtaskStatusSelect
                 value={status}
+                ownerControl={ownerControl}
                 subtaskText={subtask.text}
                 className="subtask-list-status"
                 disabled={transitioningId === subtask.id}

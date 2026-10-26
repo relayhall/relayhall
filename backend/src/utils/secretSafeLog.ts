@@ -39,6 +39,18 @@ export function logCaughtFailure(context: string, caught: unknown): string {
   return failureId;
 }
 
+/**
+ * The same line under a failure id the caller already holds (card 72b8fb97):
+ * for one failure that has two causes worth an operator's eye, both lines
+ * carry the ONE id the response returned. Same non-disclosure contract; the
+ * id is never read from the caught value.
+ */
+export function logCaughtFailureAs(context: string, caught: unknown, failureId: string): string {
+  const { category, errorClass, code } = identifyCaughtFailure(caught);
+  console.error(`${context} (${category}) [class=${errorClass} code=${code} id=${failureId}]`);
+  return failureId;
+}
+
 /** The warning-level variant, with the same non-disclosure contract. */
 export function logCaughtWarning(context: string, caught: unknown): string {
   const { category, errorClass, code } = identifyCaughtFailure(caught);

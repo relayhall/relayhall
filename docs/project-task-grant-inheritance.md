@@ -1,7 +1,6 @@
 # Exact Project Grants on Tasks
 
-Owner-approved contract: report `0e6f09a0-4b15-4f2b-a05f-ed5e11d93d36`,
-authorization recorded in `6b8ac081-4524-4930-b9b4-9e841d5e7445`.
+Owner-approved contract.
 
 A live Grant on one Project supplies resource authority on its unrestricted
 Tasks. The Task must name that Project in its own `project_id`, and the Project
@@ -15,8 +14,16 @@ must still exist with status `active`.
 
 Task or referenced Phase restriction disables this new source. Existing exact
 Task Grants, Task roles and visibility sources keep their semantics. Project
-wildcard Grants, Project Access Profiles, Project ownership and Phase Grants
-do not become Task authority sources.
+wildcard Grants, Project Access Profiles, person Project ownership and Phase
+Grants do not become Task authority sources.
+
+**Group Project ownership is a separate source (AZ-A12 clause 7(b)).** When a
+Project's owner is a Group, its members read the Project's unrestricted Tasks
+and its live owners and managers get the same ordinary Task read/write subset,
+including on Tasks whose explicit account owner is someone else. It is its own
+Account-side rule, not this Grant arm: Group ownership never activates the
+exact-Project-Grant source, and the same restriction and active-Project rules
+apply. See the Group ownership section of [authorization](authorization.md).
 
 The existing Grant evaluator checks direct Grants, current Group membership and
 expiry. Revocation, removal of membership and principal liveness changes apply
@@ -64,4 +71,9 @@ named production-source controls without opening a database. With an explicit
 disposable URL, pass `--output-dir` outside the repository to execute baseline,
 semantic failures and restored controls. The driver modifies only its own copied
 source, fingerprints all copied runtime inputs, rejects unrelated failures and
-removes the copy. It never starts or stops PostgreSQL.
+removes the copy. It never starts or stops PostgreSQL. Three of its controls drive
+`listPointParity` instead of the inheritance suite: they remove the Phase read
+decision from `GET /projects/{id}/phases` and from the Phase anchors of a
+Warrant's linkage, and the Project read decision from its Project anchors, and
+each must redden exactly its declared assertions. Every
+suite a selected control names gets its own baseline and final restoration.

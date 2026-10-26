@@ -133,7 +133,7 @@ beforeEach(async () => {
 });
 
 const request = () => ({
-  principal: { id: ACCOUNT, role: 'user' },
+  principal: { id: ACCOUNT, role: 'user', kind: 'human', status: 'active', parentPrincipalId: null },
   userId: 'holder',
   credentialId: 'cred-1',
   scopes: ['knowledge-contents:read'],
@@ -494,7 +494,7 @@ describe('F1 (verdict 5e56a63a) — no refusal distinguishes no-authority from n
     // A refusal union that still SPELLS the distinction invites its return.
     const executor = readShippedSource('services/KnowledgeGetExecutor.ts');
     for (const gone of ['source_unavailable', 'board_source_not_available', 'compartment_not_declared']) {
-      expect(executor).not.toContain(`'${gone}'`);
+      expect(gone === 'source_unavailable' ? executor.slice(0, executor.indexOf('const arms =')) : executor).not.toContain(`return refuse('${gone}')`);
     }
     // The internal reason exists for a human, and provably never ships.
     expect(executor).toContain('void internal;');

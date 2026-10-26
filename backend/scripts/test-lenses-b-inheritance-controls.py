@@ -48,7 +48,7 @@ try:
   with (out/(label+'.log')).open('w') as log:
    rc=subprocess.run(['node','node_modules/jest/bin/jest.js','--runInBand','--testPathIgnorePatterns=/node_modules/','--runTestsByPath','src/__tests__/lensesCreationDefaultLive.test.ts','--json','--outputFile='+str(path)],cwd=copy/'backend',env=env,stdout=log,stderr=subprocess.STDOUT,timeout=300).returncode
   assert path.exists(),label+' produced no assertion receipt'
-  data=json.loads(path.read_text());assert data['numTotalTests']==58 and data['numPendingTests']==0,label+' must execute all58'
+  data=json.loads(path.read_text());assert data['numTotalTests']==63 and data['numPendingTests']==0,label+' must execute all63'
   failed={a['title'].lstrip('. '):a for suite in data['testResults'] for a in suite['assertionResults'] if a['status']=='failed'}
   assert (rc==0)==(not failed),label+' non-assertion runner failure'
   errors='\n'.join('\n'.join(a.get('failureMessages',[])) for a in failed.values())
@@ -63,7 +63,7 @@ try:
    assert 'expect(received)' in errors,name+' did not reach an assertion oracle'
   finally:target.write_bytes(original_bytes)
   failed,_=execute(name+'-restored');assert not failed,(name,'restoration failed')
-  receipts.append({'name':name,'description':description,'expectedFailures':sorted(EXPECTED[name]),'semanticRed':True,'fullRestored':58});(out/'receipts.json').write_text(json.dumps(receipts,indent=2));print(name,'exact red/full58 restored PASS',flush=True)
+  receipts.append({'name':name,'description':description,'expectedFailures':sorted(EXPECTED[name]),'semanticRed':True,'fullRestored':63});(out/'receipts.json').write_text(json.dumps(receipts,indent=2));print(name,'exact red/full63 restored PASS',flush=True)
  failed,_=execute('final-restored');assert not failed
  assert fingerprints(root)==original and fingerprints(copy)==original
 finally:

@@ -40,8 +40,6 @@ function taskWith(dueAt: string | null): Task {
     priority: 'normal',
     subtasks: [],
     links: [],
-    sessionRefs: [],
-    autoCreated: false,
     autoStart: false,
     blockedBy: [],
     tags: [],

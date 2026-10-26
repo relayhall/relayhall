@@ -1,4 +1,5 @@
-/* NotificationsCard — the §2.12 human notification surface on the dashboard. */
+/* NotificationsCard — "Needs your action" on the dashboard (card 5854f0d6,
+   Slice B; formerly the §2.12 unread surface). Theme tokens only. */
 
 .notifications-card {
   background: var(--bg-surface);
@@ -15,8 +16,10 @@
 
 .notifications-card-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
 
@@ -30,25 +33,25 @@
   margin: 0;
 }
 
-.notifications-card-clear {
-  background: none;
-  border: none;
-  padding: var(--space-1) var(--space-2);
+.notifications-card-all {
   font-size: var(--text-sm);
   font-weight: var(--font-medium);
   color: var(--text-accent);
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-}
-
-.notifications-card-clear:hover {
-  text-decoration: underline;
 }
 
 .notifications-card-empty {
   color: var(--text-secondary);
   font-size: var(--text-sm);
   margin: 0;
+}
+
+.notifications-card-failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-error);
+  font-size: var(--text-sm);
 }
 
 .notifications-card-list {
@@ -76,54 +79,38 @@
   margin-top: 2px;
 }
 
-.notifications-card-item--exception .notifications-card-item-icon {
-  color: var(--text-warning);
-}
-
 .notifications-card-item-body {
   flex: 1;
+  /* Card 2b6f21f6 (SQ-2): a flex item will not shrink below its content's
+     min-content width by default, and the subject line is one unwrapped run,
+     so a long single-token title would push past the card's border. With no
+     minimum the body takes the room that is left and the line ellipsizes. */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
-  background: none;
-  border: none;
-  padding: 0;
-  text-align: left;
-  cursor: pointer;
-}
-
-.notifications-card-item-label {
-  font-size: var(--text-sm);
-  font-weight: var(--font-medium);
-  color: var(--text-primary);
 }
 
 .notifications-card-item-task {
   font-size: var(--text-sm);
-  color: var(--text-secondary);
+  font-weight: var(--font-medium);
+  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+a.notifications-card-item-task {
+  color: var(--text-accent);
+}
+
+.notifications-card-item-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .notifications-card-item-time {
   font-size: var(--text-xs);
   color: var(--text-secondary);
-}
-
-.notifications-card-item-read {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: none;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  padding: var(--space-1);
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.notifications-card-item-read:hover {
-  color: var(--text-primary);
-  border-color: var(--accent-color);
 }

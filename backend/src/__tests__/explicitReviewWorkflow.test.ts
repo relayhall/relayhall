@@ -89,6 +89,20 @@ describe('central Verifier-owned subtask enforcement', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
+  // The writer now rechecks the locked parent and current child in its
+  // transaction; return those rows rather than only mocking getTask().
+  const lockedRows = (status: string) => {
+    (pool.query as jest.Mock).mockImplementation(async (sql: string) => {
+      if (sql === 'SELECT status FROM tasks WHERE id = $1 FOR UPDATE') {
+        return { rows: [{ status: 'review' }] };
+      }
+      if (sql === 'SELECT status, note FROM subtasks WHERE task_id = $1 AND index = $2 FOR UPDATE') {
+        return { rows: [{ status, note: null }] };
+      }
+      return { rows: [] };
+    });
+  };
+
   test('creation cannot pre-complete subtasks or bypass the parent invariant', async () => {
     const manager = new TaskManagerDB();
     await expect(manager.createTask({
@@ -124,7 +138,7 @@ describe('central Verifier-owned subtask enforcement', () => {
       jest.spyOn(manager, 'getTask')
         .mockResolvedValueOnce(task('review'))
         .mockResolvedValueOnce(task('completed'));
-      (pool.query as jest.Mock).mockResolvedValue({ rows: [] });
+      lockedRows('review');
       const updated = await manager.updateSubtaskStatus(task('review').id, 0, 'completed', role);
       expect(updated.subtasks?.[0].status).toBe('completed');
       expect(pool.query).toHaveBeenCalledWith(
@@ -150,7 +164,7 @@ describe('central Verifier-owned subtask enforcement', () => {
     jest.spyOn(manager, 'getTask')
       .mockResolvedValueOnce(task('in-progress'))
       .mockResolvedValueOnce(task('stuck'));
-    (pool.query as jest.Mock).mockResolvedValue({ rows: [] });
+    lockedRows('in-progress');
     const stuck = await manager.updateSubtaskStatus(task('review').id, 0, 'stuck', 'agent', undefined, 'needs owner input');
     expect(stuck.subtasks?.[0].status).toBe('stuck');
 
@@ -166,7 +180,7 @@ describe('central Verifier-owned subtask enforcement', () => {
     jest.spyOn(manager, 'getTask')
       .mockResolvedValueOnce(task('empty'))
       .mockResolvedValueOnce(task('skipped'));
-    (pool.query as jest.Mock).mockResolvedValue({ rows: [] });
+    lockedRows('empty');
     const updated = await manager.updateSubtaskStatus(task('review').id, 0, 'skipped', 'orchestrator');
     expect(updated.subtasks?.[0].status).toBe('skipped');
   });

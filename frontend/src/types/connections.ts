@@ -47,8 +47,77 @@ export const API_SCRIPT_SCOPES: string[] = [
   'projects:read', 'phases:read',
 ];
 
+/**
+ * THE ONE TOKEN OF A HARNESS CONNECTOR (E462 slice S1; universal harness
+ * connector design v1.5 section 3.1).
+ *
+ * A harness (Claude Code, Codex, VS Code, Antigravity) holds ONE token, and
+ * that one token does four jobs: it serves the board's MCP tools, reports
+ * telemetry and usage quotas, opens the wake socket and mints task-bounded
+ * implementer Agents. So it is the Agent working set PLUS the three scopes the
+ * extra jobs need — `telemetry:write` (presence, quotas), `services:read` (the
+ * connector reads its own descriptor) and `principals:read` (the Agent mint and
+ * the session brief both read the caller's principal).
+ *
+ * Built from `AGENT_WORKING_SCOPES` rather than restated, so the Agent mint
+ * panel and this set cannot drift into disagreeing about the working half.
+ *
+ * Owner ruling E475 (1) adds three, each the narrowest verb of its family:
+ * `knowledge-contents:read` (research through the board's knowledge sources),
+ * `personalities:read` (read the Personalities a Task names) and
+ * `blueprints:use`. `blueprints:use` is NOT read-only: it lets the connector
+ * preview AND instantiate a published Blueprint, and instantiating creates
+ * Tasks (which `tasks:write` already allows). It is not `blueprints:read`, so
+ * the connector sees the use-only projection of a Blueprint, never its version
+ * history or ledger.
+ *
+ * Owner ruling E480 adds two more, so that the connector can instantiate a
+ * Blueprint and not only preview it: `projects:write` (every instantiation
+ * writes into, or creates, its target Project) and `phases:write` (a Blueprint
+ * that has Phases creates them). They are the ordinary write verbs of those
+ * objects, not Blueprint-only; object grants still decide which Projects and
+ * Phases. Sixteen in all; see docs/connector-onboarding.md. A credential
+ * minted before E480 keeps the scopes it has.
+ *
+ * This is the ONE definition: the wizard's harness templates mint it, and the
+ * local connector's `HARNESS_SCOPES` (cli/relayhall_connector.py) is read back
+ * out of this source by a drift test.
+ *
+ * NEVER `root`, never an `:admin` scope, never `services:write` (design B5): a
+ * connector reads its descriptor, it does not rewrite it. A test pins all three
+ * absences, the full set written out, and reads every member back out of the
+ * board's mintable catalogue.
+ */
+export const HARNESS_CONNECTOR_SCOPES: string[] = [
+  ...AGENT_WORKING_SCOPES, 'telemetry:write', 'services:read', 'principals:read',
+  'knowledge-contents:read', 'personalities:read', 'blueprints:use',
+  'projects:write', 'phases:write',
+];
+
+export type HarnessKey = 'claude-code' | 'codex' | 'vscode' | 'antigravity';
+
+/**
+ * What a harness connector declares about itself in its first published
+ * descriptor: how much telemetry it sends and the one product it reports
+ * under. Quota posts need the declared `sourceProduct`, and session telemetry
+ * needs a declared tier (both deny by default on the board).
+ *
+ * `full` for the two harnesses that report quotas and run work; `presence` for
+ * the two editor clients, which are human-driven and report presence and
+ * MCP-derived sessions only (design section 7). Both cap at the same policy tier
+ * on the board today; the difference is what each connector says it SENDS.
+ */
+export interface HarnessDeclaration {
+  /** Names the harness in the install line (`--harness <key>`). */
+  key: HarnessKey;
+  telemetryTier: 'presence' | 'full';
+  telemetryProduct: string;
+}
+
 export interface ConnectionTemplate {
   key: string;
+  /** Present on a harness template: the install line and the descriptor come from it. */
+  harness?: HarnessDeclaration;
   /** The product-facing label in wizard step 1. */
   label: string;
   /** One line under the label: what this choice is for. */
@@ -100,7 +169,16 @@ export interface ConnectionTemplate {
 export const GATEWAY_SURFACE_AVAILABLE = false;
 
 /**
- * The six choices of the owner record §3.1, in the record's own order.
+ * The choices of the owner record §3.1, in the record's own order, plus
+ * Antigravity (E462 slice S1, design v1.5 section 3.1), which sits with the
+ * other three harnesses.
+ *
+ * THE FOUR HARNESS TEMPLATES (Claude Code, Codex, VS Code, Antigravity) are the
+ * exception to the transport rule below: each makes ONE `any`-pinned token with
+ * the harness scope set, because that one token serves MCP, reports telemetry,
+ * opens the wake socket and mints Agents. See `HARNESS_CONNECTOR_SCOPES`. They
+ * are the templates that carry a `harness` declaration; Generic MCP, API script
+ * and the gateway are unchanged.
  *
  * Transport, per template, is the record's "the choice sets kind, transport and
  * a default scope template". MCP clients are pinned `mcp`, which is the tighter
@@ -116,30 +194,43 @@ export const GATEWAY_SURFACE_AVAILABLE = false;
 export const CONNECTION_TEMPLATES: ConnectionTemplate[] = [
   {
     key: 'claude-code',
+    harness: { key: 'claude-code', telemetryTier: 'full', telemetryProduct: 'claude-code' },
     label: 'Claude Code',
     blurb: 'The Claude Code CLI, working tasks from the board.',
     registrationText: 'Claude Code, connected from the Connect your agent flow.',
-    transport: 'mcp',
+    transport: 'any',
     defaultTab: 'claudeCode',
-    suggestedScopes: AGENT_WORKING_SCOPES,
+    suggestedScopes: HARNESS_CONNECTOR_SCOPES,
   },
   {
     key: 'codex',
+    harness: { key: 'codex', telemetryTier: 'full', telemetryProduct: 'openai-codex' },
     label: 'Codex',
     blurb: 'The Codex CLI, working tasks from the board.',
     registrationText: 'Codex, connected from the Connect your agent flow.',
-    transport: 'mcp',
+    transport: 'any',
     defaultTab: 'codex',
-    suggestedScopes: AGENT_WORKING_SCOPES,
+    suggestedScopes: HARNESS_CONNECTOR_SCOPES,
   },
   {
     key: 'vscode',
+    harness: { key: 'vscode', telemetryTier: 'presence', telemetryProduct: 'vscode' },
     label: 'VS Code',
     blurb: 'An editor session that reaches the board over MCP.',
     registrationText: 'VS Code, connected from the Connect your agent flow.',
-    transport: 'mcp',
+    transport: 'any',
     defaultTab: 'generic',
-    suggestedScopes: AGENT_WORKING_SCOPES,
+    suggestedScopes: HARNESS_CONNECTOR_SCOPES,
+  },
+  {
+    key: 'antigravity',
+    harness: { key: 'antigravity', telemetryTier: 'presence', telemetryProduct: 'antigravity' },
+    label: 'Antigravity',
+    blurb: 'Google Antigravity, an editor session that reaches the board over MCP.',
+    registrationText: 'Antigravity, connected from the Connect your agent flow.',
+    transport: 'any',
+    defaultTab: 'generic',
+    suggestedScopes: HARNESS_CONNECTOR_SCOPES,
   },
   {
     key: 'generic-mcp',
@@ -183,6 +274,132 @@ export function recommendedScopesFor(
   available: string[],
 ): string[] {
   return template.suggestedScopes.filter((scope) => available.includes(scope));
+}
+
+/** Is this a harness template — one that makes the one-token harness connector? */
+export function isHarnessTemplate(
+  template: ConnectionTemplate | null | undefined,
+): template is ConnectionTemplate & { harness: HarnessDeclaration } {
+  return Boolean(template?.harness);
+}
+
+/**
+ * THE CEILING A TEMPLATE PUTS ON ITS TOKEN.
+ *
+ * A harness template cuts the delegable set down to the harness set, in the
+ * order the session's own catalogue lists it, so the menu cannot offer
+ * `services:write`, an `:admin` scope or anything else outside what the design
+ * names — however much the session could delegate. It can only narrow: a scope
+ * the session may not delegate is absent, so the wizard never offers a button
+ * that produces a 403 — and `harnessScopesMissing` names what was cut, so the
+ * wizard warns about it by name instead of issuing a smaller token silently.
+ *
+ * Every other template, and no template yet, leaves the whole delegable set:
+ * decision 1 (owner ruling of 2026-09-07) still governs those.
+ */
+export function scopeCeilingFor(
+  template: ConnectionTemplate | null | undefined,
+  connectable: string[],
+): string[] {
+  if (!isHarnessTemplate(template)) return connectable;
+  return connectable.filter((scope) => HARNESS_CONNECTOR_SCOPES.includes(scope));
+}
+
+/**
+ * THE PART OF THE HARNESS SET THIS SESSION CANNOT PASS ON (E462 S2, carried
+ * from the S1 review).
+ *
+ * `scopeCeilingFor` cuts the harness set down to what the session may
+ * delegate, which is right (the wizard never offers a scope the board would
+ * refuse), but on its own it was SILENT: a Member who cannot delegate, say,
+ * `telemetry:write` got a token without it and a sentence counting against the
+ * cut-down ceiling, as if nothing were missing. This names what was cut, in the
+ * order the harness set lists it, so the wizard can say so by name.
+ */
+export function harnessScopesMissing(connectable: string[]): string[] {
+  return HARNESS_CONNECTOR_SCOPES.filter((scope) => !connectable.includes(scope));
+}
+
+/**
+ * The sentence for a harness token, in place of "everything you can do", which
+ * would be false here: the harness set is a deliberate subset, and a screen
+ * promising more than it issues is the defect class this file keeps being
+ * repaired for.
+ *
+ * It counts against the WHOLE harness set (`HARNESS_CONNECTOR_SCOPES`), never
+ * against what this session happened to be able to delegate, so "16 of the 16"
+ * is only ever said of a token that really has the full set.
+ */
+export function harnessAuthoritySentence(chosen: number): string {
+  return `This connection gets one token for the board's tools, reporting and wake: ${chosen} of the ${HARNESS_CONNECTOR_SCOPES.length} things a harness connection can be given. It is never given administrator rights or the right to change services.`;
+}
+
+/**
+ * The warning, by name, when the session cannot delegate part of the harness
+ * set. Null when nothing is missing. `relayhall connector check` fails on the
+ * same condition, so the sentence says what the person will meet next.
+ */
+export function harnessDelegationWarning(missing: string[]): string | null {
+  if (missing.length === 0) return null;
+  const names = missing.length === 1
+    ? missing[0]
+    : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
+  const verb = missing.length === 1 ? 'it' : 'them';
+  return `You cannot pass on ${names}, so this token will not have ${verb}. The connector needs the whole harness set: relayhall connector check will fail until someone who can delegate ${verb} widens the token on the Credentials page.`;
+}
+
+/**
+ * What the installer does for this harness that the generic install sentence
+ * does not say, shown under the install line. For Antigravity (owner ruling
+ * E475 (2)) the installer writes one entry into Antigravity's own MCP config
+ * file and keeps a backup of that file beside it first. Null for every other
+ * harness.
+ */
+export function installNoteFor(template: ConnectionTemplate | null | undefined): string | null {
+  if (!isHarnessTemplate(template) || template.harness.key !== 'antigravity') return null;
+  return "For Antigravity the installer adds one entry, relayhall, to ~/.gemini/config/mcp_config.json. Before it changes that file it keeps a timestamped backup beside it, unless the file holds another server's credential, which is never copied. The entry starts the local proxy and holds no token; restart Antigravity afterwards.";
+}
+
+/**
+ * The first capability descriptor a harness connector registers with: no
+ * execution options, one declared telemetry tier and one declared product.
+ * Null for a template that is not a harness.
+ */
+export function connectorDescriptorFor(
+  template: ConnectionTemplate | null | undefined,
+): { options: never[]; telemetry: { tier: 'presence' | 'full'; products: string[] } } | null {
+  if (!isHarnessTemplate(template)) return null;
+  return {
+    options: [],
+    telemetry: { tier: template.harness.telemetryTier, products: [template.harness.telemetryProduct] },
+  };
+}
+
+/**
+ * The one line a person runs on the machine where the harness lives, instead
+ * of a configuration snippet:
+ * `relayhall connector install --harness <h> --board <origin>`.
+ *
+ * It names the harness and the board's ORIGIN and nothing else. The token is
+ * never on it: the installer asks for the token at a hidden prompt, so it never
+ * reaches a command line, a shell history or a process listing. The origin is
+ * taken from the pack's board endpoint (`<origin>/api`), and an endpoint that
+ * is not a URL yields no line rather than a guess.
+ */
+export function installLineFor(
+  template: ConnectionTemplate | null | undefined,
+  boardEndpoint: string | null | undefined,
+): string | null {
+  if (!isHarnessTemplate(template) || !boardEndpoint) return null;
+  let origin: string;
+  try {
+    const parsed = new URL(boardEndpoint);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    origin = parsed.origin;
+  } catch {
+    return null;
+  }
+  return `relayhall connector install --harness ${template.harness.key} --board ${origin}`;
 }
 
 /* ── WHAT A NEW CONNECTION MAY BE GIVEN (card 6e25ae48) ──────────────── */
@@ -435,6 +652,7 @@ export interface ConnectionAgent {
 }
 
 export interface Connection {
+  ownerControl?: boolean;
   principalId: string;
   handle: string;
   displayName: string | null;
@@ -457,6 +675,10 @@ export interface Connection {
 export interface BootstrapInstructions {
   boardEndpoint: string;
   bootstrapLine: string;
+  /** Card 94e8bb0b: the copyable bootstrap prompt; never carries a credential. */
+  bootstrapPrompt?: string;
+  /** Card 94e8bb0b: secure configuration guidance, one sentence per entry. */
+  configurationGuidance?: string[];
   mcpConfig: { claudeCode: unknown; codex: string; generic: unknown };
   cliEnv: string[];
   previewPath: string;
@@ -582,6 +804,10 @@ export function connectionRefusalMessage(
       // the short one, and leaving the old words would send somebody hunting a
       // connection the rollback removed.
       return 'The board could not give the connection an identity, so nothing was created. Try again — if it happens twice, an administrator has to look at this.';
+    case 'CREDENTIAL_KEYS_NOT_CONFIGURED':
+      // A server-side configuration state (no credential key set), not
+      // something the person can change in this form. Name who fixes it and how.
+      return 'This server has no credential key set yet, so it cannot give the connection a credential, and nothing was created. Whoever runs this server can fix it: run ./setup.sh on the server, answer "no" to keep the existing configuration, then restart the backend. Then try again.';
     default:
       break;
   }

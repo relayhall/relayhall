@@ -1,10 +1,11 @@
 import React, { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Users, RefreshCw, Search, Plus, X } from 'lucide-react';
 import { usePrincipals, useMyPrincipal } from '../hooks/usePrincipals';
 import { PrincipalAvatar } from '../components/PrincipalAvatar';
 import { Button } from '../components/Button';
 import { CreateIdentityWizard } from '../components/identity/CreateIdentityWizard';
+import { IdentityDetailPage } from './IdentityDetailPage';
 import type { Principal, PrincipalKind } from '../types/task';
 import { authenticatedFetch } from '../utils/auth';
 import './PrincipalsPage.css';
@@ -21,6 +22,17 @@ const PROTECTED_HANDLES: Record<string, string> = {
   dashboard_user: 'The owner principal cannot be disabled through the API.',
 };
 
+/* Card ff410dc4 (SQ-4): a disabled or terminated identity is still readable,
+   but it no longer crowds the live directory: each kind folds its non-active
+   rows into one collapsed section, with a count. Nothing is deleted. */
+type StatusFilter = 'all' | 'active' | 'non-active';
+type SortKey = 'handle' | 'last-seen';
+
+function lastSeenValue(principal: Principal): number {
+  const seen = principal.lastSeenAt ? new Date(principal.lastSeenAt).getTime() : NaN;
+  return Number.isNaN(seen) ? -Infinity : seen;
+}
+
 function formatLastSeen(value?: string | null): string {
   if (!value) return '—';
   const seen = new Date(value).getTime();
@@ -36,9 +48,17 @@ function formatLastSeen(value?: string | null): string {
 /** Configured identity directory and bounded lifecycle controls. */
 export const PrincipalsPage: React.FC = () => {
   const { principals, loading, unavailable, failed, reload } = usePrincipals();
-  const { me } = useMyPrincipal();
+  const { me, scopes } = useMyPrincipal();
+  // Card caea70ef: `?identity=<id>` opens one identity's detail page inside
+  // this settings entry, so it stays behind the same Identities guard and
+  // needs no route of its own. The id is only ever matched against the
+  // directory below; nothing is asked about an id the directory lacks.
+  const [searchParams] = useSearchParams();
+  const openId = searchParams.get('identity');
   const [query, setQuery] = useState('');
   const [kindFilter, setKindFilter] = useState<PrincipalKind | 'all'>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [sortBy, setSortBy] = useState<SortKey>('handle');
   const [showCreate, setShowCreate] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -74,13 +94,18 @@ export const PrincipalsPage: React.FC = () => {
       );
     });
 
-    return KIND_ORDER.map(kind => ({
-      kind,
-      rows: matches
-        .filter(p => p.kind === kind)
-        .sort((a, b) => a.handle.localeCompare(b.handle)),
-    })).filter(group => group.rows.length > 0);
-  }, [principals, query, kindFilter]);
+    const order = (a: Principal, b: Principal) => (sortBy === 'last-seen'
+      ? lastSeenValue(b) - lastSeenValue(a) || a.handle.localeCompare(b.handle)
+      : a.handle.localeCompare(b.handle));
+    return KIND_ORDER.map(kind => {
+      const ofKind = matches.filter(p => p.kind === kind).sort(order);
+      return {
+        kind,
+        rows: statusFilter === 'non-active' ? [] : ofKind.filter(p => p.status === 'active'),
+        folded: statusFilter === 'active' ? [] : ofKind.filter(p => p.status !== 'active'),
+      };
+    }).filter(group => group.rows.length + group.folded.length > 0);
+  }, [principals, query, kindFilter, statusFilter, sortBy]);
 
   const counts = useMemo(() => {
     const byKind = new Map<PrincipalKind, number>();
@@ -88,7 +113,103 @@ export const PrincipalsPage: React.FC = () => {
     return byKind;
   }, [principals]);
 
-  const filtersActive = Boolean(query.trim() || kindFilter !== 'all');
+  const filtersActive = Boolean(query.trim() || kindFilter !== 'all' || statusFilter !== 'all');
+
+  const renderTable = (rows: Principal[], label: string) => (
+    /* Scrolls horizontally at narrow widths, so it is reachable from the
+       keyboard and named (walkthrough item R14). */
+    <div className="principals-table" role="table" aria-label={label} tabIndex={0}>
+      <div className="principals-row principals-row--head" role="row">
+        <span role="columnheader">Identity</span>
+        <span role="columnheader">Role</span>
+        <span role="columnheader">Harness</span>
+        <span role="columnheader">Status</span>
+        <span role="columnheader">Last seen</span>
+      </div>
+      {rows.map((p: Principal) => (
+        <div
+          key={p.id}
+          className={`principals-row${me?.id === p.id ? ' principals-row--me' : ''}`}
+          role="row"
+        >
+          {/* Handle, not display name: this is the directory you search and
+              filter by handle, so showing "Owner" here while the Assignee
+              filter offers "dashboard_user" would make the two halves of the
+              UI disagree. */}
+          <span role="cell" className="principals-identity">
+            {/* Card caea70ef: the row opens the identity's detail page. */}
+            <Link
+              className="principals-open"
+              to={`?identity=${encodeURIComponent(p.id)}`}
+              aria-label={`Open ${p.handle}`}
+            >
+              <PrincipalAvatar principal={p} size="sm" preferHandle />
+            </Link>
+            {p.displayName && <span className="principals-muted">{p.displayName}</span>}
+            {me?.id === p.id && <span className="principals-you">you</span>}
+            {p.provenance && <span className="principals-provenance">{p.provenance}</span>}
+          </span>
+          <span role="cell">{p.role || <em className="principals-muted">inherited</em>}</span>
+          <span role="cell">{p.harness || '—'}</span>
+          <span role="cell" className="principals-status-cell">
+            <span className={`principals-status principals-status--${p.status}`}>{p.status}</span>
+            {me?.id !== p.id && (
+              PROTECTED_HANDLES[p.handle] ? (
+                <button
+                  type="button"
+                  className="principals-toggle"
+                  disabled
+                  title={PROTECTED_HANDLES[p.handle]}
+                >
+                  Disable
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="principals-toggle"
+                  disabled={togglingId === p.id}
+                  aria-busy={togglingId === p.id}
+                  onClick={() => togglePrincipal(p)}
+                >
+                  {p.status === 'active' ? 'Disable' : 'Enable'}
+                </button>
+              )
+            )}
+          </span>
+          <span role="cell" className="principals-muted">{formatLastSeen(p.lastSeenAt)}</span>
+        </div>
+      ))}
+    </div>
+  );
+
+  if (openId) {
+    const opened = principals.find((p) => p.id === openId);
+    if (opened) {
+      return (
+        <IdentityDetailPage
+          principal={opened}
+          directory={principals}
+          me={me}
+          scopes={scopes}
+          onDirectoryChanged={reload}
+        />
+      );
+    }
+    return (
+      <div className="principals-page">
+        <Link className="principals-back" to="/settings/principals">Back to Identities</Link>
+        {loading ? (
+          <div className="principals-empty" role="status">Loading…</div>
+        ) : failed ? (
+          <div className="principals-error" role="alert">
+            Could not load principals. <button className="principals-inline-retry" onClick={reload}>Retry</button>
+          </div>
+        ) : (
+          <div className="principals-empty">That identity is not in the directory this session can read.</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="principals-page">
@@ -108,13 +229,15 @@ export const PrincipalsPage: React.FC = () => {
         </div>
       </div>
 
+      {/* Card 66496447 (absorbed into a2d1e317): say when to use which. */}
       <p className="principals-intro">
-        People, agents and services RelayHall can attribute work to. <strong>Create identity</strong>
-        {' '}makes any of the three in one flow — a colleague who signs in, a service that declares
-        what it is for, or an agent connected to this board — and mints its credential in the same
-        act when one is wanted. Your own agents are also listed, and connected, on{' '}
-        <Link to="/settings/connections">My connections</Link>. Identities are disabled here;
-        credentials remain separately scoped and revocable.
+        People, agents and services RelayHall can attribute work to. Use <strong>Create identity</strong>
+        {' '}for an identity that is not your own connection: a service account (a CI bot, a Connector,
+        an integration), a colleague when no identity provider is configured, or an agent that
+        belongs to somebody else. It mints the credential in the same act when one is wanted. For
+        your own agents, use <Link to="/settings/connections">My connections</Link>: it is the same
+        act, and it is where they are listed afterwards. Identities are disabled here; credentials
+        remain separately scoped and revocable.
       </p>
 
       {showCreate && (
@@ -181,6 +304,19 @@ export const PrincipalsPage: React.FC = () => {
                 </button>
               ))}
             </div>
+            <label className="principals-select" htmlFor="principals-status">Status
+              <select id="principals-status" className="principals-select-control" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}>
+                <option value="all">Active, non-active folded</option>
+                <option value="active">Active only</option>
+                <option value="non-active">Non-active only</option>
+              </select>
+            </label>
+            <label className="principals-select" htmlFor="principals-sort">Sort
+              <select id="principals-sort" className="principals-select-control" value={sortBy} onChange={(e) => setSortBy(e.target.value as SortKey)}>
+                <option value="handle">Handle A to Z</option>
+                <option value="last-seen">Last seen, newest first</option>
+              </select>
+            </label>
           </div>
 
           {grouped.length === 0 && filtersActive ? (
@@ -188,7 +324,7 @@ export const PrincipalsPage: React.FC = () => {
               No principals match the current filters.{' '}
               <button
                 className="principals-inline-retry"
-                onClick={() => { setQuery(''); setKindFilter('all'); }}
+                onClick={() => { setQuery(''); setKindFilter('all'); setStatusFilter('all'); }}
               >
                 Clear filters
               </button>
@@ -198,63 +334,15 @@ export const PrincipalsPage: React.FC = () => {
           {grouped.map(group => (
             <section key={group.kind} className="principals-group">
               <h2 className="principals-group-title">{group.kind}</h2>
-              {/* Scrolls horizontally at narrow widths, so it is reachable
-                  from the keyboard and named (walkthrough item R14). */}
-              <div className="principals-table" role="table" aria-label="Accounts" tabIndex={0}>
-                <div className="principals-row principals-row--head" role="row">
-                  <span role="columnheader">Identity</span>
-                  <span role="columnheader">Role</span>
-                  <span role="columnheader">Harness</span>
-                  <span role="columnheader">Status</span>
-                  <span role="columnheader">Last seen</span>
-                </div>
-                {group.rows.map((p: Principal) => (
-                  <div
-                    key={p.id}
-                    className={`principals-row${me?.id === p.id ? ' principals-row--me' : ''}`}
-                    role="row"
-                  >
-                    {/* Handle, not display name: this is the directory you
-                        search and filter by handle, so showing "Owner" here
-                        while the Assignee filter offers "dashboard_user" would
-                        make the two halves of the UI disagree. */}
-                    <span role="cell" className="principals-identity">
-                      <PrincipalAvatar principal={p} size="sm" preferHandle />
-                      {p.displayName && <span className="principals-muted">{p.displayName}</span>}
-                      {me?.id === p.id && <span className="principals-you">you</span>}
-                      {p.provenance && <span className="principals-provenance">{p.provenance}</span>}
-                    </span>
-                    <span role="cell">{p.role || <em className="principals-muted">inherited</em>}</span>
-                    <span role="cell">{p.harness || '—'}</span>
-                    <span role="cell" className="principals-status-cell">
-                      <span className={`principals-status principals-status--${p.status}`}>{p.status}</span>
-                      {me?.id !== p.id && (
-                        PROTECTED_HANDLES[p.handle] ? (
-                          <button
-                            type="button"
-                            className="principals-toggle"
-                            disabled
-                            title={PROTECTED_HANDLES[p.handle]}
-                          >
-                            Disable
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            className="principals-toggle"
-                            disabled={togglingId === p.id}
-                            aria-busy={togglingId === p.id}
-                            onClick={() => togglePrincipal(p)}
-                          >
-                            {p.status === 'active' ? 'Disable' : 'Enable'}
-                          </button>
-                        )
-                      )}
-                    </span>
-                    <span role="cell" className="principals-muted">{formatLastSeen(p.lastSeenAt)}</span>
-                  </div>
-                ))}
-              </div>
+              {group.rows.length > 0 && renderTable(group.rows, 'Accounts')}
+              {group.folded.length > 0 && (
+                <details className="principals-folded" open={statusFilter === 'non-active'}>
+                  <summary className="principals-folded-summary">
+                    Non-active {group.kind} identities ({group.folded.length})
+                  </summary>
+                  {renderTable(group.folded, `Non-active ${group.kind} identities`)}
+                </details>
+              )}
             </section>
           ))}
         </>

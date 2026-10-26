@@ -92,8 +92,16 @@ const linkedReportsSpy: jest.Mock = jest.fn(async (ids: string[]) =>
 let progressChangedFixtures: string[] = [];
 const progressChangedSpy: jest.Mock = jest.fn(async (ids: string[]) =>
   progressChangedFixtures.filter(id => ids.includes(id)));
-const depEdgesSpy: jest.Mock = jest.fn(async () => [{ from: IN_B, to: IN_A }]);
-const knowEdgesSpy: jest.Mock = jest.fn(async () => [{ from: IN_A, to: IN_B }]);
+/** The edge fixtures, and the shape of the real reads: `queryDependencyEdges`
+ *  and `queryKnowledgeEdges` return edges whose BOTH endpoints are in the ids
+ *  they were handed. A mock that ignored its ids would hand an empty scope two
+ *  edges over Tasks the route never listed — the query layer never does. */
+const DEP_EDGES = [{ from: IN_B, to: IN_A }];
+const KNOW_EDGES = [{ from: IN_A, to: IN_B }];
+const edgesWithin = (edges: Array<{ from: string; to: string }>, ids: string[]) =>
+  edges.filter(edge => ids.includes(edge.from) && ids.includes(edge.to));
+const depEdgesSpy: jest.Mock = jest.fn(async (ids: string[]) => edgesWithin(DEP_EDGES, ids));
+const knowEdgesSpy: jest.Mock = jest.fn(async (ids: string[]) => edgesWithin(KNOW_EDGES, ids));
 const boardSpy: jest.Mock = jest.fn(async () => ({ columns: {} }));
 jest.mock('../services/TaskManagerDB', () => ({
   ...(jest.requireActual('../services/TaskManagerDB') as Record<string, unknown>),
@@ -203,17 +211,23 @@ describe('GET /tasks/graph', () => {
     const before = await request('/tasks/graph');
     // A knowledge edge appears without any Task updated_at rotating — the
     // production reference path does exactly this.
-    knowEdgesSpy.mockResolvedValue([{ from: IN_A, to: IN_B }, { from: IN_B, to: IN_A }]);
-    const after = await request('/tasks/graph', { 'If-None-Match': before.etag! });
-    expect(after.status).toBe(200);
-    expect(after.etag).not.toBe(before.etag);
-    expect(after.json.edges.filter((e: any) => e.kind === 'knowledge')).toHaveLength(2);
-    // Edge REMOVAL invalidates too.
-    knowEdgesSpy.mockResolvedValue([]);
-    const removed = await request('/tasks/graph', { 'If-None-Match': after.etag! });
-    expect(removed.status).toBe(200);
-    expect(removed.etag).not.toBe(after.etag);
-    knowEdgesSpy.mockResolvedValue([{ from: IN_A, to: IN_B }]);
+    const bothWays = [{ from: IN_A, to: IN_B }, { from: IN_B, to: IN_A }];
+    knowEdgesSpy.mockImplementation(async (ids: string[]) => edgesWithin(bothWays, ids));
+    try {
+      const after = await request('/tasks/graph', { 'If-None-Match': before.etag! });
+      expect(after.status).toBe(200);
+      expect(after.etag).not.toBe(before.etag);
+      expect(after.json.edges.filter((e: any) => e.kind === 'knowledge')).toHaveLength(2);
+      // Edge REMOVAL invalidates too.
+      knowEdgesSpy.mockImplementation(async () => []);
+      const removed = await request('/tasks/graph', { 'If-None-Match': after.etag! });
+      expect(removed.status).toBe(200);
+      expect(removed.etag).not.toBe(after.etag);
+    } finally {
+      // Restore the id-faithful default, not a fixed list: later suites hand
+      // the edge reads an EMPTY scope and expect an empty answer.
+      knowEdgesSpy.mockImplementation(async (ids: string[]) => edgesWithin(KNOW_EDGES, ids));
+    }
   });
 
   test('updatedSince accepts ONLY the emitted encoding and returns the delta with fullCount', async () => {
@@ -520,5 +534,259 @@ describe('GET /tasks/graph — taxonomy data for the map tiles', () => {
     expect(json.reports).toBeUndefined();
     expect(progressSpy).not.toHaveBeenCalled();
     expect(linkedReportsSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The Map's MCP read, driven end to end: `relayhall_task_graph`'s REAL handler
+ * -> `callBoard` -> the REAL in-process ingress (`mcpAuthMiddleware`,
+ * `sharedAuthorizationMiddleware`, the production tasks router) -> the SAME
+ * mocked query layer and authorization predicate every REST assertion above
+ * runs against. Nothing here mocks the dispatcher: the negatives for a
+ * restricted Phase and a concealed Report are measured on what the TOOL
+ * returns, under the caller's own credential, not cited from the REST tests.
+ *
+ * The credential is resolved by the ingress exactly as the wire suite resolves
+ * it (`c4McpProtocol`): `authenticatePrincipalKey` is the one seam mocked, and
+ * it hands back a principal with `tasks:read` and no delegation chain.
+ */
+describe('relayhall_task_graph — the same route, through the in-process MCP ingress', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { toolByName } = require('../mcp/registry');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { principalService } = require('../services/PrincipalService');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { authorizationService } = require('../services/AuthorizationService');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { TEXT_BUDGET } = require('../mcp/shape');
+
+  const PRINCIPAL_ID = '88888888-8888-4888-8888-888888888888';
+  const CALLER = { authorization: 'Bearer rh_dev_keyid01.secretsecretsecretsecret', toolName: 'relayhall_task_graph' };
+  const graph = (args: Record<string, unknown> = {}): Promise<string> =>
+    toolByName('relayhall_task_graph').handler(args, CALLER);
+  const detailed = async (args: Record<string, unknown> = {}): Promise<any> =>
+    JSON.parse(await graph({ ...args, response_format: 'detailed' }));
+  const STRICT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+  beforeAll(() => {
+    jest.spyOn(principalService, 'bumpLastSeen').mockImplementation(() => undefined as never);
+    jest.spyOn(principalService, 'authenticatePrincipalKey').mockResolvedValue({
+      principal: {
+        id: PRINCIPAL_ID, kind: 'service', handle: 'map_reader', displayName: 'Map reader',
+        status: 'active', role: 'agent', boundTaskId: null, purpose: null, legacyIdentity: false,
+        ownExpression: null, sourceTag: null, harness: null, personalityId: null,
+        parentPrincipalId: null, lastSeenAt: null, metadata: {},
+      },
+      credential: {
+        id: '99999999-9999-4999-8999-999999999999', principalId: PRINCIPAL_ID,
+        credentialType: 'api_key', keyId: 'keyid01', scopes: ['tasks:read'],
+        expiresAt: null, revokedAt: null, transport: 'mcp', graceUntil: null, metadata: {},
+      },
+    });
+  });
+
+  afterAll(() => {
+    (principalService.authenticatePrincipalKey as jest.Mock).mockRestore();
+    (principalService.bumpLastSeen as jest.Mock).mockRestore();
+  });
+
+  test('detailed output IS the REST envelope for the same scope — same nodes, edges, etag; never the out-of-grant Task', async () => {
+    const rest = await request('/tasks/graph');
+    const mcp = await detailed();
+    expect(rest.status).toBe(200);
+    expect(mcp.etag).toBe(rest.etag);
+    const { etag: _etag, generatedAt: mcpAt, ...mcpBody } = mcp;
+    const { generatedAt: restAt, ...restBody } = rest.json;
+    expect(mcpBody).toEqual(restBody);
+    expect(mcpAt).toMatch(STRICT_INSTANT);
+    expect(restAt).toMatch(STRICT_INSTANT);
+    expect(mcp.nodes.map((n: any) => n.id).sort()).toEqual([IN_A, IN_B]);
+    expect(mcp.nodes.map((n: any) => n.id)).not.toContain(OUT_C);
+    expect(JSON.stringify(mcp)).not.toContain('gamma');
+    expect(mcp.edges).toEqual([
+      { from: IN_B, to: IN_A, kind: 'dependency' },
+      { from: IN_A, to: IN_B, kind: 'knowledge' },
+    ]);
+    expect(mcp.fullCount).toBe(2);
+    // The route was reached through the ingress under THIS credential: the
+    // edge reads were fed only the authorized ids, exactly as over REST.
+    expect(depEdgesSpy).toHaveBeenCalledWith([IN_A, IN_B]);
+    expect(knowEdgesSpy).toHaveBeenCalledWith([IN_A, IN_B]);
+  });
+
+  test('NEGATIVE: a restricted Phase hung off an authorized Task is never disclosed through the tool', async () => {
+    const mcp = await detailed();
+    // Allowed projection: the authorized node still carries its phaseId, and
+    // the readable Phase arrives with its identity.
+    expect(mcp.nodes.find((n: any) => n.id === IN_B).phaseId).toBe(PHASE_RESTRICTED);
+    expect(mcp.phases.find((p: any) => p.id === PHASE_OPEN)).toMatchObject({ id: PHASE_OPEN, name: 'Cutover', goal: 'Zero-downtime switch', position: 0 });
+    // Hidden projection: name and goal of the restricted Phase are absent from
+    // BOTH formats the model can ask for.
+    expect(mcp.phases.map((p: any) => p.id)).not.toContain(PHASE_RESTRICTED);
+    const detailedText = await graph({ response_format: 'detailed' });
+    const conciseText = await graph();
+    for (const text of [detailedText, conciseText]) {
+      expect(text).not.toContain('Sealed');
+      expect(text).not.toContain('Confidential');
+    }
+    expect(conciseText).toContain('phases: 1');
+  });
+
+  test('NEGATIVE: a concealed Report linked to an authorized Task is never disclosed through the tool', async () => {
+    const mcp = await detailed();
+    expect(mcp.reports.map((r: any) => r.id)).toContain(REPORT_OPEN);
+    expect(mcp.reports.map((r: any) => r.id)).not.toContain(REPORT_SECRET);
+    const detailedText = await graph({ response_format: 'detailed' });
+    const conciseText = await graph();
+    for (const text of [detailedText, conciseText]) expect(text).not.toContain('Sealed report');
+    expect(conciseText).toContain('reports: 1');
+    // Report and progress reads were asked only over authorized ids.
+    for (const spy of [progressSpy, linkedReportsSpy]) {
+      const ids = (spy.mock.calls[0] as any[])[0] as string[];
+      expect(ids).toContain(IN_A);
+      expect(ids).not.toContain(OUT_C);
+    }
+  });
+
+  test('spends the returned etag: If-None-Match answers not modified, and an edge-only change breaks the match', async () => {
+    const first = await detailed();
+    expect(first.etag).toMatch(/^"g-[0-9a-f]{32}"$/);
+    const cached = await graph({ ifNoneMatch: first.etag });
+    expect(cached).toContain('not modified');
+    expect(cached).toContain(first.etag);
+    knowEdgesSpy.mockImplementationOnce(async (ids: string[]) =>
+      edgesWithin([{ from: IN_A, to: IN_B }, { from: IN_B, to: IN_A }], ids));
+    const changed = await detailed({ ifNoneMatch: first.etag });
+    expect(changed.etag).not.toBe(first.etag);
+    expect(changed.edges.filter((e: any) => e.kind === 'knowledge')).toHaveLength(2);
+  });
+
+  test('delta read: only the updated node, scoped phases/reports and fullCount kept, taxonomy for moved progress', async () => {
+    const quiet = await detailed({ updatedSince: '2026-08-15T11:00:00.000Z' });
+    expect(quiet.nodes.map((n: any) => n.id)).toEqual([IN_B]);
+    expect(quiet.deltaOf).toBe('2026-08-15T11:00:00.000Z');
+    expect(quiet.fullCount).toBe(2);
+    expect(quiet.phases.map((p: any) => p.id)).toContain(PHASE_OPEN);
+    expect(quiet.reports.map((r: any) => r.id)).toEqual([REPORT_OPEN]);
+    expect(quiet.taxonomy).toBeUndefined();
+    progressChangedFixtures = [IN_A];
+    try {
+      const moved = await detailed({ updatedSince: '2026-08-15T11:00:00.000Z' });
+      expect(moved.nodes.map((n: any) => n.id)).toEqual([IN_B]);
+      expect(moved.taxonomy).toEqual([{ id: IN_A, progress: { done: 2, total: 5 } }]);
+      const concise = await graph({ updatedSince: '2026-08-15T11:00:00.000Z' });
+      expect(concise).toContain('nodes: 1');
+      expect(concise).toContain('fullCount: 2');
+      expect(concise).toContain('taxonomy: 1');
+      expect(concise).toContain('deltaOf: 2026-08-15T11:00:00.000Z');
+    } finally {
+      progressChangedFixtures = [];
+    }
+  });
+
+  test('generatedAt is the strict instant the route emits, and is accepted back as updatedSince', async () => {
+    const full = await detailed();
+    expect(full.generatedAt).toMatch(STRICT_INSTANT);
+    const later = await detailed({ updatedSince: full.generatedAt });
+    expect(later.deltaOf).toBe(full.generatedAt);
+    expect(later.nodes).toEqual([]);
+    expect(later.fullCount).toBe(2);
+    expect(await graph()).toMatch(/^generatedAt: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/m);
+  });
+
+  test('project LOD returns aggregate hubs and no edges, phases or reports', async () => {
+    const mcp = await detailed({ lod: 'project' });
+    expect(mcp.lod).toBe('project');
+    expect(mcp.nodes).toEqual([expect.objectContaining({ kind: 'project', project: 'RelayHall', total: 2 })]);
+    expect(mcp.edges).toEqual([]);
+    expect(mcp).not.toHaveProperty('phases');
+    expect(mcp).not.toHaveProperty('reports');
+    expect(depEdgesSpy).not.toHaveBeenCalled();
+    expect(phaseSummariesSpy).not.toHaveBeenCalled();
+    expect(linkedReportsSpy).not.toHaveBeenCalled();
+    const concise = await graph({ lod: 'project' });
+    expect(concise).toContain('lod: project');
+    expect(concise).toContain('edges: 0 (dependency 0, knowledge 0)');
+  });
+
+  test('every filter, including the Assignee narrowing, reaches the scope query exactly as the route parses it', async () => {
+    await graph({
+      statuses: ['todo', 'stuck'], projects: ['RelayHall'], phaseIds: ['null', PHASE_OPEN],
+      priorities: ['high'], tags: ['x'], q: 'alpha', includeArchived: true,
+      mine: true, unassigned: true, owner: 'scout',
+    });
+    expect(scopeRowsSpy).toHaveBeenCalledTimes(1);
+    expect(scopeRowsSpy.mock.calls[0]).toEqual([
+      ['todo', 'stuck'],
+      {
+        q: 'alpha', projects: ['RelayHall'], phaseIds: [null, PHASE_OPEN], priorities: ['high'],
+        tags: ['x'], includeArchived: true,
+        // `mine` resolves to the CALLING principal the ingress authenticated —
+        // never an id the tool could name.
+        ownerPrincipalId: PRINCIPAL_ID, unassigned: true, ownerHandle: 'scout',
+      },
+    ]);
+  });
+
+  test('an empty scope is an empty graph with fullCount 0, in both formats', async () => {
+    scopeRowsSpy.mockResolvedValueOnce([]);
+    const mcp = await detailed();
+    expect(mcp).toMatchObject({ lod: 'task', nodes: [], edges: [], phases: [], reports: [], fullCount: 0 });
+    // The edge reads were scoped to the EMPTY authorized set — the empty
+    // `edges` above is the query layer's honest answer to that, not a mock's
+    // fixed list surviving an empty scope.
+    expect(depEdgesSpy).toHaveBeenCalledWith([]);
+    expect(knowEdgesSpy).toHaveBeenCalledWith([]);
+    expect(linkedReportsSpy).toHaveBeenCalledWith([]);
+    scopeRowsSpy.mockResolvedValueOnce([]);
+    const concise = await graph();
+    expect(concise).toContain('fullCount: 0');
+    expect(concise).toContain('nodes: 0');
+  });
+
+  test('a large graph passes through the real ingress whole: 12,000 nodes, past the text budget, never cut', async () => {
+    const rows12k = Array.from({ length: 12_000 }, (_, index) =>
+      row(`00000000-0000-4000-8000-${String(index).padStart(12, '0')}`, 'todo', 'RelayHall', '2026-08-15T10:00:00.000Z', `node ${index}`));
+    scopeRowsSpy.mockResolvedValueOnce(rows12k);
+    const text = await graph({ response_format: 'detailed' });
+    expect(text.length).toBeGreaterThan(TEXT_BUDGET);
+    expect(text).not.toContain('truncated at');
+    expect(text).not.toContain('continue_from');
+    const parsed = JSON.parse(text);
+    expect(parsed.nodes).toHaveLength(12_000);
+    expect(parsed.fullCount).toBe(12_000);
+    expect(parsed.nodes[11_999].title).toBe('node 11999');
+  });
+
+  test('the route 400s come back as instructive tool errors carrying the route message, with no scope read', async () => {
+    await expect(graph({ statuses: ['finished'] })).rejects.toThrow(/statuses must name known states only/);
+    await expect(graph({ lod: 'galaxy' })).rejects.toThrow(/lod must be one of/);
+    for (const bad of ['2026-08-15', '2026-08-15T12:00:00Z', 'yesterday']) {
+      await expect(graph({ updatedSince: bad })).rejects.toThrow(/updatedSince must be an ISO 8601/);
+    }
+    expect(scopeRowsSpy).not.toHaveBeenCalled();
+  });
+
+  test("a route-ceiling refusal is a 403 carrying the board's own code, with no scope read", async () => {
+    (authorizationService.authorizeRoute as jest.Mock).mockImplementation(() => ({ allowed: false }));
+    try {
+      // The ceiling answers a bare FORBIDDEN, not an explicit scope code, so the
+      // tool error carries that code and the whoami / access_preview pointers
+      // and does not assert a cause the board did not state.
+      await expect(graph()).rejects.toThrow(/\(HTTP 403\) \[FORBIDDEN\]/);
+      await expect(graph()).rejects.toThrow(/relayhall_principal_whoami/);
+      await expect(graph()).rejects.not.toThrow(/issue or extend a credential/);
+      expect(scopeRowsSpy).not.toHaveBeenCalled();
+    } finally {
+      (authorizationService.authorizeRoute as jest.Mock).mockImplementation(() => ({ allowed: true }));
+    }
+  });
+
+  test('unknown or mis-shaped arguments are refused before the ingress is touched', async () => {
+    for (const bad of [{ limit: 10 }, { offset: 0 }, { continue_from: 0 }, { statuses: 'todo' }, { tags: [1] }]) {
+      await expect(graph(bad)).rejects.toThrow(/Unknown arguments|must be an array of strings/);
+    }
+    expect(principalService.authenticatePrincipalKey).not.toHaveBeenCalled();
+    expect(scopeRowsSpy).not.toHaveBeenCalled();
   });
 });

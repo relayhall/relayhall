@@ -20,9 +20,9 @@
  *                               assignee can read; CONTROL: the same
  *                               assignment written straight to SQL, with
  *                               the coupling bypassed, is INVISIBLE.
- *   2. Chain-aware targeting  — the vehicle lands on the ACCOUNT;
- *                               CONTROL: the identical grant placed on the
- *                               Connector instead changes nothing.
+ *   2. Chain-aware targeting  — AZ-A10 lands the role rows on the
+ *                               ASSIGNEE itself; CONTROL: an ordinary grant
+ *                               placed on the Connector changes nothing.
  *   3. own() exclusion        — a narrow own() refuses the assignment;
  *                               CONTROL: widening own() lets it through.
  *   4. B5 refcount + D4       — an OWNER grant colliding with the vehicle
@@ -49,12 +49,18 @@
  *  11. R3 non-escalation      — a reference the assigner cannot read is
  *                               not granted; CONTROL: one it can read is.
  *  12. R2(b) recompute        — a link edit moves the vehicle with it.
- *  13. R6 backfill            — pre-existing assignments gain vehicles and
- *                               an unvehicleable one is unassigned;
- *                               CONTROL: the migration is a no-op on a
- *                               second run.
- *  14. §1 predicate untouched — the shared predicate gained no arm and no
- *                               scope string was minted.
+ *  13. R6 backfill            — replayed in the AZ-A10 shape (149's own
+ *                               backfill): an attributable pre-existing
+ *                               assignment gains assignee-landed role rows
+ *                               and its Account vehicle is reaped; an
+ *                               unattributable one is audited, never
+ *                               guessed; CONTROL: the backfill is a no-op
+ *                               on a second run.
+ *  14. §1 predicate untouched — the shared predicate's ONLY link-table
+ *                               arm is the ratified AZ-A10 clause-4 role
+ *                               arm, pinned byte for byte (no auto-grant
+ *                               or warrant arm inside or beside it), and
+ *                               no scope string was minted.
  *  15. R3 on link edits    — a linker who cannot read an object cannot
  *                            confer it by linking it (review bedc25f3 B2);
  *                            CONTROL: an object the linker CAN read is
@@ -66,9 +72,10 @@
  *                            still succeeds.
  *  17. Vehicle transitions — a warrant-only change is a real transition
  *                            (bedc25f3 B4); CONTROL: all three directions.
- *  18. Backfill liveness   — a dead chain is unassigned, not vehicled
- *                            (bedc25f3 B5); CONTROL: a live chain is
- *                            vehicled and keeps its assignment.
+ *  18. Backfill liveness   — in the 149 shape: a dead assignee chain
+ *                            stays unreadable and a dead assigner chain
+ *                            confers nothing (bedc25f3 B5); CONTROL: the
+ *                            live chain and the live assigner do.
  *  19. AZ-A3 one shape     — an all-except ceiling now CARRIES an
  *                            assignment, means what it says in both
  *                            directions, and stays future-inclusive;
@@ -80,6 +87,40 @@
  */
 const { spawnSync } = require("child_process");
 const path = require("path");
+
+/**
+ * Section 14's pin: the AZ-A10 clause 4 role arm of the shared predicate,
+ * byte for byte. Bounds: backend/src/services/AuthorizationService.ts from
+ * `const roleGrantSql =` (which must occur exactly once) up to, not
+ * including, the newline before the first `    if (!chain)` after it, with
+ * CRLF read as LF. Any edit inside that arm (a warrant or auto-grant
+ * clause, a dropped liveness bound) turns s14 red; a deliberate change
+ * re-ratifies the arm and updates this text in the same commit.
+ */
+const RATIFIED_ROLE_ARM = [
+  "const roleGrantSql = (principalIds: string[]): string => {",
+  "      if (!principalIds.length) return 'FALSE';",
+  "      const accepted = (['read', 'write', 'use', 'invoke', 'admin'] as GrantVerb[])",
+  "        .filter(verb => grantAllows(verb, action));",
+  "      if (!accepted.length) return 'FALSE';",
+  "      const grantees = nextParam(principalIds);",
+  "      const resourceType = nextParam(resource.type);",
+  "      const verbs = nextParam(accepted);",
+  "      return `EXISTS (SELECT 1 FROM access_vehicle_links role_link",
+  "        JOIN grants role_grant ON role_grant.id = role_link.target_id",
+  "        JOIN tasks role_task ON role_task.id = role_link.task_id",
+  "        WHERE role_link.vehicle_kind = 'role' AND role_link.target_kind = 'grant'",
+  "          AND role_task.status NOT IN ('completed', 'archived')",
+  "          AND role_grant.grantee_type = 'principal'",
+  "          AND role_grant.grantee_id = ANY(${grantees}::uuid[])",
+  "          AND role_grant.resource_type = ${resourceType}",
+  "          AND role_grant.resource_id = ${resource.id}",
+  "          AND role_grant.verb = ANY(${verbs}::text[])",
+  "          AND (role_grant.expires_at IS NULL OR role_grant.expires_at > clock_timestamp())",
+  "          AND (role_link.expires_at IS NULL OR role_link.expires_at > clock_timestamp()))`;",
+  "    };",
+  "",
+].join("\n");
 
 const probe = `
 import { pool } from "../src/db/connection";
@@ -125,6 +166,16 @@ async function main() {
   const tag = "s7-" + randomUUID().slice(0, 8);
   const out: Record<string, unknown> = {};
 
+  // AZ-A10: a role link records its creating principal from the acting
+  // identity (the server writes the grantor; no caller field can), and
+  // recompute refuses a link with none ROLE_ASSIGNER_UNKNOWN. So the fixture
+  // actor is a real, live administrator Account, the identity an owner-plane
+  // session acts as, and the root-scoped assigner below is that same Account.
+  const fixtureAccount = (await principalService.createPrincipal({
+    handle: tag + "-assigner", kind: "human", role: "admin",
+  }))!;
+  ACTOR.principalId = fixtureAccount.id;
+
   const mkTask = async (title: string, extra: Record<string, string | null> = {}) => {
     const id = randomUUID();
     await pool.query(
@@ -165,7 +216,13 @@ async function main() {
 
   /** The ASSIGNER: a root-scoped session actor, the shape actorFromRequest
    * builds for the owner plane. */
-  const assignerRoot = { principalId: null, handle: "s7-assigner", role: "admin", scopes: ["root"], authenticated: true, delegation: null } as any;
+  const assignerRoot = { principalId: fixtureAccount.id, handle: "s7-assigner", role: "admin", scopes: ["root"], authenticated: true, delegation: null } as any;
+
+  // Revoke enumerates only Tasks the caller may read, using the production predicate.
+  const visibleToAssigner = async <T>(rows: T[], idOf: (row: T) => string): Promise<T[]> => {
+    const allowed = await authorizationRepository.authorizedIds(assignerRoot, "task", rows.map(idOf), "read");
+    return rows.filter(row => allowed.has(idOf(row)));
+  };
 
   const inTxn = async <T>(fn: (client: any) => Promise<T>): Promise<T> => {
     const client = await pool.connect();
@@ -200,14 +257,21 @@ async function main() {
   await pool.query("UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2", [one.serviceId, task1]);
   out.s1_coupledAssignmentIsVisible = await connectorCanRead(one.connectorId, task1);
 
-  // ── 2 · Chain-aware targeting: the vehicle lands on the ACCOUNT ──────
+  // ── 2 · Chain-aware targeting: AZ-A10 lands on the ASSIGNEE ─────────
+  // AZ-A10 clause 4: the assignment writes role-linked rows landed on the
+  // assignee itself, and a live role-linked row on a delegated chain
+  // identity is what supplies the Account-side positive source.
   const landed = await pool.query(
-    "SELECT landed_on_principal_id FROM access_vehicle_links WHERE task_id = $1 LIMIT 1", [task1]);
-  out.s2_vehicleLandedOnAccount = String(landed.rows[0].landed_on_principal_id) === one.accountId;
+    \`SELECT l.landed_on_principal_id::text AS landed, g.grantee_id::text AS grantee FROM access_vehicle_links l
+       JOIN grants g ON g.id = l.target_id
+      WHERE l.task_id = $1 AND l.vehicle_kind = 'role' AND l.role = 'implementer' AND l.target_kind = 'grant'\`, [task1]);
+  out.s2_roleRowsLandOnTheAssignee = landed.rows.length > 0
+    && landed.rows.every((r: any) => r.landed === one.connectorId && r.grantee === one.connectorId);
 
-  // POSITIVE CONTROL: the identical grant placed on the CONNECTOR instead
-  // of the Account carries nothing — which is why the vehicle targets the
-  // chain root (AZ-24/AZ-26).
+  // POSITIVE CONTROL: an ORDINARY grant placed on the CONNECTOR carries
+  // nothing: only a role-linked row counts there (AZ-A10 clause 4), and
+  // owner-plane object authority must still reach the chain root
+  // (AZ-24/AZ-26).
   const two = await mkConnector("two");
   const task2 = await mkTask("s7 connector-granted task");
   await pool.query("UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2", [two.serviceId, task2]);
@@ -247,9 +311,10 @@ async function main() {
   // ── 4 · The B5 trap: an OWNER grant is linked, never adopted ─────────
   const four = await mkConnector("four");
   const task4 = await mkTask("s7 collision task");
-  // The owner plane got there first, on the exact tuple the vehicle wants.
+  // The owner plane got there first, on the exact tuple the role row wants
+  // (AZ-A10: the assignee, not its Account).
   const ownerGrant = await grantService.create(
-    { granteeId: four.accountId, resourceType: "task", resourceId: task4, verb: "read" }, ACTOR);
+    { granteeId: four.connectorId, resourceType: "task", resourceId: task4, verb: "read" }, ACTOR);
   await inTxn((client) => accessVehicleService.attach(client, {
     taskId: task4, serviceId: four.serviceId, warrantId: null, actor: ACTOR, assigner: assignerRoot,
   }));
@@ -331,7 +396,7 @@ async function main() {
   }
   const sharedGrant = await pool.query(
     "SELECT id FROM grants WHERE grantee_id = $1 AND resource_type = 'report' AND resource_id = $2",
-    [seven.accountId, reportId]);
+    [seven.connectorId, reportId]);
   const sharedGrantId = sharedGrant.rows.length === 1 ? String(sharedGrant.rows[0].id) : null;
   await inTxn((client) => accessVehicleService.detach(client, taskA, ACTOR, "s7 proof: first releases"));
   const afterFirst = await pool.query("SELECT id FROM grants WHERE id = $1", [sharedGrantId]);
@@ -411,17 +476,20 @@ async function main() {
     [nine.serviceId, revokeWarrant, task9]);
 
   let revokeRefusal: string | null = null;
+  let revokeWarning = "";
   try {
-    await warrantService.revoke(revokeWarrant, "s7 proof", ACTOR);
+    await warrantService.revoke(revokeWarrant, "s7 proof", ACTOR, visibleToAssigner);
   } catch (e: any) {
     revokeRefusal = e?.code ?? String(e);
+    revokeWarning = e?.message ?? "";
   }
   out.s9_unacknowledgedRevokeWarns = revokeRefusal === "WARRANT_HAS_DEPENDENT_TASKS";
+  out.s9_warnsWithTheReadableDependent = revokeWarning.includes(task9) && revokeWarning.includes("s7 revoke task");
   // POSITIVE CONTROL: the warned-off revoke changed NOTHING.
   const untouched = await pool.query("SELECT execution_service_id FROM tasks WHERE id = $1", [task9]);
   out.control9_warnedRevokeLeavesAssignmentIntact = untouched.rows[0].execution_service_id !== null;
 
-  await warrantService.revoke(revokeWarrant, "s7 proof", ACTOR, { acknowledgeDependents: true });
+  await warrantService.revoke(revokeWarrant, "s7 proof", ACTOR, visibleToAssigner, { acknowledgeDependents: true });
   const afterRevoke = await pool.query("SELECT execution_service_id, execution_warrant_id FROM tasks WHERE id = $1", [task9]);
   out.s9_acknowledgedRevokeAutoUnassigns =
     afterRevoke.rows[0].execution_service_id === null && afterRevoke.rows[0].execution_warrant_id === null;
@@ -443,19 +511,27 @@ async function main() {
     principalId: narrowAssignerAccount.id, handle: "narrow", role: "user",
     scopes: ["tasks:write", "services:invoke"], authenticated: true, delegation: null,
   } as any;
-  // The assigner CAN read the task (so R1 can be satisfied) but not the report.
-  await grantService.create({ granteeId: narrowAssignerAccount.id, resourceType: "task", resourceId: task11, verb: "read" }, ACTOR);
+  // The assigner holds the task (so R1 can be satisfied) but not the report.
+  // AZ-A10: the implementer's task row is read AND write, so the assigning
+  // act must itself hold write on the task (plannedRoleRules refuses
+  // ROLE_EXCEEDS_ASSIGNER otherwise); write admits read.
+  await grantService.create({ granteeId: narrowAssignerAccount.id, resourceType: "task", resourceId: task11, verb: "write" }, ACTOR);
   await inTxn((client) => accessVehicleService.attach(client, {
     taskId: task11, serviceId: eleven.serviceId, warrantId: null, actor: ACTOR, assigner: narrowAssigner,
   }));
+  // AZ-A10 lands role rows on the assignee itself; the Account is checked
+  // too, so the section cannot pass by looking where nothing lands.
   const leaked = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_type = 'report' AND resource_id = $2",
-    [eleven.accountId, secretReport]);
+    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = ANY($1::uuid[]) AND resource_type = 'report' AND resource_id = $2",
+    [[eleven.connectorId, eleven.accountId], secretReport]);
   out.s11_unreadableReferenceNotGranted = leaked.rows[0].n === 0;
   const taskGranted = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_type = 'task' AND resource_id = $2",
-    [eleven.accountId, task11]);
-  out.control11_readableReferenceIsGranted = taskGranted.rows[0].n === 1;
+    \`SELECT array_agg(g.verb ORDER BY g.verb)::text[] AS verbs FROM grants g
+       JOIN access_vehicle_links l ON l.target_id = g.id AND l.target_kind = 'grant'
+      WHERE l.task_id = $2 AND l.vehicle_kind = 'role' AND l.role = 'implementer'
+        AND g.grantee_id = $1 AND g.resource_type = 'task' AND g.resource_id = $2\`,
+    [eleven.connectorId, task11]);
+  out.control11_readableReferenceIsGranted = JSON.stringify(taskGranted.rows[0].verbs) === JSON.stringify(["read", "write"]);
 
   // ── 12 · R2(b) same-transaction recompute on a link edit ────────────
   const twelve = await mkConnector("twelve");
@@ -468,15 +544,15 @@ async function main() {
     "INSERT INTO reports (id, title, content, task_ids, author) VALUES ($1,$2,'body',ARRAY[$3::uuid],'s7')",
     [lateReport, "s7 late-linked report", task12]);
   const beforeRecompute = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.accountId, lateReport]);
+    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.connectorId, lateReport]);
   await inTxn((client) => accessVehicleService.recompute(client, task12, ACTOR, assignerRoot));
   const afterRecompute = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.accountId, lateReport]);
+    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.connectorId, lateReport]);
   out.s12_recomputePicksUpTheNewLink = beforeRecompute.rows[0].n === 0 && afterRecompute.rows[0].n === 1;
   await pool.query("UPDATE reports SET task_ids = ARRAY[]::uuid[] WHERE id = $1", [lateReport]);
   await inTxn((client) => accessVehicleService.recompute(client, task12, ACTOR, assignerRoot));
   const afterUnlink = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.accountId, lateReport]);
+    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2", [twelve.connectorId, lateReport]);
   out.control12_recomputeDropsTheRemovedLink = afterUnlink.rows[0].n === 0;
 
   // ── 10 · R4 reopen: a dead warrant returns the task UNASSIGNED ──────
@@ -499,11 +575,21 @@ async function main() {
     "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1, execution_warrant_id = $2 WHERE id = $3",
     [ten.serviceId, deadWarrant, task10]);
 
+  // Completion now requires a real, independently appointed Verifier in Review.
+  const verifier = (await principalService.createPrincipal({
+    handle: tag + "-verifier", kind: "human", role: "qa",
+  }))!;
+  await pool.query("UPDATE tasks SET verifier_principal_id = $1 WHERE id = $2", [verifier.id, task10]);
+  for (const verb of ["read", "write"] as const) {
+    await grantService.create({ granteeId: verifier.id, resourceType: "task", resourceId: task10, verb }, ACTOR);
+  }
   const verifierActor = {
-    principalId: null, handle: "s7-verifier", role: "qa" as const,
-    authorization: assignerRoot,
+    principalId: verifier.id, handle: verifier.handle, role: "qa" as const,
+    authorization: { principalId: verifier.id, handle: verifier.handle, role: "qa",
+      scopes: ["tasks:read", "tasks:write"], authenticated: true, delegation: null },
   };
   // Terminal first — which reaps the links but keeps the warrant pointer.
+  await taskManagerDB.updateTask(task10, { status: "review" } as any, verifierActor as any);
   await taskManagerDB.updateTask(task10, { status: "completed" } as any, verifierActor as any);
   const afterTerminal = await pool.query("SELECT execution_warrant_id FROM tasks WHERE id = $1", [task10]);
   out.s10_terminalKeepsTheWarrantPointer = afterTerminal.rows[0].execution_warrant_id === deadWarrant;
@@ -516,6 +602,7 @@ async function main() {
   out.control10_reopenWithLiveWarrantKeepsAssignment = liveReopen.rows[0].execution_service_id !== null;
 
   // Now kill the warrant behind its back and reopen again.
+  await taskManagerDB.updateTask(task10, { status: "review" } as any, verifierActor as any);
   await taskManagerDB.updateTask(task10, { status: "completed" } as any, verifierActor as any);
   await pool.query("UPDATE warrants SET status = 'revoked', revoked_at = NOW() WHERE id = $1", [deadWarrant]);
   await taskManagerDB.updateTask(task10, { status: "in-progress" } as any, verifierActor as any);
@@ -524,39 +611,89 @@ async function main() {
   out.s10_reopenWithDeadWarrantReturnsUnassigned =
     deadReopen.rows[0].execution_service_id === null && deadReopen.rows[0].execution_warrant_id === null;
 
-  // ── 13 · R6 backfill: pre-existing assignments gain their vehicle ────
-  // The pre-ruling state, reproduced exactly: assignments written straight
-  // to SQL with no vehicle anywhere.
+  // ── 13 · R6 backfill, in the AZ-A10 shape (migration 149) ───────────
+  // 149 superseded 099's Account-landed auto-grant with assignee-landed
+  // role rows, each attributed to the real actor the old vehicle names; an
+  // assignment with no attributable assigner is audited and left alone,
+  // never guessed. 099's ON CONFLICT target (task_id, target_kind,
+  // target_id) no longer exists after 149, so 099 cannot be replayed on
+  // this schema. The replay is 149's own backfill: the published file's
+  // text from its helper function to the end, executed unchanged (its DDL
+  // head is not re-runnable and is not the backfill).
+  const az149 = readFileSync(join(__dirname, "../src/migrations/149_az_a10_role_grants.sql"), "utf8");
+  const backfillAnchor = "CREATE OR REPLACE FUNCTION az_a10_backfill_proven_cap(";
+  if (az149.split(backfillAnchor).length !== 2) throw new Error("149 backfill anchor must occur exactly once");
+  const replay149Backfill = () => pool.query(az149.slice(az149.indexOf(backfillAnchor)));
+  const roleRowsOf = async (taskId: string, holderId: string) => (await pool.query(
+    \`SELECT g.verb, l.created_by_principal_id::text AS grantor FROM access_vehicle_links l
+       JOIN grants g ON g.id = l.target_id
+      WHERE l.task_id = $1 AND l.vehicle_kind = 'role' AND l.role = 'implementer' AND l.target_kind = 'grant'
+        AND l.landed_on_principal_id = $2 AND g.grantee_id = $2 AND g.resource_type = 'task' AND g.resource_id = $1
+      ORDER BY g.verb\`, [taskId, holderId])).rows;
+  /** The pre-149 state of an assignment that had its 099-era vehicle: the
+   * Account-landed auto-grant read row, linked with the real assigner. */
+  const mk099Vehicle = async (taskId: string, conn: { accountId: string; connectorId: string }, assignerId: string) => {
+    const g = await pool.query(
+      \`INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id, provenance)
+       VALUES ('principal', $1, 'task', $2, 'read', $3, 'assignment:grant') RETURNING id\`,
+      [conn.accountId, taskId, assignerId]);
+    await pool.query(
+      \`INSERT INTO access_vehicle_links (task_id, assignee_principal_id, landed_on_principal_id, vehicle_kind,
+         warrant_id, target_kind, target_id, created_by_vehicle, created_by_principal_id)
+       VALUES ($1, $2, $3, 'auto-grant', NULL, 'grant', $4, TRUE, $5)\`,
+      [taskId, conn.connectorId, conn.accountId, g.rows[0].id, assignerId]);
+    return String(g.rows[0].id);
+  };
+
   const thirteen = await mkConnector("thirteen");
-  const legacyConn = await mkConnector("legacy");
-  await pool.query("UPDATE principals SET legacy_identity = TRUE WHERE id = $1", [legacyConn.connectorId]);
+  const unattributed = await mkConnector("unattributed");
   const backfillTask = await mkTask("s7 backfill task");
-  const legacyTask = await mkTask("s7 legacy-assignee task");
-  await pool.query(
-    "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2",
-    [thirteen.serviceId, backfillTask]);
-  await pool.query(
-    "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2",
-    [legacyConn.serviceId, legacyTask]);
+  const unattributedTask = await mkTask("s7 unattributed-assignment task");
+  for (const [conn, t] of [[thirteen, backfillTask], [unattributed, unattributedTask]] as const) {
+    await pool.query(
+      "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2", [conn.serviceId, t]);
+  }
+  const supersededGrant = await mk099Vehicle(backfillTask, thirteen, fixtureAccount.id);
+  // POSITIVE CONTROL: an assignment with no vehicle anywhere is invisible
+  // before the backfill, so the section can tell "materialized" from
+  // "readable anyway".
   out.control13_preBackfillAssignmentIsInvisible =
-    (await connectorCanRead(thirteen.connectorId, backfillTask)) === false;
+    (await connectorCanRead(unattributed.connectorId, unattributedTask)) === false;
 
-  const migrationSql = readFileSync(join(__dirname, "../src/migrations/099_assignment_access_vehicles.sql"), "utf8");
-  await pool.query(migrationSql);
+  await replay149Backfill();
 
-  out.s13_backfillGivesTheAssigneeItsVehicle = await connectorCanRead(thirteen.connectorId, backfillTask);
-  const legacyAfter = await pool.query("SELECT execution_service_id FROM tasks WHERE id = $1", [legacyTask]);
-  out.s13_legacyAssigneeIsUnassigned = legacyAfter.rows[0].execution_service_id === null;
+  const backfilled = await roleRowsOf(backfillTask, thirteen.connectorId);
+  out.s13_backfillGivesTheAssigneeItsRoleRows =
+    JSON.stringify(backfilled.map((r: any) => r.verb)) === JSON.stringify(["read", "write"])
+    && backfilled.every((r: any) => r.grantor === fixtureAccount.id);
+  out.s13_assigneeReadsThroughItsRoleRows = await connectorCanRead(thirteen.connectorId, backfillTask);
+  const oldVehicle = await pool.query(
+    \`SELECT (SELECT COUNT(*)::int FROM access_vehicle_links WHERE task_id = $1 AND vehicle_kind = 'auto-grant') AS links,
+            (SELECT COUNT(*)::int FROM grants WHERE id = $2) AS grants\`, [backfillTask, supersededGrant]);
+  out.s13_supersededAccountVehicleIsReaped = oldVehicle.rows[0].links === 0 && oldVehicle.rows[0].grants === 0;
+  const unattributedLinks = await pool.query(
+    "SELECT COUNT(*)::int AS n FROM access_vehicle_links WHERE task_id = $1", [unattributedTask]);
+  const skipped = await pool.query(
+    \`SELECT COUNT(*)::int AS n FROM audit_events WHERE action = 'grant.reference_skipped' AND resource_id = $1
+        AND metadata->>'migration' = '149_az_a10_role_grants.sql'\`, [unattributedTask]);
+  out.s13_unattributedAssignmentIsAuditedNotGuessed = unattributedLinks.rows[0].n === 0 && skipped.rows[0].n >= 1
+    && (await connectorCanRead(unattributed.connectorId, unattributedTask)) === false;
 
-  // Idempotence: re-running the whole file changes nothing and adds no
+  // Idempotence: re-running the backfill changes nothing and adds no
   // duplicate link or grant.
   const linksBefore = await pool.query("SELECT COUNT(*)::int AS n FROM access_vehicle_links");
   const grantsBefore = await pool.query("SELECT COUNT(*)::int AS n FROM grants");
-  await pool.query(migrationSql);
+  await replay149Backfill();
   const linksAfter = await pool.query("SELECT COUNT(*)::int AS n FROM access_vehicle_links");
   const grantsAfter = await pool.query("SELECT COUNT(*)::int AS n FROM grants");
   out.control13_backfillIsIdempotent =
     linksBefore.rows[0].n === linksAfter.rows[0].n && grantsBefore.rows[0].n === grantsAfter.rows[0].n;
+  // "Left alone" includes the assignment itself: after both replays the
+  // unattributed Task still names the service it was assigned to, so 149
+  // neither guessed a vehicle for it nor quietly unassigned it.
+  const unattributedAfter = await pool.query("SELECT execution_service_id FROM tasks WHERE id = $1", [unattributedTask]);
+  out.s13_unattributedAssignmentIsLeftInPlace =
+    unattributedAfter.rows[0].execution_service_id === unattributed.serviceId;
 
   // ── 15 · R3 on link edits: a linker cannot confer what it cannot read ─
   //
@@ -588,13 +725,15 @@ async function main() {
   } as any;
 
   await inTxn((client) => accessVehicleService.recompute(client, task15, ACTOR, narrowLinker));
+  // AZ-A10 lands on the assignee; the Account is checked too, so the
+  // section cannot pass by looking where nothing lands.
   const leakedByLink = await pool.query(
-    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2",
-    [fifteen.accountId, privateReport]);
+    "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = ANY($1::uuid[]) AND resource_id = $2",
+    [[fifteen.connectorId, fifteen.accountId], privateReport]);
   out.s15_linkerCannotConferWhatItCannotRead = leakedByLink.rows[0].n === 0;
   const conferred = await pool.query(
     "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2",
-    [fifteen.accountId, readableReport]);
+    [fifteen.connectorId, readableReport]);
   out.control15_linkerConfersWhatItCanRead = conferred.rows[0].n === 1;
 
   // CONTROL: "not permitted to confer" is not "no longer referenced". An
@@ -603,11 +742,11 @@ async function main() {
   await inTxn((client) => accessVehicleService.recompute(client, task15, ACTOR, assignerRoot));
   const rootConferred = await pool.query(
     "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2",
-    [fifteen.accountId, privateReport]);
+    [fifteen.connectorId, privateReport]);
   await inTxn((client) => accessVehicleService.recompute(client, task15, ACTOR, narrowLinker));
   const survivedNarrow = await pool.query(
     "SELECT COUNT(*)::int AS n FROM grants WHERE grantee_id = $1 AND resource_id = $2",
-    [fifteen.accountId, privateReport]);
+    [fifteen.connectorId, privateReport]);
   out.control15_narrowLinkerCannotStripAccess =
     rootConferred.rows[0].n === 1 && survivedNarrow.rows[0].n === 1;
 
@@ -705,32 +844,71 @@ async function main() {
   out.s17_warrantToAutoGrantIsHonored =
     afterBack.rows[0].execution_warrant_id === null && afterBack.rows[0].execution_service_id !== null;
 
-  // ── 18 · Backfill liveness: a dead chain is never left assigned ───────
+  // ── 18 · Backfill liveness, in the AZ-A10 shape (migration 149) ─────
   //
-  // The r1 defect (bedc25f3 B5): the walk checked identity SHAPE but not
-  // §5.1 LIVENESS, so a Connector whose last credential had been revoked
-  // kept an invisible assignment through the one-time repair.
+  // The r1 defect (bedc25f3 B5) was a backfill that checked identity SHAPE
+  // but not §5.1 LIVENESS. 149 attributes every row to its original
+  // assigner and proves that assigner's cap only through LIVE credentials
+  // on each delegated link, so a dead assigner chain confers nothing.
+  // 149 does NOT check the ASSIGNEE's liveness: it writes role rows onto a
+  // Connector whose credential is revoked just as onto a live one. A dead
+  // assignee chain stays unreadable only because its chain is resolved at
+  // read time and a dead one is refused (delegationService.resolveChain, as
+  // the auth middleware does; connectorCanRead mirrors it), so
+  // s18_deadChainStaysUnreadable rests on that read-time liveness, not on
+  // anything the backfill withholds.
   const deadChain = await mkConnector("deadchain");
   const liveChain = await mkConnector("livechain");
   const deadTask = await mkTask("s7 dead-chain task");
   const liveTask = await mkTask("s7 live-chain task");
-  await pool.query(
-    "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2",
-    [deadChain.serviceId, deadTask]);
-  await pool.query(
-    "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2",
-    [liveChain.serviceId, liveTask]);
+  for (const [conn, t] of [[deadChain, deadTask], [liveChain, liveTask]] as const) {
+    await pool.query(
+      "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2", [conn.serviceId, t]);
+    await mk099Vehicle(t, conn, fixtureAccount.id);
+  }
   // Kill the dead chain the way §5.1 defines dead: no live credential.
   await pool.query("UPDATE principal_credentials SET revoked_at = NOW() WHERE principal_id = $1", [deadChain.connectorId]);
   out.control18_deadChainReallyIsDead = (await delegationService.resolveChain(deadChain.connectorId)).alive === false;
 
-  await pool.query(readFileSync(join(__dirname, "../src/migrations/099_assignment_access_vehicles.sql"), "utf8"));
+  // Two delegated ASSIGNERS of the same provable shape (parent-only own(),
+  // a tasks:write credential, an Account holding write on the task); one
+  // is then killed. Each assigned one task to the live chain.
+  const mkDelegatedAssigner = async (suffix: string, taskId: string) => {
+    const conn = await mkConnector(suffix);
+    await pool.query("UPDATE principals SET own_expression = $1 WHERE id = $2",
+      [JSON.stringify({ scopes: "parent", objects: "parent" }), conn.connectorId]);
+    await principalService.issueCredential({ principalId: conn.connectorId, scopes: ["tasks:read", "tasks:write"] }, ACTOR);
+    await grantService.create({ granteeId: conn.accountId, resourceType: "task", resourceId: taskId, verb: "write" }, ACTOR);
+    return conn;
+  };
+  const liveAssignerTask = await mkTask("s7 live-assigner task");
+  const deadAssignerTask = await mkTask("s7 dead-assigner task");
+  const liveAssigner = await mkDelegatedAssigner("live-assigner", liveAssignerTask);
+  const deadAssigner = await mkDelegatedAssigner("dead-assigner", deadAssignerTask);
+  for (const [t, a] of [[liveAssignerTask, liveAssigner], [deadAssignerTask, deadAssigner]] as const) {
+    await pool.query(
+      "UPDATE tasks SET execution_service_id = $1, execution_descriptor_version = 1 WHERE id = $2", [liveChain.serviceId, t]);
+    await mk099Vehicle(t, liveChain, a.connectorId);
+  }
+  await pool.query("UPDATE principal_credentials SET revoked_at = NOW() WHERE principal_id = $1", [deadAssigner.connectorId]);
 
-  const deadAfter = await pool.query("SELECT execution_service_id FROM tasks WHERE id = $1", [deadTask]);
-  out.s18_deadChainIsUnassignedNotVehicled = deadAfter.rows[0].execution_service_id === null;
+  await replay149Backfill();
+
+  out.s18_deadChainStaysUnreadable = (await connectorCanRead(deadChain.connectorId, deadTask)) === false;
   const liveAfter = await pool.query("SELECT execution_service_id FROM tasks WHERE id = $1", [liveTask]);
   out.control18_liveChainKeepsItsAssignment = liveAfter.rows[0].execution_service_id !== null;
   out.control18_liveChainCanRead = await connectorCanRead(liveChain.connectorId, liveTask);
+  // (The dead assigner's 099-era Account row is not superseded: 149 replaces
+  // an old vehicle only once the assignee's own rows exist.)
+  const deadAssignerSkipped = await pool.query(
+    \`SELECT COUNT(*)::int AS n FROM audit_events WHERE action = 'grant.reference_skipped' AND resource_id = $1
+        AND metadata->>'migration' = '149_az_a10_role_grants.sql'\`, [deadAssignerTask]);
+  out.s18_deadAssignerChainConfersNothing =
+    (await roleRowsOf(deadAssignerTask, liveChain.connectorId)).length === 0 && deadAssignerSkipped.rows[0].n >= 1;
+  const liveConferred = await roleRowsOf(liveAssignerTask, liveChain.connectorId);
+  out.control18_liveAssignerChainConfers = liveConferred.length === 2
+    && liveConferred.every((r: any) => r.grantor === liveAssigner.connectorId)
+    && await connectorCanRead(liveChain.connectorId, liveAssignerTask);
 
   // ── 19 · AZ-A3: one ceiling shape, and all-except finally carries ────
   //
@@ -818,9 +996,25 @@ async function main() {
     Boolean(convRow) && convRow.ceiling_profile_version_id !== null && convRow.ceiling_rules === null;
 
   // ── 14 · §1 shared predicate untouched, no scope minted ─────────────
-  const predicateSource = readFileSync(join(__dirname, "../src/services/AuthorizationService.ts"), "utf8");
+  // AZ-A10 clause 4 deliberately gave the shared predicate ONE arm over the
+  // link table: a live role-linked row (vehicle_kind 'role'), with role rows
+  // kept out of the ordinary grant seam. That arm is pinned byte for byte
+  // (RATIFIED_ROLE_ARM, bounds stated there), so a warrant or auto-grant
+  // clause written INSIDE it turns s14 red. Outside it, the only mention of
+  // the link machinery allowed is the one seam flag that keeps role rows out
+  // of the ordinary grant seam, so no separate arm can join it either.
+  const predicateSource = readFileSync(join(__dirname, "../src/services/AuthorizationService.ts"), "utf8")
+    .replace(/\\r\\n/g, "\\n");
   const scopeMapSource = readFileSync(join(__dirname, "../src/utils/scopeMap.ts"), "utf8");
-  out.s14_predicateMentionsNoVehicle = !/vehicle/i.test(predicateSource);
+  const ratifiedRoleArm: string = ${JSON.stringify(RATIFIED_ROLE_ARM)};
+  const roleArmStart = predicateSource.indexOf("const roleGrantSql =");
+  const roleArmEnd = roleArmStart < 0 ? -1 : predicateSource.indexOf("\\n    if (!chain)", roleArmStart);
+  out.s14_roleArmIsTheRatifiedText = predicateSource.split("const roleGrantSql =").length === 2
+    && roleArmEnd > roleArmStart && predicateSource.slice(roleArmStart, roleArmEnd) === ratifiedRoleArm;
+  const seamFlag = "excludeVehicleRole: true";
+  out.s14_predicateMentionsOnlyTheRoleArm = predicateSource.split(seamFlag).length === 2
+    && predicateSource.split(ratifiedRoleArm).length === 2
+    && !/vehicle/i.test(predicateSource.split(seamFlag).join("").split(ratifiedRoleArm).join(""));
   out.s14_scopeMapMentionsNoVehicle = !/vehicle/i.test(scopeMapSource);
 
   console.log(JSON.stringify(out, null, 2));
@@ -838,7 +1032,7 @@ main().catch(err => { console.error(err); process.exit(1); });
 const fs = require("fs");
 const tmp = path.join(__dirname, ".s7-assignment-coupling-probe.ts");
 fs.writeFileSync(tmp, probe);
-const result = spawnSync(path.join(__dirname, "..", "node_modules", ".bin", "tsx"), [tmp], {
+const result = spawnSync(process.execPath, [require.resolve("tsx/cli"), tmp], {
   stdio: "inherit",
   env: {
     ...process.env,

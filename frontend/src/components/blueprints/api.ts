@@ -10,6 +10,15 @@ export async function blueprintRequest<T>(path: string, options?: RequestInit): 
   let body;
   try { body = await response.json(); }
   catch { throw new BlueprintRequestError('A complete response was not received. Retry the same request.', 'RESPONSE_UNCERTAIN', undefined, true); }
+  return blueprintAnswer<T>(response, body);
+}
+/** One answer already read (card 72b8fb97: the step-up retry reads it), judged
+ * as `blueprintRequest` judges it; a body that was not JSON (null) is an
+ * uncertain response. */
+export function blueprintAnswer<T>(response: Response, body: any): T {
+  if (body === null || typeof body !== 'object') {
+    throw new BlueprintRequestError('A complete response was not received. Retry the same request.', 'RESPONSE_UNCERTAIN', undefined, true);
+  }
   if (!response.ok || body.success === false) {
     throw new BlueprintRequestError(typeof body.error === 'string' ? body.error : 'The operation could not be completed.',
       typeof body.code === 'string' ? body.code : 'OPERATION_REFUSED', typeof body.field === 'string' ? body.field : undefined, response.status >= 500);

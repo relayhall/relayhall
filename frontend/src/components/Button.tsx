@@ -14,6 +14,11 @@ interface ButtonProps {
   size?: 'standard' | 'compact';
   icon?: React.ReactNode;
   disabled?: boolean;
+  /* Unavailable for now but still focusable: `aria-disabled` instead of
+     `disabled`, so keyboard focus is not thrown off a control that is only
+     busy (card 5854f0d6 review). The caller's onClick must return early
+     while it is set: the button still receives clicks. */
+  ariaDisabled?: boolean;
   className?: string;
   /* Explicit default: a classless <button> inside a <form> would submit it. */
   type?: 'button' | 'submit';
@@ -26,10 +31,18 @@ interface ButtonProps {
   ariaExpanded?: boolean;
   ariaControls?: string;
   ariaHaspopup?: React.AriaAttributes["aria-haspopup"];
+  /* The id of the text that explains this control, such as why it is
+     disabled. A hyphenated `aria-describedby` on this component type-checks
+     and is silently dropped, because nothing is spread (card 3fc32dd1). */
+  ariaDescribedBy?: string;
   /* Reaches the rendered element as `data-testid`. Kept explicit rather than
      spreading arbitrary props: a control kit that forwards anything stops
      being a contract (task 482e21fa). */
   dataTestId?: string;
+  /* E469: opt in to the phone long-press / focus label (ui/LabelTip.tsx), for a
+     button whose words are visually hidden on a phone. Inert unless the button
+     sits in a row that calls useLabelTips. */
+  labelTip?: boolean;
 }
 
 export const Button: React.FC<ButtonProps> = ({
@@ -39,6 +52,7 @@ export const Button: React.FC<ButtonProps> = ({
   size = 'standard',
   icon,
   disabled = false,
+  ariaDisabled,
   className = '',
   type = 'button',
   title,
@@ -47,12 +61,15 @@ export const Button: React.FC<ButtonProps> = ({
   ariaExpanded,
   ariaControls,
   ariaHaspopup,
-  dataTestId
+  ariaDescribedBy,
+  dataTestId,
+  labelTip = false
 }) => {
   return (
     <button
       onClick={onClick}
       disabled={disabled}
+      aria-disabled={ariaDisabled || undefined}
       className={`btn btn-${variant} ${size === 'compact' ? 'btn-compact' : ''} ${className}`}
       type={type}
       title={title}
@@ -61,7 +78,9 @@ export const Button: React.FC<ButtonProps> = ({
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
       aria-haspopup={ariaHaspopup}
+      aria-describedby={ariaDescribedBy}
       data-testid={dataTestId}
+      data-label-tip={labelTip ? '' : undefined}
     >
       {icon && <span className="btn-icon">{icon}</span>}
       <span className="btn-text">{children}</span>

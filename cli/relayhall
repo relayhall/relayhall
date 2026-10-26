@@ -6,7 +6,7 @@ Usage:
   relayhall next
   relayhall current
   relayhall get ID
-  relayhall create TITLE [options]
+  relayhall create TITLE [options]               # No --phase: lands in the project's inbox phase if it names one
   relayhall update ID [options]
   relayhall move ID STATUS [--notes NOTES]
   relayhall archive ID [--reason TEXT]           # Any status; non-completed archives as abandoned (warns)
@@ -25,20 +25,36 @@ Usage:
   relayhall stuck-subtask TASK_ID INDEX --reason # Agent/Verifier: marks Stuck
   relayhall skip-subtask TASK_ID INDEX           # Orchestrator: marks skipped (counts as done)
   relayhall uncomplete-subtask TASK_ID INDEX     # Legacy: marks as empty
+  relayhall add-subtask TASK_ID TEXT [--position N] [--status S] --idempotency-key KEY  # new stable id
+  relayhall reorder-subtasks TASK_ID SUBTASK_ID... --idempotency-key KEY  # every current id, once
+  relayhall rename-subtask TASK_ID SUBTASK_ID TEXT --idempotency-key KEY  # id, position, state unchanged
 
   # Task dependencies
   relayhall add-dep TASK_ID DEPENDS_ON_ID        # Add dependency (task depends on another)
   relayhall remove-dep TASK_ID DEPENDS_ON_ID     # Remove dependency
   relayhall deps TASK_ID                         # Show dependencies for a task
 
+  # Task lifecycle and history (each verb composes the route its MCP tool composes; docs/cli.md)
+  relayhall task-stream ID | task-timeline ID [--filter F] [--before CURSOR] [--limit N]
+  relayhall task-graph [--status S ...] [--project P ...] [--phase ID|null ...] [--lod task|project] [--mine]
+  relayhall task-arm|task-park ID --idempotency-key KEY
+  relayhall task-release ID [--reason R] | task-recover ID --service CONNECTOR [--reason R]
+  relayhall task-success-criteria ID (--criterion C ... | --criteria TEXT | --criteria-file F)
+  relayhall lease claim ID [--lease-seconds N] | lease renew ID LEASE | lease release ID LEASE
+  relayhall bulk-archive ID [ID ...] [--reason R]
+  relayhall session-brief | warrants | access-request preview|file|status|withdraw|collect
+  relayhall native-execution|native-review ID ACTION [--execution-id|--review-id ID] [--payload-file F]
+  # Write verbs take --idempotency-key KEY (16-128 chars): retry with the SAME key after an uncertain result
+
   # Project management
   relayhall projects [--include-stats]
   relayhall project get ID
   relayhall project create --name NAME [--description DESC] [--status STATUS]
-  relayhall project update|edit ID --revision REV [--name] [--description] [--status]
+  relayhall project update|edit ID --revision REV [--name] [--description] [--status] [--inbox-phase PHASE | --clear-inbox-phase]
   relayhall project archive ID --revision REV
   relayhall project unarchive ID --revision REV
   relayhall project stats ID [--days DAYS]
+  relayhall project brief PROJECT [--json]
   relayhall project context PROJECT [--json]
   relayhall project compatibility-status PROJECT [--json]
 
@@ -60,12 +76,13 @@ Usage:
 
   # Skill management (bare plural `relayhall skills` = skill list)
   relayhall skills
-  relayhall skill list [--category CAT] [--tag TAG] [--search QUERY] [--project PROJECT] [-v]
+  relayhall skill list [--category CAT] [--tag TAG] [--search QUERY] [--project PROJECT] [--all-owners] [-v]
   relayhall skill get SKILL [--version VERSION] [--full]
   relayhall skill search QUERY
   relayhall skill create --name NAME [--category CAT] [--description DESC] [--usage TEXT] [--usage-file FILE] [--tags TAGS]
   relayhall skill update SKILL [--category] [--description] [--usage] [--tags]
   relayhall skill audience SKILL {global,project}
+  relayhall skill owner SKILL OWNER_PRINCIPAL_ID --reason TEXT
   relayhall skill pin SKILL PROJECT VERSION
   relayhall skill unpin SKILL PROJECT
   relayhall skill delete SKILL [--confirm]
@@ -89,6 +106,9 @@ Examples:
   relayhall create "Ship the beta" --project my-project --notes "Cut from the Friday build"
   relayhall create "Ship the beta" --due 2026-09-07T17:00:00Z
   relayhall create "Research topic" --project my-project --status ideas --tags "research,agent-task"
+  # No --phase: the Task lands in the project's inbox phase when the project names one
+  # (status Ideas unless --status is given); --phase PHASE or --phase null (the backlog) wins.
+  relayhall create "Follow-up from the release" --project my-project --phase PHASE_UUID --status todo
   relayhall create "Nightly maintenance" --project ops --status todo --auto-start true   # orchestrator may auto-pick this
 
   # Task management
@@ -145,6 +165,7 @@ Complete Workflows:
 import sys
 import os
 import json
+import hashlib
 import argparse
 import urllib.request
 import urllib.parse
@@ -153,6 +174,7 @@ import re
 import subprocess
 import uuid
 import mimetypes
+from pathlib import Path
 import tempfile
 from difflib import SequenceMatcher
 
@@ -233,7 +255,7 @@ def get_token():
         except:
             pass
     
-    # 3b. Shared config file (config.json — also used by clawbeat)
+    # 3b. Shared config file (config.json — also used by other tools)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
@@ -398,7 +420,15 @@ def api(method, path, data=None, timeout=30, exit_on_error=True, headers=None):
             return {"success": False, "error": body, "status": e.code}
         else:
             if exit_on_error:
-                print(f"❌ API error: {err.get('error', body)}", file=sys.stderr)
+                # Card d56e58e1: the refusal's stable code is part of the
+                # contract (the MCP tools and the resource verbs print it), so
+                # it rides on the same line instead of being dropped.
+                stable = err.get('code')
+                suffix = f" [{stable}]" if isinstance(stable, str) and re.fullmatch(r'[A-Z][A-Z0-9_]{1,63}', stable) else ""
+                print(f"❌ API error: {err.get('error', body)}{suffix}", file=sys.stderr)
+                audit_ref = err.get('auditRef')
+                if isinstance(audit_ref, str) and re.fullmatch(r'ka_[0-9a-f]{32}', audit_ref):
+                    print(f"Audit reference: {audit_ref}", file=sys.stderr)
                 sys.exit(1)
             # `message` and `code` ride along: a refusal that names its reason
             # is useless to a caller who only ever sees the generic `error`
@@ -453,7 +483,13 @@ def resolve_project(name):
     if not name:
         return None
     projects = api("GET", "/projects?includeHidden=true").get("projects", [])
-    
+
+    # Card d56e58e1: the `project` field takes an id as well as a name (POST
+    # /tasks, the MCP tools), so an exact Project id passes through unchanged.
+    for p in projects:
+        if str(p.get("id", "")).lower() == name.strip().lower():
+            return p["id"]
+
     # Exact match first
     for p in projects:
         if p["name"] == name:
@@ -678,10 +714,28 @@ def format_project(p, include_stats=False, stats=None):
 
 # ─── Commands ───
 
+# Card 41e24358: why a card has no usable Verifier, one fixed phrase per arm
+# of the server's predicate (services/VerifierUsability).
+VERIFIER_ARM_TEXT = {
+    "none": "no Verifier set",
+    "principal": "Verifier not active",
+    "chain": "Verifier disabled or without a live credential",
+    "scope": "Verifier lacks tasks:write",
+    "independence": "Verifier is the Assignee",
+}
+
 def cmd_list(args):
     params = {}
-    if args.status:
+    without_verifier = getattr(args, "without_usable_verifier", False)
+    if args.status and "," in args.status:
+        # Card 41e24358: the morning census reads several states at once
+        # (relayhall tasks --without-usable-verifier --status todo,review).
+        params["statuses"] = ",".join(validate_status(s.strip()) for s in args.status.split(",") if s.strip())
+    elif args.status:
         params["status"] = validate_status(args.status)
+    if without_verifier:
+        params["verifierUnusable"] = "true"
+
     if args.project:
         params["project"] = resolve_project(args.project)
     if args.priority:
@@ -690,7 +744,14 @@ def cmd_list(args):
     # first-class view, not the absence of a filter.
     if getattr(args, "phase", None):
         params["phaseId"] = args.phase
-    
+    # Card d56e58e1: the filters GET /tasks and relayhall_task_list accept.
+    if getattr(args, "tag", None):
+        params["tag"] = args.tag
+    if getattr(args, "query", None):
+        params["q"] = args.query
+    if getattr(args, "include_archived", False):
+        params["includeArchived"] = "true"
+
     qs = "&".join(f"{k}={urllib.parse.quote(v)}" for k, v in params.items())
     path = f"/tasks?{qs}" if qs else "/tasks"
     result = api("GET", path)
@@ -710,6 +771,9 @@ def cmd_list(args):
             print(f"\n── {status.upper()} ({len(by_status[status])}) ──")
             for t in by_status[status]:
                 print(f"  {format_task(t, verbose=args.verbose)}")
+                if without_verifier:
+                    arm = (t.get("verifierUsability") or {}).get("failedArm") or "none"
+                    print(f"      Verifier: {VERIFIER_ARM_TEXT.get(arm, arm)} [{arm}]")
 
 def cmd_next(args):
     result = api("GET", "/tasks/next")
@@ -873,6 +937,7 @@ def build_connector_profile(args):
     return profile
 
 def cmd_create(args):
+    idem = _idem_kw(args)
     data = {"title": args.title}
 
     execution_profile = build_connector_profile(args)
@@ -903,8 +968,16 @@ def cmd_create(args):
 
     # Phase membership (RH-P2.4). The phase must belong to the same project;
     # the server refuses a mismatch outright rather than silently repairing it.
+    # Card b13e5ac9: with NO --phase the field is not sent, and the server
+    # files the Task in the project's inbox phase when it names one. 'null'
+    # sends an explicit null - the unphased backlog - which wins like any
+    # explicit phase.
     if getattr(args, "phase", None):
-        data["phaseId"] = args.phase
+        data["phaseId"] = None if args.phase.strip().lower() == "null" else args.phase
+    # Card 41e24358: a Verifier named at creation is accepted only when it is
+    # the Project's default or a Phase default of it (422 VERIFIER_NOT_ALLOWED).
+    if getattr(args, "verifier", None):
+        data["verifierPrincipalId"] = args.verifier if UUID_PATTERN.match(args.verifier) else _resolve_principal_id(args.verifier)
 
     if args.description:
         data["description"] = args.description
@@ -964,6 +1037,7 @@ def cmd_create(args):
         data["model"] = args.model
     if execution_profile:
         data["executionProfile"] = execution_profile
+    _assignment_fields(args, data)
 
     personalities = _fetch_personalities()
     if getattr(args, 'personality', None):
@@ -995,7 +1069,7 @@ def cmd_create(args):
         if generalist:
             data["personalityId"] = generalist["id"]
 
-    result = api("POST", "/tasks", data)
+    result = api("POST", "/tasks", data, **idem)
     task = result.get("task", {})
     full_id = task.get('id', '')
     task_id_short = full_id[:8] if full_id else 'TASKID'
@@ -1046,6 +1120,7 @@ def cmd_create(args):
         print('   💡 Consider setting: --model <openclaw-model-id>, --thinking (low/medium/high) — agents use the configured default model and low thinking if unset', file=sys.stderr)
 
 def cmd_update(args):
+    idem = _idem_kw(args)
     task_id = resolve_task_id(args.id)
     data = {}
     
@@ -1088,6 +1163,7 @@ def cmd_update(args):
         execution_profile = build_connector_profile(args)
         if execution_profile:
             data["executionProfile"] = execution_profile
+        _assignment_fields(args, data)
     if hasattr(args, 'auto_start') and args.auto_start is not None:
         data["autoStart"] = args.auto_start == "true"
     if getattr(args, 'personality', None):
@@ -1129,11 +1205,12 @@ def cmd_update(args):
         print("Nothing to update. Use --status, --priority, --project, etc.", file=sys.stderr)
         sys.exit(1)
     
-    result = api("PATCH", f"/tasks/{task_id}", data)
+    result = api("PATCH", f"/tasks/{task_id}", data, **idem)
     task = result.get("task", {})
     print(f"✅ Updated: {format_task(task)}")
 
 def cmd_move(args):
+    idem = _idem_kw(args)
     task_id = resolve_task_id(args.id)
     status = validate_status(args.status)
     
@@ -1179,7 +1256,7 @@ def cmd_move(args):
             print("⚠️ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", file=sys.stderr)
             print("\nTo confirm, re-run with --force --confirm-override", file=sys.stderr)
             sys.exit(1)
-        print("⚠️ Force override CONFIRMED: skipping all guardrail checks.", file=sys.stderr)
+        print("⚠️ Local override confirmed. Server authority and lifecycle rules still apply.", file=sys.stderr)
 
     # DoD gate (non-blocking): warn when promoting ideas -> todo without a
     # definitionOfDone. The move still proceeds — this is a nudge, not a block.
@@ -1194,12 +1271,23 @@ def cmd_move(args):
                 print(f"   Add one first: relayhall update {task_id[:8]} --definition-of-done \"...\"", file=sys.stderr)
                 print("   (Move proceeds anyway — this is a warning, not a block.)", file=sys.stderr)
 
+    # Card d56e58e1: --notes is the move's reason, recorded the way
+    # relayhall_task_move records feedback — an attributed Task note appended
+    # through POST /tasks/:id/notes, then the status PATCH. It used to ride on
+    # the PATCH as `notes`, which REPLACES the Task's notes field. A note
+    # appends on every call, so one retry key encloses both limbs (they are
+    # different operations, so one value keys one row each); without
+    # --idempotency-key a key is minted and printed for the retry.
     data = {"status": status}
-    if args.notes:
-        data["notes"] = args.notes
     if is_agent_context():
         data["role"] = "agent"
-    result = api("PATCH", f"/tasks/{task_id}", data)
+    notes = (args.notes or "").strip()
+    if notes:
+        if not idem:
+            idem = {"headers": {"Idempotency-Key": f"cli-move-{uuid.uuid4()}"}}
+            print(f"Retry key: {idem['headers']['Idempotency-Key']} (repeat with --idempotency-key after an uncertain result)", file=sys.stderr)
+        api("POST", f"/tasks/{task_id}/notes", {"text": notes}, **idem)
+    result = api("PATCH", f"/tasks/{task_id}", data, **idem)
     task = result.get("task", {})
     if result.get("warning"):
         print(f"⚠️  {result['warning']}", file=sys.stderr)
@@ -1218,6 +1306,12 @@ def cmd_archive(args):
     disposition = result.get("disposition")
     suffix = f" (disposition: {disposition})" if disposition else ""
     print(f"✅ Archived: {task_id}{suffix}")
+
+def cmd_unarchive(args):
+    """Restore archived provenance; the server selects the prior state."""
+    task_id = resolve_task_id(args.id)
+    result = api("POST", f"/tasks/{task_id}/unarchive", {})
+    print(f"Restored task {task_id} to {result.get('restoredTo', 'its recorded prior state')}")
 
 def cmd_delete(args):
     task_id = resolve_task_id(args.id)
@@ -1279,8 +1373,6 @@ def cmd_session_status(args):
             print(f"Model:      {data['model']}")
         if data.get('startedAt'):
             print(f"Started:    {data['startedAt']}")
-        if data.get('acpSessionKey'):
-            print(f"Control:    {data['acpSessionKey']}")
         if data.get('reason'):
             print(f"Reason:     {data['reason']}")
     else:
@@ -1503,6 +1595,20 @@ def cmd_complete_subtask(args):
         print(f"   ⚠️ {summary.get('stuck', 0)} subtask(s) stuck!")
     print(format_task(task, verbose=True))
 
+def cmd_owner_complete_subtask(args):
+    """Explicit owner/Main disposition, never an independent Verifier verdict."""
+    raw_id = str(args.subtask_id)
+    if not raw_id.isascii() or not raw_id.isdecimal() or int(raw_id) > 2147483647:
+        print("Subtask ID must be an unsigned integer from 0 to 2147483647.", file=sys.stderr)
+        sys.exit(1)
+    task_id = resolve_task_id(args.task_id)
+    data = {"status": "completed", "completionMode": "owner"}
+    if args.note:
+        data["reviewNote"] = args.note
+    # Intent is not authority: the server checks the actual authenticated account.
+    api("PATCH", f"/tasks/{task_id}/subtasks/by-id/{int(raw_id)}/status", data)
+    print(f"Owner/Main completed subtask {raw_id} (administrative disposition).")
+
 def cmd_approve_subtask(args):
     """Independent Verifier approves a reviewed subtask → marks it completed."""
     # Block implementation-agent contexts before the Verifier-only API rejects them.
@@ -1676,7 +1782,52 @@ def cmd_set_subtask(args):
     result = api("PATCH", f"/tasks/{task_id}/subtasks/by-id/{args.subtask_id}/status", data)
     print(json.dumps(result, indent=2))
 
+def cmd_add_subtask(args):
+    """Add one Subtask (card 2bc7b303); the answer names its new stable id."""
+    task_id = resolve_task_id(args.task_id)
+    data = {"text": args.text}
+    if args.position is not None:
+        data["position"] = args.position
+    if args.status is not None:
+        data["status"] = args.status
+    result = api("POST", f"/tasks/{task_id}/subtasks", data, **_idem_kw(args))
+    print(json.dumps({k: result.get(k) for k in ("success", "subtaskId", "position", "subtask")}, indent=2))
+
+def cmd_reorder_subtasks(args):
+    """Put a Task's Subtasks in a new order: every current stable id, exactly once."""
+    task_id = resolve_task_id(args.task_id)
+    result = api("POST", f"/tasks/{task_id}/subtasks/reorder", {"order": list(args.subtask_ids)}, **_idem_kw(args))
+    print(json.dumps({k: result.get(k) for k in ("success", "order")}, indent=2))
+
+def cmd_rename_subtask(args):
+    """Replace one Subtask's text by stable id; its id, position and state are unchanged."""
+    task_id = resolve_task_id(args.task_id)
+    result = api("PATCH", f"/tasks/{task_id}/subtasks/by-id/{args.subtask_id}/text", {"text": args.text}, **_idem_kw(args))
+    print(json.dumps({k: result.get(k) for k in ("success", "subtaskId")}, indent=2))
+
+def cmd_task_account_owner(args):
+    task_id = resolve_task_id(args.id)
+    path = f"/tasks/{task_id}/account-owner"
+    if args.action == "get":
+        result = api("GET", path)
+    else:
+        if not all([args.account, args.expected_owner, args.expected_updated_at, args.reason]):
+            raise ValueError("change requires --account, --expected-owner (UUID or none), --expected-updated-at and --reason")
+        result = api("PUT", path, {
+            "accountOwnerPrincipalId": args.account,
+            "expectedAccountOwnerPrincipalId": None if args.expected_owner == "none" else args.expected_owner,
+            "expectedUpdatedAt": args.expected_updated_at,
+            "reason": args.reason,
+        })
+    print(json.dumps(result, indent=2))
+
+def cmd_task_claim(args):
+    task_id = resolve_task_id(args.id)
+    body = {} if args.expected_assignment_epoch is None else {"expectedAssignmentEpoch": args.expected_assignment_epoch}
+    print(json.dumps(api("POST", f"/tasks/{task_id}/claim", body), indent=2))
+
 def cmd_task_append(args):
+    idem = _idem_kw(args)
     task_id = resolve_task_id(args.id)
     content = _read_optional_text_arg(args.content, args.content_file)
     if not content:
@@ -1690,7 +1841,125 @@ def cmd_task_append(args):
     }
     if args.outpost:
         data["outpostServiceId"] = args.outpost
-    result = api("POST", f"/tasks/{task_id}/stream", data)
+    if getattr(args, "referenced_entry", None):
+        data["referencedEntryId"] = args.referenced_entry
+    result = api("POST", f"/tasks/{task_id}/stream", data, **idem)
+    print(json.dumps(result, indent=2))
+
+def cmd_native_generation(args):
+    task_id = resolve_task_id(args.id)
+    root = f'/tasks/{task_id}/native-executions'
+    action = args.action
+    if action == 'reserve': path = root + '/generations'
+    elif action in ('quarantine','quarantine-dry-run'): path = root + '/quarantine' + ('/dry-run' if action.endswith('dry-run') else '')
+    elif action == 'quarantine-read':
+        if not args.quarantine_id: raise ValueError('--quarantine-id required')
+        path = root + '/quarantine/' + args.quarantine_id
+    else:
+        if not args.generation_id: raise ValueError('--generation-id required')
+        path = root + '/generations/' + args.generation_id + ('' if action == 'read' else '/' + action)
+    read = action in ('read','quarantine-read')
+    if not read and not args.payload_file: raise ValueError('--payload-file required; no automatic retry')
+    payload = None
+    if args.payload_file:
+        raw = Path(args.payload_file).read_bytes()
+        if len(raw) > 8 * 1024 * 1024: raise ValueError('payload exceeds 8MiB')
+        payload = json.loads(raw)
+        if not isinstance(payload, dict): raise ValueError('exact JSON object required')
+    print(json.dumps(api('GET' if read else 'POST',path,payload),indent=2))
+
+def _task_reports_path(task_id, scope=None, limit=None, cursor=None, pinned=False):
+    query = {}
+    if scope:
+        query["scope"] = scope
+    if limit is not None:
+        query["limit"] = str(limit)
+    if cursor:
+        query["cursor"] = cursor
+    if pinned:
+        query["pinned"] = "true"
+    path = f"/tasks/{task_id}/reports"
+    return f"{path}?{urllib.parse.urlencode(query)}" if query else path
+
+
+def cmd_task_reports(args):
+    """Bounded Report summaries for one Task (card 50b5e9c4): the 5 newest
+    authorized by default, never bodies. --all follows nextCursor through every
+    page deliberately; bodies come from `relayhall report get ID` (reports:read)
+    or, for this Task's progress Reports, `--report REPORT_ID` (tasks:read)."""
+    task_id = resolve_task_id(args.id)
+    scope = getattr(args, "scope", None)
+    limit = getattr(args, "limit", None)
+    cursor = getattr(args, "cursor", None)
+    pinned = bool(getattr(args, "pinned", False))
+    report_id = getattr(args, "report", None)
+    if report_id:
+        # One of this Task's progress Reports in full: body and content_hash,
+        # the expected hash `task-report --expected-content-hash` needs.
+        if scope or limit is not None or cursor or pinned or getattr(args, "all", False):
+            print("--report reads one progress Report; it does not combine with --scope, --limit, --cursor, --pinned or --all", file=sys.stderr)
+            sys.exit(2)
+        if len(report_id) != 36:
+            print("--report takes the full Report UUID (task-reports TASK --scope progress lists them)", file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps(api("GET", f"/tasks/{task_id}/reports/{urllib.parse.quote(report_id, safe='')}"), indent=2))
+        return
+    if not getattr(args, "all", False):
+        print(json.dumps(api("GET", _task_reports_path(task_id, scope, limit, cursor, pinned)), indent=2))
+        return
+    # Deliberate all-page retrieval: the largest page the board serves, then
+    # the board's own cursor until it says there is nothing more.
+    page_size = limit or 50
+    first = None
+    collected = []
+    seen_cursors = set()
+    pages = 0
+    while True:
+        page = api("GET", _task_reports_path(task_id, scope, page_size, cursor, pinned))
+        pages += 1
+        if first is None:
+            first = page
+        collected.extend(page.get("reports") or [])
+        pagination = page.get("pagination") or {}
+        next_cursor = pagination.get("nextCursor")
+        if not pagination.get("hasMore") or not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            print("The board returned a cursor it had already returned; stopping rather than looping.", file=sys.stderr)
+            sys.exit(1)
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    total = (first.get("pagination") or {}).get("total", len(collected))
+    result = {
+        "success": True,
+        "taskId": first.get("taskId", task_id),
+        "scope": first.get("scope", scope or "linked"),
+        "pinnedOnly": pinned,
+        "reports": collected,
+        "pinned": first.get("pinned"),
+        "pagination": {"total": total, "returned": len(collected), "hasMore": False, "pages": pages},
+        "retrieval": f"Every page was retrieved (--all). Report bodies are never included: fetch one with relayhall report get ID, or one of this Task's progress Reports with relayhall task-reports {task_id} --report REPORT_ID.",
+    }
+    print(json.dumps(result, indent=2))
+
+def cmd_task_report(args):
+    task_id = resolve_task_id(args.id)
+    content = _read_optional_text_arg(args.content, args.content_file)
+    if not content:
+        print("--content or --content-file is required", file=sys.stderr)
+        sys.exit(1)
+    data = {"title": args.title, "content": content}
+    if args.report_id:
+        data["reportId"] = args.report_id
+        data["expectedContentHash"] = args.expected_content_hash
+    if args.reconcile:
+        canonical = {"title": data["title"], "content": data["content"], "summary": None, "reportId": data.get("reportId"), "expectedContentHash": data.get("expectedContentHash")}
+        digest = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        result = api("GET", f"/tasks/{task_id}/report-operations/{urllib.parse.quote(args.idempotency_key, safe='')}?requestHash={digest}")
+        if result.get("operation", {}).get("key") != args.idempotency_key or result["operation"].get("requestHash") != digest:
+            raise ValueError("Committed operation does not match this request")
+    else:
+        result = api("POST", f"/tasks/{task_id}/reports", data, headers={"Idempotency-Key": args.idempotency_key})
     print(json.dumps(result, indent=2))
 
 def cmd_task_finish(args):
@@ -1705,6 +1974,8 @@ def cmd_task_finish(args):
             print("--report-title is required with --report-content/--report-file", file=sys.stderr)
             sys.exit(1)
         data["report"] = {"title": args.report_title, "content": report_content}
+    if args.native_generation_file:
+        data["nativeGeneration"] = json.loads(Path(args.native_generation_file).read_text(encoding="utf-8"))
     result = api("POST", f"/tasks/{task_id}/finish", data)
     print(json.dumps(result, indent=2))
 
@@ -1713,13 +1984,17 @@ def cmd_task_reference(args):
     if args.reference_command == "list":
         result = api("GET", f"/tasks/{task_id}/references")
     else:
-        result = api("POST", f"/tasks/{task_id}/references", {
+        idem = _idem_kw(args)
+        body = {
             "kind": args.kind,
             "targetId": args.target_id,
             "targetUri": args.target_uri,
             "label": args.label,
             "dryRun": args.dry_run,
-        })
+        }
+        if getattr(args, "metadata", None) is not None:
+            body["metadata"] = _json_object_arg(args.metadata, "--metadata")
+        result = api("POST", f"/tasks/{task_id}/references", body, **idem)
     print(json.dumps(result, indent=2))
 
 def cmd_add_dep(args):
@@ -2145,6 +2420,30 @@ def cmd_key_issue(args):
     print(result.get("secretOnce", ""))
     print()
     print("⚠️  This is the only time the full key is shown. Store it now.")
+    # A Connector issuance carries the onboarding pack (AUTHZ §7.4); an
+    # Account issuance does not, and then nothing more is printed.
+    onboarding = result.get("onboarding")
+    if isinstance(onboarding, dict):
+        print()
+        _print_bootstrap_prompt(onboarding)
+
+
+def _print_bootstrap_prompt(onboarding, indent=""):
+    """Card 94e8bb0b: the copyable bootstrap prompt and the secure configuration
+    guidance, exactly as the board composed them. Both are credential-free by
+    construction (utils/onboardingPack.ts), so they print after the secret and
+    never beside it."""
+    prompt = onboarding.get("bootstrapPrompt")
+    if not isinstance(prompt, str) or not prompt:
+        return
+    print(f"{indent}── BOOTSTRAP PROMPT (no credential inside; paste it into a fresh session) ──")
+    for line in prompt.split("\n"):
+        print(f"{indent}{line}")
+    guidance = onboarding.get("configurationGuidance")
+    if isinstance(guidance, list) and guidance:
+        print(f"{indent}── SECURE CONFIGURATION ──")
+        for line in guidance:
+            print(f"{indent}- {line}")
 
 # ── Identity providers and Invitations (RH-P5.SSO.W2, owner D4) ────────────
 #
@@ -2179,6 +2478,11 @@ def _identity_provider_line(p):
         flags.append("retains-id-token")
     if not p.get("subjectImmutable"):
         flags.append("SUBJECT-NOT-IMMUTABLE")
+    # Card d56e58e1 (absorbed 78b216bc): the SCIM heartbeat interval; null
+    # keeps claim-sync semantics, rendered as off.
+    if "scimHeartbeatIntervalHours" in p:
+        hours = p.get("scimHeartbeatIntervalHours")
+        flags.append(f"scim-heartbeat={hours}h" if isinstance(hours, int) and hours > 0 else "scim-heartbeat=off")
     return (
         f"{p['id']}  {p.get('name') or '-':<24} {p.get('status') or '-':<9} "
         f"{p.get('provisioningMode') or '-':<9} secret={'yes' if p.get('hasClientSecret') else 'no':<3} "
@@ -2291,6 +2595,8 @@ def cmd_identity_provider_create(args):
         body["allowPrivateIssuerAddress"] = True
     if args.additional_endpoint_origin:
         body["additionalEndpointOrigins"] = args.additional_endpoint_origin
+    if getattr(args, "scim_heartbeat_interval_hours", None) is not None:
+        body["scimHeartbeatIntervalHours"] = _scim_heartbeat_hours(args.scim_heartbeat_interval_hours)
     result = api("POST", "/identity-providers", body)
     p = result.get("identityProvider", {})
     print(f"✅ Created Identity provider {p.get('id')}")
@@ -2314,6 +2620,8 @@ def cmd_identity_provider_update(args):
     # an older parser is ever loaded, which the update body cannot assume.
     if getattr(args, "login_group_whitelist_enabled", None) is not None:
         body["loginGroupWhitelistEnabled"] = args.login_group_whitelist_enabled
+    if getattr(args, "scim_heartbeat_interval_hours", None) is not None:
+        body["scimHeartbeatIntervalHours"] = _scim_heartbeat_hours(args.scim_heartbeat_interval_hours)
     if not body:
         print("Nothing to update — pass at least one field.", file=sys.stderr)
         sys.exit(2)
@@ -2590,6 +2898,7 @@ def cmd_project_create(args):
     if not args.name:
         print("❌ --name is required", file=sys.stderr)
         sys.exit(1)
+    idem = _idem_kw(args)
 
     data = {"name": args.name}
     if args.description:
@@ -2604,7 +2913,7 @@ def cmd_project_create(args):
             sys.exit(1)
         data["status"] = args.status
 
-    result = api("POST", "/projects", data)
+    result = api("POST", "/projects", data, **idem)
     project = result.get("project", {})
     project_id = project.get("id", "")
 
@@ -2653,6 +2962,12 @@ def cmd_project_update(args):
         data["goal"] = args.goal
     if getattr(args, "clear_goal", False):
         data["goal"] = None
+    # Card b13e5ac9: the inbox phase - where a Task created without an explicit
+    # phase lands, with status Ideas. --clear-inbox-phase sends null.
+    if getattr(args, "inbox_phase", None):
+        data["inboxPhaseId"] = args.inbox_phase
+    if getattr(args, "clear_inbox_phase", False):
+        data["inboxPhaseId"] = None
     if args.status:
         if args.status not in VALID_PROJECT_STATUSES:
             print(f"❌ Invalid project status: {args.status}. Valid: {', '.join(VALID_PROJECT_STATUSES)}", file=sys.stderr)
@@ -2660,7 +2975,7 @@ def cmd_project_update(args):
         data["status"] = args.status
 
     if not data:
-        print("Nothing to update. Use --name, --description, --goal or --status.", file=sys.stderr)
+        print("Nothing to update. Use --name, --description, --goal, --status or --inbox-phase.", file=sys.stderr)
         sys.exit(1)
 
     # Revision-bound optimistic concurrency: exactly one REST call with If-Match,
@@ -2672,6 +2987,46 @@ def cmd_project_update(args):
         print(f"✅ Updated project: {project.get('name', '')}")
         print(f"   Revision: {project.get('revision', '')}")
     finish_resource_call(status, text, False, render)
+
+def _default_verifier_value(args):
+    """<principal|none> or --clear -> a principal id, or None to clear."""
+    value = getattr(args, "principal", None)
+    if getattr(args, "clear", False):
+        if value not in (None, "none"):
+            resource_usage_error("Give a principal or --clear, not both")
+        return None
+    if value is None:
+        resource_usage_error("Give a principal (id or handle), 'none', or --clear")
+    if value.strip().lower() == "none":
+        return None
+    return value if UUID_PATTERN.match(value) else _resolve_principal_id(value)
+
+def _set_default_verifier(target, object_id, revision, principal_id, as_json):
+    """Card 41e24358: PUT /<target>/{id}/default-verifier. A login-session act:
+    a bearer credential (RELAYHALL_TOKEN) is refused SESSION_ONLY by the server."""
+    status, text = resource_api("PUT", f"/{target}/{object_id}/default-verifier",
+                                {"principalId": principal_id}, headers={"If-Match": revision or ""})
+    def render(envelope):
+        record = envelope.get("project" if target == "projects" else "phase", {})
+        value = record.get("defaultVerifierPrincipalId")
+        noun = "project" if target == "projects" else "phase"
+        print(f"✅ Default Verifier of {noun} {object_id[:8]}: {value or 'none'}")
+        print(f"   New cards inherit it; existing cards are unchanged. Revision: {record.get('revision', '')}")
+    finish_resource_call(status, text, as_json, render)
+
+def cmd_project_set_default_verifier(args):
+    project_id = resolve_resource_project(args.id)
+    revision = getattr(args, "revision", None)
+    if not revision:
+        status, text = resource_api("GET", f"/projects/{project_id}")
+        if status is None or status >= 400:
+            finish_resource_call(status, text, False, None)
+        revision = json.loads(text).get("project", {}).get("revision")
+    _set_default_verifier("projects", project_id, revision, _default_verifier_value(args), getattr(args, "json", False))
+
+def cmd_phase_set_default_verifier(args):
+    revision = getattr(args, "revision", None) or _resolve_phase_revision(args.phase_id)
+    _set_default_verifier("phases", args.phase_id, revision, _default_verifier_value(args), getattr(args, "json", False))
 
 def cmd_project_archive(args):
     """Archive a project (soft, reversible - preserves all data)"""
@@ -2896,9 +3251,10 @@ def cmd_project_resource_get(args):
                          lambda envelope: print(format_resource(envelope.get("resource", {}), verbose=True)))
 
 def cmd_project_resource_add(args):
+    idem = _idem_kw(args)
     project_id = resolve_resource_project(args.project)
     body = _resource_body_from_args(args, args.resource_kind)
-    status, text = resource_api("POST", f"/projects/{project_id}/resources", body)
+    status, text = resource_api("POST", f"/projects/{project_id}/resources", body, **idem)
     def render(envelope):
         resource = envelope.get("resource", {})
         print(f"✅ Added {resource.get('kind', args.resource_kind)} resource: {resource.get('name', args.name)}")
@@ -2979,6 +3335,14 @@ def cmd_project_resource_replace(args):
               f"with {replacement.get('name', '')} [{replacement.get('kind', '?')}]")
         print(f"   New ID: {replacement.get('id', '')}   Revision: {replacement.get('revision', '')}")
     finish_resource_call(status, text, False, render)
+
+def cmd_project_brief(args):
+    # Fetch the canonical bounded brief; never assemble context locally.
+    project_id = resolve_resource_project(args.project)
+    status, text = resource_api("POST", f"/projects/{project_id}/brief", {})
+    def render(envelope):
+        print(envelope.get("brief", ""))
+    finish_resource_call(status, text, args.json, render)
 
 def cmd_project_context(args):
     project_id = resolve_resource_project(args.project)
@@ -3241,17 +3605,18 @@ def cmd_report_list(args):
     """List reports."""
     params = []
     if hasattr(args, 'tags') and args.tags:
-        params.append(f"tags={args.tags}")
+        params.append(("tags", args.tags))
     if hasattr(args, 'project') and args.project:
         project_id = resolve_project_id(args.project)
-        params.append(f"project_id={project_id}")
+        params.append(("project_id", project_id))
     if hasattr(args, 'pinned') and args.pinned:
-        params.append("pinned=true")
+        params.append(("pinned", "true"))
     limit = getattr(args, 'limit', 20) or 20
-    params.append(f"limit={limit}")
-    params.append("offset=0")
+    params.append(("limit", str(limit)))
+    params.append(("offset", str(getattr(args, 'offset', 0) or 0)))
+    params.extend(_report_filter_params(args))
 
-    query = "&".join(params)
+    query = urllib.parse.urlencode(params)
     result = api("GET", f"/reports?{query}")
     reports = result.get("reports", [])
     total = result.get("total", len(reports))
@@ -3287,7 +3652,8 @@ def cmd_report_list(args):
         print(f"  {rid:<10} {pinned}{title:<40} {date_str:<12} {tags:<20} {project:<15}")
 
     if result.get("hasMore"):
-        print(f"\n  ... and more. Use --limit to see more.")
+        next_offset = (getattr(args, 'offset', 0) or 0) + len(reports)
+        print(f"\n  ... and more. Next page: --offset {next_offset}")
     print()
 
 def load_report_handover(args):
@@ -3321,6 +3687,7 @@ def load_report_handover(args):
 
 def cmd_report_create(args):
     """Create a report."""
+    idem = _idem_kw(args)
     if not args.content and not args.file:
         print("❌ --content or --file is required", file=sys.stderr)
         sys.exit(1)
@@ -3361,7 +3728,7 @@ def cmd_report_create(args):
     if handover is not None:
         data["handover"] = handover
 
-    result = api("POST", "/reports", data)
+    result = api("POST", "/reports", data, **idem)
     report = result.get("report", result)
 
     full_id = report.get('id', 'N/A')
@@ -3531,16 +3898,19 @@ def cmd_report_unarchive(args):
 
 def cmd_report_search(args):
     """Search reports."""
-    params = [f"q={urllib.parse.quote(args.query)}"]
+    params = [("q", args.query)]
     if hasattr(args, 'tags') and args.tags:
-        params.append(f"tags={args.tags}")
+        params.append(("tags", args.tags))
     if hasattr(args, 'project') and args.project:
         project_id = resolve_project_id(args.project)
-        params.append(f"project_id={project_id}")
+        params.append(("project_id", project_id))
     limit = getattr(args, 'limit', 20) or 20
-    params.append(f"limit={limit}")
+    params.append(("limit", str(limit)))
+    if getattr(args, 'offset', None):
+        params.append(("offset", str(args.offset)))
+    params.extend(_report_filter_params(args))
 
-    query = "&".join(params)
+    query = urllib.parse.urlencode(params)
     result = api("GET", f"/reports?{query}")
     reports = result.get("reports", [])
     total = result.get("total", len(reports))
@@ -3761,6 +4131,10 @@ def format_skill(t, verbose=False):
     
     if verbose:
         line += f"\n     ID: {t['id']}"
+        if t.get("owner_principal_id"):
+            owner = t.get("owner_display_name") or t["owner_principal_id"]
+            kind = " (group)" if t.get("owner_kind") == "group" else ""
+            line += f"\n     Owner: {owner}{kind}"
         if t.get("description"):
             desc = t["description"][:120]
             line += f"\n     {desc}{'...' if len(t.get('description', '')) > 120 else ''}"
@@ -3800,6 +4174,9 @@ def cmd_skill_list(args):
             params["tag"] = args.tag
         if args.search:
             params["search"] = args.search
+        # Card d67e6990: every owner's drafts (root or skills:admin only).
+        if getattr(args, "all_owners", False):
+            params["owner"] = "all"
 
         qs = "&".join(f"{k}={urllib.parse.quote(v)}" for k, v in params.items())
         path = f"/skills?{qs}" if qs else "/skills"
@@ -3907,6 +4284,28 @@ def cmd_skill_search(args):
         print(format_skill(t, verbose=True))
     print()
 
+def _apply_skill_md_file(args, data):
+    """`--skill-md-file`: the file's exact bytes become the Version's SKILL.md.
+
+    REST already accepts `skill_md` (routes/skills.ts) and the registry digests
+    exactly what it stores, so a reviewed file in the repository publishes
+    with the digest a reader can recompute from that file. The name in its
+    frontmatter must match the catalog name; the board refuses otherwise.
+    """
+    path = getattr(args, "skill_md_file", None)
+    if not path:
+        return False
+    if getattr(args, "usage", None) or getattr(args, "usage_file", None):
+        print("❌ --skill-md-file carries the whole document; drop --usage/--usage-file", file=sys.stderr)
+        sys.exit(2)
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            data["skill_md"] = handle.read()
+    except FileNotFoundError:
+        print(f"❌ File not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    return True
+
 def cmd_skill_create(args):
     """Create a new skill."""
     if not args.name:
@@ -3919,7 +4318,9 @@ def cmd_skill_create(args):
         data["category"] = args.category
     if args.description:
         data["description"] = args.description
-    if args.usage:
+    if _apply_skill_md_file(args, data):
+        pass  # the whole document; --usage and --usage-file were refused with it
+    elif args.usage:
         data["usage_instructions"] = args.usage
     elif args.usage_file:
         try:
@@ -3947,7 +4348,9 @@ def cmd_skill_update(args):
         data["category"] = args.category
     if args.description:
         data["description"] = args.description
-    if args.usage:
+    if _apply_skill_md_file(args, data):
+        pass  # the whole document; --usage and --usage-file were refused with it
+    elif args.usage:
         data["usage_instructions"] = args.usage
     elif args.usage_file:
         try:
@@ -4014,6 +4417,37 @@ def cmd_skill_audience(args):
     updated = result.get("skill", {})
     audience = "global" if updated.get("is_global") else "project pins only"
     print(f"✅ Skill {skill['name']} audience: {audience}")
+
+def cmd_skill_owner(args):
+    """Assign or change a Skill's owner (card d67e6990; skills:admin).
+
+    A full Skill id is read by id, which an administrator may do for any
+    owner's draft; a name or id prefix is resolved over every owner's drafts
+    (owner=all). The owner must be an active person Account; moving a Skill
+    into or out of a Group is a dashboard step-up act (AZ-A12 clause 9(e)).
+    """
+    if not args.reason or not args.reason.strip():
+        print("❌ --reason is required", file=sys.stderr)
+        sys.exit(2)
+    ref = args.skill
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", ref):
+        skill = api("GET", f"/skills/{ref}").get("skill") or {}
+    else:
+        candidates = api("GET", "/skills?owner=all").get("skills", [])
+        matches = [t for t in candidates if t["name"].lower() == ref.lower() or t["id"].startswith(ref)]
+        if len(matches) != 1:
+            print(f"❌ {len(matches)} Skills match \"{ref}\"; pass the full Skill id", file=sys.stderr)
+            sys.exit(1)
+        skill = matches[0]
+    result = api("PUT", f"/skills/{skill['id']}/owner",
+                 {"ownerPrincipalId": args.owner, "reason": args.reason.strip()},
+                 headers={"If-Match": skill["revision"]})
+    updated = result.get("skill", {})
+    owner = updated.get("owner_display_name") or updated.get("owner_principal_id") or args.owner
+    if result.get("changed") is False:
+        print(f"✅ Skill {updated.get('name', skill['name'])} already owned by {owner}")
+    else:
+        print(f"✅ Skill {updated.get('name', skill['name'])} owner: {owner}")
 
 def cmd_skill_context(args):
     """Preview effective skill context for a project."""
@@ -4494,6 +4928,7 @@ def cmd_phase_get(args):
 
 def cmd_phase_create(args):
     """Create a Phase under an active Project."""
+    idem = _idem_kw(args)
     data = {"projectId": resolve_project_id(args.project), "name": args.name}
     if getattr(args, "goal", None) is not None:
         data["goal"] = args.goal
@@ -4501,7 +4936,7 @@ def cmd_phase_create(args):
         data["status"] = args.status
     if getattr(args, "position", None) is not None:
         data["position"] = args.position
-    status, text = resource_api("POST", "/phases", data)
+    status, text = resource_api("POST", "/phases", data, **idem)
     def render(envelope):
         ph = envelope.get("phase", {})
         print(f"✅ Created phase: {ph.get('name')}")
@@ -4623,22 +5058,267 @@ def cmd_home_group_clear(args):
     status, text = resource_api("DELETE", "/principals/me/home-group")
     finish_resource_call(status, text, getattr(args, "json", False), _render_home_group)
 
+# ── Card 549cc51f · the shared-area writer list ──────────────────────────────
+#
+# `relayhall shared-writers list | add <account> | remove <account>`. A
+# knowledge source's organisation-wide shared area is readable by everyone the
+# source admits and writable only by the Accounts on its writer list.
+#
+# `list` works for any authenticated caller holding services:read. `add` and
+# `remove` are LOGIN-SESSION acts for root or an administrator (owner rulings
+# E298, E299): sign in with `relayhall login` first. An `rh_` credential in
+# RELAYHALL_TOKEN never performs them, and the CLI says so before anything is
+# sent. Each change needs a reason and a step-up: the CLI asks for your password
+# (or reads RELAYHALL_PASSWORD), mints a single-use token bound to the act and
+# the Account at POST /auth/step-up, exactly as `agent mint` does, and sends the
+# change once with a fresh retry key. The Account is an EXACT UUID: this verb
+# never resolves a name, a handle or a prefix.
+
+SHARED_WRITER_STEP_UP_ACTIONS = {
+    "add": "knowledge.shared-writer.add",
+    "remove": "knowledge.shared-writer.remove",
+}
+
+SHARED_WRITER_HINTS = {
+    "SHARED_WRITER_REQUIRES_SESSION": "Changing the writer list is a login-session act: run `relayhall login` first; bearer credentials never perform it.",
+    "SHARED_WRITER_REQUIRES_ADMINISTRATOR": "Only root or an administrator (admin, operator, orchestrator) changes the writer list.",
+    "SHARED_WRITER_NOT_AN_ACCOUNT": "Only a person's Account can be listed, never a connection, an agent, a Group or a service identity.",
+    "SHARED_WRITER_SOURCE_REQUIRED": "More than one knowledge source accepts writes: name one with --source.",
+    "STEP_UP_REQUIRED": "The step-up was not accepted for this act and Account; run the verb again.",
+}
+
+
+def _shared_writer_query(args):
+    source = getattr(args, "source", None)
+    return f"?source={_exact_uuid(source, '--source')}" if source else ""
+
+
+def _render_shared_writers(envelope):
+    source = envelope.get("source") or {}
+    writers = envelope.get("writers") or []
+    print(f"Shared area of {source.get('name') or '-'} ({source.get('slug') or '-'}), scope {envelope.get('scope') or '-'}")
+    print(f"You can write it: {'yes' if envelope.get('youCanWrite') else 'no'}")
+    if not writers:
+        print("Nobody can write this shared area.")
+        return
+    for writer in writers:
+        line = f"  {writer.get('accountId')}  {writer.get('label') or '-'}"
+        if writer.get("expiresAt"):
+            line += f"  (expires {writer['expiresAt']})"
+        if writer.get("active") is False:
+            line += "  [not active: the source does not receive it]"
+        print(line)
+
+
+def _shared_writer_refuse_bearer():
+    """An `rh_` credential never performs a writer-list change: refuse before anything is sent."""
+    token = get_token()
+    if isinstance(token, str) and token.startswith("rh_"):
+        print("❌ Changing the shared-area writer list is a login-session act: an rh_ credential never performs it.",
+              file=sys.stderr)
+        print("   Run `relayhall login` as root or an administrator, unset RELAYHALL_TOKEN, and try again.", file=sys.stderr)
+        sys.exit(3)
+
+
+def _shared_writer_change(args, kind):
+    import getpass
+    import uuid
+    account_id = _exact_uuid(args.account_id, "account")
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not 20 <= len(reason) <= 2000:
+        resource_usage_error("--reason must be 20-2000 characters; it is kept in the audit record")
+    body = {"accountId": account_id, "reason": reason}
+    if getattr(args, "source", None):
+        body["source"] = _exact_uuid(args.source, "--source")
+    if kind == "add" and getattr(args, "expires_at", None):
+        body["expiresAt"] = args.expires_at
+    _shared_writer_refuse_bearer()
+    password = getattr(args, "password", None) or os.environ.get("RELAYHALL_PASSWORD") or getpass.getpass("Password (step-up): ")
+    status, text = resource_api("POST", "/auth/step-up", {
+        "password": password, "action": SHARED_WRITER_STEP_UP_ACTIONS[kind], "targetId": account_id})
+    try:
+        step = json.loads(text)
+    except (ValueError, TypeError):
+        step = {}
+    if status is None or status >= 400 or not isinstance(step, dict) or not step.get("stepUpToken"):
+        message = (step.get("message") or step.get("error")) if isinstance(step, dict) else None
+        print(f"❌ Step-up refused: {message or 'HTTP ' + str(status)}", file=sys.stderr)
+        print("   The writer list changes only in a login session: run `relayhall login` first.", file=sys.stderr)
+        sys.exit(3)
+    body["stepUpToken"] = step["stepUpToken"]
+    path = "/knowledge-shared-writers" if kind == "add" else "/knowledge-shared-writers/remove"
+    status, text = resource_api("POST", path, body, headers={"Idempotency-Key": str(uuid.uuid4())})
+    if status is not None and status >= 400 and not getattr(args, "json", False):
+        try:
+            code = json.loads(text).get("code")
+        except (ValueError, TypeError, AttributeError):
+            code = None
+        if code in SHARED_WRITER_HINTS:
+            print(f"   {SHARED_WRITER_HINTS[code]}", file=sys.stderr)
+
+    def render(envelope):
+        verb = "Added" if kind == "add" else "Removed"
+        print(f"✅ {verb} {account_id} {'to' if kind == 'add' else 'from'} the shared-area writer list")
+        print(f"   before: {', '.join(envelope.get('before') or []) or '(none)'}")
+        print(f"   after:  {', '.join(envelope.get('after') or []) or '(none)'}")
+        print("   The source applies the change at its next snapshot (about 20 seconds).")
+
+    finish_resource_call(status, text, getattr(args, "json", False), render)
+
+
+def cmd_shared_writers_list(args):
+    """List the Accounts that may write a knowledge source's shared area (services:read)."""
+    status, text = resource_api("GET", f"/knowledge-shared-writers{_shared_writer_query(args)}")
+    finish_resource_call(status, text, getattr(args, "json", False), _render_shared_writers)
+
+
+def cmd_shared_writers_add(args):
+    """Add an Account to the writer list (root or administrator login session; reason; step-up)."""
+    _shared_writer_change(args, "add")
+
+
+def cmd_shared_writers_remove(args):
+    """Remove an Account from the writer list (root or administrator login session; reason; step-up)."""
+    _shared_writer_change(args, "remove")
+
+
+# ── LENSES-c c1-A (card 46cfbd1d) · Group roles: owners and managers ──────────
+#
+# `relayhall group steward list|add|remove`. A Group role is an `owner` or
+# `manager` row, one per Account per Group, appointed by hand only. Appointing
+# and removing are ROOT LOGIN-SESSION acts: the /groups ceiling is root, and the
+# handler refuses a bearer credential holding root REQUIRES_LOGIN_SESSION
+# (AZ-18). Sign in with `relayhall login` first; an `rh_` credential in
+# RELAYHALL_TOKEN never performs them. The root path carries NO step-up (the
+# design rules none there), so neither verb asks for a password, exactly as
+# `credential revoke` and `credential rotate` do not. Reading the roles rides
+# principals:read.
+#
+# Targets are EXACT UUIDs: these verbs never resolve a name, a handle or a
+# prefix, because the wrong Group or Account is the one mistake a role act
+# cannot afford. The server's refusal is printed verbatim with its code.
+# There is deliberately no owner verb here: an owner's removal of a manager
+# row is a dashboard act under step-up, and no route lets an owner appoint.
+
+GROUP_STEWARD_ROLES_CLI = ("owner", "manager")
+
+GROUP_STEWARD_INERT = {
+    "principal_inactive": "the holder is not active (disabled or terminated)",
+    "elevated_role": "the holder now holds an elevated role (admin, operator or orchestrator)",
+    "not_a_member": "the holder is not a member of the Group",
+}
+
+
+def _exact_uuid(value, what):
+    """Refuse anything but an exact UUID, before any request leaves."""
+    if not isinstance(value, str) or not UUID_PATTERN.fullmatch(value):
+        resource_usage_error(
+            f"{what} must be an exact UUID (got {value!r}); this verb never resolves names, handles or prefixes")
+    return value.lower()
+
+
+def _steward_flag(steward):
+    if steward.get("live"):
+        return "live"
+    reason = steward.get("inertReason") or "unknown"
+    return f"inert ({reason})"
+
+
+def _render_group_steward(steward):
+    print(f"{steward.get('role') or '-':<8} {steward.get('accountPrincipalId')}  {steward.get('handle') or '-'}"
+          f"  [{steward.get('kind') or '-'}, {steward.get('status') or '-'}]  {_steward_flag(steward)}")
+    if not steward.get("live"):
+        reason = steward.get("inertReason") or "unknown"
+        print(f"    why inert: {GROUP_STEWARD_INERT.get(reason, reason)} - an inert role confers nothing")
+    print(f"    appointed by {steward.get('appointedByPrincipalId') or '-'} at {steward.get('appointedAt') or '-'}")
+
+
+def _render_group_stewards(envelope):
+    stewards = envelope.get("stewards") or []
+    if not stewards:
+        print("No Group roles in this Group.")
+        return
+    for steward in stewards:
+        _render_group_steward(steward)
+
+
+def cmd_group_steward_list(args):
+    """List a Group's roles, owners first, each live or inert with its reason."""
+    group_id = _exact_uuid(args.group_id, "group-id")
+    status, text = resource_api("GET", f"/groups/{group_id}/stewards")
+    finish_resource_call(status, text, getattr(args, "json", False), _render_group_stewards)
+
+
+def cmd_group_steward_add(args):
+    """Appoint a Group role (root login session; no step-up)."""
+    group_id = _exact_uuid(args.group_id, "group-id")
+    account_id = _exact_uuid(args.account_id, "account-id")
+    if args.role not in GROUP_STEWARD_ROLES_CLI:
+        resource_usage_error(f"--role must be one of: {', '.join(GROUP_STEWARD_ROLES_CLI)}")
+    status, text = resource_api(
+        "POST", f"/groups/{group_id}/stewards", {"accountPrincipalId": account_id, "role": args.role})
+
+    def render(envelope):
+        steward = envelope.get("steward") or {}
+        print(f"✅ Appointed {steward.get('role') or args.role} in Group {group_id}")
+        _render_group_steward(steward)
+        if not steward.get("live"):
+            print("   The row is recorded but inert until the condition above changes.")
+
+    finish_resource_call(status, text, getattr(args, "json", False), render)
+
+
+def cmd_group_steward_remove(args):
+    """Remove a Group role row, owner or manager, live or inert (root login session; no step-up)."""
+    group_id = _exact_uuid(args.group_id, "group-id")
+    account_id = _exact_uuid(args.account_id, "account-id")
+    if not confirm_prompt(f"Remove the Group role of {account_id} in Group {group_id}? [y/N] "):
+        print("Cancelled. Nothing was sent.", file=sys.stderr)
+        sys.exit(1)
+    status, text = resource_api("DELETE", f"/groups/{group_id}/stewards/{account_id}")
+
+    def render(envelope):
+        removed = envelope.get("removed") or {}
+        print(f"✅ Removed the {removed.get('role') or '-'} role of {removed.get('accountPrincipalId') or account_id}"
+              f" in Group {group_id}")
+
+    finish_resource_call(status, text, getattr(args, "json", False), render)
+
+
 def cmd_grant_list(args):
-    """List object-level grants (owner plane). Filters: --grantee, --resource-type."""
+    """List object-level grants (owner plane). Filters: --grantee, --resource-type.
+
+    Card ff410dc4 (E407 item 1): --limit or --cursor reads ONE page (newest
+    first unless --sort says otherwise) and prints the next cursor; --made,
+    --verb, --expiry, --target, --q and --sort narrow or order it. Every flag
+    is an additive query parameter of GET /grants, so the bare command is the
+    unpaged list it always was."""
+    from urllib.parse import urlencode
     query = []
     if getattr(args, "grantee", None):
-        query.append(f"granteeId={args.grantee}")
+        query.append(("granteeId", args.grantee))
     if getattr(args, "resource_type", None):
-        query.append(f"resourceType={args.resource_type}")
-    suffix = ("?" + "&".join(query)) if query else ""
+        query.append(("resourceType", args.resource_type))
+    for flag, key in (("verb", "verb"), ("made", "made"), ("expiry", "expiry"), ("target", "target"),
+                      ("q", "q"), ("sort", "sort"), ("limit", "limit"), ("cursor", "cursor")):
+        value = getattr(args, flag, None)
+        if value is not None and value != "":
+            query.append((key, str(value)))
+    suffix = ("?" + urlencode(query)) if query else ""
     status, text = resource_api("GET", f"/grants{suffix}")
     def render(envelope):
         grants = envelope.get("grants", [])
-        print(f"🔑 Grants ({len(grants)})")
+        page = envelope.get("pagination")
+        total = f" of {page.get('total')}" if isinstance(page, dict) and page.get("total") is not None else ""
+        print(f"🔑 Grants ({len(grants)}{total})")
         for g in grants:
             target = g.get("resourceId") or "*"
             expiry = f"  expires {g['expiresAt']}" if g.get("expiresAt") else ""
-            print(f"   {g.get('id', '')[:8]}  {g.get('granteeId', '')[:8]} → {g.get('resourceType')}:{target[:8] if target != '*' else '*'} [{g.get('verb')}]{expiry}")
+            made = g.get("madeBy") if isinstance(g.get("madeBy"), dict) else None
+            origin = f"  {made.get('class')}{'/' + made['via'] if made.get('via') else ''}" if made else ""
+            print(f"   {g.get('id', '')[:8]}  {g.get('granteeId', '')[:8]} → {g.get('resourceType')}:{target[:8] if target != '*' else '*'} [{g.get('verb')}]{expiry}{origin}")
+        if isinstance(page, dict) and page.get("nextCursor"):
+            print(f"   more: --cursor {page['nextCursor']}" + (f" --sort={page['sort']}" if page.get("sort") else ""))
     finish_resource_call(status, text, getattr(args, "json", False), render)
 
 def cmd_grant_add(args):
@@ -4657,8 +5337,17 @@ def cmd_grant_add(args):
     finish_resource_call(status, text, getattr(args, "json", False), render)
 
 def cmd_grant_remove(args):
-    """Revoke a grant by ID (owner plane). Revocation is deletion."""
+    """Revoke a grant by ID (owner plane). Revocation is deletion.
+
+    Owner ruling E418(b): DELETE /grants/{id} needs a login session and a
+    step-up bound to (grant.revoke, id), so the board refuses every bearer
+    credential SESSION_ONLY. This command sends the request and prints the
+    board's answer; revoke on the Access page, which asks you to confirm it
+    is you. Bulk clean-up of redundant grants is on that page too (E413).
+    """
     status, text = resource_api("DELETE", f"/grants/{args.grant_id}")
+    if status == 403 and "SESSION_ONLY" in (text or ""):
+        print("Revoking a grant is a signed-in act with a step-up: use Settings → Access grants on the board.", file=sys.stderr)
     def render(envelope):
         print(f"✅ Revoked grant {args.grant_id[:8]}")
     finish_resource_call(status, text, getattr(args, "json", False), render)
@@ -4733,6 +5422,7 @@ def cmd_agent_mint(args):
         print(f"   {line}")
     print("   MCP config (generic stdio):")
     print("   " + json.dumps(onboarding.get("mcpConfig", {}).get("generic", {}), separators=(",", ":")))
+    _print_bootstrap_prompt(onboarding, indent="   ")
     brief = onboarding.get("brief")
     if brief:
         out_path = getattr(args, "brief_out", None)
@@ -4854,7 +5544,7 @@ _relayhall_completion() {
             COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
             ;;
         project)
-            local project_cmds="get create update archive unarchive delete stats context compatibility-status resource"
+            local project_cmds="get create update archive unarchive delete stats brief context compatibility-status resource"
             if [ $COMP_CWORD -eq 2 ]; then
                 COMPREPLY=( $(compgen -W "${project_cmds}" -- ${cur}) )
             fi
@@ -5075,7 +5765,544 @@ def _add_resource_common_flags(parser, export_policy=True):
         parser.add_argument("--export-policy", dest="export_policy", choices=VALID_RESOURCE_EXPORT_POLICIES,
                             help="Whether the value may leave this installation (default installation-only)")
 
+# ─── Contract parity verbs (card d56e58e1) ───
+#
+# Each verb below is a thin composition of ONE governed REST route that an MCP
+# tool already composes; the route stays the gate and its refusal (with its
+# stable code) is what the caller sees. docs/cli.md maps verb ↔ route ↔ tool.
+
+def _retry_key(value, flag="--idempotency-key"):
+    """Validate a retry key (16-128 characters, the MCP contract) or exit 2."""
+    if not isinstance(value, str) or not 16 <= len(value) <= 128:
+        print(f"❌ {flag} must contain 16-128 characters; keep the same value when retrying an uncertain write",
+              file=sys.stderr)
+        sys.exit(2)
+    return value
+
+
+def _idem_kw(args):
+    """{'headers': {'Idempotency-Key': key}} when --idempotency-key was given, else {}.
+
+    The header is OPTIONAL at REST (middleware/idempotency.ts) and REQUIRED on
+    the MCP tools, so a verb sends it exactly when the caller supplies one."""
+    key = getattr(args, "idempotency_key", None)
+    if key is None:
+        return {}
+    return {"headers": {"Idempotency-Key": _retry_key(key)}}
+
+
+def _add_idempotency_flag(parser, required=False):
+    parser.add_argument("--idempotency-key", dest="idempotency_key", required=required,
+                        help="Retry key (16-128 characters): send the SAME value again after an uncertain "
+                             "result and the board answers with the first outcome instead of writing twice")
+
+
+def _json_object_arg(value, flag):
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        print(f"❌ {flag} must be a JSON object", file=sys.stderr)
+        sys.exit(2)
+    return parsed
+
+
+def _json_object_file(path, flag):
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as error:
+        print(f"❌ {flag}: {error}", file=sys.stderr)
+        sys.exit(2)
+    if len(raw) > 8 * 1024 * 1024:
+        print(f"❌ {flag} exceeds 8MiB", file=sys.stderr)
+        sys.exit(2)
+    return _json_object_arg(raw.decode("utf-8"), flag)
+
+
+def _scim_heartbeat_hours(value):
+    """A positive whole number of hours, or none/null to keep claim-sync semantics."""
+    if str(value).strip().lower() in ("none", "null"):
+        return None
+    try:
+        hours = int(value)
+    except ValueError:
+        hours = 0
+    if hours < 1:
+        print("❌ --scim-heartbeat-interval-hours must be a positive whole number of hours, or none to clear it",
+              file=sys.stderr)
+        sys.exit(2)
+    return hours
+
+
+def _add_assignment_flags(parser):
+    parser.add_argument("--warrant", help="Warrant UUID the assignment's access travels on (with --service)")
+    parser.add_argument("--role-grant-expires-at", dest="role_grant_expires_at",
+                        help="When the assignment's grant rows expire (with --service, never with --warrant): "
+                             "an ISO-8601 instant, or a local wall clock with --role-grant-zone")
+    parser.add_argument("--role-grant-zone", dest="role_grant_zone",
+                        help="IANA zone for a local --role-grant-expires-at (sends {local, zone})")
+
+
+def _assignment_fields(args, data):
+    """executionWarrantId / roleGrantExpiresAt, exactly as POST /tasks, PATCH and recover read them."""
+    warrant = getattr(args, "warrant", None)
+    if warrant:
+        data["executionWarrantId"] = warrant
+    expires = getattr(args, "role_grant_expires_at", None)
+    zone = getattr(args, "role_grant_zone", None)
+    if zone and not expires:
+        print("❌ --role-grant-zone needs --role-grant-expires-at", file=sys.stderr)
+        sys.exit(2)
+    if expires:
+        data["roleGrantExpiresAt"] = {"local": expires, "zone": zone} if zone else expires
+
+
+def _add_report_page_flags(parser):
+    parser.add_argument("--offset", type=int, default=0, help="Rows to skip; pair with --limit to page")
+    parser.add_argument("--status", choices=["active", "archived"])
+    parser.add_argument("--updated-since", dest="updated_since", help="ISO-8601 instant")
+    parser.add_argument("--sort", choices=["updated_at", "created_at"])
+    parser.add_argument("--order", choices=["asc", "desc"])
+
+
+def _report_filter_params(args):
+    params = []
+    for flag, key in (("status", "status"), ("updated_since", "updated_since"), ("sort", "sort"), ("order", "order")):
+        value = getattr(args, flag, None)
+        if value:
+            params.append((key, value))
+    return params
+
+
+def _print_json(result):
+    print(json.dumps(result, indent=2, ensure_ascii=True))
+
+
+def cmd_task_stream(args):
+    task_id = resolve_task_id(args.id)
+    _print_json(api("GET", f"/tasks/{task_id}/stream"))
+
+
+def cmd_task_timeline(args):
+    task_id = resolve_task_id(args.id)
+    query = [(key, value) for key, value in (("filter", args.filter), ("before", args.before),
+                                             ("limit", None if args.limit is None else str(args.limit))) if value]
+    path = f"/tasks/{task_id}/timeline" + (f"?{urllib.parse.urlencode(query)}" if query else "")
+    _print_json(api("GET", path))
+
+
+def cmd_task_graph(args):
+    query = []
+    for flag, key in (("statuses", "statuses"), ("projects", "projects"), ("phases", "phaseIds"),
+                      ("priorities", "priorities"), ("tags", "tags")):
+        values = getattr(args, flag, None)
+        if values:
+            query.append((key, ",".join(values)))
+    for flag, key in (("q", "q"), ("lod", "lod"), ("updated_since", "updatedSince"), ("owner", "owner")):
+        value = getattr(args, flag, None)
+        if value:
+            query.append((key, value))
+    for flag, key in (("include_archived", "includeArchived"), ("mine", "mine"), ("unassigned", "unassigned"),
+                      ("without_usable_verifier", "verifierUnusable")):
+        if getattr(args, flag, False):
+            query.append((key, "true"))
+    path = "/tasks/graph" + (f"?{urllib.parse.urlencode(query)}" if query else "")
+    _print_json(api("GET", path))
+
+
+def cmd_task_success_criteria(args):
+    task_id = resolve_task_id(args.id)
+    if args.criterion:
+        criteria = list(args.criterion)
+    else:
+        criteria = _read_optional_text_arg(args.criteria, args.criteria_file)
+    api("PATCH", f"/tasks/{task_id}/success-criteria", {"successCriteria": criteria})
+    print(f"✅ Updated success criteria for Task {task_id}")
+
+
+def cmd_task_arm_or_park(args):
+    idem = _idem_kw(args)
+    task_id = resolve_task_id(args.id)
+    arm = args.command == "task-arm"
+    result = api("PATCH", f"/tasks/{task_id}", {"autoStart": arm}, **idem)
+    print(f"✅ Task {'armed' if arm else 'parked'} (read the Task for its current state)")
+    _print_json(result)
+
+
+def cmd_task_release(args):
+    task_id = resolve_task_id(args.id)
+    body = {"reason": args.reason} if args.reason else {}
+    _print_json(api("POST", f"/tasks/{task_id}/release", body))
+
+
+def cmd_task_recover(args):
+    task_id = resolve_task_id(args.id)
+    body = {"executionProfile": build_connector_profile(args)}
+    if args.reason:
+        body["reason"] = args.reason
+    _assignment_fields(args, body)
+    _print_json(api("POST", f"/tasks/{task_id}/recover", body))
+
+
+def cmd_lease(args):
+    task_id = resolve_task_id(args.id)
+    root = f"/tasks/orchestration/{task_id}"
+    if args.lease_command == "claim":
+        body = {} if args.lease_seconds is None else {"leaseSeconds": args.lease_seconds}
+        result = api("POST", f"{root}/claim", body)
+        print("Renew the Lease with 'relayhall lease renew' before it expires; nothing else renews it.", file=sys.stderr)
+    elif args.lease_command == "renew":
+        result = api("POST", f"{root}/lease/{args.lease_id}/heartbeat", {})
+    else:
+        body = {"reason": args.reason} if args.reason else {}
+        result = api("POST", f"{root}/lease/{args.lease_id}/release", body)
+    _print_json(result)
+
+
+def cmd_bulk_archive(args):
+    if not 1 <= len(args.ids) <= 200:
+        print("❌ bulk-archive names 1-200 Completed Tasks", file=sys.stderr)
+        sys.exit(2)
+    body = {"taskIds": resolve_task_id_list(args.ids)}
+    if args.reason:
+        body["reason"] = args.reason
+    _print_json(api("POST", "/tasks/bulk-archive", body))
+
+
+def cmd_session_brief(args):
+    result = api("POST", "/principals/me/brief", {})
+    if args.json:
+        _print_json(result)
+    else:
+        print(result.get("brief") or result.get("content") or "")
+
+
+def cmd_warrants(args):
+    result = api("GET", "/delegation/warrants")
+    if args.json:
+        _print_json(result)
+        return
+    warrants = result.get("warrants", [])
+    if not warrants:
+        print("No Warrants.")
+    for w in warrants:
+        print(f"{w.get('id', '')}  {str(w.get('status') or '-'):<10} {w.get('name') or w.get('title') or ''}")
+
+
+def cmd_principal_remediation_queue(args):
+    result = api("GET", "/principals/remediation-queue")
+    if args.json:
+        _print_json(result)
+        return
+    queue = result.get("queue", [])
+    if not queue:
+        print("Remediation queue is empty.")
+    for row in queue:
+        signal = row.get("deprovisionSignal")
+        print(f"{row.get('principalId', '')}  {row.get('kind') or '-':<8} {row.get('handle', ''):<28} "
+              f"{row.get('status') or '-':<9} live-credentials={row.get('liveCredentials', 0)}"
+              + (f"  deprovision={signal}" if signal else "")
+              + ("  legacy" if row.get("legacyIdentity") else ""))
+        if row.get("reason"):
+            print(f"    {row['reason']}")
+
+
+def cmd_service_review_requests(args):
+    status, text = resource_api("GET", f"/services/{args.service}/review-requests")
+    finish_resource_call(status, text, True)
+
+
+def cmd_credential_reveal(args):
+    _print_json(api("POST", f"/credentials/{args.credential_id}/reveal", {}))
+
+
+def cmd_access_request(args):
+    action = args.access_action
+    base = "/delegation/access-requests"
+    if action == "preview":
+        query = [(key, getattr(args, flag)) for flag, key in (
+            ("target_type", "targetType"), ("target_id", "targetId"), ("object_type", "objectType"),
+            ("source", "sourceId"), ("grantee", "granteePrincipalId"), ("grantee_type", "granteeType"))
+            if getattr(args, flag, None)]
+        result = api("GET", f"{base}/preview" + (f"?{urllib.parse.urlencode(query)}" if query else ""))
+    elif action == "file":
+        body = {"kind": args.kind}
+        for flag, key in (("target_type", "targetType"), ("target_id", "targetId"), ("grantee", "granteePrincipalId"),
+                          ("grantee_type", "granteeType"), ("transport", "requestedTransport"), ("label", "label"),
+                          ("reason", "reason"), ("related_task", "relatedTaskId"), ("related_phase", "relatedPhaseId"),
+                          ("expires_at", "requestedExpiresAt")):
+            value = getattr(args, flag, None)
+            if value:
+                body[key] = value
+        if args.change_file:
+            body["change"] = _json_object_file(args.change_file, "--change-file")
+        if args.rules_file:
+            try:
+                rules = json.loads(Path(args.rules_file).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                print(f"❌ --rules-file: {error}", file=sys.stderr)
+                sys.exit(2)
+            body["requestedRules"] = rules
+        if args.scope:
+            body["requestedScopes" if args.kind == "credential" else "addScopes"] = list(args.scope)
+        if args.kind == "authority-edit":
+            body["object"] = {"type": "credential"}
+        result = api("POST", base, body)
+    elif action == "status":
+        if args.approval:
+            result = api("GET", f"{base}/{args.approval}")
+        else:
+            filters = [(key, getattr(args, flag)) for flag, key in (("status", "status"), ("kind", "kind"))
+                       if getattr(args, flag, None)]
+            if args.kind:
+                result = api("GET", f"{base}?{urllib.parse.urlencode(filters)}")
+            else:
+                # As relayhall_access_request status: every kind, the caller's
+                # agent-mint requests (their own kind=agent-mint list) beside it.
+                suffix = f"?{urllib.parse.urlencode(filters)}" if filters else ""
+                others = api("GET", f"{base}{suffix}")
+                mints = api("GET", f"{base}?{urllib.parse.urlencode(filters + [('kind', 'agent-mint')])}")
+                listed = list(others.get("approvals") or []) + list(mints.get("approvals") or [])
+                listed.sort(key=lambda row: str(row.get("requestedAt") or ""), reverse=True)
+                result = {"success": True, "approvals": listed}
+    else:
+        result = api("POST", f"{base}/{args.approval_id}/{action}", {})
+    _print_json(result)
+
+
+_NATIVE_EXECUTION_ACTIONS = ["list", "open", "authorize-launch", "heartbeat", "attest", "close", "cancel", "reconcile"]
+_NATIVE_REVIEW_ACTIONS = ["inputs", "list", "request", "lease", "attest", "verdict", "uncertain", "reconcile", "cancel"]
+
+
+def cmd_native_execution_or_review(args):
+    task_id = resolve_task_id(args.id)
+    action = args.action
+    if args.command == "native-execution":
+        root = f"/tasks/{task_id}/native-executions"
+        reads, collection, item_id, flag = ("list",), ("list", "open"), args.execution_id, "--execution-id"
+    else:
+        root = f"/tasks/{task_id}/native-reviews"
+        reads, collection, item_id, flag = ("inputs", "list"), ("inputs", "list", "request"), args.review_id, "--review-id"
+    if action not in collection and not item_id:
+        print(f"❌ {action} needs {flag}", file=sys.stderr)
+        sys.exit(2)
+    if action == "inputs":
+        path = f"{root}/inputs"
+    elif action in collection:
+        path = root
+    else:
+        path = f"{root}/{item_id}/{action}"
+    if action in reads:
+        result = api("GET", path)
+    else:
+        payload = _json_object_file(args.payload_file, "--payload-file") if args.payload_file else {}
+        result = api("POST", path, payload)
+    _print_json(result)
+
+
+def cmd_knowledge_write(args):
+    action = args.knowledge_command
+    if action == "propose":
+        body = {"title": args.title, "content": _read_optional_text_arg(args.content, args.content_file)}
+        if args.source:
+            body["source"] = args.source
+        if args.note_type:
+            body["noteType"] = args.note_type
+        if args.tags:
+            body["tags"] = list(args.tags)
+        if args.target:
+            body["target"] = args.target if args.target in ("default", "personal") else {"compartmentId": args.target}
+        if args.task:
+            body["taskId"] = args.task
+        if args.basis:
+            body["basis"] = list(args.basis)
+        if args.revision_of:
+            body["revisionOf"] = args.revision_of
+        if args.expected_revision:
+            body["expectedRevision"] = args.expected_revision
+        result = api("POST", "/knowledge-writes/propose", body)
+    elif action == "preview":
+        body = {"proposalId": args.proposal_id}
+        if args.source:
+            body["source"] = args.source
+        result = api("POST", "/knowledge-writes/preview", body)
+    else:
+        idem = {"headers": {"Idempotency-Key": _retry_key(args.idempotency_key)}}
+        body = {"proposalId": args.proposal_id, "previewDigest": args.preview_digest,
+                "expectedRevision": args.expected_revision}
+        if args.source:
+            body["source"] = args.source
+        result = api("POST", "/knowledge-writes/commit", body, **idem)
+    _print_json(result)
+
+
+def add_parity_parsers(sub):
+    """Parsers for the contract-parity verbs; returns nothing (dispatch is by command name)."""
+    p = sub.add_parser("task-stream", help="Read a Task's attributed stream (GET /tasks/{id}/stream)")
+    p.add_argument("id")
+
+    p = sub.add_parser("task-timeline", help="Read a Task's merged timeline, paged by --before")
+    p.add_argument("id")
+    p.add_argument("--filter", choices=["all", "handover", "system"])
+    p.add_argument("--before", help="nextCursor from the previous page")
+    p.add_argument("--limit", type=int, help="Page size (the board caps it at 50)")
+
+    p = sub.add_parser("task-graph", help="Read the scoped Task graph (GET /tasks/graph) as JSON")
+    p.add_argument("--status", dest="statuses", action="append", choices=VALID_STATUSES)
+    p.add_argument("--project", dest="projects", action="append", help="Project name or id (repeatable)")
+    p.add_argument("--phase", dest="phases", action="append", help="Phase UUID, or null for the unphased backlog (repeatable)")
+    p.add_argument("--priority", dest="priorities", action="append", choices=PRIORITIES)
+    p.add_argument("--tag", dest="tags", action="append")
+    p.add_argument("--q", help="Free-text query over title and description")
+    p.add_argument("--lod", choices=["task", "project"])
+    p.add_argument("--updated-since", dest="updated_since", help="Delta read: generatedAt of an earlier read")
+    p.add_argument("--include-archived", dest="include_archived", action="store_true")
+    p.add_argument("--mine", action="store_true")
+    p.add_argument("--unassigned", action="store_true")
+    p.add_argument("--owner", help="Assignee handle")
+    p.add_argument("--without-usable-verifier", dest="without_usable_verifier", action="store_true")
+
+    p = sub.add_parser("task-success-criteria", help="Write the Verifier-owned success criteria")
+    p.add_argument("id")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--criterion", action="append", help="One criterion (repeatable; sends a list)")
+    group.add_argument("--criteria", help="The criteria as one text")
+    group.add_argument("--criteria-file", help="Read the criteria text from a file")
+
+    for verb, text in (("task-arm", "Arm a Task: allow execution eligibility (does not claim or move it)"),
+                       ("task-park", "Park a Task: remove execution eligibility (keeps its Assignee and status)")):
+        p = sub.add_parser(verb, help=text)
+        p.add_argument("id")
+        _add_idempotency_flag(p, required=True)
+
+    p = sub.add_parser("task-release", help="Release your claim on a Task")
+    p.add_argument("id")
+    p.add_argument("--reason")
+
+    p = sub.add_parser("task-recover", help="Force-release and reassign a Task you shepherd to a Connector")
+    p.add_argument("id")
+    p.add_argument("--service", required=True, help="Connector (registered Service slug or UUID) the work restarts on")
+    p.add_argument("--descriptor-version")
+    p.add_argument("--option", action="append", help="key=value (exact string) or key:=json (repeatable)")
+    p.add_argument("--parameter", action="append", help="optionKey.paramKey=value or :=json (repeatable)")
+    p.add_argument("--reason")
+    _add_assignment_flags(p)
+
+    p = sub.add_parser("lease", help="Orchestration-plane Lease: claim, renew, release")
+    lease_sub = p.add_subparsers(dest="lease_command", required=True)
+    q = lease_sub.add_parser("claim")
+    q.add_argument("id")
+    q.add_argument("--lease-seconds", dest="lease_seconds", type=int)
+    q = lease_sub.add_parser("renew")
+    q.add_argument("id")
+    q.add_argument("lease_id")
+    q = lease_sub.add_parser("release")
+    q.add_argument("id")
+    q.add_argument("lease_id")
+    q.add_argument("--reason")
+
+    p = sub.add_parser("bulk-archive", help="Archive up to 200 named Completed Tasks; results in input order")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("--reason")
+
+    p = sub.add_parser("session-brief", help="Compile YOUR session brief (the bootstrap act)")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("warrants", help="List the Warrants you may mint under")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("access-request", help="Preview, file, read, withdraw or collect access requests")
+    access_sub = p.add_subparsers(dest="access_action", required=True)
+    q = access_sub.add_parser("preview", help="What may be requested here (writes nothing)")
+    for flag in ("--target-type", "--target-id", "--source", "--grantee"):
+        q.add_argument(flag)
+    q.add_argument("--object-type", choices=["task", "phase", "project", "report", "skill", "personality", "service", "blueprint"])
+    q.add_argument("--grantee-type", choices=["principal", "group"])
+    q = access_sub.add_parser("file", help="File one request")
+    q.add_argument("--kind", required=True, choices=["change", "grant", "credential", "authority-edit"])
+    q.add_argument("--reason", required=True, help="20-2000 characters")
+    for flag in ("--target-type", "--target-id", "--grantee", "--label", "--related-task", "--related-phase", "--expires-at"):
+        q.add_argument(flag)
+    q.add_argument("--grantee-type", choices=["principal", "group"])
+    q.add_argument("--transport", choices=["any", "mcp", "api"])
+    q.add_argument("--change-file", help="JSON object: the requested values (kind change)")
+    q.add_argument("--rules-file", help="JSON array of rules (kind grant)")
+    q.add_argument("--scope", action="append", help="Scope (kind credential or authority-edit; repeatable)")
+    q = access_sub.add_parser("status", help="Read one request, or list yours")
+    q.add_argument("--approval")
+    q.add_argument("--kind", choices=["change", "grant", "credential", "authority-edit", "agent-mint"])
+    q.add_argument("--status", choices=["pending", "approved", "denied", "collected", "lapsed"])
+    for verb in ("withdraw", "collect"):
+        q = access_sub.add_parser(verb)
+        q.add_argument("approval_id")
+
+    for verb, actions, id_flag in (("native-execution", _NATIVE_EXECUTION_ACTIONS, "--execution-id"),
+                                   ("native-review", _NATIVE_REVIEW_ACTIONS, "--review-id")):
+        p = sub.add_parser(verb, help="Native coordination route; no provider launch or automatic retry")
+        p.add_argument("id")
+        p.add_argument("action", choices=actions)
+        p.add_argument(id_flag)
+        p.add_argument("--payload-file", help="Exact JSON object body")
+
+
+PARITY_COMMANDS = {
+    "task-stream": cmd_task_stream,
+    "task-timeline": cmd_task_timeline,
+    "task-graph": cmd_task_graph,
+    "task-success-criteria": cmd_task_success_criteria,
+    "task-arm": cmd_task_arm_or_park,
+    "task-park": cmd_task_arm_or_park,
+    "task-release": cmd_task_release,
+    "task-recover": cmd_task_recover,
+    "lease": cmd_lease,
+    "bulk-archive": cmd_bulk_archive,
+    "session-brief": cmd_session_brief,
+    "warrants": cmd_warrants,
+    "access-request": cmd_access_request,
+    "native-execution": cmd_native_execution_or_review,
+    "native-review": cmd_native_execution_or_review,
+}
+
 PRIORITIES = ("urgent", "high", "normal", "low", "someday")
+
+
+def cmd_knowledge(args):
+    if args.knowledge_command == "sources":
+        result = api("GET", "/knowledge-sources")
+    elif args.knowledge_command == "search":
+        body = {"protocol_version": 2, "q": args.query, "limitPerSource": args.limit_per_source, "timeoutMs": args.timeout_ms}
+        for name in ("sources", "kinds", "categories"):
+            value = getattr(args, name, None)
+            if value is not None:
+                body[name] = value
+        # Card 40e0e542: the default scope is current knowledge; the archive
+        # categories sources declare are searched only on this explicit opt-in.
+        if getattr(args, "include_archive", False):
+            body["includeArchive"] = True
+        result = api("POST", "/knowledge-queries", body)
+    elif args.knowledge_command == "get":
+        query = {"handle": args.handle}
+        if args.continuation: query["continuation"] = args.continuation
+        if args.if_none_match: query["ifNoneMatch"] = args.if_none_match
+        result = api("GET", "/knowledge-contents?" + urllib.parse.urlencode(query))
+    else:
+        raise SystemExit("Use knowledge sources, search or get")
+    # Coverage first and grouped native JSON; source-authored text stays escaped.
+    print(json.dumps(result, indent=2, ensure_ascii=True))
+
+def cli_version(script_path=None):
+    """The version of the checkout this script ships in: the `version` of
+    `backend/package.json` beside `cli/` (the release keeps it equal to the
+    release number). "unknown" outside a checkout. Read locally, never asked of
+    a board."""
+    here = os.path.dirname(os.path.realpath(str(script_path or __file__)))
+    try:
+        with open(os.path.join(here, os.pardir, "backend", "package.json"), encoding="utf-8") as handle:
+            version = json.load(handle).get("version")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+    return version if isinstance(version, str) and version else "unknown"
 
 
 def main():
@@ -5106,6 +6333,8 @@ Subtask Workflow (6-state lifecycle):
 """
     )
     # Global flags
+    parser.add_argument("--version", action="version", version=f"relayhall {cli_version()}",
+                        help="Print the version of this checkout and exit")
     parser.add_argument("--api", help="API base URL (overrides RELAYHALL_API_URL)")
     parser.add_argument("--token", help="Auth token (overrides RELAYHALL_TOKEN)")
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-confirm all interactive prompts")
@@ -5118,18 +6347,42 @@ Subtask Workflow (6-state lifecycle):
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
         from relayhall_blueprints import register as register_blueprints, run as run_blueprint
     register_blueprints(sub)
-    
+    # Card 94e8bb0b item 3: the harness-local connection skill installer lives
+    # in its own module beside this script, loaded exactly as the Blueprint one is.
+    try:
+        from relayhall_connection_skill import register as register_connection_skill, run as run_connection_skill
+    except ModuleNotFoundError as error:
+        if error.name != 'relayhall_connection_skill': raise
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        from relayhall_connection_skill import register as register_connection_skill, run as run_connection_skill
+    register_connection_skill(sub)
+    # E462 slice S2: `relayhall connector install|check|status|uninstall|mcp|run`,
+    # the local connector for one harness (token in OS custody, stdio MCP proxy).
+    from relayhall_connector import register as register_connector, run as run_connector
+    register_connector(sub)
+    from relayhall_access_preview import register as register_access_preview, run as run_access_preview
+    register_access_preview(sub)
+    # E467: `relayhall actions [list]`, the Action Center queue (read only).
+    from relayhall_actions import register as register_actions, run as run_actions
+    register_actions(sub)
+
     # login
     p_login = sub.add_parser("login", help="Login and cache auth token")
     p_login.add_argument("--password", help="Password (or use RELAYHALL_PASSWORD env, or interactive prompt)")
     
     # list
-    p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
-    p_list.add_argument("--status", "-s")
+    p_list = sub.add_parser("list", aliases=["ls", "tasks"], help="List tasks")
+    p_list.add_argument("--status", "-s", help="A state, or several comma-separated (todo,review)")
     p_list.add_argument("--project", "-p")
     p_list.add_argument("--phase", help="Filter by Phase UUID, or 'null' for the unphased backlog")
     p_list.add_argument("--priority", choices=PRIORITIES)
     p_list.add_argument("--verbose", "-v", action="store_true")
+    p_list.add_argument("--without-usable-verifier", dest="without_usable_verifier", action="store_true",
+                        help="Only tasks without a usable Verifier (none set, inactive, dead chain, no tasks:write, or the Assignee); prints why")
+    p_list.add_argument("--tag", help="Only tasks carrying this tag")
+    p_list.add_argument("--query", "-q", help="Free-text query over title and description")
+    p_list.add_argument("--include-archived", dest="include_archived", action="store_true",
+                        help="Include archived tasks (the list is unpaged, as REST is)")
     
     # next
     sub.add_parser("next", help="Get next auto-start task")
@@ -5148,7 +6401,8 @@ Subtask Workflow (6-state lifecycle):
     p_create.add_argument("--status", "-s", default="ideas")
     p_create.add_argument("--priority", default="normal", choices=PRIORITIES)
     p_create.add_argument("--project", "-p")
-    p_create.add_argument("--phase", help="Phase UUID to group this task under (optional; unphased is the project backlog)")
+    p_create.add_argument("--phase", help="Phase UUID to group this task under. Omit it and the task lands in the project's inbox phase when the project names one (status Ideas unless --status is given), or in the unphased project backlog when it does not; 'null' files it in the backlog explicitly")
+    p_create.add_argument("--verifier", help="Verifier principal (id or handle); accepted only when it is the project's default Verifier or a phase default of it. Omit it to inherit the landing phase's default, else the project's")
     p_create.add_argument("--subtasks", help="Semicolon-separated subtask list")
     p_create.add_argument("--tags", help="Comma-separated tags")
     p_create.add_argument("--notes", help="Task notes (the same field 'update --notes' writes)")
@@ -5174,6 +6428,8 @@ Subtask Workflow (6-state lifecycle):
     p_create.add_argument("--constraints-file", help="Read task constraints from a text/markdown file")
     p_create.add_argument("--report", action="append", default=[], help="Link a RelayHall report by ID prefix or URL (repeatable)")
     p_create.add_argument("--no-subtasks", action="store_true", help="Suppress warning about missing subtasks")
+    _add_assignment_flags(p_create)
+    _add_idempotency_flag(p_create)
     
     # update
     p_update = sub.add_parser("update", aliases=["edit"], help="Update a task")
@@ -5205,12 +6461,15 @@ Subtask Workflow (6-state lifecycle):
     p_update.add_argument("--constraints", help="Replace task constraints / guardrails (semicolon or newline separated)")
     p_update.add_argument("--constraints-file", help="Read constraints from a text/markdown file")
     p_update.add_argument("--report", action="append", default=[], help="Append a linked RelayHall report by ID prefix or URL (repeatable)")
+    _add_assignment_flags(p_update)
+    _add_idempotency_flag(p_update)
     
     # move
     p_move = sub.add_parser("move", help="Move task to a status")
     p_move.add_argument("id")
     p_move.add_argument("status")
-    p_move.add_argument("--notes", help="Add notes when moving")
+    p_move.add_argument("--notes", help="The move's reason, appended as an attributed Task note before the move (never replaces the Task's notes)")
+    _add_idempotency_flag(p_move)
     p_move.add_argument("--force", "-f", action="store_true", help="Force move, bypass guardrail checks")
     p_move.add_argument("--confirm-override", action="store_true", help="Required with --force to confirm bypass (prevents accidental force moves)")
     
@@ -5236,6 +6495,9 @@ Subtask Workflow (6-state lifecycle):
         help="Why this task is being archived (appended to task notes as 'Archived (<disposition>): <reason>')",
     )
     
+    p_unarchive = sub.add_parser("unarchive", help="Restore an archived task to its recorded prior state")
+    p_unarchive.add_argument("id", help="Task ID")
+
     # delete
     p_delete = sub.add_parser("delete", help="Delete a task")
     p_delete.add_argument("id")
@@ -5274,6 +6536,19 @@ Subtask Workflow (6-state lifecycle):
     p_comp_sub.add_argument("task_id")
     p_comp_sub.add_argument("index", help="0-based subtask index")
     
+    p_account_owner = sub.add_parser("task-account-owner", help="Read or explicitly transfer Task account ownership; preserves authorship and review evidence")
+    p_account_owner.add_argument("action", choices=["get", "change"])
+    p_account_owner.add_argument("id")
+    p_account_owner.add_argument("--account", help="Target active human account UUID")
+    p_account_owner.add_argument("--expected-owner", help="Current account UUID from get, or none")
+    p_account_owner.add_argument("--expected-updated-at", help="Exact revision from get; never refreshed automatically")
+    p_account_owner.add_argument("--reason")
+
+    p_owner_sub = sub.add_parser("owner-complete-subtask", help="Owner/Main administrative completion, not independent verification")
+    p_owner_sub.add_argument("task_id")
+    p_owner_sub.add_argument("subtask_id", help="Stable subtask ID (not a positional index)")
+    p_owner_sub.add_argument("--note", help="Evidence or reason for the owner disposition")
+
     # approve-subtask (orchestrator: marks completed)
     p_approve_sub = sub.add_parser("approve-subtask", help="Approve subtask → completed (independent Verifier)")
     p_approve_sub.add_argument("task_id")
@@ -5314,6 +6589,27 @@ Subtask Workflow (6-state lifecycle):
     p_set_sub.add_argument("--note")
     p_set_sub.add_argument("--reason")
 
+    # Card 2bc7b303 (E374): the Subtask structure verbs, same authority as set-subtask.
+    p_add_sub = sub.add_parser("add-subtask", help="Add one Subtask; prints its new stable id")
+    p_add_sub.add_argument("task_id")
+    p_add_sub.add_argument("text")
+    p_add_sub.add_argument("--position", type=int, help="1-based position (default: append)")
+    p_add_sub.add_argument("--status", choices=VALID_SUBTASK_STATUSES, help="Initial state (default: empty)")
+    _add_idempotency_flag(p_add_sub)
+    p_reorder_sub = sub.add_parser("reorder-subtasks", help="Reorder Subtasks: every current stable id, exactly once")
+    p_reorder_sub.add_argument("task_id")
+    p_reorder_sub.add_argument("subtask_ids", nargs="+", help="Stable Subtask ids in the new order")
+    _add_idempotency_flag(p_reorder_sub)
+    p_rename_sub = sub.add_parser("rename-subtask", help="Replace a Subtask's text by stable id")
+    p_rename_sub.add_argument("task_id")
+    p_rename_sub.add_argument("subtask_id")
+    p_rename_sub.add_argument("text")
+    _add_idempotency_flag(p_rename_sub)
+
+    p_claim = sub.add_parser("task-claim", help="Claim an armed Task; assigned Connector uses the current assignment epoch")
+    p_claim.add_argument("id")
+    p_claim.add_argument("--expected-assignment-epoch")
+
     p_task_append = sub.add_parser("task-append", help="Append an attributed Task stream entry")
     p_task_append.add_argument("id")
     append_content = p_task_append.add_mutually_exclusive_group(required=True)
@@ -5323,6 +6619,27 @@ Subtask Workflow (6-state lifecycle):
     p_task_append.add_argument("--event-type", default="handover.note")
     p_task_append.add_argument("--outpost", help="Service UUID; required for reported provenance")
     p_task_append.add_argument("--dry-run", action="store_true")
+    p_task_append.add_argument("--referenced-entry", dest="referenced_entry", help="UUID of an earlier stream entry on this Task")
+    _add_idempotency_flag(p_task_append)
+
+    p_task_reports = sub.add_parser("task-reports", help="List a Task's Reports as bounded summaries (5 newest authorized; never bodies)")
+    p_task_reports.add_argument("id")
+    p_task_reports.add_argument("--scope", choices=["linked", "progress"], help="linked (default): every associated Report; progress: task-bound progress Reports only")
+    p_task_reports.add_argument("--limit", type=int, help="Page size, 1-50 (default 5)")
+    p_task_reports.add_argument("--cursor", help="nextCursor from a previous page")
+    p_task_reports.add_argument("--pinned", action="store_true", help="Only pinned Reports")
+    p_task_reports.add_argument("--all", action="store_true", help="Follow nextCursor through every page and print them together")
+    p_task_reports.add_argument("--report", metavar="REPORT_ID", help="Read one of this Task's progress Reports in full (body and content_hash for --expected-content-hash); needs tasks:read only")
+    p_task_report = sub.add_parser("task-report", help="Create/edit your claimed Task progress Report; finish freezes it")
+    p_task_report.add_argument("id")
+    p_task_report.add_argument("--title", required=True)
+    body = p_task_report.add_mutually_exclusive_group(required=True)
+    body.add_argument("--content")
+    body.add_argument("--content-file")
+    p_task_report.add_argument("--idempotency-key", required=True, help="Keep this logical key after an uncertain response")
+    p_task_report.add_argument("--reconcile", action="store_true", help="Read the exact committed operation; never repeat a create")
+    p_task_report.add_argument("--report-id")
+    p_task_report.add_argument("--expected-content-hash")
 
     p_task_finish = sub.add_parser("finish", help="Atomically file/link a Report, hand over, and move to Review")
     p_task_finish.add_argument("id")
@@ -5335,6 +6652,13 @@ Subtask Workflow (6-state lifecycle):
     report_body.add_argument("--report-content")
     report_body.add_argument("--report-file")
     p_task_finish.add_argument("--dry-run", action="store_true")
+    p_task_finish.add_argument("--native-generation-file")
+    p_generation = sub.add_parser("native-generation",help="Versioned coordination; no provider or automatic retry")
+    p_generation.add_argument("id")
+    p_generation.add_argument("action",choices=["reserve","read","consume","publication-intent","quarantine-dry-run","quarantine","quarantine-read"])
+    p_generation.add_argument("--generation-id")
+    p_generation.add_argument("--quarantine-id")
+    p_generation.add_argument("--payload-file")
 
     p_task_reference = sub.add_parser("task-reference", help="List or add typed Task References")
     reference_sub = p_task_reference.add_subparsers(dest="reference_command")
@@ -5347,6 +6671,8 @@ Subtask Workflow (6-state lifecycle):
     p_reference_add.add_argument("--target-uri")
     p_reference_add.add_argument("--label", required=True)
     p_reference_add.add_argument("--dry-run", action="store_true")
+    p_reference_add.add_argument("--metadata", help="JSON object stored with the Reference")
+    _add_idempotency_flag(p_reference_add)
     
     # add-dep (add task dependency)
     p_add_dep = sub.add_parser("add-dep", help="Add dependency (task depends on another)")
@@ -5395,6 +6721,8 @@ Subtask Workflow (6-state lifecycle):
     p_pset_password.add_argument(
         "--stdin", action="store_true",
         help="Read the password from the first line of stdin instead of prompting. Never pass a password as an argument: argv reaches shell history and every ps listing.")
+    p_premediation = principal_sub.add_parser("remediation-queue", help="The Access manager remediation queue: legacy identities and directory deprovision signals (root)")
+    p_premediation.add_argument("--json", action="store_true", help="Raw JSON envelope")
     p_pgrants = principal_sub.add_parser("grants", help="Show a principal's object-level grants (RH-P2.3)")
     p_pgrants.add_argument("principal", help="Principal id, prefix or handle")
     p_pgrants.add_argument("--json", action="store_true", help="Raw JSON envelope")
@@ -5443,6 +6771,8 @@ Subtask Workflow (6-state lifecycle):
     p_kissue.add_argument("--scopes", required=True, help="Comma-separated scope list (<object>:<verb>, e.g. tasks:read,personalities:read; root = global sentinel)")
     p_kissue.add_argument("--label")
     p_kissue.add_argument("--expires-at", help="ISO timestamp")
+    p_kreveal = key_sub.add_parser("reveal", help="Re-reveal a credential secret inside your own lineage (audited, rate-limited)")
+    p_kreveal.add_argument("credential_id")
     p_klist = key_sub.add_parser("list", help="List a principal's credentials (no secrets)")
     p_klist.add_argument("principal", help="Principal id or handle")
     p_krotate = key_sub.add_parser("rotate", help="Rotate a credential")
@@ -5483,6 +6813,8 @@ Subtask Workflow (6-state lifecycle):
                               help="Permit an issuer that resolves to a private, loopback or CGNAT address (SS-5)")
     p_idp_create.add_argument("--additional-endpoint-origin", action="append",
                               help="Extra origin an endpoint may live on; repeatable (SS-5)")
+    p_idp_create.add_argument("--scim-heartbeat-interval-hours", dest="scim_heartbeat_interval_hours",
+                              help="SCIM heartbeat interval in whole hours; none keeps claim-sync semantics")
     # SS-21 has no default anywhere else, and it has none here: an operator who
     # omits the declaration has not made it, and the declaration is the point.
     idp_decl = p_idp_create.add_mutually_exclusive_group(required=True)
@@ -5498,6 +6830,8 @@ Subtask Workflow (6-state lifecycle):
     p_idp_update.add_argument("--client-private-key-file",
                               help="Path to a replacement PEM private key (never echoed)")
     p_idp_update.add_argument("--provisioning-mode", choices=["invited", "jit", "directory"])
+    p_idp_update.add_argument("--scim-heartbeat-interval-hours", dest="scim_heartbeat_interval_hours",
+                              help="SCIM heartbeat interval in whole hours; none clears it (claim-sync semantics)")
     idp_restrict = p_idp_update.add_mutually_exclusive_group()
     idp_restrict.add_argument("--restrict-login-groups", dest="login_group_whitelist_enabled",
                               action="store_true", default=None,
@@ -5584,6 +6918,7 @@ Subtask Workflow (6-state lifecycle):
     p_proj_create.add_argument("--status", default="active")
     p_proj_create.add_argument("--nfs", action="store_true", help="Retired: project creation never touches the filesystem (use 'project resource add-workspace')")
     p_proj_create.add_argument("--init", action="store_true", help="Retired: project creation never touches the filesystem (use 'project resource add-workspace')")
+    _add_idempotency_flag(p_proj_create)
 
     # project update
     p_proj_update = project_sub.add_parser("update", aliases=["edit"], help="Update a project (optimistic concurrency via --revision)")
@@ -5593,9 +6928,20 @@ Subtask Workflow (6-state lifecycle):
     p_proj_update.add_argument("--description")
     p_proj_update.add_argument("--goal", help="The project goal (an outcome statement)")
     p_proj_update.add_argument("--clear-goal", action="store_true", help="Remove the project goal")
+    p_proj_inbox = p_proj_update.add_mutually_exclusive_group()
+    p_proj_inbox.add_argument("--inbox-phase", dest="inbox_phase", help="Phase UUID of this project that a task created without --phase lands in (status Ideas)")
+    p_proj_inbox.add_argument("--clear-inbox-phase", dest="clear_inbox_phase", action="store_true", help="Remove the project's inbox phase (new tasks without --phase stay unphased)")
     p_proj_update.add_argument("--status")
     p_proj_update.add_argument("--source-dir", dest="source_dir", help="Opaque workbench source reference (core does not resolve it)")
     p_proj_update.add_argument("--nfs-dir", dest="nfs_dir", help="Opaque shared-storage reference (core does not resolve it)")
+
+    # project set-default-verifier (card 41e24358)
+    p_proj_dv = project_sub.add_parser("set-default-verifier", help="Set or clear the Verifier new tasks of this project inherit (login session: root, an administrator or the person owner)")
+    p_proj_dv.add_argument("id", help="Project name or ID")
+    p_proj_dv.add_argument("principal", nargs="?", help="Principal id or handle, or 'none' to clear")
+    p_proj_dv.add_argument("--clear", action="store_true", help="Clear the default")
+    p_proj_dv.add_argument("--revision", help="Expected revision (If-Match); read automatically when omitted")
+    p_proj_dv.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
     # project archive
     p_proj_archive = project_sub.add_parser("archive", help="Archive a project (soft, reversible; requires --revision)")
@@ -5618,6 +6964,10 @@ Subtask Workflow (6-state lifecycle):
     p_proj_stats.add_argument("id")
     p_proj_stats.add_argument("--days", type=int, default=7)
     
+    p_proj_brief = project_sub.add_parser("brief", help="Bounded project awareness (projects:read and tasks:read)")
+    p_proj_brief.add_argument("project", help="Project UUID or name")
+    p_proj_brief.add_argument("--json", action="store_true", help="Print the raw REST envelope")
+
     # project context (canonical: no query params; active + available resources only)
     p_proj_context = project_sub.add_parser("context", help="Agent-facing project context (active, available resources)")
     p_proj_context.add_argument("project", help="Project UUID or name")
@@ -5651,6 +7001,7 @@ Subtask Workflow (6-state lifecycle):
     p_res_addrepo.add_argument("--default-branch", dest="default_branch")
     _add_resource_common_flags(p_res_addrepo)
     p_res_addrepo.set_defaults(resource_kind="repository")
+    _add_idempotency_flag(p_res_addrepo)
 
     p_res_addenv = resource_sub.add_parser("add-environment", help="Add an environment resource")
     p_res_addenv.add_argument("project", help="Project UUID or name")
@@ -5659,6 +7010,7 @@ Subtask Workflow (6-state lifecycle):
     p_res_addenv.add_argument("--stage", required=True, choices=VALID_ENVIRONMENT_STAGES)
     _add_resource_common_flags(p_res_addenv)
     p_res_addenv.set_defaults(resource_kind="environment")
+    _add_idempotency_flag(p_res_addenv)
 
     # No --export-policy: workspace resources are always installation-only.
     p_res_addws = resource_sub.add_parser("add-workspace", help="Add a workspace resource (always installation-only)")
@@ -5668,6 +7020,7 @@ Subtask Workflow (6-state lifecycle):
     p_res_addws.add_argument("--purpose", required=True, choices=VALID_WORKSPACE_PURPOSES)
     _add_resource_common_flags(p_res_addws, export_policy=False)
     p_res_addws.set_defaults(resource_kind="workspace")
+    _add_idempotency_flag(p_res_addws)
 
     p_res_addref = resource_sub.add_parser("add-reference", help="Add a reference resource")
     p_res_addref.add_argument("project", help="Project UUID or name")
@@ -5676,6 +7029,7 @@ Subtask Workflow (6-state lifecycle):
     p_res_addref.add_argument("--category", required=True, choices=VALID_REFERENCE_CATEGORIES)
     _add_resource_common_flags(p_res_addref)
     p_res_addref.set_defaults(resource_kind="reference")
+    _add_idempotency_flag(p_res_addref)
 
     p_res_edit = resource_sub.add_parser("edit", help="Edit a resource (optimistic concurrency via --revision)")
     p_res_edit.add_argument("project", help="Project UUID or name")
@@ -5777,6 +7131,7 @@ Subtask Workflow (6-state lifecycle):
     p_skill_list.add_argument("--search", "-s", help="Search by name/description")
     p_skill_list.add_argument("--project", "-p", help="Show skills for a specific project")
     p_skill_list.add_argument("--verbose", "-v", action="store_true", help="Show details")
+    p_skill_list.add_argument("--all-owners", action="store_true", help="Every owner's drafts (root or skills:admin)")
 
     # skill get
     p_skill_get = skill_sub.add_parser("get", help="Get full details of a skill")
@@ -5795,6 +7150,7 @@ Subtask Workflow (6-state lifecycle):
     p_skill_create.add_argument("--description", "-d", help="Skill description")
     p_skill_create.add_argument("--usage", help="Usage instructions (inline)")
     p_skill_create.add_argument("--usage-file", help="Read usage instructions from file")
+    p_skill_create.add_argument("--skill-md-file", help="Send a complete SKILL.md (frontmatter included) as the new Version's exact content")
     p_skill_create.add_argument("--tags", help="Comma-separated tags")
 
     # skill update
@@ -5805,6 +7161,7 @@ Subtask Workflow (6-state lifecycle):
     p_skill_update.add_argument("--description", "-d", help="New description")
     p_skill_update.add_argument("--usage", help="New usage instructions (inline)")
     p_skill_update.add_argument("--usage-file", help="Read usage instructions from file")
+    p_skill_update.add_argument("--skill-md-file", help="Send a complete SKILL.md (frontmatter included) as the next Version's exact content")
     p_skill_update.add_argument("--tags", help="Comma-separated tags (replaces all)")
 
     # skill delete
@@ -5839,6 +7196,11 @@ Subtask Workflow (6-state lifecycle):
     p_skill_audience.add_argument("skill", help="Skill name or ID")
     p_skill_audience.add_argument("audience", choices=["global", "project"], help="Audience policy")
 
+    p_skill_owner = skill_sub.add_parser("owner", help="Assign or change a Skill's owner (skills:admin)")
+    p_skill_owner.add_argument("skill", help="Skill id, or a name resolved over every owner's drafts")
+    p_skill_owner.add_argument("owner", help="The new owner's principal id (an active person Account)")
+    p_skill_owner.add_argument("--reason", required=True, help="Why the owner changes (audited)")
+
     # skill context
     p_skill_context = skill_sub.add_parser("context", help="Preview effective skill context for project")
     p_skill_context.add_argument("project", help="Project name or ID")
@@ -5869,6 +7231,45 @@ Subtask Workflow (6-state lifecycle):
     p_charter_show.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
     # services (bare plural alias for `service list`, mirroring `skills`)
+    p_knowledge = sub.add_parser("knowledge", help="Search authorized knowledge sources and fetch cited revisions")
+    knowledge_sub = p_knowledge.add_subparsers(dest="knowledge_command")
+    knowledge_sub.add_parser("sources")
+    knowledge_search = knowledge_sub.add_parser("search")
+    knowledge_search.add_argument("query")
+    knowledge_search.add_argument("--source", dest="sources", action="append")
+    knowledge_search.add_argument("--kind", dest="kinds", action="append", choices=["code", "docs", "data"])
+    knowledge_search.add_argument("--category", dest="categories", action="append")
+    knowledge_search.add_argument("--limit-per-source", type=int, default=8)
+    knowledge_search.add_argument("--timeout-ms", type=int, default=8000)
+    knowledge_search.add_argument("--include-archive", dest="include_archive", action="store_true",
+                                  help="Also search the archive categories sources declare (default: current knowledge only)")
+    knowledge_get = knowledge_sub.add_parser("get")
+    knowledge_get.add_argument("handle")
+    knowledge_get.add_argument("--continuation")
+    knowledge_get.add_argument("--if-none-match")
+    knowledge_propose = knowledge_sub.add_parser("propose", help="Propose a note; returns the exact bytes and audience, writes nothing")
+    knowledge_propose.add_argument("--title", required=True)
+    knowledge_body = knowledge_propose.add_mutually_exclusive_group(required=True)
+    knowledge_body.add_argument("--content")
+    knowledge_body.add_argument("--content-file")
+    knowledge_propose.add_argument("--source", help="Knowledge source UUID (default: the one write-capable source you may use)")
+    knowledge_propose.add_argument("--note-type")
+    knowledge_propose.add_argument("--tag", dest="tags", action="append")
+    knowledge_propose.add_argument("--target", help="default, personal, or a compartment UUID")
+    knowledge_propose.add_argument("--task", help="Task UUID whose context the note is written in")
+    knowledge_propose.add_argument("--basis", action="append", help="Sealed handle the note was made from (repeatable)")
+    knowledge_propose.add_argument("--revision-of", help="Sealed handle of the note this updates")
+    knowledge_propose.add_argument("--expected-revision", help="absent, or the 64-hex revision")
+    knowledge_preview = knowledge_sub.add_parser("preview", help="Re-resolve an open proposal against current grants")
+    knowledge_preview.add_argument("proposal_id")
+    knowledge_preview.add_argument("--source")
+    knowledge_commit = knowledge_sub.add_parser("commit", help="Commit a proposal with the preview digest you showed")
+    knowledge_commit.add_argument("proposal_id")
+    knowledge_commit.add_argument("--preview-digest", required=True)
+    knowledge_commit.add_argument("--expected-revision", required=True, help="absent for a new note, else the 64-hex revision")
+    knowledge_commit.add_argument("--source")
+    _add_idempotency_flag(knowledge_commit, required=True)
+
     p_services = sub.add_parser("services", help="List registered services (alias for service list)")
     p_services.set_defaults(kind=None, status=None, include_retired=False, json=False)
 
@@ -5918,6 +7319,8 @@ Subtask Workflow (6-state lifecycle):
     p_service_descriptor.add_argument("--version", help="Version number (default: current)")
     p_service_descriptor.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
+    p_service_review = service_sub.add_parser("review-requests", help="Pending native verification requests for your own Connector")
+    p_service_review.add_argument("service", help="Service UUID")
     p_service_versions = service_sub.add_parser("versions", help="List descriptor version history")
     p_service_versions.add_argument("service", help="Service slug or UUID")
     p_service_versions.add_argument("--json", action="store_true", help="Raw JSON envelope")
@@ -5983,6 +7386,7 @@ Subtask Workflow (6-state lifecycle):
     p_phase_create.add_argument("--status", choices=PHASE_SETTABLE_STATUSES_CLI, help="Initial status (default todo)")
     p_phase_create.add_argument("--position", type=int, help="Ordering hint within the project (ties are allowed)")
     p_phase_create.add_argument("--json", action="store_true", help="Raw JSON envelope")
+    _add_idempotency_flag(p_phase_create)
 
     p_phase_update = phase_sub.add_parser("update", aliases=["edit"], help="Update a phase")
     p_phase_update.add_argument("phase_id", help="Phase UUID")
@@ -5993,6 +7397,13 @@ Subtask Workflow (6-state lifecycle):
     p_phase_update.add_argument("--position", type=int, help="New ordering hint")
     p_phase_update.add_argument("--revision", help="Expected revision (If-Match); read automatically when omitted")
     p_phase_update.add_argument("--json", action="store_true", help="Raw JSON envelope")
+
+    p_phase_dv = phase_sub.add_parser("set-default-verifier", help="Set or clear the Verifier new tasks landing in this phase inherit, ahead of the project default")
+    p_phase_dv.add_argument("phase_id", help="Phase UUID")
+    p_phase_dv.add_argument("principal", nargs="?", help="Principal id or handle, or 'none' to clear (the phase then inherits the project default)")
+    p_phase_dv.add_argument("--clear", action="store_true", help="Clear the default")
+    p_phase_dv.add_argument("--revision", help="Expected revision (If-Match); read automatically when omitted")
+    p_phase_dv.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
     p_phase_archive = phase_sub.add_parser("archive", help="Archive a phase (reversible)")
     p_phase_archive.add_argument("phase_id", help="Phase UUID")
@@ -6043,6 +7454,57 @@ Subtask Workflow (6-state lifecycle):
     p_hg_clear = home_group_sub.add_parser("clear", help="Clear your home-group pointer")
     p_hg_clear.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
+    # group steward (LENSES-c c1-A, card 46cfbd1d): the Group roles. Root
+    # login-session acts with exact-UUID targets; no gate verbs, no owner verb.
+    p_group = sub.add_parser("group", help="Groups: the Group roles (owners and managers)")
+    group_sub = p_group.add_subparsers(dest="group_command")
+    p_group_steward = group_sub.add_parser(
+        "steward", help="Group roles: list them, or appoint and remove (root login session only)")
+    group_steward_sub = p_group_steward.add_subparsers(dest="group_steward_command")
+
+    p_gs_list = group_steward_sub.add_parser(
+        "list", help="List a Group's roles, owners first, live or inert with the reason")
+    p_gs_list.add_argument("group_id", help="Group UUID (exact)")
+    p_gs_list.add_argument("--json", action="store_true", help="Raw JSON envelope")
+
+    p_gs_add = group_steward_sub.add_parser(
+        "add", help="Appoint a Group role (root login session; a bearer credential is refused; no step-up)")
+    p_gs_add.add_argument("group_id", help="Group UUID (exact)")
+    p_gs_add.add_argument("account_id", help="Account principal UUID (exact)")
+    p_gs_add.add_argument("--role", required=True, choices=GROUP_STEWARD_ROLES_CLI, help="owner or manager")
+    p_gs_add.add_argument("--json", action="store_true", help="Raw JSON envelope")
+
+    p_gs_remove = group_steward_sub.add_parser(
+        "remove", help="Remove a Group role row, owner or manager, live or inert (root login session; no step-up)")
+    p_gs_remove.add_argument("group_id", help="Group UUID (exact)")
+    p_gs_remove.add_argument("account_id", help="Account principal UUID (exact)")
+    p_gs_remove.add_argument("--json", action="store_true", help="Raw JSON envelope")
+
+    # shared-writers (card 549cc51f): the shared-area writer list. `list` for any
+    # caller with services:read; `add` and `remove` are root or administrator
+    # login-session acts with a reason and a step-up (an rh_ credential is refused).
+    p_shared_writers = sub.add_parser(
+        "shared-writers", help="The shared-area writer list of a knowledge source (changes: administrator login session)")
+    shared_writers_sub = p_shared_writers.add_subparsers(dest="shared_writers_command")
+    p_sw_list = shared_writers_sub.add_parser("list", help="List who may write the shared area, and whether you may")
+    p_sw_list.add_argument("--source", help="Knowledge source UUID (exact); omit when one source accepts writes")
+    p_sw_list.add_argument("--json", action="store_true", help="Raw JSON envelope")
+    p_sw_add = shared_writers_sub.add_parser(
+        "add", help="Add an Account (root or administrator login session; reason and step-up)")
+    p_sw_add.add_argument("account_id", help="Account principal UUID (exact)")
+    p_sw_add.add_argument("--reason", required=True, help="Why (20-2000 characters; kept in the audit record)")
+    p_sw_add.add_argument("--expires-at", help="Optional ISO-8601 expiry; omitted = never")
+    p_sw_add.add_argument("--source", help="Knowledge source UUID (exact); omit when one source accepts writes")
+    p_sw_add.add_argument("--password", help="Step-up password (defaults to RELAYHALL_PASSWORD or an interactive prompt)")
+    p_sw_add.add_argument("--json", action="store_true", help="Raw JSON envelope")
+    p_sw_remove = shared_writers_sub.add_parser(
+        "remove", help="Remove an Account (root or administrator login session; reason and step-up)")
+    p_sw_remove.add_argument("account_id", help="Account principal UUID (exact)")
+    p_sw_remove.add_argument("--reason", required=True, help="Why (20-2000 characters; kept in the audit record)")
+    p_sw_remove.add_argument("--source", help="Knowledge source UUID (exact); omit when one source accepts writes")
+    p_sw_remove.add_argument("--password", help="Step-up password (defaults to RELAYHALL_PASSWORD or an interactive prompt)")
+    p_sw_remove.add_argument("--json", action="store_true", help="Raw JSON envelope")
+
     # grant (RH-P2.3) - object-level authority; mutation is owner-plane (root)
     p_grant = sub.add_parser("grant", help="Object-level grant management (RH-P2.3; owner-plane)")
     grant_sub = p_grant.add_subparsers(dest="grant_command")
@@ -6050,6 +7512,19 @@ Subtask Workflow (6-state lifecycle):
     p_grant_list = grant_sub.add_parser("list", aliases=["ls"], help="List grants")
     p_grant_list.add_argument("--grantee", help="Filter by grantee principal UUID")
     p_grant_list.add_argument("--resource-type", choices=GRANT_RESOURCE_TYPES, help="Filter by resource type")
+    # Card ff410dc4 (E407 item 1): the additive paging, filter, sort and search parameters.
+    p_grant_list.add_argument("--verb", choices=["read", "write", "use", "invoke", "admin"], help="Filter by verb")
+    p_grant_list.add_argument("--made", choices=["hand", "system", "unknown", "all"],
+                              help="Filter by origin: hand-made, system-made, unknown, or all (default all)")
+    p_grant_list.add_argument("--expiry", choices=["any", "none", "live", "expired", "expiring"],
+                              help="Filter by expiry: none, not expired, expired, or expiring within 14 days")
+    p_grant_list.add_argument("--target", choices=["any", "live", "archived", "missing", "wildcard"],
+                              help="Filter by the granted object's state")
+    p_grant_list.add_argument("--q", help="Search the grantee, granter, object title and ids")
+    p_grant_list.add_argument("--sort", choices=["-created", "created", "grantee", "-grantee", "resource", "-resource",
+                                                 "verb", "-verb", "expires", "-expires"], help="Sort order")
+    p_grant_list.add_argument("--limit", type=int, help="Read one page of this many grants (1-200)")
+    p_grant_list.add_argument("--cursor", help="Read the page after this cursor (printed after a page)")
     p_grant_list.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
     p_grant_add = grant_sub.add_parser("add", help="Create a grant (requires a root credential)")
@@ -6060,7 +7535,7 @@ Subtask Workflow (6-state lifecycle):
     p_grant_add.add_argument("--expires-at", help="ISO expiry timestamp (optional)")
     p_grant_add.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
-    p_grant_remove = grant_sub.add_parser("remove", aliases=["rm"], help="Revoke a grant by ID")
+    p_grant_remove = grant_sub.add_parser("remove", aliases=["rm"], help="Revoke a grant by ID (refused for bearer credentials: a signed-in act with step-up, E418)")
     p_grant_remove.add_argument("grant_id", help="Grant UUID")
     p_grant_remove.add_argument("--json", action="store_true", help="Raw JSON envelope")
 
@@ -6105,6 +7580,7 @@ Subtask Workflow (6-state lifecycle):
     p_report_list.add_argument("--project", "-p", help="Filter by project name")
     p_report_list.add_argument("--limit", "-l", type=int, default=20, help="Max results (default 20)")
     p_report_list.add_argument("--pinned", action="store_true", help="Show only pinned reports")
+    _add_report_page_flags(p_report_list)
 
     # report create
     p_report_create = report_sub.add_parser("create", help="Create a report")
@@ -6119,6 +7595,7 @@ Subtask Workflow (6-state lifecycle):
     p_report_create_handover = p_report_create.add_mutually_exclusive_group()
     p_report_create_handover.add_argument("--handover", help="Structured handover as a JSON object")
     p_report_create_handover.add_argument("--handover-file", help="Read structured handover JSON from file")
+    _add_idempotency_flag(p_report_create)
 
     # report get
     p_report_get = report_sub.add_parser("get", help="Get a report by ID")
@@ -6160,6 +7637,7 @@ Subtask Workflow (6-state lifecycle):
     p_report_search.add_argument("--tags", help="Filter by tags (comma-separated)")
     p_report_search.add_argument("--project", "-p", help="Filter by project name")
     p_report_search.add_argument("--limit", "-l", type=int, default=20, help="Max results (default 20)")
+    _add_report_page_flags(p_report_search)
 
     # status
     sub.add_parser("status", help="Show API status and system health")
@@ -6183,6 +7661,8 @@ Subtask Workflow (6-state lifecycle):
     p_keys_generate.add_argument("--duration", help="Optional key lifetime, for example 30d")
     
     # completion
+    add_parity_parsers(sub)
+
     p_completion = sub.add_parser("completion", help="Generate shell completion scripts")
     p_completion.add_argument("shell", choices=["bash", "zsh"], help="Shell type")
     
@@ -6202,11 +7682,23 @@ Subtask Workflow (6-state lifecycle):
         sys.exit(0)
     
     cmd = args.command
+    if cmd in PARITY_COMMANDS:
+        return PARITY_COMMANDS[cmd](args)
+    if cmd == "access":
+        return run_access_preview(args, api)
+    if cmd == "actions":
+        return run_actions(args, api)
     if cmd in ("blueprint", "blueprints"):
         return run_blueprint(args, api)
+    if cmd == "connection-skill":
+        sys.exit(run_connection_skill(args, api, get_api_url()))
+    if cmd == "connector":
+        # The connector never takes the global --token (it reads its own from
+        # OS custody) and never calls api(): `run` refuses a --token outright.
+        sys.exit(run_connector(args, global_token=args.token))
     if cmd == "login":
         cmd_login(args)
-    elif cmd in ("list", "ls"):
+    elif cmd in ("list", "ls", "tasks"):
         cmd_list(args)
     elif cmd == "next":
         cmd_next(args)
@@ -6226,6 +7718,8 @@ Subtask Workflow (6-state lifecycle):
         cmd_reject(args)
     elif cmd == "archive":
         cmd_archive(args)
+    elif cmd == "unarchive":
+        cmd_unarchive(args)
     elif cmd == "delete":
         cmd_delete(args)
     elif cmd == "session-status":
@@ -6240,6 +7734,8 @@ Subtask Workflow (6-state lifecycle):
         cmd_doctor(args)
     elif cmd == "complete-subtask":
         cmd_complete_subtask(args)
+    elif cmd == "owner-complete-subtask":
+        cmd_owner_complete_subtask(args)
     elif cmd == "approve-subtask":
         cmd_approve_subtask(args)
     elif cmd == "reject-subtask":
@@ -6254,8 +7750,25 @@ Subtask Workflow (6-state lifecycle):
         cmd_start_subtask(args)
     elif cmd == "set-subtask":
         cmd_set_subtask(args)
+    elif cmd == "add-subtask":
+        cmd_add_subtask(args)
+    elif cmd == "reorder-subtasks":
+        cmd_reorder_subtasks(args)
+    elif cmd == "rename-subtask":
+        cmd_rename_subtask(args)
+    elif cmd == "task-account-owner":
+        cmd_task_account_owner(args)
+    elif cmd == "task-claim":
+        cmd_task_claim(args)
     elif cmd == "task-append":
         cmd_task_append(args)
+    elif cmd == "native-generation":
+        cmd_native_generation(args)
+
+    elif cmd == "task-reports":
+        cmd_task_reports(args)
+    elif cmd == "task-report":
+        cmd_task_report(args)
     elif cmd == "finish":
         cmd_task_finish(args)
     elif cmd == "task-reference":
@@ -6287,6 +7800,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_principal_set_password(args)
         elif args.principal_command == "grants":
             cmd_principal_grants(args)
+        elif args.principal_command == "remediation-queue":
+            cmd_principal_remediation_queue(args)
     elif cmd == "agent":
         if not args.agent_command:
             p_agent.print_help()
@@ -6307,7 +7822,7 @@ Subtask Workflow (6-state lifecycle):
             cmd_personality_update(args)
         elif args.personality_command == "retire":
             cmd_personality_retire(args)
-    elif cmd == "key":
+    elif cmd == "credential":
         if not args.key_command:
             p_key.print_help()
             sys.exit(0)
@@ -6319,6 +7834,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_key_rotate(args)
         elif args.key_command == "revoke":
             cmd_key_revoke(args)
+        elif args.key_command == "reveal":
+            cmd_credential_reveal(args)
     elif cmd == "identity-provider":
         if not args.identity_provider_command:
             p_idp.print_help()
@@ -6394,6 +7911,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_skill_unpin(args)
         elif sc == "audience":
             cmd_skill_audience(args)
+        elif sc == "owner":
+            cmd_skill_owner(args)
         elif sc == "context":
             cmd_skill_context(args)
     elif cmd == "charter":
@@ -6409,6 +7928,11 @@ Subtask Workflow (6-state lifecycle):
             cmd_charter_versions(args)
         elif cc == "show-version":
             cmd_charter_show_version(args)
+    elif cmd == "knowledge":
+        if args.knowledge_command in ("propose", "preview", "commit"):
+            cmd_knowledge_write(args)
+        else:
+            cmd_knowledge(args)
     elif cmd == "services":
         cmd_service_list(args)
     elif cmd == "phases":
@@ -6445,6 +7969,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_phase_create(args)
         elif pc in ("update", "edit"):
             cmd_phase_update(args)
+        elif pc == "set-default-verifier":
+            cmd_phase_set_default_verifier(args)
         elif pc == "archive":
             cmd_phase_archive(args)
         elif pc == "unarchive":
@@ -6464,6 +7990,31 @@ Subtask Workflow (6-state lifecycle):
             cmd_home_group_set(args)
         elif hc == "clear":
             cmd_home_group_clear(args)
+    elif cmd == "group":
+        if args.group_command != "steward":
+            p_group.print_help()
+            sys.exit(0)
+        gsc = args.group_steward_command
+        if gsc == "list":
+            cmd_group_steward_list(args)
+        elif gsc == "add":
+            cmd_group_steward_add(args)
+        elif gsc == "remove":
+            cmd_group_steward_remove(args)
+        else:
+            p_group_steward.print_help()
+            sys.exit(0)
+    elif cmd == "shared-writers":
+        swc = args.shared_writers_command
+        if swc == "list":
+            cmd_shared_writers_list(args)
+        elif swc == "add":
+            cmd_shared_writers_add(args)
+        elif swc == "remove":
+            cmd_shared_writers_remove(args)
+        else:
+            p_shared_writers.print_help()
+            sys.exit(0)
     elif cmd == "grant":
         if not args.grant_command:
             p_grant.print_help()
@@ -6509,6 +8060,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_service_retire_version(args)
         elif svc in ("delete", "rm"):
             cmd_service_delete(args)
+        elif svc == "review-requests":
+            cmd_service_review_requests(args)
     elif cmd == "report":
         if not args.report_command:
             p_report.print_help()
@@ -6557,6 +8110,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_project_create(args)
         elif args.project_command in ("update", "edit"):
             cmd_project_update(args)
+        elif args.project_command == "set-default-verifier":
+            cmd_project_set_default_verifier(args)
         elif args.project_command == "archive":
             cmd_project_archive(args)
         elif args.project_command == "unarchive":
@@ -6565,6 +8120,8 @@ Subtask Workflow (6-state lifecycle):
             cmd_project_delete(args)
         elif args.project_command == "stats":
             cmd_project_stats(args)
+        elif args.project_command == "brief":
+            cmd_project_brief(args)
         elif args.project_command == "context":
             cmd_project_context(args)
         elif args.project_command == "compatibility-status":
@@ -6641,9 +8198,14 @@ def run_tests():
     
     # Test 3: format_subtask_status for all states
     print("\nTest 3: Subtask status formatting")
+    # Card d4290486: the oracle is the icon table and its docstring (review is
+    # the yellow marker, in-progress the arrows); every state is checked.
     test_cases = [
         ({"status": "empty"}, "⬜"),
-        ({"status": "review"}, "🔄"),
+        ({"status": "in-progress"}, "🔄"),
+        ({"status": "review"}, "🟡"),
+        ({"status": "stuck"}, "🔴"),
+        ({"status": "skipped"}, "⏭️"),
         ({"status": "completed"}, "✅"),
     ]
     for subtask, expected_icon in test_cases:
@@ -6666,6 +8228,27 @@ def run_tests():
         print(f"  ❌ FAIL: Review icon not found in: {formatted}")
         failed += 1
     
+    # Test 5: group steward verbs refuse a non-UUID target before any request
+    print("\nTest 5: group steward targets are exact UUIDs")
+    try:
+        _exact_uuid("engineering", "group-id")
+        print("  ❌ FAIL: a name was accepted as a Group id")
+        failed += 1
+    except SystemExit as exit_code:
+        if exit_code.code == 2:
+            print("  ✅ PASS: a name is a usage error (exit 2), nothing sent")
+            passed += 1
+        else:
+            print(f"  ❌ FAIL: expected exit 2, got {exit_code.code}")
+            failed += 1
+    sample = "0B7A5FF6-3C1D-4C21-9A4F-1F1F1F1F1F1F"
+    if _exact_uuid(sample, "group-id") == sample.lower():
+        print("  ✅ PASS: an exact UUID is accepted (sent lowercase)")
+        passed += 1
+    else:
+        print("  ❌ FAIL: an exact UUID was not passed through")
+        failed += 1
+
     print(f"\n{'='*50}")
     print(f"Tests: {passed + failed} | Passed: {passed} | Failed: {failed}")
     if failed == 0:

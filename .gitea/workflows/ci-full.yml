@@ -25,10 +25,10 @@ name: CI (full)
 # cancels a run to free a runner slot, and a push that schedules BOTH
 # workflows on ONE ref puts them in that queue against each other. Four
 # full-tier runs were destroyed that way (1025, 1027, 1030, 1032) before the
-# rule was found. A release ref and a tag keep the FAST tier - it owns the
-# publication, terminology and residue gates, and a release is the last ref
-# that should lose them - so the full tier stays off those refs and is asked
-# for by name instead:
+# rule was found. A release ref keeps the FAST tier - it owns the
+# publication, terminology and residue gates - and a `v*` release tag runs
+# neither tier (see `ci.yml`), so the full tier stays off those refs and is
+# asked for by name instead:
 #
 #     git push origin <sha>:refs/heads/ci-full/<name>
 #
@@ -43,11 +43,11 @@ on:
 permissions:
   contents: read
 
-# NO `concurrency:` BLOCK, deliberately. Every ref this workflow fires on is a
-# promotion ref, and a discarded full run is indistinguishable from one that was
-# never required - so there is nothing here to opt out of, and no group for a
-# later run to evict an earlier one from. Two runs of this workflow on two refs
-# are two independent promotion records and both are meant to complete.
+# Development full-test branches retain only their newest candidate.
+# Manual dispatch and ci-full/release/** or ci-full/main preserve each run.
+concurrency:
+  group: full-${{ github.ref }}-${{ (github.event_name != 'push' || contains(github.ref, '/release/') || endsWith(github.ref, '/main')) && github.run_id || 'dev' }}
+  cancel-in-progress: true
 
 jobs:
 
@@ -61,8 +61,8 @@ jobs:
   # database, so it does not share that budget with the live gates.
   carriage_controls:
     name: Directory carriage mutation controls
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -73,9 +73,11 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,13 +94,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -106,29 +103,9 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
-        run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -161,9 +138,9 @@ jobs:
     # one serial job with everything else. Neither reads rows another gate
     # wrote: each drives its own suite under mutation, so both start from this
     # job's own freshly migrated database, in the order they hold on main.
-    # The runner's own job timeout is 75m; this matches it.
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+    # The runner's own job timeout is 150m (raised from 75m on 11 Oct 2026: the document-controls job needs 63 minutes idle and more beside a lane); this matches it.
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -174,9 +151,11 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -193,13 +172,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -207,29 +181,9 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
-        run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -244,6 +198,130 @@ jobs:
         run: |
           proof_dir="$(mktemp -d)"
           python3 ../scripts/project-task-inheritance-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 785e1eed P1-C. Eight controls widen the mint ceiling past the live
+      # predicate (three in the live arm, three in the algebra arm, two by
+      # dropping a half of the filing check) and one narrows it back to the
+      # pre-repair algebra; each must redden exactly its declared tests.
+      - name: Agent mint ceiling mutation controls (785e1eed)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/mint-ceiling-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 40e0e542. Seven controls, each of which must redden exactly its
+      # declared tests of the unit, pin, live and Knowledge page suites: drop
+      # the archive subtraction; forward includeArchive to the source as a
+      # field; let archiveCategories escape the declared categories; change the
+      # selector schema without moving its sha256 pin; and the rider's three -
+      # make the scope sentence unconditional; drop the opt-in from the search
+      # ledger; remove the page's fix for a tick made before the principal
+      # read resolves. The page suite is vitest, so the frontend is installed.
+      - name: Install the frontend for the default search scope drill (40e0e542)
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      # Machinery queue 9b761f09: two vitest-only lane drills that sat in no
+      # tier and rotted unseen (a literal test count; anchors that moved). The
+      # UI drill clones the clean checkout and must run before any step could
+      # leave a file in it; each control must redden exactly its declared test
+      # and the source is fingerprinted before and after. No database.
+      - name: UI refinement mutation controls (9b761f09)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/ui-refinement-mutations.py --source .. --output "$proof_dir/ui-refinement"
+      - name: Settings identity UI mutation controls (9b761f09)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/ui-settings-mutations.py --source .. --output "$proof_dir/ui-settings"
+      - name: Map plane mutation controls (9b761f09)
+        run: python3 ../scripts/test-map-plane-mutations.py
+      # The Personality projection controls run jest against a private copy of
+      # backend/src with a mocked database (no live schema proof; the live
+      # Personality contract runs in live_gates).
+      - name: Personality version projection mutation controls (9b761f09)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/test-personality-version-mutations.py --output-dir "$proof_dir/personality-version"
+      - name: Authority edit frontend mutation controls (AZ-A13 stage 3)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/authority-edit-frontend-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Knowledge default search scope mutation controls (40e0e542)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/knowledge-default-scope-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 1fd5de08, line 1 (owner ruling E428). Nine controls, each of which must
+      # redden exactly its declared tests of the console's live suite or its two
+      # vitest suites: the source list, the search fan-out and the get route
+      # each without the selector arm; the page filtering results on the
+      # client; the explain view dropping the score; the coverage lines
+      # dropping an unavailable source; the reader showing a refusal as a
+      # failure, naming the refusal's cause, and rendering source bytes as
+      # markup. The frontend installed above serves the vitest half.
+      - name: Knowledge search console mutation controls (F14 1fd5de08)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/knowledge-console-mutations.py --output-dir "$proof_dir/receipts"
+      # Card b595b3b0. Eleven controls, each of which must redden exactly its
+      # declared tests of the live activity suite or the board and hook vitest
+      # suites: activity read for ids the caller may not read; an absent
+      # observation presented as activity; an earlier assignment epoch revived;
+      # the card inferring activity from the lifecycle status; a hidden tab
+      # still reading; an obsolete read publishing over a newer one; and the
+      # 30d198df follow-ups: a board update emptying every badge; the board
+      # reading cards outside In Progress; such a card showing a badge; clock
+      # skew refusing the batch; a kept row losing its deadline. The
+      # frontend installed above serves the vitest half.
+      - name: Task activity mutation controls (b595b3b0)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/task-activity-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 8fe6d7bb. Eight controls on the plugin deployment view default,
+      # each of which must redden exactly its declared tests of the plugin host
+      # contract, proxy, installation-route and view-default live suites: the
+      # default satisfies a non-view capability; the proxy write path admits
+      # it; the write description admits it; the settings filter applies it to
+      # a non-view entry; a malformed default loads; a default that bypassed
+      # validation counts at use time; it reaches a request without an Account;
+      # the per-entry settings read-only flag admits it (card bedf50cc).
+      # Jest only, no database.
+      - name: Plugin view default mutation controls (8fe6d7bb)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/plugin-view-default-mutations.py --output-dir "$proof_dir/receipts"
+      # Card d1471ea9 (owner ruling E438(1)). Five controls on the sidebar
+      # widget grow opt-in, each of which must redden exactly its declared tests
+      # of the widget vitest suite or the plugin contract and installation jest
+      # suites: every widget grows without the opt-in; an opted-in widget has no
+      # host ceiling; a resize message skips the origin and source-window check;
+      # a grow that is not a boolean loads; the registry drops grow: true. The
+      # frontend installed above serves the vitest half. No database.
+      - name: Sidebar widget grow mutation controls (E438, d1471ea9)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/plugin-widget-grow-mutations.py --output-dir "$proof_dir/receipts"
+      # Card fa519c4c (subtask 2085337). Fourteen controls on the plugin health
+      # probe, each of which must redden exactly its declared tests of the probe
+      # suite (real sockets, real fetch, the answers recorded from the plugin
+      # containers) or the loader pin: the cause code is not read; the cause is
+      # read through a getter; a timeout is not named; a 3xx is not named; a
+      # redirect is followed; a degraded 2xx counts healthy; the recorded
+      # "healthy" word is refused; an undocumented 2xx body marks the plugin
+      # unhealthy; the body read is unbounded; the log line loses the plugin
+      # name; the log line carries an address; an unchanged failure logs on
+      # every tick; a recovery is silent; a non-2xx loses its number. No database.
+      - name: Plugin health probe mutation controls (fa519c4c)
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/plugin-health-probe-mutations.py --output-dir "$proof_dir/receipts"
       - name: Blueprint document policy and census real-red controls (7e202fca)
         run: |
           python3 ../scripts/blueprints-document-mutations.py --output-dir /tmp/blueprint-document-proof
@@ -251,17 +329,81 @@ jobs:
           python3 ../scripts/blueprints-schema-mutations.py --output-dir /tmp/blueprint-schema-proof
           python3 ../scripts/blueprints-setup-mutations.py --output-dir /tmp/blueprint-setup-proof
           python3 ../scripts/blueprints-census-mutations.py --root .. --output /tmp/blueprint-census-proof
+      # Card 785e1eed P1-B (AZ-A9 grant requests). Twelve controls each withdraw
+      # one rule the amendment's clauses bind - the inert grantee, ALREADY_HELD,
+      # the approved expiry, the decider ceiling, the bearer-only plane, the
+      # administrator-or-root decider, the admin-verb closure, both terminal
+      # writers' revocation, the phase arm, the narrowing rule and (E43 Q1) the
+      # administrator arm on every kind - and each must redden exactly its
+      # declared tests of the live suite. P1-B-2 (clause 13) adds the credential
+      # suite's controls: the executor and decide ceilings, the collect binding,
+      # the scope closures, the scope narrowing, the terminal revoke, the secret
+      # kept out of the ledger, ALREADY_HELD and the decider arm.
+      - name: Grant and credential request mutation controls (785e1eed P1-B, P1-B-2)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/access-request-mutations.py --output-dir "$proof_dir/receipts"
+          python3 ../scripts/access-request-mutations.py --suite credential --output-dir "$proof_dir/credential-receipts"
+      # Card 46cfbd1d (LENSES-c c1-A), given a tier by machinery queue
+      # 9b761f09: its anchors drifted twice while it ran nowhere. Seventeen
+      # controls on the Group roles relation (migration 152, the fragment, the
+      # route register, the owner removal order, the bearer branch, the
+      # session seam), each of which must redden exactly its declared tests of
+      # the live, register and seam suites, in a disposable copy; a closing
+      # run re-applies the original migration and the source is fingerprinted.
+      - name: Group roles mutation controls (46cfbd1d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/lenses-stewards-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 4e159741 (RH-LENSES-d, obligation B-L10d): the design names no red
+      # mutation, so the build writes and proves them. Ten on the lens contract
+      # (the route ceiling's placement, the admin arm in both directions, the
+      # absent manager key, the one session classification, a route that
+      # consults the lens - which the live comparison sees once the lens surface
+      # is removed - and a load-time copy the importer register sees) and six
+      # on the dashboard's lens navigation (frontend installed above), each of
+      # which must redden exactly its declared tests, in a disposable copy.
+      - name: Lens contract mutation controls (4e159741)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/lenses-d-mutations.py --output-dir "$proof_dir/receipts"
+          python3 ../scripts/lenses-d-mutations.py --suite frontend --output-dir "$proof_dir/frontend-receipts"
+      # Card b5c83682 (LENSES-c c1-B; design delta G.2 drill 11): every control
+      # of the owner-only gates and the manager lens ships a mutation that
+      # reddens it alone - the scope rules' order, each gate's predicate order
+      # and its owner-only standing, the step-up bindings, the row locks, the
+      # lens's fragment and its absent key - each of which must redden exactly
+      # its declared tests of the live, register, seam and lens suites, in a
+      # disposable copy, with a closing baseline and a fingerprinted source.
+      - name: Owner-only gates mutation controls (b5c83682)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/lenses-gates-mutations.py --output-dir "$proof_dir/receipts"
 
-  blueprint_controls:
-    name: Blueprint runtime, gate and installation controls
-    # The Blueprint runtime, isolated-source and clean-installation controls, in
-    # their main order. `npm run build` is deliberately NOT run here: the two
-    # steps that read `backend/dist` (the SETGOV census and the orchestration
-    # reachability drill) sit after the boot check in `live_gates`, which is
-    # where they are on main too.
-    # The runner's own job timeout is 75m; this matches it.
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+  drill_controls:
+    name: Mutation and compiled-process drills given a tier
+    # Machinery queue 9b761f09: eighteen drills ran in no tier, and four of them
+    # had rotted (anchors moved by a refactor, a timing ratio measured against
+    # an acquisition deadline that later grew, a developer's fixed container
+    # name). Each cheap green one now has a step here, on this job's own
+    # database; the two expensive ones stay on demand (docs/ci.md, "Drills
+    # outside both tiers"). The compiled-process drill that needs a FRESH
+    # database runs first. The two drills that bring their own databases run
+    # in board_drill_controls, so neither job comes near its budget.
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -272,9 +414,431 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The disposable-copy drills copy the committed tree; the history is
+          # fetched so a copy is the same tree a developer's checkout holds.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        run: node scripts/wait-for-postgres.js
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      # The compiled-process drills boot dist/server.js, the artefact the
+      # container runs, so the build is part of what they measure.
+      - name: Build the backend the compiled-process drills boot
+        run: npm run build
+      # Card 46cfbd1d (LENSES-c). Needs a FRESH database: it is the first
+      # drill on this job's database.
+      - name: Group stewards against the compiled process (46cfbd1d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/lenses-stewards-compiled-drill.js
+      - name: Authority edit in place against the compiled process (1a38270d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/authority-edit-compiled-drill.js
+      - name: Group owner tiers against the compiled process (ee81ee0f)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/group-owner-compiled-drill.js
+      - name: Group ownership transfer against the compiled process (311229fd)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/group-ownership-transfer-compiled-drill.js
+      - name: Group principal against the compiled process (20f40e40)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/group-principal-compiled-drill.js
+      # Card a9b1e69c (AZ-A12 build 5, G.2 drill 9): the hub classes, the owner
+      # fields, the owner-change socket and the Group-owner feed basis against
+      # the compiled process, with real sessions, step-up and sockets.
+      - name: Group owner hub against the compiled process (a9b1e69c)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/group-owner-hub-compiled-drill.js
+      # Card 1e56dbef (AZ-A12 build 6, clause 12): the Access Explorer read
+      # model against the compiled process - the read and write it states
+      # for a member, a manager, an outsider and a real Connector equal what
+      # the real routes answer; concealment, the Group tier and SR-3.
+      - name: Access Explorer against the compiled process (1e56dbef)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/access-explorer-compiled-drill.js
+      # Card 5854f0d6 (Notifications and Timeline, E394): Needs your action and
+      # the Timeline against the compiled process - two Accounts' rows apart on
+      # every page, a tasks:read bearer reading Task rows only, field names never
+      # values, the Verifier's action item, the clamped last-seen cursor.
+      - name: Notifications and Timeline against the compiled process (5854f0d6)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/notifications-timeline-compiled-drill.js
+      # The disposable-copy mutation drills: each control edits one anchor in
+      # a copy of the tree and must redden exactly its declared tests.
+      - name: Default Verifier mutation controls (41e24358)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/default-verifier-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Group owner tier mutation controls (ee81ee0f)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/group-owner-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Group ownership transfer mutation controls (311229fd)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/group-ownership-transfer-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Group principal mutation controls (20f40e40)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/group-principal-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Notification hub mutation controls (b1e3b16d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/notification-hub-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Group owner hub mutation controls (a9b1e69c)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/group-owner-hub-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Non-UUID path id mutation controls (bc847bd0)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/non-uuid-path-id-mutations.py --out "$proof_dir/receipts" --live
+      # The in-place mutation drills: each edits a file of this throwaway
+      # checkout, runs its suites and restores it; nothing else writes the
+      # checkout while they run.
+      - name: Project-scoped authorization mutation controls (RH-AZ.PROJ-a)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node ./node_modules/.bin/tsx scripts/az-proj-mutation-drill.ts
+      - name: Dashboard authorization mutation controls (72258a60)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node ./node_modules/.bin/tsx scripts/dashboard-authorization-mutation-drill.ts
+      - name: First-run administrator and role act mutation controls (27322abb)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node ./node_modules/.bin/tsx scripts/first-run-mutation-drill.ts
+      - name: Mint target authorization mutation controls (45e7110a)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node ./node_modules/.bin/tsx scripts/mint-target-authorization-mutation-drill.ts
+      - name: Liveness bookkeeping bound mutation controls (8491557e)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node ./node_modules/.bin/tsx scripts/presence-write-bound-mutation-drill.ts
+      # Owner ruling E462 (universal harness connector design, section 6): wake
+      # protocol 2. Each control withdraws one guard (the verify and stuck
+      # predicates, their per-kind withdrawal and dedupe, the protocol-1 gate,
+      # the own-work guard, the outcome frame) in a copy of the tree and must
+      # redden exactly its declared tests of the live suite, which also runs
+      # once in live_gates (npm run test:connector-notifications).
+      - name: Wake protocol 2 kinds and outcome mutation controls (E462 S4)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: python3 ../scripts/connector-wake-kinds-mutations.py --output-dir "$(mktemp -d)/proof"
+      # Owner ruling E462 S5: the connector's ring (cli/relayhall_connector_ring.py).
+      # Each control withdraws one guard (the acknowledgement, the receive-only
+      # rule, the local policy, the Agent per run, the run's MCP isolation,
+      # publisher trust, the own-work guard, supervision, the secret strip) in
+      # a copy of cli/ and must redden exactly its declared tests of the ring,
+      # census and task suites, by an assertion. pytest only; no database.
+      - name: Connector ring mutation controls (E462 S5)
+        run: |
+          python3 -c 'import pytest' 2>/dev/null || pip install --quiet --break-system-packages pytest
+          python3 ../scripts/connector-ring-mutations.py --output-dir "$(mktemp -d)/proof" --jobs 2
+      # Owner ruling E462 S4b: each control withdraws one verification-mode
+      # guard (setter, timing, finish, claim, the verifier-agent arm, G(Task),
+      # the legacy arm, the wake) in a copy of the tree and must redden exactly
+      # its declared tests of the live suite, which also runs once in
+      # live_gates (npm run test:verification-modes).
+      - name: Verification modes mutation controls (E462 S4b)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: python3 ../scripts/verification-modes-mutations.py --output-dir "$(mktemp -d)/proof"
+
+  board_drill_controls:
+    name: Board-wide mutation drills on their own databases
+    # Machinery queue 9b761f09: the Access Explorer and the Notifications and
+    # Timeline drills read board-wide state, so each migrates a fresh template
+    # database and starts every live run on a fresh copy of it, restoring this
+    # job's database at the end (docs/ci.md). On the shared database the Access
+    # Explorer runs grew slower one after another and pushed drill_controls
+    # past its 150 minutes (full-tier run 6440); together they are about 50
+    # minutes, so they have this job to themselves.
+    timeout-minutes: 150
+    runs-on: relayhall-full
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The disposable-copy drills copy the committed tree; the history is
+          # fetched so a copy is the same tree a developer's checkout holds.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        run: node scripts/wait-for-postgres.js
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      - name: Access Explorer mutation controls (1e56dbef)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/access-explorer-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Notifications and Timeline mutation controls (5854f0d6)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/notifications-timeline-mutations.py --output-dir "$proof_dir/receipts"
+      - name: Action Center queue for agents mutation controls (E467)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/action-items-owner-mutations.py --output-dir "$proof_dir/receipts"
+
+  authority_edit_controls:
+    name: Authority edit in place, live and mutation controls
+    # Card 1a38270d (AUTHZ amendment AZ-A13 stage 2, edit in place). Its own
+    # job, from its own freshly migrated database: the live suite and then its
+    # red-proof drill, which drives that suite once per control (about 40
+    # minutes), so neither lengthens the 150-minute budget of another job.
+    timeout-minutes: 150
+    runs-on: relayhall-full
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -291,13 +855,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -305,29 +864,155 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
+      - name: Bring up the contract database (base schema + migrations)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: node scripts/load-base-schema.js && npm run migrate
+      # Editing a Connector credential, a warrant and a grant IN PLACE, against a
+      # REAL PostgreSQL through the production router and the MCP ingress: the
+      # narrowing save, the one-act widening with step-up (root, an
+      # administrator, the owning Account within its own access), the agent's
+      # filing and the decide on /approvals, the stale check, the caps, the
+      # lifetime with its revert and sweep, the narrow-all act, the warrant pin
+      # and riding tasks, the grant rules, the audit shape and the secret kept
+      # out of every record; the edited credential is USED with the same token.
+      # The same step runs the follow-ups suite (owner rulings E148 and E149):
+      # the residual a revert keeps, named in its records, and no edit adding
+      # knowledge-contents:write to an Agent credential.
+      - name: Authority edits in place, live (1a38270d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:authority-edit
+      # Card ff410dc4 (owner ruling E407 item 1): the Access page's grants list
+      # read one keyset page at a time against a REAL PostgreSQL through the
+      # production router: no duplicate and no gap across pages while rows are
+      # written and revoked between them, under every sort; each row's origin
+      # derived from the grants columns and the audit ledger, never guessed;
+      # every filter, the search and the root ceiling (two Accounts without
+      # root see nothing); and EXPLAIN of the default query on a seeded table.
+      - name: Grants list paging and origin, live (ff410dc4)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:grants-list
+      # Owner rulings E407 item 2, E413 and E418(b) against a REAL PostgreSQL
+      # through the production router and MCP ingress: the creation writer
+      # writes a grant only when the authorization engine says it changes
+      # access; the session-only bulk revoke (dry run by default, at most 500
+      # ids, a step-up bound to the id set, a live re-check per id, a read-back
+      # that rolls the whole batch back on any difference, one audit row per
+      # grant and one summary row); and the single DELETE's session and
+      # step-up refusals and allowed path.
+      - name: Grants writer, bulk revoke and single delete, live (E413)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:grants-bulk-revoke
+      # Each control withdraws ONE rule of E407 item 2, E413 or E418(b) (or one
+      # engine arm the writer's skip rests on) and must redden exactly its
+      # declared tests of that suite, for an assertion.
+      - name: Grants writer and bulk revoke mutation controls (E413)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
         run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/grants-bulk-revoke-mutations.py --output-dir "$proof_dir/receipts"
+      # Each control withdraws ONE rule the amendment binds and must redden
+      # exactly its declared tests, for an assertion: the census controls (the
+      # writer and reader registers, the method-specific MCP ban), the live
+      # controls, and drill 8, one mutation in the shared credential policy
+      # that reddens the credential-request suite too (clause 7, E73), and the
+      # follow-ups controls (E148, E149), and the stage 3 lifetime/step-up and
+      # N14 quota controls against their own named assertions.
+      - name: Authority edit in place mutation controls (1a38270d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/authority-edit-mutations.py --suite census --output-dir "$proof_dir/census-receipts"
+          python3 ../scripts/authority-edit-mutations.py --output-dir "$proof_dir/receipts"
+          python3 ../scripts/authority-edit-mutations.py --suite credential --output-dir "$proof_dir/credential-receipts"
+          python3 ../scripts/authority-edit-mutations.py --suite followups --output-dir "$proof_dir/followups-receipts"
+          python3 ../scripts/authority-edit-mutations.py --suite stage3 --output-dir "$proof_dir/stage3-receipts"
+
+  blueprint_controls:
+    name: Blueprint runtime, gate and installation controls
+    # The Blueprint runtime, isolated-source and clean-installation controls, in
+    # their main order. `npm run build` is deliberately NOT run here: the two
+    # steps that read `backend/dist` (the SETGOV census and the orchestration
+    # reachability drill) sit after the boot check in `live_gates`, which is
+    # where they are on main too.
+    # The runner's own job timeout is 150m (raised from 75m on 11 Oct 2026: the document-controls job needs 63 minutes idle and more beside a lane); this matches it.
+    timeout-minutes: 150
+    runs-on: relayhall-full
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The migration-ledger gate resolves a BASELINE commit and fails
+          # closed when it cannot (review 696bff8c, R2-F5): a shallow clone has
+          # no `origin/main` and no first parent, so the deletion and
+          # append-only controls would have nothing to compare against. A
+          # warning-and-skip is not a safety control, so the history it needs
+          # is fetched instead of the control being softened.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -359,15 +1044,14 @@ jobs:
           DB_PASSWORD: relayhall_ci
         run: python3 ../scripts/blueprints-examples-live.py --profile ci --root .. --output /tmp/blueprint-examples-proof --with-exporter-mutation
 
-  live_gates:
-    name: Live authorization gates against a real PostgreSQL
-    # The order-sensitive live chain, unbroken and in its main order. The
-    # list/point parity gate stays FIRST on a freshly migrated database because
-    # its assertions are equalities over counts, and the boot check keeps its
-    # position ahead of the two steps that read `backend/dist`.
-    # The runner's own job timeout is 75m; this matches it.
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+  assignment_coupling_controls:
+    name: Assignment coupling and role-grant-expiry controls
+    # Card 500fedaa, including the E112-absorbed 699b1f0b drill. S7 starts
+    # on its own fresh database; neither existing order-sensitive job changes.
+    # 150m is the runner ceiling, not a measured budget. Exact runner timing
+    # and all 17 declared red controls remain acceptance requirements.
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -378,9 +1062,83 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      CI: 'true'
+      RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: relayhall_ci
+      DB_USER: relayhall_ci
+      DB_PASSWORD: relayhall_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Wait for PostgreSQL to accept connections
+        env:
+          PGHOST: postgres
+          PGPORT: '5432'
+          PGUSER: relayhall_ci
+          PGPASSWORD: relayhall_ci
+          PGDATABASE: relayhall_ci
+        run: node scripts/wait-for-postgres.js
+      - name: Bring up the contract database (base schema + migrations)
+        run: node scripts/load-base-schema.js && npm run migrate
+      - name: S7 assignment-access coupling, live (500fedaa)
+        run: npm run test:s7-assignment-coupling
+      - name: Role-grant-expiry mutation controls (500fedaa, absorbs 699b1f0b)
+        run: |
+          proof_dir="$(mktemp -d)"
+          npm run drill:role-grant-expiry -- --output-dir "$proof_dir/receipts"
+          cat "$proof_dir/receipts/closure.json"
+      # Card 14d33463: the MCP/REST Task archive parity drill (94b3b6ea) reads
+      # `backend/dist`, so it builds first. It starts the compiled MCP ingress
+      # and REST routers in process and owns only randomly named rows in this
+      # job's disposable service database. It runs last here, not in
+      # `live_gates`, so its rows never precede that job's ordered chain.
+      - name: MCP Task archive parity, live (94b3b6ea, 14d33463)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          npm run build
+          npm run test:archive-mcp-live
+
+  live_gates:
+    name: Live authorization gates against a real PostgreSQL
+    # The order-sensitive live chain, unbroken and in its main order. The
+    # list/point parity gate stays FIRST on a freshly migrated database because
+    # its assertions are equalities over counts, and the boot check keeps its
+    # position ahead of the two steps that read `backend/dist`.
+    # The runner's own job timeout is 150m (raised from 75m on 11 Oct 2026: the document-controls job needs 63 minutes idle and more beside a lane); this matches it.
+    timeout-minutes: 150
+    runs-on: relayhall-full
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relayhall_ci
+          POSTGRES_PASSWORD: relayhall_ci
+          POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -397,13 +1155,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -411,29 +1164,9 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
-        run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -502,6 +1235,18 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:project-task-inheritance
+      # Explicit Project owner changes are a current-authority and SQL
+      # transaction contract. The same real DB gate covers Project/Phase
+      # visibility, delegated revocation, revision races and audit rollback.
+      - name: Project ownership authority and atomicity
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:project-ownership
       # Card f9b7febe. For a Task the caller may not read, GET /tasks/{id}
       # answered 404 while PATCH /tasks/{id} answered 403, so an id could be
       # confirmed by writing to it: concealment was a property of the VERB
@@ -562,6 +1307,141 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:mint-target
+      # Card 785e1eed P1-B and P1-B-2 (AZ-A9, ratified 2026-10-10 (E43)). An
+      # Agent or Connector files a grant request, and a Connector a credential
+      # request, on the bearer-only /delegation/access-requests routes and over
+      # MCP; root or an administrator session decides it on /approvals under
+      # step-up; a grant approval writes expiring grant rows the live predicate
+      # then reads, a credential approval is collected once by the requesting
+      # credential and the new key is used; and both terminal writers revoke
+      # them. Every number is read back from stored rows through the production
+      # router. No `if:` guard, for the same reason the gates above carry none.
+      - name: Grant and credential requests file, decide, collect and revoke, live (785e1eed P1-B, P1-B-2)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:access-requests
+      # Card 7c77fcf3. The internal execution keys (executionServiceId,
+      # executionDescriptorVersion) are never request fields: POST /tasks and
+      # PATCH /tasks/:id refuse them by name, the MCP task tools refuse or relay
+      # the refusal, recovery reads its named fields only, and a body carrying
+      # either key leaves the assignment, descriptor pin, access vehicle,
+      # vehicle grants and assignment epoch exactly as they were, while the
+      # executionProfile path and its services:invoke gate are unchanged.
+      # Every number is read back from stored rows through the production
+      # router. No `if:` guard, for the same reason the gates above carry none.
+      - name: Internal execution keys are never request fields, live (7c77fcf3)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:raw-execution-keys
+      # Card c3880767. Every column of `tasks` is classified as a public
+      # request field or server-written, and the live column list is read from
+      # information_schema, so a column a later migration adds fails here
+      # until it is classified. POST /tasks and PATCH /tasks/:id refuse every
+      # key that names a server-written column (the retry budget, review
+      # state, review evidence, runtime linkage, timestamps, ownership and
+      # provenance) by name and leave the stored row byte-identical, the MCP
+      # task tools refuse or relay the refusal, and every public field and
+      # every in-repo client payload still writes. Every number is read back
+      # from stored rows through the production router. No `if:` guard, for
+      # the same reason the gates above carry none.
+      - name: Server-written Task columns are never request fields, live (c3880767)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:task-server-written-columns
+          npm run drill:success-criteria
+      # Card b1e3b16d (hub lane L2). The notification history is read from the
+      # ledgers with read state per principal (migration 144): one Account
+      # marking a row read leaves another's unread, mark-all stays inside the
+      # caller's filter and visibility, the stuck notice stays addressed, an
+      # approval row reaches only sessions inside the approvals self-scope, and
+      # read state survives a restart. Every number is read back from stored
+      # rows through the production router. No `if:` guard, for the same reason
+      # the gates above carry none.
+      - name: Notification history and read state, live (b1e3b16d L2)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:notification-read-state
+      # Card b1e3b16d (the approvals hub view). GET /approvals?view=hub groups
+      # every pending kind by whose it is, conceals titles the session cannot
+      # read, lists skill versions only where the publish route would admit the
+      # session, lists verification requests waiting on a verifier read-only
+      # (never decidable, only on a task the session reads), and reports
+      # `decidable` by the decide route's own rule - checked
+      # against that route item by item. Two controls ride with it: the default
+      # GET /approvals answer is unchanged, and the router still mounts exactly
+      # approve and deny. No `if:` guard, for the same reason.
+      - name: Approvals hub view, live (b1e3b16d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:approvals-hub
+      # Card 785e1eed P2-B slice 1 (AZ-A10 clause 6, E43 Q4, E62). The assigning
+      # act dates the grant rows its execution assignment writes: the default is
+      # three months after the assignment, any earlier or later future date and
+      # 'unlimited' are admitted from whoever performs the act, a past date is
+      # refused, a shared row is the latest of its links, and the terminal
+      # reapers are unchanged. Every date is read back from stored rows through
+      # the production router. No `if:` guard, for the same reason the gates
+      # above carry none.
+      - name: Assignment grant expiry, live (785e1eed P2-B)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:role-grant-expiry
+
+      # P2-D current predicate/source visibility. Explicit disposable database;
+      # self/owner router + MCP, context/caps/liveness/concealment and audit.
+      - name: Current authority preview against the live evaluator (P2-D)
+        working-directory: backend
+        env:
+          CI: 'true'
+          P2D_COMPILED: '1'
+          RELAYHALL_TEST_DB_URL: postgresql://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: |
+          npm run build
+          npm run test:authority-preview
+
+      - name: Authority preview mutation controls (P2-D)
+        working-directory: backend
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgresql://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: python3 scripts/authority-preview-drill.py
       # Cards aad1894b and 91af25a6. The own-Report arm of the Task/Report link
       # compared the UNTAGGED provenance string to a principal UUID, and got
       # both answers wrong: the author of a REST-filed Report could not link its
@@ -597,6 +1477,68 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:telemetry-projection
+      # Card dac2ca71 (RH-TW1b slice 1). The OTLP/HTTP receivers: every committed
+      # capture (Claude Code over protobuf and JSON, and a second producer, the
+      # OpenTelemetry Python SDK) is replayed by a real Connector credential
+      # through the production router, then measured in the database - stored
+      # once, exact after a jsonb round trip, idempotent under replay, absent
+      # from every text column wherever the translation dropped it, and counted
+      # on adapter health. The dedupe is the UNIQUE idempotency key and the
+      # rollups are SQL, which a mocked pool cannot measure. No `if:` guard, for
+      # the same reason the gates above carry none.
+      - name: OTLP receivers against PostgreSQL (dac2ca71)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:telemetry-otlp
+      # Card dac2ca71. Migration 163 replaces the receiver-limit CHECK only when it
+      # matches migration 112's text EXACTLY and raises otherwise; the drill builds
+      # the renamed, independent-check, differing and duplicated estates in
+      # throwaway schemas and measures the catalog after each.
+      - name: Migration 163 exact-predecessor drill (dac2ca71)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:migrations:telemetry-otlp-surfaces
+      # Card beac9c79 (owner decision D6), homed by machinery queue 9b761f09:
+      # eight separate connections race one principal's ingest interval and
+      # exactly one may win, and the real `ingest` is driven through its
+      # rate-limited, FK-refused and blocked paths under bounded timeouts. The
+      # probe's tables are derived from this migrated database (LIKE ...
+      # INCLUDING ALL) inside a throwaway schema it drops; a hand copy rotted
+      # silently while no tier ran it.
+      - name: Telemetry receiver limits, two-client race (beac9c79)
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:limits:telemetry-receiver
+      # Card 35b73092. MCP-derived sessions are telemetry ROWS a Connector's own
+      # MCP tool calls leave behind: the gate drives the production MCP server
+      # and router with real credentials for two Accounts, reads the rows back
+      # as each Account through the same routes the Agent sessions page uses,
+      # and diffs the whole schema around a call to prove only the telemetry
+      # tables moved. The heartbeat bound is the UNIQUE idempotency key, which a
+      # mocked pool does not have. No `if:` guard, for the same reason the gates
+      # above carry none.
+      - name: MCP-derived agent sessions (35b73092)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mcp-derived-sessions
       # Cards 6e25ae48 and 3f145fa3. "Connect your agent" is the headline card on
       # the dashboard of a fresh install and could not succeed for the person who
       # created it. Both halves of the repair are properties of stored rows — the
@@ -627,7 +1569,25 @@ jobs:
           DB_NAME: relayhall_ci
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
-        run: npm run test:password-act
+        run: |
+          npm run test:password-act
+          npm run test:charter-approval-audit
+          npm run drill:charter-approval-audit
+      # Card a3e76724. An Account whose only proof is its Identity provider
+      # could not mint a step-up token, so every step-up-gated act was out of
+      # its reach. The proof is a pending row, a really signed ID token, a
+      # single-winner collection and a token burned by the production consumer
+      # -- stored rows, measured through the production routers, with no `if:`.
+      - name: Step-up through the Identity provider (a3e76724)
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+          CI: 'true'
+        run: npm run test:step-up-sso
       # Card 0b4b779b (RH-KW1 candidate C). The knowledge fan-out set is a
       # SELECTOR property and the board adapter is an in-query predicate;
       # both need real rows, and the suite fails rather than skips without a
@@ -695,6 +1655,715 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:lenses-home-group
+      # Card f87776ad (owner ruling D37(d)). A Skill Version's provenance attests
+      # the kind of the Principal that created it, and migration 083's insert
+      # trigger is the guard. The dashboard once carried a loaded Version's
+      # agent-drafted provenance into a human's new draft and the trigger's
+      # refusal surfaced as a generic lifecycle conflict. Driven through the
+      # production router with a real login session and a real bearer
+      # credential; the independent-review publication rule rides the same run.
+      - name: Skill draft provenance against the creator kind, live (f87776ad)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:skill-provenance
+      # Card d67e6990 (D24 part 1; AZ-A12 build 4, M-c). A Skill has an owner,
+      # and the registry shows a Skill's drafts to its owner. Two Accounts over
+      # the production router: after the owner act, the first Account's list and
+      # session brief no longer carry the second Account's drafts and the
+      # second's do; migration 162's explicit list is re-applied in a rolled-back
+      # transaction; the owner act is audited and a Group move needs a step-up.
+      - name: Skill ownership and owner-scoped drafts, live (d67e6990)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:skill-ownership
+      # Card 1118fefa. The session brief is the bootstrap, and its ceiling was
+      # principals:read, so an ordinary tasks/reports Agent could never bootstrap
+      # and every work-plane tool refused it. Minted through the real approval
+      # path, the Agent bootstraps, claims, moves, saves and lists a draft Report
+      # and finishes to Review over MCP, with the REST status of every call
+      # recorded; principals:read still gates the directory, and a credential
+      # with no scopes bootstraps on its identity alone and can do nothing else.
+      - name: Session-brief bootstrap for a task-scoped Agent, live (1118fefa)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:session-bootstrap
+      # Card c334177b. An Agent minted with NO object rule stored an empty own()
+      # list, and an empty list refused every Task act - so the approved,
+      # bootstrapped Agent was refused 403 at the claim of its own bound Task.
+      # Minted through the real approval path with no rules, the Agent now
+      # claims, moves, saves a draft Report and finishes over MCP; it gains
+      # nothing on any other Task, an approval narrowed by scope or to a
+      # read-only rule still narrows, and the parent Connector's own() cap
+      # still binds, live.
+      - name: Rule-less task-bound Agent works its bound Task, live (c334177b)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:bound-agent-claim
+      # Card b13e5ac9 (owner ruling D34(b), Charter v5 §6.1). A Project names
+      # one inbox phase; a Task created without an explicit phase lands there
+      # with status Ideas, and an explicit phaseId or status wins. Proven for
+      # all four creation surfaces - REST, the dashboard's two request bodies,
+      # MCP tools/call and the real CLI program - with and without a phase,
+      # plus the setting's refusals, the suspended default, the untouched
+      # existing Task and the compiled Brief, over the production router.
+      - name: New-card defaults land in the project inbox phase, live (b13e5ac9)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:inbox-defaults
+      # Card 785e1eed P1-C. The Agent mint ceiling (T2) compared a request with
+      # grant rows, matching verbs exactly, and did not run at filing. It is now
+      # the live predicate: an Account owning the Task's Project, holding only a
+      # write grant or a Project grant mints through request, approval and
+      # collect; no authority refuses at filing (REST and MCP) and at decide
+      # with the same words; and across a matrix of authority sources the
+      # filing verdict equals what an Agent holding the rule can do live; the
+      # non-exact selectors are never admitted wider, cell by cell.
+      - name: Agent mint ceiling equals the live predicate, live (785e1eed)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mint-ceiling
+      # Card 20f40e40 (AZ-A12 build 1). A Group is also a principal of kind
+      # 'group' with the same id. Migration 146 re-applies cleanly and its
+      # backfill, self-checks and post-check are drilled in rolled-back
+      # transactions; every clause-3 refusal is measured both ways through the
+      # production router, the MCP ingress and raw SQL; every /principals/:id
+      # mutation refuses a Group first, audited; deletion refuses
+      # GROUP_OWNS_OBJECTS and terminates the principal; and the ownership-status
+      # act is a root login session with a step-up no earlier refusal spends.
+      - name: Group principal kind and lifecycle, live (20f40e40)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:group-principal
+      # Card 46cfbd1d (LENSES-c c1-A). Group roles: migration 152 re-applies
+      # and is pinned by name; the holder and no-update triggers refuse by
+      # rule; a root login session appoints and removes while a root bearer,
+      # an operator and an editor are refused; a row is live only while its
+      # holder is active, a member and not elevated (leave, disable, promotion
+      # and termination each drilled); a Group owner removes a manager row with
+      # a step-up no refusal spends; GROUP_HAS_STEWARDS; the catalog's steward
+      # row and SR-2 never reach a bearer.
+      - name: Group roles, owners and managers, live (46cfbd1d)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:lenses-stewards
+      # Card ee81ee0f (AZ-A12 build 2). The owner arm resolves a Group owner by
+      # tier: members read and use, live owners and managers get the write
+      # subset, nobody gets admin, shepherd or verify through Group ownership;
+      # a Group-owned Project reaches its Phases and Tasks by both paths under
+      # the restriction rules; disabling, leaving and inert role rows apply on
+      # the next request; the arm stays on the Account side of the chain (own()
+      # caps, the Agent bound-Task cap and the mint ceiling); point and list
+      # decisions agree for every action; Charter approval stays with
+      # administrators.
+      - name: Group ownership by tier, live (ee81ee0f)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:group-owner-arm
+      # Card 41e24358 (default Verifier, design ba22fd01, ratified E298). The
+      # inheritance order at creation (explicit, the landing Phase after the
+      # inbox decision, the Project, none) with verifier_source and the role
+      # rows; an unusable default never refuses and a change never reassigns;
+      # the usable predicate's four arms at the point and in the list filter,
+      # in parity; the Review warning never blocks (REST move, MCP move, REST
+      # and MCP finish, create in Review); MCP task_create refuses a
+      # non-default Verifier and accepts a default; the default write's gates
+      # (owner, administrator, a grant that is not ownership, a bearer, a
+      # Group-owned Project, Group and Agent values) and its audit rows.
+      - name: Default Verifier per Project and Phase, live (41e24358)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:default-verifier
+      # Card 19dd180c. A finish dry run answers what the real finish answers:
+      # every refusal (no Task role, the assigned Verifier, not In Progress, an
+      # open Subtask, an unlinkable or foreign Task Report, a native
+      # generation the Task lacks or a quarantine hold, a quarantined
+      # oversized handover) paired with the real call for the same actor and
+      # state through REST and MCP, every accepted finish a valid dry run that
+      # writes nothing, and the retry contract (no key; after a finish both
+      # are refused TASK_NOT_FINISHABLE).
+      - name: Finish dry run parity with execution, live (19dd180c)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:finish-dryrun-parity
+      # Owner ruling E462 (universal harness connector design, section 6.8,
+      # slice S4b): verification modes. Who may set `none` and when, the
+      # displaced default and the audit rows, a `none` finish that completes
+      # and readies its dependents (and rings them), the setter re-check, the
+      # assigned claim without a Verifier, the verifier-agent arm with its
+      # negative controls and the chain guard G(Task).
+      - name: Verification modes per Task, live (E462 S4b)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:verification-modes
+      # Card 311229fd (AZ-A12 build 3). Moving a Project or a Task into, out
+      # of or between Groups: a bearer credential, an appointed Main and the
+      # MCP tool are refused GROUP_OWNER_SESSION_ONLY, a non-administrator
+      # GROUP_OWNER_REQUIRES_ADMINISTRATOR and a missing or foreign step-up
+      # STEP_UP_REQUIRED, each before the token is spent and audited outside
+      # the rolled-back transaction; root and an administrator with step-up
+      # move, undo and clear; a disabled Group is no target; a Task's undo pins
+      # the person; the audit row names the deciding arm; creation with a Group
+      # owner is one transaction; owner-candidates lists Groups to the deciders
+      # only; person-to-person transfers are unchanged.
+      - name: Group ownership transfer act, live (311229fd)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:group-ownership-transfer
+      # Card a9b1e69c (AZ-A12 build 5, clauses 12-13, D-16). The owner column
+      # decides the hub's group class first and a live Group grant is the
+      # fallback, in the hub and in the AZ-A9 decider view; the Project record
+      # and the Task account-owner read carry ownerKind and ownerDisplayName,
+      # as the OpenAPI states; a Group owner's transition event reaches its
+      # members (never a disabled Group's), the owner-change hint fans out to
+      # the active members, and My work counts Group ownership at the edit
+      # tier only. Build 4 (card 1942926f): G.2 drill 1's skill rows on a
+      # Group-owned Skill.
+      - name: Group owner hub class, owner fields and feed fan-out, live (a9b1e69c)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:group-owner-hub
+      # Card 1e56dbef (AZ-A12 build 6, clause 12 and E45 (3)). The Access
+      # Explorer read model agrees with the enforcing evaluator on a generated
+      # matrix of principal kinds, object kinds and every action (Group
+      # owners, live and expired grants, profiles, Agents under a Warrant),
+      # with a second-rule-set negative control; every admitted principal is
+      # listed; unreadable objects are concealed; another principal's
+      # authority only to root; the Group tier and SR-3.
+      - name: Access Explorer read model, live (1e56dbef)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:access-explorer
+      # Card 4e159741 (RH-LENSES-d). The lens contract over real requests: the
+      # same Account is refused the admin lens on a bearer holding root and
+      # receives it on a login session and on the dashboard token; no caller
+      # gets a manager key; an Account holding no scope reads its own lenses;
+      # and (control R-8-v1) every outcome and body of the touched route
+      # families and the dashboard family is identical with the lens surface
+      # removed.
+      - name: Lens contract, live (4e159741)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:lenses-contract
+      # Card b5c83682 (LENSES-c c1-B). The owner-only gates over real requests:
+      # a live Group owner (an editor) appoints a manager from the Group's
+      # active members, approves a Group-owned Project's Charter and moves a
+      # Group-owned Project or Task out to a member, or their own into the
+      # Group, each with a step-up; each condition flipped alone refuses by its
+      # own code before the token is spent; the manager lens appears with a live
+      # row and only then; a promotion to operator and back; two concurrent
+      # member removals that wait on the gates' locks.
+      - name: Group owners' gates and the manager lens, live (b5c83682)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:lenses-gates
+      # Card 5854f0d6 (Notifications and Timeline, E394, design section 7).
+      # Two Accounts: A never sees B's Task, Report (promoted, outpost,
+      # deleted), Phase, Project, Skill draft or approval rows; a tasks:read
+      # bearer sees no other type; pages are never short; the report builder
+      # equals filterVisibleReports; each action kind opens and closes; keyset
+      # windows; EXPLAIN index use; field names never values.
+      - name: Notifications and Timeline, live (5854f0d6)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:notifications-timeline
+      # Owner ruling E467 (the Action Center queue for agents): a person's own
+      # Connector and an Agent under it list the items waiting on the person's
+      # Account (every kind, the person's seen state, the Action Center's caps);
+      # another person's Connector sees none of them; a title only where the
+      # caller can read the object (the point routes are the outside anchor);
+      # read only over REST, MCP and the CLI.
+      - name: Action Center queue for agents, live (E467)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:action-items-owner
+      # Card b796067e (RB-11 Governor v0, the core door, D-8). The three
+      # knowledge note verbs relay through the production router and the MCP
+      # ingress to a STUB write source that verifies every write assertion
+      # against the published keyset; the answers come back unchanged and no
+      # note content lands anywhere in the schema; a credential without
+      # knowledge-contents:write is refused by name; an Agent holds the scope
+      # only when its mint names it; the audit is fail-closed; the source's
+      # C.11 refusals pass through; the C.16 bounds refuse before any dial.
+      - name: Knowledge write door through the router and MCP, live (b796067e)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:knowledge-write
+      # Card 40e0e542 (owner ruling E127 (5), selector amendment v1.2). The
+      # default search scope through the production router and the MCP ingress
+      # against a STUB v2 source: a default search asks each source for its
+      # categories minus its declared archive and says so; includeArchive sends
+      # the request unchanged and says so; an all-archive source is skipped by
+      # default; the flag never reaches a source and grants nothing; a
+      # default-search handle cannot open an archive document; every coverage
+      # record names searchedCategories and archive.
+      - name: Knowledge default search scope through the router and MCP, live (40e0e542)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:knowledge-default-scope
+      # Card 549cc51f (owner rulings E298, E299, E310). The shared-area writer
+      # list through the production router and the MCP ingress: the root or
+      # administrator login-session gate with a step-up on every change, every
+      # refusal named and audited with nothing written and no step-up spent,
+      # the expiry sweep as actor system, the snapshot element (E299 F3: a
+      # listed Account outside the export selection never denies it) and the
+      # one MCP read tool. Then the five mutation controls, each red at exactly
+      # its declared tests: the administrator gate, the step-up consume, the
+      # bearer refusal, the F3 filter, and an MCP write composition.
+      - name: Shared-area writer list, live and mutation controls (549cc51f)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:shared-writers
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/shared-writers-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 1fd5de08, line 1 (owner ruling E428). The Knowledge search console's
+      # door through the production router with two Accounts signed in to the
+      # dashboard: each lists only the sources its selector covers; a caller
+      # without access to a source gets no result from it, and it is never
+      # consulted, dialed or named; narrowing to it answers as an unknown id;
+      # a borrowed handle is refused like a forged one; withdrawn access holds
+      # on the next search and read; results carry only the fields the
+      # explain view reads; the MCP search tool answers the same set.
+      - name: Knowledge search console door, live (F14 1fd5de08)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:knowledge-console
+      # Card 502fb19e (the universal change request, owner ruling E325,
+      # migration 158; train T1). Kind change is filed on the bearer door by
+      # every tier, refused by name with a durable audit, decided on /approvals
+      # with ONE step-up by root or an administrator session (a root session
+      # alone for grant edits and revocations), and applied by the existing
+      # executors: grant rows for an Account and a Group, a grant edit and
+      # revocation, a credential's scopes, a credential collected by its target
+      # Connector, a compartment row and a writer-list row. The stale check,
+      # self-decision, the export selection at decide, the deparse of the five
+      # restated arms and the lifecycle exporter's byte-equal read-back are
+      # read back from stored rows. No `if:` guard, as for every gate here.
+      - name: 'Universal change requests: model, standing and decide, live (e97e65ea T1)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:change-requests
+      # The six controls of the change-request drill, each red at exactly its
+      # declared tests: the change arm removed, a self-decision admitted, a
+      # second step-up consumed, the ELSE arm changed, the E299 F3 filter
+      # dropped, and the KNOWLEDGE_NOT_EXPORTED re-check at decide dropped.
+      - name: 'Universal change requests: mutation controls (e97e65ea T1)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/change-request-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 9ce0b0b0 (the universal change request, owner ruling E325; train
+      # T2 slice S4). The identity targets are filed on both doors, refused by
+      # name, decided with ONE step-up and applied by the executors of the
+      # direct acts with the decider as the standing principal: a role through
+      # the lifted role-change seam, a new Account by a root session only, an
+      # Account's status on both doors through the one status seam (sessions
+      # revoked, requests naming it lapsed), another principal's credential
+      # revoked, and the four warrant acts (a warrant filed over MCP writes
+      # nothing until a person decides). Slice S5 adds its object section beside
+      # it in the same script: a Project's owner, a Task's and a Report's account
+      # owner, the default Verifiers, a Charter revision, a Phase goal, a Task's
+      # roles, restricted access and a Report's opening visibility, each applied
+      # by its direct act with the decider as the acting principal, within the
+      # decider's own reach on the object. No `if:` guard, as for every gate here.
+      - name: 'Universal change requests: identity and object targets, live (e97e65ea T2)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:change-request-targets
+      # The seventeen controls of the T2 drill, each red at exactly its declared
+      # tests: the target principal, a revoked credential's holder and a
+      # warrant's holder deciding; an operator giving an elevated role; the
+      # status seam's session revoke, its lapse and its direct door dropped;
+      # the root-only identity targets decided by an administrator; the role
+      # and warrant stale checks dropped; a role narrowed sideways; a warrant
+      # cap widened; a pin loosened by request; a user asking a role on its own
+      # Connector; the role not published after COMMIT; the warrant losing the
+      # decision's step-up; and principal.create losing the decision ledger.
+      # Slice S5's thirty-one controls, each measured on the object section's
+      # own suite: the decider's reach on the object unchecked per target, the
+      # decider's session facts replaced, the principal a change names deciding
+      # it, forged or foreign decision evidence on both seams that accept it,
+      # the Group arms of a Project's owner, the new Report executor's three
+      # refusals, the filing standing and grantee, the access audit row, the
+      # opening-only visibility, both stale checks, and E311 on both routes.
+      - name: 'Universal change requests: mutation controls (e97e65ea T2)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/change-request-target-mutations.py --output-dir "$proof_dir/receipts"
+      # Card ab8f78e9 (owner rulings E91 and E89 (c), migration 161). The
+      # per-session MCP action log through the production MCP server and
+      # router: one row per admitted tools/call under the caller's session,
+      # the closed error code, no argument stored anywhere in the table, a
+      # non-allowlisted tool with no target, the log read on the session's
+      # own point route with the same 404 for another Account and the per-row
+      # narrowing, the 90-day sweep with its receipt, nothing for a caller
+      # that may not be shown, and a failed log write that never fails the
+      # tool. No `if:` guard, as for every gate here.
+      - name: MCP action log through the router and MCP, live (ab8f78e9)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mcp-action-log
+      # The five controls of the action-log drill, each red at exactly its
+      # declared tests: arguments stored, a non-allowlisted target accepted,
+      # an allowlisted tool reading another argument, the visibility check
+      # dropped, and a retention sweep that ignores its bound.
+      - name: MCP action log mutation controls (ab8f78e9)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/mcp-action-log-mutations.py --output-dir "$proof_dir/receipts"
+      # Card e220be94 (owner ruling E353). The plugin bridge's board metrics:
+      # queue (the caller Account's armed todo Tasks) and throughput (its
+      # handbacks in the rolling hour), counted over stored task and stream
+      # rows through the production router with real session and bearer
+      # authentication; unknown stays unknown, never 0. No `if:` guard, as for
+      # every gate here.
+      - name: 'Plugin bridge board metrics: queue and throughput, live (e220be94)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:board-metrics
+      # The eight controls of the board-metrics drill, each red at exactly its
+      # declared tests: a global queue count, another Account's handbacks, the
+      # window widened, unarmed Tasks counted, unknown shown as 0, the
+      # freshness stamp dropped, the caller-reach guard dropped, and the
+      # tasks:read scope check dropped.
+      - name: 'Plugin bridge board metrics: mutation controls (e220be94)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/board-metrics-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 76369965. relayhall_lease_claim sent only leaseSeconds to the
+      # orchestration claim route, which requires snapshotUpdatedAt, harness
+      # and resourceKey, so no call through it could take a Lease. The gate
+      # drives the tool through the production MCP route with bootstrapped
+      # Connector and Agent credentials: claim, exact retry, renew and
+      # release for the admitted roles, and each refusal by name with nothing
+      # written. No `if:` guard, as for every gate here.
+      - name: MCP Lease claim through the router and MCP, live (76369965)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mcp-lease-claim
+      # Card 2bc7b303 (owner ruling E374). The Subtask structure verbs:
+      # relayhall_subtask_create, _reorder and _update_text over their REST
+      # routes. The gate drives them through the production MCP route and the
+      # router with bootstrapped Connector credentials: new stable ids at a
+      # 1-based position, permutation-only reorder, text edits that keep id and
+      # state, same-key retry receipts, and refusal exactly where
+      # relayhall_subtask_set is refused. No `if:` guard, as for every gate here.
+      - name: Subtask structure verbs through the router and MCP, live (2bc7b303)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:subtask-structure
+      # Card 742fae98. The Map's Reports display mode: the per-task Report
+      # count the dashboard draws is computed from GET /tasks/graph, which
+      # narrows Reports Report by Report; two Accounts reading the same Task
+      # get their own readable sets, anchored on each Account's Report point
+      # reads. The Collapsed | Expanded choice is stored per principal
+      # (migration 165) and refused at the column outside its two values.
+      # No `if:` guard, as for every gate here.
+      - name: 'Map Reports display: per-Account counts and the stored mode, live (742fae98)'
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:map-reports
+      # Card bedf50cc (owner ruling E380, stage 1). Plugin availability and
+      # host-stored plugin settings through the production routers, the host
+      # proxy and the backend effective read over stored rows: every state x
+      # switch x file grant at every site, concealment, resolution with locks,
+      # value bounds, If-Match and replay, the assertion jti, the administrator
+      # and session gates, audit without values. Then the eight controls of its
+      # drill, each red at exactly its declared tests: the availability gate
+      # at the proxy, the bridge and the registry; the Account derivation; the
+      # lock check; the Account's own session gate; the administrator gate; the
+      # jti check. No `if:` guard, as for every gate here.
+      - name: Plugin availability and settings, live and mutation controls (bedf50cc)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:plugin-availability
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/plugin-availability-mutations.py --output-dir "$proof_dir/receipts"
+      # Card 08792425 (member N6, the core half of two-way registration; the
+      # default-store design's choice C7). Knowledge source registration
+      # through the production routers and the MCP ingress over stored rows:
+      # migration 168 pinned by name; the login-session gate (every bearer, a
+      # root bearer included, refused); the step-up bound to the action and the
+      # fingerprint; invalid bundles, an unconfirmed fingerprint and duplicates
+      # refused by name with nothing written and no step-up spent; one audit row
+      # carrying the confirmed fingerprint; a return bundle of public material
+      # only; and the dial refused unavailable:transport until the credential
+      # reference resolves, then made through the default trust store only.
+      # Then the drill's controls, each red at exactly its declared tests: the
+      # step-up, the session-only gate, the recorded fingerprint confirmation,
+      # no secret in the return bundle, and the denied audit row written
+      # before a refusal answers. No `if:` guard.
+      - name: Knowledge source registration, live and mutation controls (08792425)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:knowledge-registration
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/knowledge-registration-mutations.py --output-dir "$proof_dir/receipts"
+      # Card b595b3b0. Truthful task activity: a task-attributed frame needs the
+      # current claimant and assigned connector; GET /tasks/activity reads only
+      # the Tasks the caller may read, in one bounded batch, and an absent,
+      # reassigned or out-of-progress observation is unknown, never activity.
+      - name: Task activity attribution, authority and isolation, live (b595b3b0)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:task-activity
+      # Card bc847bd0 (owner ruling E159, "refuse names"). A path id that is not a
+      # full UUID is refused by name with 400 before anything reads it, on every
+      # family the census of the class found answering 5xx, through the
+      # production routers and the MCP ingress. Each family's census table is
+      # compared with the router's own stack, and every other route with a path
+      # parameter must answer a name-shaped value without a 5xx.
+      - name: Non-UUID path ids refused by name through the router and MCP, live (bc847bd0)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:non-uuid-path-ids
+      - name: Scoped connector WebSocket notifications against real PostgreSQL
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:connector-notifications -- --silent
       - name: Retry contract against a real PostgreSQL (fb06c930, owner ruling 94ecf329)
         env:
           RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
@@ -704,6 +2373,10 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:idempotency
+      - name: Dependency graph concurrency and Brief authorization
+        env:
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+        run: npm run test:dependencies
       - name: Prove the SSO login-drill oracles (cba66ebb, 533db731)
         run: node --test ../scripts/sso-login-drill-oracles.test.mjs
       # SETGOV candidate A (card bbec04de). The LIVE drill needs a real
@@ -743,6 +2416,9 @@ jobs:
       # `normalizePathForScope` - the anchor five of those findings depend on.
       # It runs after `npm run build` because it reads `backend/dist`.
       - name: Prove the SETGOV contract census and its normaliser anchor (bbec04de)
+        # Offline imports must use the existing unreachable database target.
+        env:
+          RELAYHALL_BOOT_CHECK: '1'
         run: node ../scripts/setgov-contract-census.mjs
       # Card 590c638a: the claim/lease surface once answered ORCHESTRATION_DISABLED
       # on every deployment because a switch never reached the process. The
@@ -753,6 +2429,66 @@ jobs:
         run: node --test ../scripts/orchestration-config-drill-oracles.test.mjs
       - name: Orchestration configuration reaches the compiled process (590c638a)
         run: node ../scripts/orchestration-config-reachability-drill.mjs
+      - name: Native verification evidence, authority and session correlation (6b8af7d6)
+        env:
+          # Disposable CI fixture only; never a deployment identity.
+          RELAYHALL_DEPLOYMENT_ID: '11111111-1111-4111-8111-111111111111'
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:native-review
+          npm run test:native-execution
+          npm run test:task-creator-access
+      # Card 1444cc80 (restriction first). A reader that may read the Task but
+      # not its session is answered {state: restricted} for an expired and a
+      # live link alike, through REST and MCP as current principals. Three
+      # controls, each red at exactly its declared tests of the live and the
+      # service suite with its own leak in the values received: the link's
+      # expiry evaluated before the restriction, the native triple added to a
+      # restricted session, and a count added to it.
+      - name: Native verification session privacy mutation controls (1444cc80)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          proof_dir="$(mktemp -d)"
+          python3 ../scripts/native-review-privacy-mutations.py --output-dir "$proof_dir/receipts"
+      # P2-C history readers use the real MCP ingress and migrated PostgreSQL.
+      # This suite is excluded from mocked FAST discovery and runs here by name.
+      - name: MCP Task history readers, live (P2-C)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: npm run test:mcp-task-history
+      # Last: this destructive acceptance owns synthetic rows in the disposable service DB.
+      - name: Standalone Report atomic creation and sponsor authority (a79978ee)
+        env:
+          CI: 'true'
+          RELAYHALL_TEST_DB_URL: postgres://relayhall_ci:relayhall_ci@postgres:5432/relayhall_ci
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_NAME: relayhall_ci
+          DB_USER: relayhall_ci
+          DB_PASSWORD: relayhall_ci
+        run: |
+          npm run test:standalone-report-atomic
+          npm run test:account-control
+          npm run test:metrics
 
   feata_drills:
     name: FEAT-A mutation drills
@@ -760,9 +2496,9 @@ jobs:
     # after the Task write-field contract on the shared database; it drives that
     # same suite under mutation and builds its own fixtures, so a freshly
     # migrated database is the stricter starting state, not a weaker one.
-    # The runner's own job timeout is 75m; this matches it.
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+    # The runner's own job timeout is 150m (raised from 75m on 11 Oct 2026: the document-controls job needs 63 minutes idle and more beside a lane); this matches it.
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -773,9 +2509,11 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -792,13 +2530,8 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -806,29 +2539,9 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
-        run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -855,8 +2568,8 @@ jobs:
   # it is the ONLY step in its group, and therefore trivially the last one.
   scale_load:
     name: Task read-load contract
-    timeout-minutes: 75
-    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    runs-on: relayhall-full
     defaults:
       run:
         working-directory: backend
@@ -867,9 +2580,11 @@ jobs:
           POSTGRES_USER: relayhall_ci
           POSTGRES_PASSWORD: relayhall_ci
           POSTGRES_DB: relayhall_ci
+          PGCTLTIMEOUT: '300'
+          POSTGRES_INITDB_ARGS: --no-sync
         options: >-
-          --health-cmd "pg_isready -U relayhall_ci"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -h 127.0.0.1 -U relayhall_ci -d relayhall_ci"
+          --health-start-period 120s --health-interval 10s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -887,13 +2602,8 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - name: Install backend dependencies
         run: npm ci --no-audit --no-fund
-      # The service container's own health-check gates nothing in THIS job. The
-      # backend job reaches its bootstrap only after `tsc` and a full jest run,
-      # so PostgreSQL has always been listening by the time it connects; here a
-      # warm npm cache returns `npm ci` in seconds and `load-base-schema` can
-      # reach the socket first, which is the `ECONNREFUSED :5432` this job dies
-      # on. The readiness is waited for rather than left to that accident of
-      # ordering, and a database that never arrives still fails the job.
+      # Runner service health is supplemental: this job must independently pass
+      # the TCP/query readiness gate before loading schema or running any tests.
       - name: Wait for PostgreSQL to accept connections
         env:
           PGHOST: postgres
@@ -901,29 +2611,9 @@ jobs:
           PGUSER: relayhall_ci
           PGPASSWORD: relayhall_ci
           PGDATABASE: relayhall_ci
-        # A socket answering is not readiness: the postgres image runs a
-        # temporary server during first-boot initialisation, stops it, and
-        # starts the real one, so a TCP probe (or a single pg_isready) can pass
-        # and the very next connection is told "the database system is
-        # starting up". Readiness here is TWO successful `SELECT 1` queries two
-        # seconds apart, through the same driver the gate uses.
-        run: |
-          node -e '
-            const { Client } = require("pg");
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            (async () => {
-              let ok = 0;
-              for (let attempt = 1; attempt <= 45; attempt++) {
-                const c = new Client();
-                try { await c.connect(); await c.query("SELECT 1"); ok++; } catch (e) { ok = 0; }
-                try { await c.end(); } catch (e) {}
-                if (ok >= 2) { console.log("PostgreSQL ready after " + attempt + " probes"); process.exit(0); }
-                await sleep(2000);
-              }
-              console.error("PostgreSQL at postgres:5432 did not answer two consecutive queries within 90s");
-              process.exit(1);
-            })();
-          '
+        # A shared, bounded gate keeps two successful queries two seconds apart.
+        # Slow first boot is allowed up to 180s; failures retain safe diagnostics.
+        run: node scripts/wait-for-postgres.js
       - name: Bring up the contract database (base schema + migrations)
         env:
           DB_HOST: postgres
@@ -956,3 +2646,45 @@ jobs:
           DB_USER: relayhall_ci
           DB_PASSWORD: relayhall_ci
         run: npm run test:scale-load
+
+  completion_reference_lifecycle:
+    name: Completion reference lifecycle owned PostgreSQL
+    runs-on: relayhall-full
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: mixed_cleanup_test_lifecycle
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    container: node:22.23.4-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
+    env:
+      CI: 'true'
+      RELAYHALL_OWNED_FIXTURE: completion-reference
+      RELAYHALL_TEST_DB_URL: postgresql://fixture:fixture@postgres:5432/mixed_cleanup_test_lifecycle
+      PGHOST: postgres
+      DB_HOST: postgres
+      PGPORT: '5432'
+      DB_PORT: '5432'
+      PGDATABASE: mixed_cleanup_test_lifecycle
+      DB_NAME: mixed_cleanup_test_lifecycle
+      PGUSER: fixture
+      DB_USER: fixture
+      PGPASSWORD: fixture
+      DB_PASSWORD: fixture
+      NODE_OPTIONS: --max-old-space-size=1024
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: node scripts/wait-for-postgres.js && node scripts/load-base-schema.js && npx ts-node --transpile-only src/db/migrate.ts
+      - name: Completion reference lifecycle storage regressions
+        run: npm run test:completion-reference-lifecycle

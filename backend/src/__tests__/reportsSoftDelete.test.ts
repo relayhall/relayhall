@@ -98,7 +98,7 @@ describe('DELETE /reports/:id soft delete route behaviour', () => {
   it('threads include_deleted=true through list and get', async () => {
     await withServer('dashboard_user', async base => {
       await fetch(`${base}/reports?include_deleted=true`);
-      expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ include_deleted: true }));
+      expect(manager.list).toHaveBeenCalledWith(expect.objectContaining({ include_deleted: true }), expect.any(Function));
       await fetch(`${base}/reports/${RID}?include_deleted=true`);
       expect(manager.getById).toHaveBeenCalledWith(RID, { includeDeleted: true });
       await fetch(`${base}/reports/${RID}`);

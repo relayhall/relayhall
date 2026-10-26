@@ -33,10 +33,11 @@ beforeEach(() => {
   localStorage.clear();
   document.documentElement.removeAttribute('data-theme');
   document.documentElement.removeAttribute('data-reduced-motion');
-  mockFetch.mockResolvedValue({ theme: null, reducedMotion: 'system' });
+  mockFetch.mockResolvedValue({ theme: null, reducedMotion: 'system', mapReportsMode: 'collapsed' });
   mockSave.mockImplementation(async (patch) => ({
     theme: 'theme' in patch ? (patch.theme ?? null) : null,
     reducedMotion: patch.reducedMotion ?? 'system',
+    mapReportsMode: patch.mapReportsMode ?? 'collapsed',
   }));
 });
 afterEach(cleanup);
@@ -75,7 +76,7 @@ describe('the user config page', () => {
 
   test('sends an explicit null to hand the choice back to the deployment', async () => {
     const user = userEvent.setup();
-    mockFetch.mockResolvedValue({ theme: 'relay-light', reducedMotion: 'system' });
+    mockFetch.mockResolvedValue({ theme: 'relay-light', reducedMotion: 'system', mapReportsMode: 'collapsed' });
     renderPage();
     await waitFor(() =>
       expect(screen.getByRole('radio', { name: /Relay light/ })).toBeChecked());

@@ -3,10 +3,12 @@
  *
  * The board holds no connection into any agent runtime: it never scrapes
  * harness state, sessions files, or transcripts. Session activity appears
- * here only when reporter outposts self-report it through the typed ingest
- * contract. With no reporters connected the page renders its documented empty
- * state — the zero-config default, not an error — and that empty state is the
- * one UI-REFINE polished, unchanged.
+ * here when reporter outposts self-report it through the typed ingest
+ * contract, and — since card `35b73092` — when a Connector that declared a
+ * telemetry tier works through the board's own MCP server: the board then
+ * records that Connector's session from the tool calls it received, under
+ * the product `mcp`. With neither, the page renders its documented empty
+ * state — the zero-config default, not an error.
  *
  * WHAT IS NEW (card `50e74c1d`): when reporters HAVE pushed, the page renders
  * the derived presence projection (one chip per telemetry source, on the
@@ -23,23 +25,52 @@
  * THREE STATES, NEVER CONFLATED. Loading, error and empty are separate: a
  * refusal renders as a refusal, not as "no reporters connected". An operator
  * reading the empty state must be able to trust that it means what it says.
+ *
+ * THE MCP ACTION LOG (card `ab8f78e9`, owner ruling E91). An `mcp` session's
+ * expanded timeline also lists the tool calls the board's MCP server received
+ * inside it — tool, target, outcome, duration, time; never arguments — with an
+ * honest empty state and the plain statement that REST and CLI calls are not
+ * shown. It rides the session's own point read, so it adds no visibility.
+ *
+ * SHORT SESSIONS, THE FILTER AND PAGING (card `0ac41d40`, owner ruling E89
+ * (b)). The server hides SHORT sessions — at most three events, under two
+ * minutes, no model and no tokens — before its row limit and says how many it
+ * hid; "Show N short sessions" asks for them. A Reporter and a Product select
+ * narrow the list on the server, and "Load more" asks for the next page.
+ *
+ * THE POLL REFRESHES THE LOADED WINDOW. Every 20 s the infinite query re-reads
+ * EVERY page it has loaded, in order from the first, each next offset taken
+ * from the page just re-read — so the page keeps showing the newest
+ * (pages × 50) rows under the CURRENT filter and toggle, the number of loaded
+ * pages is kept (fewer only when the list itself shrank), and rows are
+ * de-duplicated by their triple. The filter, the toggle and every open
+ * timeline are the reader's own state: a poll never writes them. Only the
+ * reader changing the filter or the toggle starts again from the first page.
  */
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { keepPreviousData, useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronDown, ChevronRight, Radio } from 'lucide-react';
+import { Button } from '../components/Button';
 import { CoreSurfacePlaceholder } from '../components/CoreSurfacePlaceholder';
 import { formatDateTime } from '../utils/dateFormat';
 import {
+  MCP_ACTION_LOG_PRODUCT,
   PRESENCE_LABELS,
+  SESSIONS_WINDOW_DAYS,
   SESSION_STATE_HINTS,
   SESSION_STATE_LABELS,
   TELEMETRY_POLL_MS,
+  describeActionOutcome,
+  describeShortSession,
   fetchPresence,
   fetchSession,
   fetchSessions,
   formatCount,
+  reporterName,
   shortSessionRef,
   type TelemetryPresenceRow,
+  type TelemetrySessionAction,
   type TelemetrySessionRow,
 } from '../utils/telemetryProjection';
 import '../styles/telemetry-projection.css';
@@ -64,7 +95,7 @@ const PresenceChip: React.FC<{ source: TelemetryPresenceRow }> = ({ source }) =>
       </span>
     </div>
     <dl className="telemetry-source-facts">
-      <div><dt>Reporter</dt><dd>{source.connectorHandle ?? source.connectorId}</dd></div>
+      <div><dt>Reporter</dt><dd>{reporterName(source)}</dd></div>
       <div><dt>Last seen</dt><dd><Instant value={source.lastSeenAt} /></dd></div>
       <div><dt>Sessions</dt><dd>{formatCount(source.sessionCount)}</dd></div>
       <div><dt>Events</dt><dd>{formatCount(source.eventCount)}</dd></div>
@@ -79,6 +110,68 @@ const PresenceChip: React.FC<{ source: TelemetryPresenceRow }> = ({ source }) =>
       </p>
     )}
   </li>
+);
+
+/**
+ * The MCP ACTION LOG of one session (card `ab8f78e9`, owner ruling E91): each
+ * tool call the board's MCP server received inside the session — tool, the
+ * object it named, outcome, duration, time — and never its arguments. It
+ * arrives with the session's own detail read, so it is visible to exactly the
+ * readers of the session and to nobody else.
+ */
+const SessionActions: React.FC<{
+  sessionRef: string;
+  actions: TelemetrySessionAction[];
+  truncated: boolean;
+}> = ({ sessionRef, actions, truncated }) => (
+  <section className="telemetry-section" aria-label={`MCP tool calls in session ${shortSessionRef(sessionRef)}`}>
+    <h3>MCP tool calls</h3>
+    {actions.length === 0 ? (
+      <p className="telemetry-inline-status">
+        No MCP tool calls are recorded for this session. Calls are recorded from the
+        first call after this log was introduced, and only inside a live session.
+      </p>
+    ) : (
+      <table className="telemetry-table telemetry-table--timeline">
+        <caption className="sr-only">
+          MCP tool calls in session {shortSessionRef(sessionRef)}, most recent first
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Observed</th>
+            <th scope="col">Tool</th>
+            <th scope="col">Target</th>
+            <th scope="col">Outcome</th>
+            <th scope="col" className="telemetry-numeric">Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          {actions.map((action, index) => (
+            <tr key={`${action.observedAt}:${action.toolName}:${index}`}>
+              <td><Instant value={action.observedAt} /></td>
+              <td><span className="telemetry-mono">{action.toolName}</span></td>
+              <td>
+                {action.targetType && action.targetId
+                  ? <>{action.targetType} <span className="telemetry-mono">{action.targetId}</span></>
+                  : '—'}
+              </td>
+              <td>{describeActionOutcome(action)}</td>
+              <td className="telemetry-numeric">{`${formatCount(action.durationMs)} ms`}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+    {truncated && (
+      <p className="telemetry-inline-status">
+        Showing the most recent tool calls only — this session has more than the timeline limit.
+      </p>
+    )}
+    <p className="telemetry-note">
+      MCP only: calls made over the REST API or the CLI are not shown here. Tool
+      arguments are never recorded.
+    </p>
+  </section>
 );
 
 const SessionTimeline: React.FC<{ session: TelemetrySessionRow }> = ({ session }) => {
@@ -102,8 +195,20 @@ const SessionTimeline: React.FC<{ session: TelemetrySessionRow }> = ({ session }
     );
   }
   const detail = query.data;
+  const actionLog = sourceProduct === MCP_ACTION_LOG_PRODUCT && detail ? (
+    <SessionActions
+      sessionRef={sessionRef}
+      actions={detail.actions ?? []}
+      truncated={detail.actionsTruncated === true}
+    />
+  ) : null;
   if (!detail || detail.events.length === 0) {
-    return <p className="telemetry-inline-status">This session reported no events inside the window.</p>;
+    return (
+      <>
+        <p className="telemetry-inline-status">This session reported no events inside the window.</p>
+        {actionLog}
+      </>
+    );
   }
 
   return (
@@ -150,6 +255,7 @@ const SessionTimeline: React.FC<{ session: TelemetrySessionRow }> = ({ session }
           Showing the most recent events only — this session has more than the timeline limit.
         </p>
       )}
+      {actionLog}
     </>
   );
 };
@@ -176,6 +282,7 @@ const SessionRow: React.FC<{ session: TelemetrySessionRow }> = ({ session }) => 
           </button>
         </td>
         <td>{session.sourceProduct}</td>
+        <td>{reporterName(session)}</td>
         <td>
           <span
             className={`telemetry-chip telemetry-chip--${session.state}`}
@@ -192,7 +299,7 @@ const SessionRow: React.FC<{ session: TelemetrySessionRow }> = ({ session }) => 
       </tr>
       {open && (
         <tr id={panelId} className="telemetry-timeline-row">
-          <td colSpan={8}><SessionTimeline session={session} /></td>
+          <td colSpan={9}><SessionTimeline session={session} /></td>
         </tr>
       )}
     </>
@@ -205,11 +312,12 @@ const EMPTY_STATE = (
     heading="No reporters connected"
     description={
       <>
-        Agent sessions appear here when connectors self-report their activity.
-        The board never reads harness state, sessions files, or transcripts
-        — everything on this page arrives because a reporter chose to send
-        it. An empty page means no reporter is installed, not that
-        something is broken.
+        Agent sessions appear here when connectors self-report their activity,
+        or when a connector that declared a telemetry tier works through this
+        board&apos;s MCP server — the board then records that session from the
+        tool calls it received. The board never reads harness state, sessions
+        files, or transcripts. An empty page means neither has happened yet,
+        not that something is broken.
       </>
     }
     sections={[
@@ -224,6 +332,12 @@ const EMPTY_STATE = (
           <>
             The board stores only what reporters send. There is no
             board-side polling, file watching, or transcript scraping.
+          </>,
+          <>
+            A connector whose descriptor declares a telemetry tier and that
+            works through this board&apos;s MCP server appears here as an{' '}
+            <code>mcp</code> source, recorded from the tool calls the board
+            itself received — nothing else about its runtime is read.
           </>,
           <>
             The typed ingest contract lives at{' '}
@@ -262,31 +376,137 @@ const EMPTY_STATE = (
   />
 );
 
-export const SessionsPage: React.FC = () => {
+const LinkedSession: React.FC<{sessionRef:string;connectorId:string;sourceProduct:string}> = key => {
+  const query=useQuery({queryKey:['telemetry-session',key.connectorId,key.sourceProduct,key.sessionRef],queryFn:()=>fetchSession(key),refetchInterval:TELEMETRY_POLL_MS});
+  if(query.isPending) return <p role="status">Loading linked native session…</p>;
+  if(query.error || !query.data) return <p role="alert">Linked native session is restricted, expired or unavailable.</p>;
+  return <section aria-label="Linked native session"><h2>Linked native session</h2><p>{key.sourceProduct} · {key.connectorId} · {key.sessionRef}</p><SessionTimeline session={query.data.session}/></section>;
+};
+/** A session's identity, as the React key, the cache key and the route use it. */
+const sessionIdentity = (row: { connectorId: string; sourceProduct: string; sessionRef: string }): string =>
+  `${row.connectorId}:${row.sourceProduct}:${row.sessionRef}`;
+
+/**
+ * The choices the Reporter and Product selects offer: every reporter and
+ * product the presence projection names, plus the CURRENT choice even when a
+ * poll no longer names it — a select whose value vanished from its options
+ * would silently show "All" while the list stayed filtered.
+ */
+function filterChoices(
+  sources: TelemetryPresenceRow[],
+  connectorId: string,
+  sourceProduct: string,
+  knownNames: Map<string, string>,
+): { reporters: Array<{ id: string; name: string }>; products: string[] } {
+  const reporters = new Map<string, string>();
+  for (const source of sources) reporters.set(source.connectorId, reporterName(source));
+  if (connectorId && !reporters.has(connectorId)) {
+    reporters.set(connectorId, knownNames.get(connectorId) ?? connectorId);
+  }
+  const products = new Set(sources.map((source) => source.sourceProduct));
+  if (sourceProduct) products.add(sourceProduct);
+  return {
+    reporters: [...reporters.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
+    products: [...products].sort((a, b) => a.localeCompare(b)),
+  };
+}
+
+/**
+ * The URL parameters of a deep link to ONE session (`?sessionRef&connectorId&sourceProduct`):
+ * the Action Center drops them when another tab is chosen (owner ruling E453).
+ */
+export const SESSION_LINK_PARAMS = ['sessionRef', 'connectorId', 'sourceProduct'] as const;
+
+/**
+ * The reported agent sessions. Since owner ruling E453 this is the Action
+ * Center's Agent sessions tab (`embedded`): the page's own heading gives way to
+ * the tab's panel heading, and `/sessions` is an alias of that tab.
+ */
+export const SessionsPage: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
+  const [params]=useSearchParams();
+  const linked={sessionRef:params.get('sessionRef')||'',connectorId:params.get('connectorId')||'',sourceProduct:params.get('sourceProduct')||''};
+  const hasLinked=Object.values(linked).some(Boolean);
+  const validLinked=/^rhp_[A-Za-z0-9_-]+$/.test(linked.sessionRef) && /^[0-9a-f-]{36}$/i.test(linked.connectorId) && /^[a-z][a-z0-9._-]{0,63}$/.test(linked.sourceProduct);
+  // The reader's own choices. Never written by a poll, and NOT kept in the URL:
+  // `connectorId` and `sourceProduct` there are the deep link to ONE session.
+  const [connectorId, setConnectorId] = useState('');
+  const [sourceProduct, setSourceProduct] = useState('');
+  const [includeShort, setIncludeShort] = useState(false);
+  // The last name each reporter was shown under, so a choice a poll no longer
+  // names keeps its name in the select.
+  const knownNames = useRef(new Map<string, string>());
   const presenceQuery = useQuery({
     queryKey: ['telemetry-presence'],
     queryFn: fetchPresence,
     refetchInterval: TELEMETRY_POLL_MS,
   });
-  const sessionsQuery = useQuery({
-    queryKey: ['telemetry-sessions'],
-    queryFn: fetchSessions,
+  const sessionsQuery = useInfiniteQuery({
+    // The filter and the toggle are part of the key, so changing either starts
+    // a new list at its first page; a poll refetches the pages of THIS key.
+    queryKey: ['telemetry-sessions', connectorId, sourceProduct, includeShort],
+    queryFn: ({ pageParam }) => fetchSessions({
+      offset: pageParam,
+      includeShort,
+      connectorId: connectorId || undefined,
+      sourceProduct: sourceProduct || undefined,
+    }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => lastPage.nextOffset ?? undefined,
     refetchInterval: TELEMETRY_POLL_MS,
+    // While a new filter's first page loads, the previous rows stay on screen
+    // (marked busy) rather than the controls unmounting under the reader.
+    placeholderData: keepPreviousData,
   });
 
   const loading = presenceQuery.isPending || sessionsQuery.isPending;
   const error = (presenceQuery.error ?? sessionsQuery.error) as Error | undefined;
   const sources = presenceQuery.data?.sources ?? [];
-  const sessions = sessionsQuery.data?.sessions ?? [];
-  const hasData = sources.length > 0 || sessions.length > 0;
+  for (const source of sources) knownNames.current.set(source.connectorId, reporterName(source));
+  const pages = sessionsQuery.data?.pages ?? [];
+  // Every count describes the WHOLE filtered list, and the first page of a
+  // refresh is the freshest statement of it.
+  const firstPage = pages[0];
+  const hiddenCount = firstPage?.hiddenCount ?? 0;
+  const shortCount = firstPage?.shortCount ?? 0;
+  const total = firstPage?.total ?? 0;
+  const shortRule = firstPage?.shortSession ?? null;
+  // One row per triple: a row that moved between two pages while they were
+  // re-read is shown once, at its first place.
+  const seen = new Set<string>();
+  const sessions = pages.flatMap((page) => page.sessions).filter((session) => {
+    const identity = sessionIdentity(session);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+  const filtered = connectorId !== '' || sourceProduct !== '';
+  const showToggle = shortCount > 0 || includeShort;
+  const showSessions = total > 0 || shortCount > 0 || filtered || includeShort;
+  const hasData = sources.length > 0 || showSessions;
+  const choices = filterChoices(sources, connectorId, sourceProduct, knownNames.current);
+  const days = `${formatCount(SESSIONS_WINDOW_DAYS)} days`;
+  const shortLabel = `Show ${formatCount(shortCount)} short ${shortCount === 1 ? 'session' : 'sessions'}`;
+
+  const status = `${formatCount(sources.length)} reporting source(s); showing ${formatCount(sessions.length)} of `
+    + `${formatCount(total)} session(s) in the last ${days}`
+    + (hiddenCount > 0 ? `; ${formatCount(hiddenCount)} short session(s) hidden.` : '.');
 
   return (
-    <div className="sessions-page">
-      <div className="sessions-header">
-        <h1>
-          <Radio size={24} aria-hidden="true" /> Agent sessions
-        </h1>
-      </div>
+    <div className={embedded ? 'notifications-page-panel' : 'sessions-page'}>
+      {hasLinked && (validLinked?<LinkedSession {...linked}/>:<p role="alert">A native session link requires its full Connector, product and session identity.</p>)}
+      {embedded ? (
+        <div className="notifications-page-toolbar">
+          <h2>Agent sessions</h2>
+        </div>
+      ) : (
+        <div className="sessions-header">
+          <h1>
+            <Radio size={24} aria-hidden="true" /> Agent sessions
+          </h1>
+        </div>
+      )}
 
       {/* Polling replaces this region in place. `aria-live="polite"` is on the
           status line only, so a refresh announces a change of state rather
@@ -294,7 +514,7 @@ export const SessionsPage: React.FC = () => {
       <p className="telemetry-status" aria-live="polite">
         {loading ? 'Loading reported sessions…'
           : error ? 'Sessions could not be read.'
-            : hasData ? `${formatCount(sources.length)} reporting source(s), ${formatCount(sessions.length)} session(s).`
+            : hasData ? status
               : 'No reported sessions.'}
       </p>
 
@@ -321,36 +541,113 @@ export const SessionsPage: React.FC = () => {
             </section>
           )}
 
-          {sessions.length > 0 && (
-            <section className="telemetry-section" aria-labelledby="telemetry-sessions-heading">
+          {showSessions && (
+            <section
+              className="telemetry-section"
+              aria-labelledby="telemetry-sessions-heading"
+              aria-busy={sessionsQuery.isPlaceholderData}
+            >
               <h2 id="telemetry-sessions-heading">Sessions</h2>
-              <div className="telemetry-table-scroll">
-                <table className="telemetry-table">
-                  <caption className="sr-only">
-                    Reported agent sessions, most recently active first
-                  </caption>
-                  <thead>
-                    <tr>
-                      <th scope="col">Session</th>
-                      <th scope="col">Product</th>
-                      <th scope="col">State</th>
-                      <th scope="col">Started</th>
-                      <th scope="col">Last seen</th>
-                      <th scope="col">Models</th>
-                      <th scope="col" className="telemetry-numeric">Events</th>
-                      <th scope="col" className="telemetry-numeric">Tokens</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sessions.map((session) => (
-                      <SessionRow
-                        key={`${session.connectorId}:${session.sourceProduct}:${session.sessionRef}`}
-                        session={session}
-                      />
+              <div className="telemetry-session-controls">
+                <div className="form-group telemetry-session-filter">
+                  <label htmlFor="telemetry-filter-reporter">Reporter</label>
+                  <select
+                    id="telemetry-filter-reporter"
+                    className="form-select"
+                    value={connectorId}
+                    onChange={(event) => setConnectorId(event.target.value)}
+                  >
+                    <option value="">All reporters</option>
+                    {choices.reporters.map((reporter) => (
+                      <option key={reporter.id} value={reporter.id}>{reporter.name}</option>
                     ))}
-                  </tbody>
-                </table>
+                  </select>
+                </div>
+                <div className="form-group telemetry-session-filter">
+                  <label htmlFor="telemetry-filter-product">Product</label>
+                  <select
+                    id="telemetry-filter-product"
+                    className="form-select"
+                    value={sourceProduct}
+                    onChange={(event) => setSourceProduct(event.target.value)}
+                  >
+                    <option value="">All products</option>
+                    {choices.products.map((product) => (
+                      <option key={product} value={product}>{product}</option>
+                    ))}
+                  </select>
+                </div>
+                {showToggle && (
+                  <Button
+                    variant="secondary"
+                    size="compact"
+                    ariaPressed={includeShort}
+                    ariaDescribedBy={shortRule ? 'telemetry-short-definition' : undefined}
+                    onClick={() => setIncludeShort((was) => !was)}
+                  >
+                    {shortLabel}
+                  </Button>
+                )}
               </div>
+              {showToggle && shortRule && (
+                <p id="telemetry-short-definition" className="telemetry-note">
+                  Short means {describeShortSession(shortRule)} — typically a connector that opened a
+                  session and did nothing else. Short sessions are hidden unless shown here; Stats
+                  still count them.
+                </p>
+              )}
+
+              {sessions.length > 0 ? (
+                <div className="telemetry-table-scroll">
+                  <table className="telemetry-table">
+                    <caption className="sr-only">
+                      Reported agent sessions, most recently active first
+                    </caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Session</th>
+                        <th scope="col">Product</th>
+                        <th scope="col">Reporter</th>
+                        <th scope="col">State</th>
+                        <th scope="col">Started</th>
+                        <th scope="col">Last seen</th>
+                        <th scope="col">Models</th>
+                        <th scope="col" className="telemetry-numeric">Events</th>
+                        <th scope="col" className="telemetry-numeric">Tokens</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sessions.map((session) => (
+                        <SessionRow key={sessionIdentity(session)} session={session} />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="telemetry-inline-status">
+                  {hiddenCount > 0
+                    ? `Every session ${filtered ? 'that matches this reporter and product ' : ''}in the last ${days} is short. `
+                      + `Use “${shortLabel}” to list ${hiddenCount === 1 ? 'it' : 'them'}.`
+                    : filtered
+                      ? `No sessions match this reporter and product in the last ${days}.`
+                      : `No sessions in the last ${days}.`}
+                </p>
+              )}
+
+              {sessionsQuery.hasNextPage && (
+                <div className="telemetry-load-more">
+                  <Button
+                    variant="secondary"
+                    size="compact"
+                    disabled={sessionsQuery.isFetchingNextPage}
+                    onClick={() => { void sessionsQuery.fetchNextPage(); }}
+                  >
+                    {sessionsQuery.isFetchingNextPage
+                      ? 'Loading more…'
+                      : `Load more sessions (${formatCount(Math.max(total - sessions.length, 0))} more)`}
+                  </Button>
+                </div>
+              )}
               <p className="telemetry-note">
                 Metadata only. Tier&nbsp;0 stores no prompts, responses, or tool
                 payloads, so there is nothing on this page to open into a

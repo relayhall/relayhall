@@ -7,7 +7,7 @@ fresh clone and no deployment-specific overlay.
 
 - Git
 - Docker Engine 24 or newer
-- Docker Compose v2.20 or newer (`docker compose`, not legacy
+- Docker Compose v2.24 or newer (`docker compose`, not legacy
   `docker-compose`)
 - OpenSSL
 - 2 GB RAM, one CPU core, and roughly 4 GB free disk for a small installation
@@ -45,10 +45,20 @@ The script:
 
 1. verifies Docker, Compose, and OpenSSL;
 2. copies `.env.example` to the gitignored `.env`;
-3. creates `relayhall.config.json` from its example;
+3. creates `relayhall.config.json` from its example, readable by the backend
+   (mode `644`; it holds no secrets);
 4. generates a database password and JWT signing secret;
 5. hashes the dashboard password without writing its plaintext to disk;
-6. creates local data and backup directories.
+6. asks for the public address (host name, scheme and port; by default
+   `localhost`, `http` and the frontend port) and writes `CORS_ORIGIN` from it,
+   and for `https` also `RELAYHALL_PUBLIC_API_URL`;
+7. generates the backend's four key sets into the gitignored
+   `relayhall.keys.env` (mode `600`), only for a set Compose would not already
+   pass to the backend, and never changing one that exists;
+8. creates local data and backup directories.
+
+Back up `relayhall.keys.env` with the database, stored apart from the dumps
+([Key sets](../DEPLOYMENT.md#key-sets)).
 
 Review the generated files before starting:
 
@@ -56,13 +66,14 @@ Review the generated files before starting:
 docker compose config --quiet
 ```
 
-Never commit `.env`, `relayhall.config.json`, database dumps, or `data/`.
+Never commit `.env`, `relayhall.keys.env`, `relayhall.config.json`, database
+dumps, or `data/`.
 
 ### Manual setup
 
 ```bash
 install -m 600 .env.example .env
-cp relayhall.config.example.json relayhall.config.json
+install -m 644 relayhall.config.example.json relayhall.config.json
 ```
 
 Edit `.env` and replace all three placeholders:
@@ -74,11 +85,33 @@ Edit `.env` and replace all three placeholders:
   must be doubled (`$` becomes `$$`). Running `./setup.sh` is the supported way
   to generate it safely.
 
+The backend refuses to start while `POSTGRES_PASSWORD` or `JWT_SECRET` is still
+the placeholder, and says which. Set `CORS_ORIGIN` to the exact origin your
+browser uses.
+
 The internal backend port is fixed at `3001`. `BACKEND_PORT`, `FRONTEND_PORT`,
 and `POSTGRES_HOST_PORT` configure loopback host bindings. Change them if a
 local port is already occupied.
 
 `VITE_API_BASE_URL` should remain `/api` for the standard same-origin frontend.
+
+Then create the key sets. Running `./setup.sh` once `.env` is complete (answer
+`no` to reconfigure) generates exactly these; by hand, write one pair per set
+into `relayhall.keys.env` with mode `600`, using the formats `.env.example`
+documents:
+
+```bash
+umask 077
+d=$(date -u +%Y%m%d)
+k() { printf "%s='{\"%s\":\"%s\"}'\n%s=%s\n" "$1" "$3" "$4" "$2" "$3"; }
+{
+  k RELAYHALL_CREDENTIAL_KEYS RELAYHALL_CREDENTIAL_ACTIVE_KEY "credential-$d" "$(openssl rand -base64 32)"
+  k RELAYHALL_TELEMETRY_PEPPERS RELAYHALL_TELEMETRY_ACTIVE_PEPPER "telemetry-$d" "$(openssl rand -base64 32)"
+  k RELAYHALL_KNOWLEDGE_HANDLE_KEYS RELAYHALL_KNOWLEDGE_HANDLE_ACTIVE_KEY "handle-$d" "$(openssl rand -base64 32)"
+  k RELAYHALL_KNOWLEDGE_ASSERTION_KEYS RELAYHALL_KNOWLEDGE_ASSERTION_ACTIVE_KEY "assertion-$d" \
+    "$(openssl genpkey -algorithm ed25519 -outform DER | openssl base64 -A)"
+} > relayhall.keys.env
+```
 
 ## 3. Build and start
 
@@ -111,12 +144,13 @@ through nginx's same-origin `/api` proxy and proves the browser-to-backend path.
 
 Open <http://localhost:8082/dashboard/> in a browser on the Docker host.
 For access from another machine, configure an HTTPS reverse proxy and set
-`CORS_ORIGIN` to that exact HTTPS origin first; see
-[Ingress and TLS](../DEPLOYMENT.md#ingress-and-tls). Use HTTPS for both
+`CORS_ORIGIN` and `RELAYHALL_PUBLIC_API_URL` to that exact HTTPS origin first;
+see [Domain and TLS](../DEPLOYMENT.md#domain-and-tls). Use HTTPS for both
 first-run setup and later Account sign-ins. A plain HTTP LAN address or
 hostname does not support the Secure session cookie, even when health checks
-pass. If first run already created an Account there, keep the database and sign
-in with that Account's credentials after HTTPS is ready.
+pass, and the sign-in screen says so. If first run already created an Account
+there, keep the database and sign in with that Account's credentials after
+HTTPS is ready.
 
 A deployment with no administrator yet meets the **first-run step**: it asks for
 an account name, a display name and a password, creates that person as the local
@@ -154,15 +188,21 @@ docker compose down              # preserve PostgreSQL volume
 docker compose down --volumes    # destructive reset
 ```
 
-Compose resources are project-scoped. To run another disposable copy, set a
-unique project name and unused host ports in its `.env`:
+Compose resources are project-scoped, and the shipped file names the project
+`relayhall`. To run another copy on the same Docker host, set a unique project
+name and unused host ports in its `.env` before its first start
+(`COMPOSE_PROJECT_NAME` in `.env` overrides the name in the file), and match
+`CORS_ORIGIN` to its frontend port:
 
 ```dotenv
 COMPOSE_PROJECT_NAME=relayhall-test
 POSTGRES_HOST_PORT=55432
 BACKEND_PORT=53001
 FRONTEND_PORT=58082
+CORS_ORIGIN=http://localhost:58082
 ```
+
+See [Running a second stack](../DEPLOYMENT.md#running-a-second-stack-on-one-docker-host).
 
 ## Production ingress
 

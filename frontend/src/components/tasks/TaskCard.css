@@ -168,7 +168,6 @@
 .task-card-blocked,
 .task-card-depends,
 .task-card-blocks,
-.task-card-agent-compact,
 .task-card-owner,
 .task-card-footer {
   position: relative;
@@ -312,31 +311,6 @@
   cursor: pointer;
 }
 
-/* Agent Session Link Button */
-.task-card-session-link {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--status-warning-soft);
-  border: 1px solid var(--status-warning-strong);
-  border-radius: var(--radius-sm);
-  padding: var(--space-1);
-  color: var(--text-warning);
-  cursor: pointer;
-  transition: all var(--transition-base) ease;
-  flex-shrink: 0;
-}
-
-.task-card-session-link:hover {
-  background: var(--status-warning-soft);
-  border-color: var(--status-warning-strong);
-  transform: scale(1.05);
-}
-
-.task-card-session-link:active {
-  transform: scale(0.95);
-}
-
 /* Interactive Session Badge + Status Row */
 .task-card-interactive-row {
   display: flex;
@@ -367,31 +341,11 @@
   font-weight: 600;
 }
 
-.task-card-session-status {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: 2px 6px;
-  border-radius: 8px;
-  font-size: var(--text-xs);
-  font-weight: 500;
-}
-
 .session-status-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
-}
-
-.session-status-running {
-  color: var(--text-success);
-}
-
-.session-status-running .session-status-dot {
-  background: var(--status-success-strong);
-  color: var(--text-on-fill);
-  animation: statusPulse 1.5s ease-in-out infinite;
 }
 
 /* Review 3ed95da6 F1. This colours the parent span, and the parent holds the
@@ -404,32 +358,6 @@
 
 .session-status-idle .session-status-dot {
   background: var(--overlay-strong);
-}
-
-.session-status-waiting {
-  color: var(--text-warning);
-}
-
-.session-status-waiting .session-status-dot {
-  background: var(--status-warning-strong);
-  color: var(--text-on-fill);
-  animation: statusPulse 1.5s ease-in-out infinite;
-}
-
-/* --text-info is bound as an alias of --status-info in all three Themes, so
-   this is a rename to the tier that says what it is, with no pixel change. */
-.session-status-completed {
-  color: var(--text-info);
-}
-
-.session-status-completed .session-status-dot {
-  background: var(--status-info);
-  color: var(--text-on-fill);
-}
-
-@keyframes statusPulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
 }
 
 .task-card-session-timer {
@@ -522,35 +450,6 @@
   font-size: var(--text-xs);
   color: var(--text-tertiary);
   padding: 2px 4px;
-}
-
-.task-card-agent-compact {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-  padding: var(--space-1) var(--space-3);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-soft);
-  border-radius: var(--radius-sm);
-  font-size: var(--text-xs);
-  color: var(--text-accent);
-  animation: agentPulse 2s ease-in-out infinite;
-  width: fit-content;
-  max-width: 100%;
-  box-sizing: border-box;
-}
-
-.task-card-agent-compact span {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 100%;
-}
-
-@keyframes agentPulse {
-  0%, 100% { border-color: var(--accent-soft); }
-  50% { border-color: var(--accent-color); }
 }
 
 /* Thinking Level Indicator */
@@ -781,7 +680,6 @@
 
   .task-card-project-badge,
   .task-card-tag,
-  .task-card-agent-compact,
   .task-card-interactive-badge {
     padding: 2px 6px;
   }

@@ -11,8 +11,6 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     priority: 'normal',
     subtasks: [{ id: 'sub-1', text: 'Ship feature', status: 'review' }],
     links: [],
-    sessionRefs: ['sess-1'],
-    autoCreated: false,
     autoStart: true,
     blockedBy: [],
     tags: ['qa'],

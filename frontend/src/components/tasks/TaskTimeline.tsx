@@ -111,11 +111,17 @@ function TimelineEventItem({ event, highlighted, directory }: { event: TimelineE
   const detailId = `event-${event.id}-detail`;
   const redacted = Boolean(event.redaction);
   const displayTitle = redacted ? 'History entry redacted' : event.title;
-  return <li id={`event-${event.id}`} className={`task-timeline-event task-timeline-event--${renderer.className}${redacted ? ' task-timeline-event--redacted' : ''}${highlighted ? ' task-timeline-event--highlighted' : ''}`}>
+  const completion = event.source === 'history' && event.metadata.field === 'status' && event.metadata.newValue === 'completed';
+  // E388: two weights. Server-generated (system) events are compact rows;
+  // authored and reported events are cards that preview their own text.
+  const system = event.provenance === 'system' || !event.provenance;
+  const preview = !system && !redacted && !expanded && event.description ? event.description : '';
+  return <li id={`event-${event.id}`} className={`task-timeline-event task-timeline-event--${renderer.className}${system ? ' task-timeline-event--system' : ''}${redacted ? ' task-timeline-event--redacted' : ''}${highlighted ? ' task-timeline-event--highlighted' : ''}`}>
     <div className="task-timeline-event-icon"><Icon size={16} aria-hidden="true" /></div>
     <div className="task-timeline-event-body">
       <div className="task-timeline-event-summary">
         <strong title={displayTitle}>{displayTitle}</strong>
+        {completion && !redacted && <span>Completed by {actorLabel(event, directory)}</span>}
         {!redacted ? <IconButton
           variant="ghost"
           ariaExpanded={expanded}
@@ -129,6 +135,8 @@ function TimelineEventItem({ event, highlighted, directory }: { event: TimelineE
         <span title={event.actorDetail?.principalId ?? undefined}>{actorLabel(event, directory)}</span>
         <time dateTime={event.at} title={absoluteDate(event.at)}>{relativeDate(event.at)}</time>
       </div>
+      {/* Plain text, React-escaped: board text is data and never markup. */}
+      {preview ? <p className="task-timeline-event-preview">{preview}</p> : null}
       {redacted && event.redaction ? <p className="task-timeline-redaction-tombstone">
         <span>{event.redaction.mode}</span> · redacted <time dateTime={event.redaction.redactedAt}>{absoluteDate(event.redaction.redactedAt)}</time>
       </p> : expanded ? <div id={detailId} className="task-timeline-event-detail">{renderer.renderDetail(event)}</div> : null}
@@ -215,7 +223,6 @@ export function TaskTimeline({ taskId, directory }: { taskId: string; directory?
       onChange={selectFilter}
       options={TIMELINE_FILTERS.map(item => ({ value: item.value, label: item.label }))}
     />
-    <p className="task-timeline-audit-caption" role="note">The ledger-grade stream is durable. Best-effort task History is an audit trail, not a ledger; gaps are possible.</p>
     {sourcesUnavailable.length ? <p className="task-timeline-partial-error" role="alert">
       Some history could not be loaded — <Button variant="secondary" size="compact" onClick={() => void timelineQuery.refetch()}>Retry</Button>
       <span className="sr-only"> Unavailable sources: {sourcesUnavailable.join(', ')}.</span>
@@ -234,5 +241,8 @@ export function TaskTimeline({ taskId, directory }: { taskId: string; directory?
       disabled={timelineQuery.isFetchingNextPage}
       onClick={() => void timelineQuery.fetchNextPage()}
     >{timelineQuery.isFetchingNextPage ? 'Loading older activity…' : 'Show older activity'}</Button> : null}
+    {/* E388: the audit caption is a footnote after the events, not a block
+        between the filter and the first event. */}
+    <p className="task-timeline-audit-caption" role="note">The ledger-grade stream is durable. Best-effort task History is an audit trail, not a ledger; gaps are possible.</p>
   </section>;
 }

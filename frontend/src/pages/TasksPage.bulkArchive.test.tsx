@@ -192,7 +192,7 @@ describe('bulk archive-completed of the filtered scope (E3)', () => {
     expect(bulkCalls.every(call => call.taskIds.length <= 50)).toBe(true);
     expect(bulkCalls.reduce((sum, call) => sum + call.taskIds.length, 0)).toBe(450);
     expect(toastSuccess).toHaveBeenCalledWith('Archived 449 completed tasks');
-    expect(toastWarning).toHaveBeenCalledWith('1 task could not be archived (NOT_COMPLETED)', 10000);
+    expect(toastWarning).toHaveBeenCalledWith('1 task was not archived (Task is no longer completed: 1). View archive results for details.', 10000);
   });
 
   test('an empty scope warns instead of opening the dialog', async () => {
@@ -242,4 +242,116 @@ describe('unarchive to the prior state (E5, resolves 7092b73d)', () => {
       payload: { success: true, task: { id: 'x' }, restoredTo: 'in-progress', derivedFrom: 'history' },
     });
   });
+});
+
+test('owner sees refusal reference and no successful archive count', async () => {
+ scopeIds=[uuid(1)];
+ bulkResponder=body=>({status:200,payload:{success:true,results:body.taskIds.map(id=>({id,archived:false,code:'FORBIDDEN',error:'SECRET',errorId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'})),archivedCount:0,failedCount:1}});
+ await renderTasksPage(); fireEvent.click(screen.getByRole('button',{name:'Archive completed'})); await flushRequests();fireEvent.click(screen.getByRole('button',{name:'Archive 1'}));await flushRequests();
+ expect(toastSuccess).not.toHaveBeenCalled();expect(toastWarning).toHaveBeenCalledWith('1 task was not archived (Lifecycle authority does not permit archival: 1). View archive results for details.',10000);
+});
+
+const diagnosticUuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const diagnosticCases = [
+  ['object', {toString: null}, ''],
+  ['array', [diagnosticUuid], ''],
+  ['missing', undefined, ''],
+  ['invalid', 'SECRET', ''],
+  ['valid', diagnosticUuid, ' (reference: '+diagnosticUuid+')'],
+] as const;
+test.each(diagnosticCases)('request failure with %s diagnostic keeps warning and refresh', async (_label, errorId, reference) => {
+  scopeIds = [uuid(1)];
+  bulkResponder = () => ({status: 500, payload: {success: false, code: 'BULK_ARCHIVE_FAILED', errorId, error: 'SECRET'}});
+  await renderTasksPage();
+  const boardReads = () => vi.mocked(authenticatedFetch).mock.calls.filter(([input]) => String(input).includes('/tasks/board?')).length;
+  const before = boardReads();
+  fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+  fireEvent.click(screen.getByRole('button', {name: 'Archive 1'})); await flushRequests(); await flushRequests();
+  expect(toastSuccess).not.toHaveBeenCalled();
+  expect(toastWarning).toHaveBeenCalledWith('1 task outcome is unconfirmed (Bulk archive failed: 1). View archive results for details.', 10000);
+  if (reference) expect(screen.getByText(diagnosticUuid)).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain('SECRET');
+  expect(boardReads()).toBeGreaterThan(before);
+  expect(document.querySelector('section[data-status="archived"]')).not.toBeNull();
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+test.each(diagnosticCases)('per-item failure with %s diagnostic keeps warning and refresh', async (_label, errorId, reference) => {
+  scopeIds = [uuid(1)];
+  bulkResponder = body => ({status: 200, payload: {success: true, results: body.taskIds.map(id => ({id, archived: false, code: 'FORBIDDEN', errorId, error: 'SECRET'})), archivedCount: 99, failedCount: 0}});
+  await renderTasksPage();
+  const boardReads = () => vi.mocked(authenticatedFetch).mock.calls.filter(([input]) => String(input).includes('/tasks/board?')).length;
+  const before = boardReads();
+  fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+  fireEvent.click(screen.getByRole('button', {name: 'Archive 1'})); await flushRequests(); await flushRequests();
+  expect(toastSuccess).not.toHaveBeenCalled();
+  expect(toastWarning).toHaveBeenCalledWith('1 task was not archived (Lifecycle authority does not permit archival: 1). View archive results for details.', 10000);
+  if (reference) expect(screen.getByText(diagnosticUuid)).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain('SECRET');
+  expect(boardReads()).toBeGreaterThan(before);
+  expect(document.querySelector('section[data-status="archived"]')).not.toBeNull();
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+test('eight denials retain every task and reference, concise toast and complete copy', async () => {
+ scopeIds = Array.from({length: 8}, (_, i) => uuid(i + 1));
+ const refs = scopeIds.map((_, i) => `aaaaaaaa-aaaa-4aaa-8aaa-${String(i).padStart(12, '0')}`);
+ bulkResponder = body => ({status: 200, payload: {success: true, results: body.taskIds.map((id, i) => ({id, archived: false, code: 'NOT_COMPLETED', errorId: refs[i], error: 'SECRET'}))}});
+ const writeText = vi.fn().mockResolvedValue(undefined);
+ Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText}});
+ await renderTasksPage();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive 8'})); await flushRequests();
+ expect(toastWarning).toHaveBeenCalledWith('8 tasks were not archived (Task is no longer completed: 8). View archive results for details.', 10000);
+ expect(toastSuccess).not.toHaveBeenCalled();
+ fireEvent.click(screen.getByText('View archive results (8 tasks)'));
+ for (const id of scopeIds) expect(screen.getByText(id)).toBeInTheDocument();
+ for (const ref of refs) expect(screen.getByText(ref)).toBeInTheDocument();
+ expect(screen.getAllByText('NOT_COMPLETED')).toHaveLength(8);
+ fireEvent.click(screen.getByRole('button', {name: 'Copy archive results'})); await flushRequests();
+ expect(writeText.mock.calls[0][0].split('\n')).toHaveLength(8);
+ for (const id of [...scopeIds, ...refs]) expect(writeText.mock.calls[0][0]).toContain(id);
+ expect(screen.getByText('Results copied')).toBeInTheDocument();
+ expect(document.body.textContent).not.toContain('SECRET');
+});
+test('copy denial is honest and leaves complete details available', async () => {
+ scopeIds = [uuid(1)];
+ bulkResponder = body => ({status: 200, payload: {success: true, results: body.taskIds.map(id => ({id, archived: false, code: 'FORBIDDEN'}))}});
+ Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText: vi.fn().mockRejectedValue(new Error('SECRET'))}});
+ await renderTasksPage(); fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive 1'})); await flushRequests();
+ fireEvent.click(screen.getByText('View archive results (1 task)'));
+ fireEvent.click(screen.getByRole('button', {name: 'Copy archive results'})); await flushRequests();
+ expect(screen.getByText('Could not copy results. Select and copy the details below.')).toBeInTheDocument();
+ expect(screen.getByText(uuid(1))).toBeInTheDocument();
+ expect(document.body.textContent).not.toContain('SECRET');
+});
+test.each([{results: []}, {results: [{id: uuid(1), archived: true}, {id: uuid(1), archived: true}]}])('missing or duplicate response outcome remains unconfirmed', async ({results}) => {
+ scopeIds = [uuid(1)];
+ bulkResponder = () => ({status: 200, payload: {success: true, results}});
+ await renderTasksPage(); fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive 1'})); await flushRequests();
+ expect(screen.getByText(/Outcome not confirmed/)).toBeInTheDocument();
+ expect(toastSuccess).not.toHaveBeenCalled();
+});
+test('top-level failure after possible partial writes never claims all tasks denied', async () => {
+ scopeIds = [uuid(1), uuid(2)];
+ bulkResponder = () => ({status: 500, payload: {success: false, code: 'BULK_ARCHIVE_FAILED'}});
+ await renderTasksPage(); fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive 2'})); await flushRequests();
+ expect(toastWarning).toHaveBeenCalledWith('2 task outcomes are unconfirmed (Bulk archive failed: 2). View archive results for details.', 10000);
+ expect(screen.getAllByText(/Outcome not confirmed/)).toHaveLength(2);
+ expect(toastSuccess).not.toHaveBeenCalled();
+});
+test('duplicate returned diagnostics stay complete while outcome stays unconfirmed', async () => {
+ scopeIds = [uuid(1)];
+ const refs = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'];
+ bulkResponder = () => ({status: 200, payload: {success: true, results: refs.map(errorId => ({id: uuid(1), archived: false, code: 'FORBIDDEN', errorId}))}});
+ const writeText = vi.fn().mockResolvedValue(undefined); Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {writeText}});
+ await renderTasksPage(); fireEvent.click(screen.getByRole('button', {name: 'Archive completed'})); await flushRequests();
+ fireEvent.click(screen.getByRole('button', {name: 'Archive 1'})); await flushRequests();
+ fireEvent.click(screen.getByText('View archive results (1 task)'));
+ expect(screen.getByText(/Outcome not confirmed/)).toBeInTheDocument();
+ for (const ref of refs) expect(screen.getByText(ref)).toBeInTheDocument();
+ fireEvent.click(screen.getByRole('button', {name: 'Copy archive results'})); await flushRequests();
+ for (const ref of refs) expect(writeText.mock.calls[0][0]).toContain(ref);
 });

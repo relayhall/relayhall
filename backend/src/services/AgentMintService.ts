@@ -11,7 +11,7 @@
 //   · requester live: chainAlive over the acting principal (AZ-9);
 //   · the BOUND credential live and un-graced where one exists (AZ-31c);
 //   · target Task exists and is in a MINTABLE state (not completed or
-//     archived — the ratified terminal set, sol B6);
+//     archived — the ratified terminal set, review B6);
 //   · one-writer slot free for write-capable requests (AZ-28: exactly ONE
 //     write-bound Agent per task; read+reports siblings mint freely);
 //   · requested scopes are mintable, carry no root (rule 2) and no *:admin
@@ -19,8 +19,12 @@
 //     requester's CURRENT effective scope set (the mint-time ⊆ half of
 //     T2 — the live chain cap is the other half, and both bind);
 //   · requested object rules lie within the requester's CURRENT effective
-//     object authority (Account sources ∩ own()-caps down the chain — the
-//     same shape the S3 SQL intersection enforces live).
+//     object authority, judged by the LIVE predicate itself wherever it can
+//     decide (card 785e1eed P1-C): an `exact` rule is asked of
+//     `AuthorizationService.sqlCondition` — the chain intersection the minted
+//     Agent will be evaluated under — for every action its verbs confer, so
+//     the ceiling is neither wider nor narrower than what the Agent can then
+//     do. See `assertObjectAuthorityCovers`.
 //
 // The minted Agent (§8.1): kind='agent', FIXED minimal role (NULL — never
 // settable through any delegation surface), parent = the ACTING
@@ -37,10 +41,19 @@ import { auditChainFor } from '../utils/auditChain';
 import { principalService } from './PrincipalService';
 import { delegationService } from './DelegationService';
 import { accessProfileService, type ProfileRule } from './AccessProfileService';
+import { authorizationRepository } from './AuthorizationRepository';
+import {
+  ADMINISTRATOR_ROLES, AUTHORIZATION_ACTIONS, grantAllows,
+  type AuthorizationAction, type AuthorizationActor,
+} from './AuthorizationService';
+import type { ChainLink } from './DelegationService';
+import { GRANT_VERBS, type GrantVerb } from './GrantService';
 import { isMintableScope } from '../utils/scopeMap';
 import { scopesForRole } from '../utils/identityScopes';
+import { accessVehicleService, AssignmentAccessError, type TaskGrantRole } from './AccessVehicleService';
 import {
   rulesCovered, scopesWithin, sourcesFromEffectiveAccess, sourcesFromRules,
+  type AuthoritySource,
 } from '../utils/authorityContainment';
 
 export const AGENT_CREDENTIAL_DEFAULT_MAX_AGE_HOURS = 24;
@@ -64,11 +77,125 @@ const err = (
   disposition: 'terminal' | 'transient' = 'transient',
 ) => new AgentMintError(status, code, message, disposition);
 
-const ADMINISTRATOR_ROLES = new Set(['admin', 'orchestrator']);
+type Queryable = { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> };
+
+/**
+ * The live ACTIONS a set of rule verbs confers, read from `grantAllows` — the
+ * mapping the evaluator applies to an own() rule (`ownRuleSql`) and to every
+ * grant — so the mint ceiling asks about exactly what the minted rule would
+ * let its Agent do: `write` confers read, write, claim, finish and release;
+ * `admin` confers every action.
+ */
+export function actionsConferredBy(verbs: readonly GrantVerb[]): AuthorizationAction[] {
+  return AUTHORIZATION_ACTIONS.filter((action) => verbs.some((verb) => grantAllows(verb, action)));
+}
+
+/**
+ * Verb implication for the ALGEBRA arm of the ceiling (selector forms the live
+ * predicate cannot decide object by object): a held source verb covers a
+ * requested verb when every action the requested verb confers is conferred by
+ * a held one. Derived from `grantAllows`, so `write` covers `read` and `admin`
+ * covers every verb exactly as the evaluator reads them, with no table to keep
+ * in step. The shared containment algebra is untouched: Warrant ceilings,
+ * approval edit-down and assignment non-escalation keep their own semantics.
+ */
+function withImpliedVerbs(sources: AuthoritySource[]): AuthoritySource[] {
+  return sources.map((source) => ({
+    ...source,
+    verbs: GRANT_VERBS.filter((requested) => actionsConferredBy([requested])
+      .every((action) => source.verbs.some((held) => grantAllows(held, action)))),
+  }));
+}
+
+/** The id the ceiling probe link carries. It names no principal; its own()
+ * is 'parent' on both halves, so its side of the intersection is TRUE and
+ * nothing bound to this id can contribute or remove authority. */
+const CEILING_PROBE_PRINCIPAL_ID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * The actor whose live decision IS the requester's delegable object authority:
+ * the requester's resolved chain with one neutral child link in front — the
+ * position the minted Agent will occupy.
+ *
+ * Every arm of `sqlCondition` that stays live here is one the minted Agent is
+ * evaluated under: the requester chain's own() caps (read through
+ * `ownObjectsFor`, verb implication included) and the Account side — the
+ * administrator superset, the account-owner arm
+ * `COALESCE(t.account_owner_principal_id, p.owner_principal_id)`, grants,
+ * group grants, profile rules, exact Project Grants and the read-visibility
+ * union.
+ *
+ * Every arm that goes dark is one the Agent never receives:
+ *   - `principalId` is null, so no Task-ROLE, initiator or assigned-Connector
+ *     claim arm fires — those evaluate on the ACTING identity alone and never
+ *     inherit down a chain (AZ-26), so a Connector that is a Task's claimant
+ *     cannot hand that to an Agent;
+ *   - the probe link is a parented NON-agent link, so the §8.2 bound-Task
+ *     context read and the bound-Task write cap — arms of the Agent's own
+ *     identity, not authority the requester holds — do not apply.
+ */
+function delegableAuthorityActor(chain: ChainLink[]): AuthorizationActor {
+  return {
+    principalId: null,
+    handle: 'agent-mint-ceiling',
+    role: null,
+    scopes: null,
+    authenticated: true,
+    delegation: {
+      links: [
+        {
+          principalId: CEILING_PROBE_PRINCIPAL_ID, kind: 'service', role: null,
+          parentPrincipalId: chain[0].principalId, boundTaskId: null, legacyIdentity: false,
+          ownExpression: { scopes: 'parent', objects: 'parent' },
+        },
+        ...chain.map((link) => ({
+          principalId: link.principalId, kind: link.kind, role: link.role,
+          parentPrincipalId: link.parentPrincipalId, boundTaskId: link.boundTaskId,
+          legacyIdentity: link.legacyIdentity, ownExpression: link.ownExpression,
+        })),
+      ],
+    },
+  };
+}
+
+/** Does the live predicate have a point shape for this resource type? Read
+ * from `sqlResource` itself (it throws for a type with none — today `plugin`
+ * and `surface`), never from a copied list. */
+function hasLiveShape(resourceType: ProfileRule['resourceType']): boolean {
+  try {
+    authorizationRepository.sqlResource(resourceType);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The failing rule, named in one fixed key order wherever T2 refuses. */
+function namedRule(rule: ProfileRule): ProfileRule {
+  return {
+    resourceType: rule.resourceType, selectorForm: rule.selectorForm,
+    selectorIds: [...rule.selectorIds], verbs: [...rule.verbs],
+  };
+}
 
 export interface MintAuthorityRequest {
   scopes: string[];
   rules: ProfileRule[];
+}
+
+export function normalizeMintRole(value: unknown, scopes: string[]): TaskGrantRole {
+  const role = value === undefined || value === null
+    ? (scopes.includes('tasks:write') ? 'implementer' : 'verifier') : value;
+  if (role !== 'implementer' && role !== 'verifier' && role !== 'shepherd') {
+    throw err(422, 'INVALID_MINT_ROLE', 'role must be implementer, verifier or shepherd', 'terminal');
+  }
+  if (role === 'implementer' && !scopes.includes('tasks:write')) {
+    throw err(422, 'ROLE_SCOPE_MISMATCH', 'an implementer requires tasks:write', 'terminal');
+  }
+  if (role === 'shepherd' && scopes.includes('tasks:write')) {
+    throw err(422, 'ROLE_SCOPE_MISMATCH', 'a shepherd-role Agent has no tasks:write', 'terminal');
+  }
+  return role;
 }
 
 export interface MintExecutionInput {
@@ -81,6 +208,7 @@ export interface MintExecutionInput {
   transport?: 'any' | 'mcp' | 'api';
   maxAgeHours?: number;
   label?: string | null;
+  role?: TaskGrantRole;
 }
 
 export interface MintedAgentPack {
@@ -96,6 +224,7 @@ export interface MintedAgentPack {
   expiresAt: string;
   transport: string;
   mintedUnderWarrantId: string | null;
+  role: TaskGrantRole;
 }
 
 /**
@@ -121,6 +250,12 @@ export interface MintedAgentPack {
  * about this check. With the scope mintable and this check deleted, the
  * mint SUCCEEDS outright — which is the red proof the mutation drill in
  * `__tests__/kw1AgentScopeExclusion.test.ts` takes.
+ *
+ * E149 (owner ruling, 12 Oct 2026, "bind edits too"). `knowledge-contents:write`
+ * is absent from this set: it reaches an Agent only through an explicit
+ * request at mint, inside the parent's grants (answer E2). Its edit-time twin,
+ * `AGENT_MINT_ONLY_SCOPES` in `AuthorityEditExecutor`, refuses adding it to an
+ * Agent credential by any edit (`AGENT_SCOPE_MINT_ONLY`), root included.
  */
 export const AGENT_EXCLUDED_SCOPES: ReadonlySet<string> = new Set([
   'knowledge-contents:read',
@@ -153,40 +288,96 @@ export function validateRequestedScopes(scopes: unknown): string[] {
 
 export class AgentMintService {
   /**
-   * The mint-time ⊆ check, OBJECT half (T2): requested rules must lie
-   * within the requester's CURRENT effective object authority — the
-   * Account's sources intersected with every own()-cap down the chain,
-   * mirroring the live SQL intersection. Root/administrator Accounts are
-   * the board-wide superset (§5.1). Empty rule requests pass trivially:
-   * the Agent then works purely through its bound-task role arms.
+   * The mint-time ⊆ check, OBJECT half (T2): requested rules must lie within
+   * the requester's CURRENT effective object authority (§5.2 rule 1, §6.1).
+   *
+   * CARD 785e1eed P1-C (census 82804ddf gap 3). This used to compare the
+   * request against grant and profile ROWS with exact verb matching, which is
+   * narrower than the predicate that decides every live act in three ways:
+   * `grantAllows` maps `write` to read/write/claim/finish/release; the
+   * account-owner arm counts the Task's or its Project's owner; and exact
+   * Project Grants reach their Tasks. So an Account that owned the Task's
+   * Project, or held only a `write` grant, or a Project grant, was refused
+   * MINT_EXCEEDS_REQUESTER for authority it exercises every day.
+   *
+   * THE LIVE ARM — every `exact` rule on a type the predicate has a shape for.
+   * The rule is asked of the production predicate (`authorizedIds` →
+   * `sqlCondition`), as the actor `delegableAuthorityActor` builds, for every
+   * action its verbs confer (`actionsConferredBy`) and every id it names. That
+   * is the chain intersection the minted Agent is evaluated under, minus only
+   * the arms of the Agent's own identity, so the ceiling equals what the
+   * Agent can then do — never wider, never narrower. A named object that does
+   * not exist is held by no one and refuses.
+   *
+   * THE ALGEBRA ARM — `all-of-type`, `all-except`, `all-in-project`, and the
+   * two types with no point shape. A selector that covers objects not yet
+   * created cannot be decided object by object, so containment is proven from
+   * the Account's grant and profile rows and every own() cap, as before, with
+   * two corrections that bring it to the predicate's own reading: verbs imply
+   * as `grantAllows` maps them (`withImpliedVerbs`), and the administrator
+   * superset is the predicate's `ADMINISTRATOR_ROLES` (the copy here lacked
+   * 'operator'). It stays conservative — never wider than the predicate.
+   *
+   * One function serves every path that runs T2 — the request (filing),
+   * decide, collect, the session mint and the warrant mint — so a refusal
+   * names the same failing rule, `{resourceType, selectorForm, selectorIds,
+   * verbs}`, wherever it is raised. `queryable` lets a path judge on its own
+   * open transaction. Empty rule requests pass trivially: the Agent then
+   * holds only its bound-Task default (card c334177b), itself evaluated live.
    */
-  async assertObjectAuthorityCovers(requesterPrincipalId: string, rules: ProfileRule[]): Promise<void> {
+  async assertObjectAuthorityCovers(
+    requesterPrincipalId: string,
+    rules: ProfileRule[],
+    queryable: Queryable = pool,
+  ): Promise<void> {
     if (rules.length === 0) return;
-    const chain = await delegationService.resolveChain(requesterPrincipalId);
-    for (const link of chain.links) {
+    const chain = await delegationService.resolveChain(requesterPrincipalId, queryable);
+    if (chain.links.some((link) => link.parentPrincipalId && !link.ownExpression)) {
+      throw err(403, 'MINT_EXCEEDS_REQUESTER',
+        'the requester chain carries no own() expression — no delegable authority (AZ-24)');
+    }
+    const probe = delegableAuthorityActor(chain.links);
+    for (const rule of rules) {
+      const notHeld = rule.selectorForm === 'exact' && hasLiveShape(rule.resourceType)
+        ? await this.liveCeilingMiss(probe, rule, queryable)
+        : await this.algebraCeilingMiss(chain.links, rule);
+      if (notHeld) {
+        throw err(403, 'MINT_EXCEEDS_REQUESTER',
+          `requested object authority exceeds what the requester may do live (T2): ${JSON.stringify(namedRule(rule))}; not held: ${notHeld}`);
+      }
+    }
+  }
+
+  /** The live arm: the first action/id pair the predicate refuses, or null. */
+  private async liveCeilingMiss(probe: AuthorizationActor, rule: ProfileRule, queryable: Queryable): Promise<string | null> {
+    // The predicate compares canonical text; a stored own() rule compares as
+    // `uuid`, so letter case never decides anything live and must not here.
+    const ids = [...new Set(rule.selectorIds.map((id) => id.toLowerCase()))];
+    for (const action of actionsConferredBy(rule.verbs)) {
+      const held = await authorizationRepository.authorizedIds(probe, rule.resourceType, ids, action, queryable);
+      const lacking = ids.find((id) => !held.has(id));
+      if (lacking) return `'${action}' on ${rule.resourceType} ${lacking}`;
+    }
+    return null;
+  }
+
+  /** The algebra arm: which link fails to contain the rule, or null. */
+  private async algebraCeilingMiss(links: ChainLink[], rule: ProfileRule): Promise<string | null> {
+    for (const link of links) {
       if (!link.parentPrincipalId) {
         if (ADMINISTRATOR_ROLES.has(String(link.role || '').toLowerCase())) continue;
-        const sources = sourcesFromEffectiveAccess(await accessProfileService.effectiveAccess(link.principalId));
-        const account = rulesCovered(sources, rules);
-        if (!account.covered) {
-          throw err(403, 'MINT_EXCEEDS_REQUESTER',
-            `requested object authority exceeds the requester's Account sources (T2): ${JSON.stringify(account.failing)}`);
+        const sources = withImpliedVerbs(sourcesFromEffectiveAccess(await accessProfileService.effectiveAccess(link.principalId)));
+        if (!rulesCovered(sources, [rule]).covered) {
+          return `no grant or profile rule of the Account contains this ${rule.selectorForm} selector`;
         }
       } else {
         const own = link.ownExpression;
-        if (!own) {
-          throw err(403, 'MINT_EXCEEDS_REQUESTER',
-            'the requester chain carries no own() expression — no delegable authority (AZ-24)');
-        }
-        if (own.objects !== 'parent') {
-          const capped = rulesCovered(sourcesFromRules(own.objects), rules);
-          if (!capped.covered) {
-            throw err(403, 'MINT_EXCEEDS_REQUESTER',
-              `requested object authority exceeds the chain own() cap (T2): ${JSON.stringify(capped.failing)}`);
-          }
+        if (own && own.objects !== 'parent' && !rulesCovered(withImpliedVerbs(sourcesFromRules(own.objects)), [rule]).covered) {
+          return `the own() cap of ${link.principalId} does not contain this ${rule.selectorForm} selector`;
         }
       }
     }
+    return null;
   }
 
   /**
@@ -215,7 +406,7 @@ export class AgentMintService {
   }
 
   /** Target Task must exist and be MINTABLE: not in the ratified terminal
-   * set (completed | archived — sol B6). Terminal = a T27 lapse. */
+   * set (completed | archived — review B6). Terminal = a T27 lapse. */
   async assertTaskMintable(queryable: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }, taskId: string): Promise<void> {
     const result = await queryable.query('SELECT status FROM tasks WHERE id = $1', [taskId]);
     if (result.rows.length === 0) {
@@ -233,12 +424,14 @@ export class AgentMintService {
    * write-capable credentials is bound to the same task. Read/report
    * siblings mint freely. Transient: the slot can free.
    */
-  async assertWriterSlotFree(queryable: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }, taskId: string, scopes: string[]): Promise<void> {
-    if (!scopes.includes('tasks:write')) return;
+  async assertWriterSlotFree(queryable: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }, taskId: string, scopes: string[], role?: TaskGrantRole): Promise<void> {
+    const resolvedRole = normalizeMintRole(role, scopes);
+    if (resolvedRole !== 'implementer') return;
     const result = await queryable.query(
       `SELECT p.id FROM principals p
         WHERE p.kind = 'agent' AND p.bound_task_id = $1 AND p.status = 'active'
           AND NOT p.legacy_identity
+          AND p.bound_task_role = 'implementer'
           AND EXISTS (SELECT 1 FROM principal_credentials c
                        WHERE c.principal_id = p.id
                          AND c.revoked_at IS NULL
@@ -293,20 +486,22 @@ export class AgentMintService {
    * already run every validation arm for its path.
    */
   async executeMint(client: PoolClient, input: MintExecutionInput, actor: AuditActor): Promise<MintedAgentPack> {
+    const role = normalizeMintRole(input.role, input.authority.scopes);
     const handle = `agent-${crypto.randomBytes(5).toString('hex')}`;
     const maxAgeHours = input.maxAgeHours ?? AGENT_CREDENTIAL_DEFAULT_MAX_AGE_HOURS;
     const expiresAt = new Date(Date.now() + maxAgeHours * 60 * 60 * 1000);
     const created = await client.query(
       `INSERT INTO principals
-         (kind, handle, display_name, role, status, parent_principal_id, bound_task_id,
+         (kind, handle, display_name, role, status, parent_principal_id, bound_task_id, bound_task_role,
           own_expression, minted_under_warrant_id, source_tag)
-       VALUES ('agent', $1, $2, NULL, 'active', $3, $4, $5::jsonb, $6, $7)
+       VALUES ('agent', $1, $2, NULL, 'active', $3, $4, $5, $6::jsonb, $7, $8)
        RETURNING id, handle`,
       [
         handle,
         input.label ?? null,
         input.parentPrincipalId,
         input.targetTaskId,
+        role,
         JSON.stringify({ scopes: input.authority.scopes, objects: input.authority.rules }),
         input.mintedUnderWarrantId ?? null,
         // 062's ux_principals_source_tag is UNIQUE: the tag names THIS mint.
@@ -326,11 +521,35 @@ export class AgentMintService {
         max_age_hours: maxAgeHours,
       },
     }, actor, client);
+    const assignerChain = await delegationService.resolveChain(input.parentPrincipalId, client);
+    if (!assignerChain.alive) throw err(409, 'REQUESTER_CHAIN_DEAD', 'the mint requester chain is not live', 'terminal');
+    const assigner: AuthorizationActor = {
+      principalId: input.parentPrincipalId, handle: actor.handle,
+      role: assignerChain.links[0].role, scopes: null, authenticated: true,
+      delegation: assignerChain.links.length > 1 ? { links: assignerChain.links } : null,
+    };
+    let roleRows;
+    try {
+      roleRows = await accessVehicleService.materializeRole(client, {
+        taskId: input.targetTaskId, principalId, role, actor, assigner,
+        credentialExpiresAt: expiresAt.toISOString(),
+      });
+    } catch (error) {
+      if (error instanceof AssignmentAccessError) throw err(error.status, error.code, error.message);
+      throw error;
+    }
     await auditService.record({
       action: 'agent.minted', actor,
       resourceType: 'principal', resourceId: principalId,
       metadata: {
         boundTaskId: input.targetTaskId,
+        role, roleGrantIds: roleRows.map(row => row.targetId),
+        // Historical context coordinates, read in the mint transaction. Live
+        // previews resolve these again; this receipt never grants authority.
+        derivedContext: (await client.query(
+          `SELECT id AS "taskId",phase_id AS "phaseId",project_id AS "projectId",
+            clock_timestamp() AS "observedAt" FROM tasks WHERE id=$1`, [input.targetTaskId])).rows[0],
+        contextBasis: 'AZ-19 bound-task read context; AZ-A10 stored role rows',
         parentPrincipalId: input.parentPrincipalId,
         scopes: input.authority.scopes,
         rules: input.authority.rules,
@@ -352,6 +571,7 @@ export class AgentMintService {
       expiresAt: expiresAt.toISOString(),
       transport: input.transport ?? 'any',
       mintedUnderWarrantId: input.mintedUnderWarrantId ?? null,
+      role,
     };
   }
 }

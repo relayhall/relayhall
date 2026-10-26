@@ -10,6 +10,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import * as ts from 'typescript';
 
 const SRC = path.join(__dirname, '..');
 const read = (p: string) => fs.readFileSync(path.join(SRC, p), 'utf-8');
@@ -39,7 +40,22 @@ describe('notes write paths are attributed', () => {
     const start = db.indexOf('  async archiveTask(');
     const body = db.slice(start, db.indexOf('\n  async ', start + 10));
     expect(body).toContain('actor?: TaskActor');
-    expect(body).toMatch(/archiveReason: options\.reason,\s*\}, actor\)/);
+    const source = ts.createSourceFile('TaskManagerDB.ts', db, ts.ScriptTarget.Latest, true);
+    const calls: ts.CallExpression[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isMethodDeclaration(node) && node.name.getText(source) === 'archiveTask') {
+        const walk = (child: ts.Node): void => {
+          if (ts.isCallExpression(child) && child.expression.getText(source) === 'this.updateTask') calls.push(child);
+          ts.forEachChild(child, walk);
+        };
+        ts.forEachChild(node, walk);
+      } else ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].arguments[2].getText(source)).toBe('actor');
+    expect(calls[0].arguments[1].getText(source)).toContain('archiveReason: options.reason');
+    expect(calls[0].arguments[6].getText(source)).toBe('archiveOperation');
     const routes = read('routes/tasks.ts');
     expect(routes).toContain('archiveTask(req.params.id, { reason }, requestActor(req))');
   });
@@ -59,9 +75,14 @@ describe('notes write paths are attributed', () => {
 describe('disable is a kill switch on every auth path', () => {
   it('rejects a disabled principal on both JWT branches, not only rh_ keys', () => {
     const auth = read('middleware/auth.ts');
-    // v2 branch, legacy-handle branch, and the session stub.
+    // Both JWT branches check status here; session ingress delegates its
+    // active-status check to the strict shared session-authentication boundary.
     const statusChecks = auth.match(/principal\.status !== 'active'/g) || [];
-    expect(statusChecks.length).toBeGreaterThanOrEqual(3);
+    expect(statusChecks.length).toBeGreaterThanOrEqual(2);
+    expect(auth).toContain('resolveActiveLoginSession(sessionToken)');
+    const sessionAuth = read('services/sessionAuthentication.ts');
+    expect(sessionAuth).toContain("principal.status !== 'active'");
+    expect(sessionAuth).toContain('getPrincipalByIdStrict(session.principalId)');
   });
 
   it('will not let the API disable the owner identity (R11)', () => {

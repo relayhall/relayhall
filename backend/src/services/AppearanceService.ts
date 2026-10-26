@@ -404,6 +404,11 @@ export class AppearanceService {
     if (!Number.isSafeInteger(versionNo) || versionNo < 1) {
       throw new AppearanceValidationError('INVALID_VERSION', 'version number must be a positive integer');
     }
+    // Card bc847bd0: appearance_versions.version_no is a PostgreSQL integer; a
+    // number past it reached the read and answered 500 (22003).
+    if (versionNo > 2147483647) {
+      throw new AppearanceValidationError('INVALID_VERSION', 'version number must be a positive integer up to 2147483647');
+    }
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');

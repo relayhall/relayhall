@@ -1,5 +1,5 @@
 // onboardingPack.ts — one-time onboarding packs (RH-P3.AZ-S5, card
-// bb4a5f79; AUTHZ design 4d961e37 §7.4, AZ-13, sol m11; strategy §2.10).
+// bb4a5f79; AUTHZ design 4d961e37 §7.4, AZ-13, review m11; strategy §2.10).
 //
 // A pack is RENDERED ONCE into the response that mints its credential and
 // is NEVER stored server-side: board endpoint, the credential (secretOnce),
@@ -12,8 +12,63 @@
 // The board endpoint comes from RELAYHALL_PUBLIC_API_URL when the
 // deployment declares one, else from the request's own origin — the pack
 // must name the endpoint its credential actually authenticates against.
+//
+// Card 94e8bb0b items 1-3: the pack also carries ONE short bootstrap prompt
+// and a few lines of secure configuration guidance. Both are composed from
+// the MCP endpoint alone — the composer is never handed the credential — so
+// no arm of this file can put a token into text a person pastes into a chat.
 import type { Request } from 'express';
 import type { ProfileRule } from '../services/AccessProfileService';
+
+/**
+ * The registry Skill a fresh session is sent to. Its reviewed source is
+ * `skills/relayhall-connector-bootstrap/SKILL.md`; publication is the normal
+ * Skill lifecycle (docs/connector-onboarding.md), never this file.
+ */
+export const CONNECTOR_BOOTSTRAP_SKILL = 'relayhall-connector-bootstrap';
+
+/** The MCP server name every configuration block in the pack registers. */
+export const MCP_SERVER_ALIAS = 'relayhall';
+
+/** The environment variable the Codex block and the CLI lines name. */
+export const TOKEN_ENV_VAR = 'RELAYHALL_TOKEN';
+
+/**
+ * What a new connector may read (owner ruling E475 (3)): the board, through
+ * MCP, and the connector's own folders, nothing else. The sentence itself says
+ * which folders those are, so a harness opened inside some other folder cannot
+ * count that folder as its own before the Skill loads. One sentence, said in the
+ * bootstrap prompt AND, verbatim, in the registry Skill's ground rules
+ * (`skills/relayhall-connector-bootstrap/SKILL.md`), so the two cannot drift.
+ */
+export const CONNECTOR_READ_BOUNDARY = "Read only the board, through this MCP server, and this connector's own folders (its MCP entry, its local connection skill and its state folder); never the owner's private working set, other sessions' scratchpads or other hosts.";
+
+/**
+ * The copyable bootstrap prompt. It names the configured MCP origin, what the
+ * session may read, and the steps, and nothing else: the signature takes no
+ * credential, so the prompt is identical before and after a token is minted
+ * and is safe to re-show. The read boundary comes second, before any step that
+ * reads.
+ */
+export function composeBootstrapPrompt(mcpEndpoint: string): string {
+  return [
+    `Connect to the RelayHall MCP server "${MCP_SERVER_ALIAS}" at ${mcpEndpoint} with the credential from your secure store; never paste the credential into this chat.`,
+    CONNECTOR_READ_BOUNDARY,
+    'Call relayhall_brief_compile with {"session": true} to get your session brief.',
+    `Find the published Skill ${CONNECTOR_BOOTSTRAP_SKILL} with relayhall_skill_list, load it with relayhall_skill_get (fullContent: true) and run the onboarding it describes, using only what this harness supports.`,
+    'Finish with a readiness matrix: measured results with real ids, then the remaining gaps. Do not arm or claim unrelated work.',
+  ].join('\n');
+}
+
+/** Secure configuration guidance shown beside the prompt; credential-free by the same construction. */
+export function composeConfigurationGuidance(mcpEndpoint: string): string[] {
+  return [
+    `Register the MCP server as "${MCP_SERVER_ALIAS}" at ${mcpEndpoint} using the block for your client.`,
+    `Keep the credential in your client's secret store or the ${TOKEN_ENV_VAR} environment variable. Never put it in a prompt, a Skill, a Report or a repository; Claude Code reads \${${TOKEN_ENV_VAR}} inside .mcp.json headers.`,
+    'Then paste the bootstrap prompt into a fresh session. It carries no credential, so it is safe to keep and to re-run.',
+    'For a local pointer to this connection, run relayhall connection-skill install --harness claude-code (or --harness codex). It records the origin, the Skill version and digest, and where the credential is kept, never the credential.',
+  ];
+}
 
 export interface PackCredential {
   credentialId: string;
@@ -28,6 +83,10 @@ export interface OnboardingPack {
   boardEndpoint: string;
   /** Strategy §2.10: the only instruction a harness keeps locally. */
   bootstrapLine: string;
+  /** Card 94e8bb0b: the one copyable prompt for a fresh session. Never carries a credential. */
+  bootstrapPrompt: string;
+  /** Card 94e8bb0b: secure configuration guidance, one sentence per line. */
+  configurationGuidance: string[];
   credential: PackCredential;
   /** Per-harness MCP config for the board's own `/mcp` endpoint (§7.4). */
   mcpConfig: {
@@ -72,6 +131,8 @@ export function composeOnboardingPack(input: {
   return {
     boardEndpoint: endpoint,
     bootstrapLine: `You have a RelayHall board at ${endpoint}. Authenticate with your credential and fetch everything else from it.`,
+    bootstrapPrompt: composeBootstrapPrompt(mcpEndpoint),
+    configurationGuidance: composeConfigurationGuidance(mcpEndpoint),
     credential,
     // RH-P3.C4: the MCP surface is IN-PROCESS now (owner decision D1). The
     // packs name the board's own `/mcp` Streamable HTTP endpoint — no local

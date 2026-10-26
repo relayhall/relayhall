@@ -25,6 +25,20 @@ export interface PhaseOption {
   name: string;
   status: string;
   position: number;
+  /** Explicit exceptional restriction (owner ruling 44ee41f2). */
+  restrictedAccess?: boolean;
+}
+
+/**
+ * The Project's inbox phase while its default is IN FORCE (card b13e5ac9):
+ * named by the Project, offered in its Phase list, not archived and not
+ * restricted - exactly when the server files a Task created without a phase
+ * there. Otherwise null, and a create surface preselects nothing.
+ */
+export function inboxPhaseInForce(phases: PhaseOption[], inboxPhaseId: string | null | undefined): string | null {
+  if (!inboxPhaseId) return null;
+  const phase = phases.find(p => p.id === inboxPhaseId);
+  return phase && phase.status !== 'archived' && !phase.restrictedAccess ? phase.id : null;
 }
 
 export function usePhaseOptions(projectId: string | null | undefined): PhaseOption[] {
@@ -43,6 +57,7 @@ export function usePhaseOptions(projectId: string | null | undefined): PhaseOpti
         if (data?.success && Array.isArray(data.phases)) {
           setPhases(data.phases.map((p: any) => ({
             id: p.id, name: p.name, status: p.status, position: p.position,
+            restrictedAccess: Boolean(p.restrictedAccess),
           })));
         } else {
           setPhases([]);
@@ -104,8 +119,10 @@ export function PhaseSelect({
  * searching a project's list, so it is correct even when the Phase is archived
  * or the project name cannot be resolved. A failed lookup shows the id rather
  * than claiming the task is unphased — absence and unknown are different.
+ * `nameOnly` renders the bare name, for a sentence such as the Verifier's
+ * "(inherited from Phase <name>)" (card 41e24358).
  */
-export function PhaseName({ phaseId }: { phaseId: string }) {
+export function PhaseName({ phaseId, nameOnly = false }: { phaseId: string; nameOnly?: boolean }) {
   const [phase, setPhase] = useState<PhaseOption | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -131,6 +148,7 @@ export function PhaseName({ phaseId }: { phaseId: string }) {
   }, [phaseId]);
 
   if (phase) {
+    if (nameOnly) return <span>{phase.name}</span>;
     return <span>#{phase.position} {phase.name}{phase.status === 'archived' ? ' (archived)' : ''}</span>;
   }
   return <span>{failed ? phaseId.slice(0, 8) : 'Loading…'}</span>;

@@ -62,6 +62,27 @@
 .axm-editor { margin-bottom: var(--space-4); padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-elevated); }
 .axm-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
 
+/* Lane P2-F (card 785e1eed): the New warrant form's ceiling-rules field. The
+   profile selector and the rules span the grid together, because they are one
+   choice; each rule is a bordered row, its verbs are the same chips the mint
+   dialog's scopes use, and its problem list reuses the page's error pairing
+   (.axm-error) rather than a colour pair the contrast matrix has not seen. */
+.axm-editor-wide { grid-column: 1 / -1; }
+.axm-rules { display: grid; gap: var(--space-3); min-width: 0; margin: 0; padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); }
+.axm-rules > legend { padding: 0 var(--space-1); color: var(--text-primary); font-size: var(--text-sm); font-weight: var(--font-semibold); }
+.axm-rules > p { margin: 0; }
+.axm-rule { display: grid; gap: var(--space-2); min-width: 0; padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); }
+.axm-rule-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); font-size: var(--text-sm); }
+.axm-rule-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 2fr); gap: var(--space-3); }
+.axm-rule-verbs { min-width: 0; margin: 0; padding: 0; border: 0; }
+.axm-rule-verbs > legend { margin-bottom: var(--space-1); padding: 0; color: var(--text-secondary); font-size: var(--text-xs); }
+.axm-rules-tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.axm-rules-paste { display: grid; gap: var(--space-2); }
+.axm-rules-paste > label { color: var(--text-primary); font-size: var(--text-sm); }
+.axm-rule-problems { padding: var(--space-2) var(--space-3); border: 1px solid var(--status-danger); border-radius: var(--radius-md); color: var(--text-error); background: var(--status-danger-soft); font-size: var(--text-sm); }
+.axm-rule-problems p { margin: 0 0 var(--space-1); }
+.axm-rule-problems ul { margin: 0; padding-left: var(--space-4); }
+
 .axm-minted { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); color: var(--text-secondary); font-size: var(--text-sm); }
 
 .axm-table { border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden; }
@@ -76,6 +97,7 @@
 @media (max-width: 1024px) { .axm-trow--head { display: none; } .axm-trow { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 640px) {
   .axm-editor-grid { grid-template-columns: 1fr; }
+  .axm-rule-grid { grid-template-columns: 1fr; }
   .axm-trow { grid-template-columns: 1fr; }
   .axm-item-row { align-items: flex-start; flex-direction: column; }
   .axm-section-head { align-items: stretch; flex-direction: column; }
@@ -101,13 +123,11 @@
 .axm-chip-list { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: var(--space-2) 0; padding: 0; list-style: none; }
 .axm-chip-list li { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-2); border: 1px solid var(--border-default); border-radius: var(--radius-full); background: var(--bg-surface); color: var(--text-secondary); font-size: var(--text-xs); }
 
-/* Role explanations remain available without external documentation. */
+/* Role explanations remain available without external documentation; the
+   catalogue list inside is styled by components/access/RoleExplanation.css. */
 .axm-role-guide { margin-block: var(--space-3); }
 .axm-role-guide summary { cursor: pointer; font-weight: 600; }
-.axm-role-guide dl { display: grid; gap: var(--space-3); }
-.axm-role-guide dl > div { display: grid; grid-template-columns: minmax(7rem, 1fr) minmax(0, 4fr); gap: var(--space-3); }
-.axm-role-guide dt { font-weight: 600; }
-.axm-role-guide dd { margin: 0; }
-@media (max-width: 640px) {
-  .axm-role-guide dl > div { grid-template-columns: 1fr; gap: var(--space-1); }
-}
+.axm-preview-table { width: 100%; border-collapse: collapse; text-align: left; margin: var(--space-3) 0; }
+.axm-preview-table caption { text-align: left; font-weight: 600; margin-bottom: var(--space-2); }
+.axm-preview-table th, .axm-preview-table td { padding: var(--space-2); border-bottom: 1px solid var(--border-subtle); vertical-align: top; }
+.axm-preview-table code { overflow-wrap: anywhere; font-size: var(--text-xs); }

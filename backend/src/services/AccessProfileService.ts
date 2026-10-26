@@ -211,6 +211,10 @@ export class AccessProfileError extends Error {
   }
 }
 
+/** AZ-A12 clause 3(e), for profile assignments. */
+const GROUP_ASSIGNEE_MESSAGE = "A Group is assigned a profile with assigneeType 'group' and its Group id; "
+  + "a Group principal is never an assigneeType 'principal' assignee (AZ-A12 clause 3e).";
+
 const err = (status: number, code: string, message: string, field?: string) =>
   new AccessProfileError(status, code, message, field);
 
@@ -772,6 +776,11 @@ export class AccessProfileService {
         throw err(422, 'ASSIGNEE_NOT_FOUND', 'assigneeId resolves to no principal', 'assigneeId');
       }
       const row = principal.rows[0];
+      // AZ-A12 clause 3(e): the grant refusal applies to profile assignments
+      // too. A Group is assigned with assigneeType 'group' (the §4 path).
+      if (row.kind === 'group') {
+        throw err(422, 'GROUP_PRINCIPAL_NOT_A_GRANTEE', GROUP_ASSIGNEE_MESSAGE, 'assigneeId');
+      }
       // AZ-S3 lifted the S2 sequencing guard (§4, review 94aad5aa B1):
       // Connectors and Agents are valid assignees within the §5 caps — a
       // profile assigned to a delegated identity contributes to its OWN
@@ -987,13 +996,16 @@ export class AccessProfileService {
    * assignment. Scope ceilings and role are the ROUTE plane and are not
    * repeated here.
    */
-  async effectiveAccess(principalId: string): Promise<{
+  async effectiveAccess(principalId: string,
+    // Owner rulings E407 item 2 and E413: GrantEffectService reads this
+    // inventory inside its own transaction (with and without one grant row).
+    queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool): Promise<{
     principalId: string;
     grants: Array<Record<string, unknown>>;
     profiles: Array<Record<string, unknown>>;
   }> {
     requireUuid(principalId, 'INVALID_PROFILE_VALUE', 'principalId');
-    const grants = await pool.query(
+    const grants = await queryable.query(
       `SELECT g.id, g.grantee_type, g.grantee_id, g.resource_type, g.resource_id, g.verb, g.expires_at,
               gr.name AS group_name
          FROM grants g
@@ -1007,7 +1019,7 @@ export class AccessProfileService {
         ORDER BY g.resource_type, g.verb`,
       [principalId],
     );
-    const profiles = await pool.query(
+    const profiles = await queryable.query(
       `SELECT ap.id AS profile_id, ap.name, ap.published_version_id, v.version_number,
               apa.assignee_type, apa.assignee_id, gr.name AS group_name,
               apr.resource_type, apr.selector_form, apr.selector_ids, apr.verbs

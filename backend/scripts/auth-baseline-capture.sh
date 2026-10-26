@@ -5,7 +5,10 @@
 # Purpose (epic 60558599, Phase-2 exit): pin the current post-089 401/403
 # surface against a disposable freshly migrated stack. The fixture covers only
 # current routes and includes a real short-lived principal credential so both
-# successful authentication and generic fail-closed authorization are proven.
+# successful authentication and scope-ceiling authorization are proven: an
+# off-scope call is refused 403 FORBIDDEN and the body names only the scope
+# the route requires (details.requiredScopes, owner ruling D6, card fbeb86f1,
+# which reverses the "off-scope stays generic" stance of b42af322).
 #
 # Secrets: JWTs are minted inside the backend container, legacy keys are read
 # from its environment, and the one-time rh_ key exists only inside a mode-0600
@@ -161,7 +164,7 @@ probe "091-reports-key-skills-offscope" GET  /skills   "X-Reports-Read-Key: $REP
 probe "092-reports-key-offscope"        GET  /tasks    "X-Reports-Read-Key: $REPORTS_KEY"
 probe "093-reports-key-wrong"           GET  /reports  "X-Reports-Read-Key: baseline-wrong"
 probe "094-reports-key-post"            POST /reports  "X-Reports-Read-Key: $REPORTS_KEY"
-# --- real principal credential: in-scope succeeds, off-scope stays generic --
+# --- real principal credential: in-scope succeeds, off-scope names the scope --
 PROBE_CURL_CONFIG="$SCOPED_KEY_CURL_CONFIG" \
 probe "095-rh-key-tasks-in-scope" GET /tasks
 PROBE_CURL_CONFIG="$SCOPED_KEY_CURL_CONFIG" \

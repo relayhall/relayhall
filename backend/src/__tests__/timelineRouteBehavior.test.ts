@@ -22,7 +22,7 @@ jest.mock('../services/TaskManagerDB', () => {
         updated: '2026-08-14T12:00:00.000Z',
         startedAt: '2026-08-02T00:00:00.000Z',
         sessionRefs: ['sess-1'],
-        reviewHistory: [],
+        reviewHistory: [{id:'review-1',reviewedAt:'2026-08-14T12:00:00.000Z',decision:'pass',findings:[],evidence:{reportIds:[],sessionRefs:[]}}],
       })),
     },
   };
@@ -38,7 +38,6 @@ jest.mock('../services/TaskElementService', () => {
   };
 });
 jest.mock('../services/taskAnalyzer', () => ({ taskAnalyzer: {} }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: {} }));
 jest.mock('../services/TaskReviewerService', () => ({ taskReviewerService: {} }));
 jest.mock('../services/TaskOrchestrationService', () => ({
   taskOrchestrationService: {},
@@ -123,7 +122,7 @@ describe('GET /tasks/:id/timeline handler behavior', () => {
   test('a valid previously-returned cursor is accepted', async () => {
     const first = await get(`/tasks/${TASK_ID}/timeline?limit=1`);
     expect(first.status).toBe(200);
-    // sessionRefs fixture guarantees at least one event
+    // The durable review-history fixture guarantees at least one event.
     expect(first.body.events.length).toBeGreaterThan(0);
     const cursor = Buffer.from(JSON.stringify({
       at: first.body.events[0].at, source: first.body.events[0].source, id: first.body.events[0].id,
@@ -137,8 +136,9 @@ describe('GET /tasks/:id/timeline handler behavior', () => {
     const { status, body } = await get(`/tasks/${TASK_ID}/timeline`);
     expect(status).toBe(200);
     expect(body.sourcesUnavailable).toEqual(['stream']);
-    // session synthesis still produced the legacy ref event
-    expect(body.events.map((e: any) => e.source)).toContain('session');
+    // Durable review evidence remains; retired Task JSON cannot synthesize a session.
+    expect(body.events.map((e: any) => e.source)).toContain('review');
+    expect(body.events.map((e: any) => e.source)).not.toContain('session');
   });
 
   test('healthy sources report an EMPTY sourcesUnavailable — failed is distinguishable from empty', async () => {

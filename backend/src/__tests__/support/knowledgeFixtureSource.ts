@@ -41,6 +41,12 @@ export interface FixtureBehaviour {
    * read" asks a source to do.
    */
   requireBearer?: string;
+  /**
+   * Card 3e0ae06e: answer from the request body, as a source that reads it
+   * does (a store that honours the `budget_ms` core sends). What it returns
+   * replaces `status`, `body` and `delayMs` for this one request.
+   */
+  respond?: (body: string) => { status?: number; body: string; delayMs?: number };
 }
 
 export class KnowledgeFixtureSource {
@@ -124,7 +130,9 @@ export class KnowledgeFixtureSource {
             headers: req.headers,
             body: Buffer.concat(chunks).toString('utf8'),
           });
-          const behaviour = this.behaviour;
+          const behaviour = this.behaviour.respond
+            ? { ...this.behaviour, ...this.behaviour.respond(Buffer.concat(chunks).toString('utf8')) }
+            : this.behaviour;
           const answer = (): void => {
             res.writeHead(behaviour.status ?? 200, {
               'content-type': 'application/json',

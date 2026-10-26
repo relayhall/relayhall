@@ -1,0 +1,122 @@
+/* "Needs your action" (card 5854f0d6, Slice B): the Notifications tab and the
+   rows the bell's popover and the dashboard card reuse. Theme tokens only. */
+
+.action-list-note {
+  margin: 0 0 var(--space-4);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.action-list-group {
+  margin-top: var(--space-4);
+}
+
+.action-list-group h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.action-list-count {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.action-list-capped {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.action-list-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.action-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.action-list-item:last-child {
+  border-bottom: 0;
+}
+
+.action-list-item--compact {
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.action-list-item-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+.action-list-item-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.action-list-item-subject {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+a.action-list-item-subject {
+  color: var(--text-accent);
+}
+
+.action-list-item-reason {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.action-list-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.action-list-item-project {
+  overflow-wrap: anywhere;
+}
+
+/* E455: a seen item stays listed, drawn quieter, and says it was seen. */
+.action-list-item--seen .action-list-item-subject {
+  font-weight: 400;
+}
+
+.action-list-item-seen {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.action-list-item-mark {
+  flex-shrink: 0;
+  align-self: center;
+}

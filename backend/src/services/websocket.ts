@@ -1,11 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import { Server } from 'http';
+import { Server, IncomingMessage } from 'http';
 import { verifyActiveDashboardToken } from '../utils/dashboardToken';
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { readCookie } from '../utils/cookies';
 import { isFlagOn, FLAG_SESSIONS } from '../utils/featureFlags';
-import { SESSION_COOKIE_NAME, loginSessionService } from './LoginSessionService';
-import { principalService } from './PrincipalService';
+import { SESSION_COOKIE_NAME } from './LoginSessionService';
+import { resolveActiveLoginSession, SessionAuthenticationUnavailableError } from './sessionAuthentication';
 
 /**
  * SS-W1: authenticate the upgrade from the login-session cookie.
@@ -16,23 +16,18 @@ import { principalService } from './PrincipalService';
  * same-origin and carries cookies, so the same predicate the REST ingress
  * uses works here unchanged: live row, un-idled, unrevoked, active principal.
  */
-async function sessionAuthenticatesUpgrade(cookieHeader: string | undefined): Promise<boolean> {
-  if (!isFlagOn(FLAG_SESSIONS)) return false;
+async function sessionAuthenticatesUpgrade(cookieHeader: string | undefined): Promise<string | null> {
+  if (!isFlagOn(FLAG_SESSIONS)) return null;
   const sessionToken = readCookie(cookieHeader, SESSION_COOKIE_NAME);
-  if (!sessionToken) return false;
-  try {
-    const session = await loginSessionService.resolve(sessionToken);
-    if (!session) return false;
-    const principal = await principalService.getPrincipalById(session.principalId);
-    return Boolean(principal && principal.status === 'active');
-  } catch {
-    return false;
-  }
+  if (!sessionToken) return null;
+  const resolved = await resolveActiveLoginSession(sessionToken);
+  return resolved?.principal.id ?? null;
 }
 
 export class WebSocketService {
   private wss: WebSocketServer;
   private clients: Set<WebSocket> = new Set();
+  private readonly principalForClient = new WeakMap<WebSocket, string>();
 
   constructor(server: Server, path: string = '/ws') {
     this.wss = new WebSocketServer({ noServer: true });
@@ -44,16 +39,30 @@ export class WebSocketService {
 
       const token = url.searchParams.get('token');
       let authenticated = false;
+      let principalId: string | null = null;
       if (token) {
         try {
-          await verifyActiveDashboardToken(token);
+          const identity = await verifyActiveDashboardToken(token);
+          principalId = identity.principalId ?? null;
           authenticated = true;
         } catch {
           authenticated = false;
         }
       }
       if (!authenticated) {
-        authenticated = await sessionAuthenticatesUpgrade(request.headers.cookie);
+        try {
+          principalId = await sessionAuthenticatesUpgrade(request.headers.cookie);
+          authenticated = principalId !== null;
+        } catch (error) {
+          const unavailable = error instanceof SessionAuthenticationUnavailableError;
+          const errorId = logCaughtFailure(
+            unavailable ? '[WebSocket] session authentication lookup unavailable:' : '[WebSocket] upgrade authentication failed:',
+            unavailable ? error.cause : error,
+          );
+          socket.write(`HTTP/1.1 ${unavailable ? '503 Service Unavailable' : '500 Internal Server Error'}\r\nX-Error-Id: ${errorId}\r\nConnection: close\r\n\r\n`);
+          socket.destroy();
+          return;
+        }
       }
       if (!authenticated) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -62,12 +71,12 @@ export class WebSocketService {
       }
 
       this.wss.handleUpgrade(request, socket, head, (ws) => {
-        this.wss.emit('connection', ws, request);
+        this.wss.emit('connection', ws, request, principalId);
       });
     });
 
-    this.wss.on('connection', (ws: WebSocket) => {
-      this.handleConnection(ws);
+    this.wss.on('connection', (ws: WebSocket, _request: IncomingMessage, principalId: string | null) => {
+      this.handleConnection(ws, principalId);
     });
 
     console.log(`🔌 WebSocket server initialized on ${path}`);
@@ -77,9 +86,10 @@ export class WebSocketService {
   // Connection lifecycle
   // ─────────────────────────────────────────────────────────────────
 
-  private handleConnection(ws: WebSocket) {
+  private handleConnection(ws: WebSocket, principalId: string | null) {
     console.log('📡 Client connected');
     this.clients.add(ws);
+    if (principalId) this.principalForClient.set(ws, principalId);
 
     // Send initial connection confirmation
     ws.send(JSON.stringify({
@@ -156,6 +166,22 @@ export class WebSocketService {
     // Log only if there are clients
     if (successCount > 0 || failCount > 0) {
       console.log(`📤 Broadcast: ${successCount} sent, ${failCount} failed, ${this.clients.size} total clients`);
+    }
+  }
+
+  /** The payload contains no Project or Account identifiers. */
+  public broadcastToPrincipals(principalIds: Array<string | null>, data: { type: string }): void {
+    const recipients = new Set(principalIds.filter((id): id is string => !!id));
+    const message = JSON.stringify(data);
+    for (const client of this.clients) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      const principalId = this.principalForClient.get(client);
+      if (!principalId || !recipients.has(principalId)) continue;
+      try {
+        client.send(message);
+      } catch (error) {
+        logCaughtFailure('[WebSocket] targeted invalidation failed', error);
+      }
     }
   }
 

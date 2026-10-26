@@ -308,7 +308,7 @@ def test_documented_skill_commands_run_verbatim(monkeypatch):
     documented_verbs = {shlex.split(c)[2] if shlex.split(c)[1] == "skill" else "list" for c in commands if len(shlex.split(c)) > 2}
     for verb in (
         "list", "get", "search", "create", "update", "versions", "submit-review",
-        "reject", "publish", "retire", "audience", "pin", "unpin", "delete", "context",
+        "reject", "publish", "retire", "audience", "owner", "pin", "unpin", "delete", "context",
     ):
         assert verb in documented_verbs, f"docs/skills.md no longer documents `skill {verb}`"
 
@@ -343,3 +343,57 @@ def test_documented_skill_commands_run_verbatim(monkeypatch):
             assert any(m == "POST" and p == "/skills" for m, p, _ in calls), (
                 f"documented create form did not POST /skills: {line!r}"
             )
+
+
+# ─── skill owner (card d67e6990) ───
+
+OWNER_ID = "77777777-6666-4555-8444-333322221111"
+
+
+def test_skill_list_all_owners_asks_for_every_owners_drafts(rest):
+    rest.queue.append({"success": True, "skills": [sample_skill()]})
+    run(cli.cmd_skill_list, list_args(all_owners=True))
+    assert rest.calls == [("GET", "/skills?owner=all", None)]
+
+
+def test_skill_list_without_the_flag_keeps_the_default_view(rest):
+    rest.queue.append({"success": True, "skills": [sample_skill()]})
+    run(cli.cmd_skill_list, list_args())
+    assert rest.calls == [("GET", "/skills", None)]
+
+
+def test_skill_owner_by_id_reads_the_skill_then_puts_the_owner(rest):
+    rest.queue.append({"success": True, "skill": sample_skill()})
+    rest.queue.append({"success": True, "changed": True,
+                       "skill": sample_skill(owner_principal_id=OWNER_ID, owner_display_name="Second Account")})
+    out, _, code = run(cli.cmd_skill_owner, Args(skill=SKILL_ID, owner=OWNER_ID, reason="  imported drafts  "))
+    assert code is None
+    assert rest.calls == [
+        ("GET", f"/skills/{SKILL_ID}", None),
+        ("PUT", f"/skills/{SKILL_ID}/owner", {"ownerPrincipalId": OWNER_ID, "reason": "imported drafts"}),
+    ]
+    assert "Second Account" in out
+
+
+def test_skill_owner_by_name_resolves_over_every_owners_drafts(rest):
+    rest.queue.append({"success": True, "skills": [sample_skill(), sample_skill(id=OTHER_ID, name="other")]})
+    rest.queue.append({"success": True, "changed": False, "skill": sample_skill(owner_principal_id=OWNER_ID)})
+    out, _, code = run(cli.cmd_skill_owner, Args(skill="deploy-runner", owner=OWNER_ID, reason="why"))
+    assert code is None
+    assert rest.calls[0] == ("GET", "/skills?owner=all", None)
+    assert rest.calls[1][0:2] == ("PUT", f"/skills/{SKILL_ID}/owner")
+    assert "already owned" in out
+
+
+def test_skill_owner_refuses_a_blank_reason_before_any_call(rest):
+    _, err, code = run(cli.cmd_skill_owner, Args(skill=SKILL_ID, owner=OWNER_ID, reason="   "))
+    assert code == 2 and "--reason" in err
+    assert rest.calls == []
+
+
+def test_skill_owner_parses_through_main(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "cmd_skill_owner", lambda args: seen.update(vars(args)))
+    _, _, code = run_main(["skill", "owner", SKILL_ID, OWNER_ID, "--reason", "first use"])
+    assert code is None
+    assert seen["skill"] == SKILL_ID and seen["owner"] == OWNER_ID and seen["reason"] == "first use"

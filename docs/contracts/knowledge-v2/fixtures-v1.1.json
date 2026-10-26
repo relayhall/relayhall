@@ -1,0 +1,483 @@
+[
+  {
+    "id": "query-basic",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test"
+    },
+    "valid": true
+  },
+  {
+    "id": "query-empty-category",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "categories": []
+    },
+    "valid": false
+  },
+  {
+    "id": "query-empty-kinds",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "kinds": []
+    },
+    "valid": false
+  },
+  {
+    "id": "query-unknown-kind",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "kinds": [
+        "tickets"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "query-version",
+    "definition": "query",
+    "input": {
+      "protocol_version": 1,
+      "q": "test"
+    },
+    "valid": false
+  },
+  {
+    "id": "query-limit",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "limitPerSource": 26
+    },
+    "valid": false
+  },
+  {
+    "id": "query-hard-category",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "categories": [
+        "relaybrain:note"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "query-unnamespaced-category",
+    "definition": "query",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "categories": [
+        "note"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "filter-canonical",
+    "definition": "filter",
+    "input": {
+      "version": 2,
+      "kinds": [
+        "code",
+        "docs"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "filter-empty",
+    "definition": "filter",
+    "input": {
+      "version": 2,
+      "kinds": []
+    },
+    "valid": false
+  },
+  {
+    "id": "filter-authority-injection",
+    "definition": "filter",
+    "input": {
+      "version": 2,
+      "kinds": [
+        "docs"
+      ],
+      "allowed_principals": [
+        "all"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "retrieval-complete",
+    "definition": "retrieval",
+    "input": {
+      "status": "complete",
+      "reasons": []
+    },
+    "valid": true
+  },
+  {
+    "id": "retrieval-partial",
+    "definition": "retrieval",
+    "input": {
+      "status": "partial",
+      "reasons": [
+        "store-unavailable"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "retrieval-false-complete",
+    "definition": "retrieval",
+    "input": {
+      "status": "complete",
+      "reasons": [
+        "deadline"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "retrieval-empty-partial",
+    "definition": "retrieval",
+    "input": {
+      "status": "partial",
+      "reasons": []
+    },
+    "valid": false
+  },
+  {
+    "id": "retrieval-unknown-reason",
+    "definition": "retrieval",
+    "input": {
+      "status": "partial",
+      "reasons": [
+        "secret-store"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "get-initial",
+    "definition": "getRequest",
+    "input": {
+      "protocol_version": 2,
+      "handle": "abc.def"
+    },
+    "valid": true
+  },
+  {
+    "id": "get-exclusive",
+    "definition": "getRequest",
+    "input": {
+      "protocol_version": 2,
+      "handle": "abc.def",
+      "continuation": "abc.def",
+      "ifNoneMatch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "valid": false
+  },
+  {
+    "id": "get-legacy-offset",
+    "definition": "getRequest",
+    "input": {
+      "protocol_version": 2,
+      "handle": "abc.def",
+      "continueFrom": 5
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-valid",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note"
+      ]
+    },
+    "valid": true
+  },
+  {
+    "id": "descriptor-mode",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "static",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": [
+        "relaybrain:note"
+      ]
+    },
+    "valid": false
+  },
+  {
+    "id": "descriptor-empty-vocabulary",
+    "definition": "descriptor",
+    "input": {
+      "protocol_version": 2,
+      "compartment_mode": "dynamic-opaque",
+      "classes": [
+        {
+          "key": "docs",
+          "content": "docs"
+        }
+      ],
+      "categories": []
+    },
+    "valid": false
+  },
+  {
+    "id": "result-valid",
+    "definition": "result",
+    "input": {
+      "ref": "rb://source/doc@hash",
+      "title": "t",
+      "snippet": "s",
+      "contentKind": "docs",
+      "category": "relaybrain:note",
+      "compartment": {
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "score": 0.5
+    },
+    "valid": true
+  },
+  {
+    "id": "result-opaque-id",
+    "definition": "result",
+    "input": {
+      "ref": "rb://source/doc@hash",
+      "title": "t",
+      "snippet": "s",
+      "contentKind": "docs",
+      "category": "relaybrain:note",
+      "compartment": {
+        "id": "person-name"
+      },
+      "score": 0.5
+    },
+    "valid": false
+  },
+  {
+    "id": "result-angle-ref",
+    "definition": "result",
+    "input": {
+      "ref": "<unsafe>",
+      "title": "t",
+      "snippet": "s",
+      "contentKind": "docs",
+      "category": "relaybrain:note",
+      "compartment": {
+        "id": "00000000-0000-4000-8000-000000000001"
+      },
+      "score": 0.5
+    },
+    "valid": false
+  },
+  {
+    "id": "search-request-valid",
+    "definition": "sourceSearchRequest",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "limit": 8,
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      }
+    },
+    "valid": true
+  },
+  {
+    "id": "search-request-no-filter",
+    "definition": "sourceSearchRequest",
+    "input": {
+      "protocol_version": 2,
+      "q": "test",
+      "limit": 8
+    },
+    "valid": false
+  },
+  {
+    "id": "search-response-valid",
+    "definition": "sourceSearchResponse",
+    "input": {
+      "protocol_version": 2,
+      "results": [
+        {
+          "ref": "rb://source/doc@hash",
+          "title": "t",
+          "snippet": "s",
+          "contentKind": "docs",
+          "category": "relaybrain:note",
+          "compartment": {
+            "id": "00000000-0000-4000-8000-000000000001"
+          },
+          "score": 0.5
+        }
+      ],
+      "retrieval": {
+        "status": "complete",
+        "reasons": []
+      }
+    },
+    "valid": true
+  },
+  {
+    "id": "search-response-no-retrieval",
+    "definition": "sourceSearchResponse",
+    "input": {
+      "protocol_version": 2,
+      "results": []
+    },
+    "valid": false
+  },
+  {
+    "id": "get-source-valid",
+    "definition": "sourceGetRequest",
+    "input": {
+      "protocol_version": 2,
+      "ref": "rb://source/doc@hash",
+      "compartment_id": "00000000-0000-4000-8000-000000000001",
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      },
+      "limitBytes": 262144
+    },
+    "valid": true
+  },
+  {
+    "id": "get-source-continuation",
+    "definition": "sourceGetRequest",
+    "input": {
+      "protocol_version": 2,
+      "ref": "rb://source/doc@hash",
+      "compartment_id": "00000000-0000-4000-8000-000000000001",
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      },
+      "limitBytes": 262144,
+      "continueFrom": 5,
+      "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "valid": true
+  },
+  {
+    "id": "get-source-offset-alone",
+    "definition": "sourceGetRequest",
+    "input": {
+      "protocol_version": 2,
+      "ref": "rb://source/doc@hash",
+      "compartment_id": "00000000-0000-4000-8000-000000000001",
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      },
+      "limitBytes": 262144,
+      "continueFrom": 5
+    },
+    "valid": false
+  },
+  {
+    "id": "get-source-hash-alone",
+    "definition": "sourceGetRequest",
+    "input": {
+      "protocol_version": 2,
+      "ref": "rb://source/doc@hash",
+      "compartment_id": "00000000-0000-4000-8000-000000000001",
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      },
+      "limitBytes": 262144,
+      "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "valid": false
+  },
+  {
+    "id": "get-source-continuation-etag",
+    "definition": "sourceGetRequest",
+    "input": {
+      "protocol_version": 2,
+      "ref": "rb://source/doc@hash",
+      "compartment_id": "00000000-0000-4000-8000-000000000001",
+      "filter": {
+        "version": 2,
+        "kinds": [
+          "docs"
+        ]
+      },
+      "limitBytes": 262144,
+      "continueFrom": 5,
+      "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ifNoneMatch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "valid": false
+  },
+  {
+    "id": "get-source-notModified",
+    "definition": "sourceGetResponse",
+    "input": {
+      "protocol_version": 2,
+      "status": "notModified"
+    },
+    "valid": true
+  },
+  {
+    "id": "get-source-refused",
+    "definition": "sourceGetResponse",
+    "input": {
+      "protocol_version": 2,
+      "status": "refused",
+      "code": "refused"
+    },
+    "valid": true
+  },
+  {
+    "id": "get-source-unknown-refusal",
+    "definition": "sourceGetResponse",
+    "input": {
+      "protocol_version": 2,
+      "status": "refused",
+      "code": "secret"
+    },
+    "valid": false
+  }
+]

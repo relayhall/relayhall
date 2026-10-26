@@ -19,12 +19,13 @@
 import { pool } from '../db/connection';
 import { auditService, type AuditActor } from './AuditService';
 import { clearHomePointersForPrincipals } from './HomeGroupService';
-import { stepUpService } from './StepUpService';
+import { stepUpService, stepUpRequiredError } from './StepUpService';
 import { decryptCredentialSecret, sha256Hex, CredentialCryptoError } from '../utils/credentialCrypto';
 import { bearerLayerFor } from '../utils/bearerLayers';
 import { auditChainFor } from '../utils/auditChain';
 import { invalidateApprovalsForCredentials } from '../utils/approvalInvalidation';
 import { principalService } from './PrincipalService';
+import { accessVehicleService } from './AccessVehicleService';
 
 export class CredentialLifecycleError extends Error {
   constructor(public readonly status: number, public readonly code: string, message: string) {
@@ -92,6 +93,19 @@ export class CredentialLifecycleService {
     return result.rows.length > 0;
   }
 
+  /**
+   * The §9.1 self-scope arm of the warrant registry (`routes/warrants.ts`):
+   * a session viewer is shown a Warrant only when its holder is the viewer
+   * or lies in the viewer's subtree, or the viewer is root. True when the
+   * holder is CONCEALED from the viewer. The Access Explorer asks the same
+   * question through this one function (card 1e56dbef).
+   */
+  async holderConcealedFrom(viewer: { principalId: string; isRoot: boolean }, holderPrincipalId: string): Promise<boolean> {
+    if (viewer.isRoot) return false;
+    if (holderPrincipalId === viewer.principalId) return false;
+    return !(await this.isDescendant(viewer.principalId, holderPrincipalId));
+  }
+
   async reveal(credentialId: string, caller: RevealCaller, actor: AuditActor): Promise<{ token: string }> {
     const client = await pool.connect();
     // §5.2 rule 8 (review 731415a7 B4): denial rows carry the chain of the
@@ -126,7 +140,11 @@ export class CredentialLifecycleService {
         // Session path (root or owning Account): SINGLE-USE step-up bound
         // to exactly this reveal (T16), consumed before any state detail.
         if (!caller.stepUpToken) {
-          throw err(403, 'STEP_UP_REQUIRED', 'Session reveals require a step-up token bound to this credential (§7.6)');
+          // Card 72b8fb97: the same SU-14 challenge `consume` raises, so the
+          // dashboard can step up for exactly this reveal; same code, same
+          // status, same message, and audited as a StepUpError below.
+          throw await stepUpRequiredError(caller.principalId, 'credential.reveal', credentialId,
+            'Session reveals require a step-up token bound to this credential (§7.6)', client);
         }
         stepUpEvidence = await stepUpService.consume(client, {
           token: caller.stepUpToken,
@@ -267,6 +285,8 @@ export class CredentialLifecycleService {
       await invalidateApprovalsForCredentials(
         client, revoked.rows.map((row) => String(row.id)), 'revoked', actor,
       );
+      for (const id of ids) await accessVehicleService.detachRoleHolder(
+        client, id, actor, 'AZ-A10: role holder terminated');
       // RH-LENSES-b, build obligation B-L7b: the home-pointer clear, wired
       // into offboarding. Termination FLIPS `principals.status` rather than
       // deleting the row, so `account_home_groups`' ON DELETE CASCADE never

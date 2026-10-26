@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { MemoryRouter } from 'react-router-dom';
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -14,7 +15,7 @@ afterEach(() => { cleanup(); vi.resetAllMocks(); });
 test('retains useful rows during filtering and only the latest response settles the view', async () => {
   const pending: Array<(response: Response) => void> = [];
   vi.mocked(authenticatedFetch).mockResolvedValueOnce(response('Initial skill')).mockImplementation(() => new Promise(resolve => pending.push(resolve)));
-  const user = userEvent.setup(); render(<SkillsPage />);
+  const user = userEvent.setup(); render(<MemoryRouter><SkillsPage /></MemoryRouter>);
   expect(await screen.findByRole('button', { name: /Initial skill/ })).toBeInTheDocument();
   await user.type(screen.getByPlaceholderText('Search skills...'), 'ab');
   expect(pending).toHaveLength(2);
@@ -31,7 +32,7 @@ test('retains useful rows during filtering and only the latest response settles 
 
 test('a failed request settles with retry feedback instead of an empty success state', async () => {
   vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response(JSON.stringify({ success: false, error: 'Registry unavailable' }), { status: 503 })).mockResolvedValueOnce(response('Recovered skill'));
-  const user = userEvent.setup(); render(<SkillsPage />);
+  const user = userEvent.setup(); render(<MemoryRouter><SkillsPage /></MemoryRouter>);
   expect(await screen.findByRole('alert')).toHaveTextContent('Registry unavailable');
   expect(screen.queryByText('No skills found')).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Retry' }));

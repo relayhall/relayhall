@@ -115,7 +115,7 @@ export interface DescriptorKnowledgeClass {
 /**
  * §4.3 — the declared-and-displayed knowledge block.
  *
- * `compartments` is REQUIRED NON-EMPTY (sol R1-3). §4.3 states the reason
+ * `compartments` is REQUIRED NON-EMPTY (review R1-3). §4.3 states the reason
  * exactly: "a uniform/unpartitioned corpus declares ONE canonical
  * compartment (e.g. 'corpus'), so §7.2's required-equality check can never
  * make a contract-valid source unusable". An optional list would let a
@@ -129,9 +129,42 @@ export interface DescriptorKnowledgeClass {
 export interface DescriptorKnowledgeSource {
   classes: DescriptorKnowledgeClass[];
   compartments: string[];
+  protocol_version?: 2;
+  compartment_mode?: 'dynamic-opaque';
+  categories?: string[];
+  /**
+   * Card 40e0e542 (owner ruling E127 (5), selector amendment v1.2): the
+   * declared `categories` that are this source's ARCHIVE. A search covers
+   * current knowledge by default, so the core subtracts these from the
+   * categories it asks this source to search unless the caller opts in with
+   * `includeArchive`. A non-empty subset of `categories` without duplicates
+   * (all of them is legal: such a source is searched only on opt-in); v2 only.
+   * Declaring it narrows the default search and never grants anything.
+   */
+  archiveCategories?: string[];
+  /**
+   * RB-11 Governor v0 (card `b796067e`, D-8/D-9): the source DECLARES that it
+   * accepts note writes through the door. Declaring it is one half of the
+   * write-capability predicate (`KnowledgeSourcePolicy.isKnowledgeWriteCapable`);
+   * the owner-plane `knowledgeWriteEndpoint` is the other, so — exactly as for
+   * reads — neither half alone makes a source writable. Strict and minimal:
+   * protocol 1, kinds `['note']` (v0 writes notes only; attachments are
+   * DEFERRED), and only on a v2 dynamic-opaque block, because a write targets
+   * an opaque compartment id the source resolves.
+   */
+  write?: DescriptorKnowledgeWrite;
+}
+
+/** RB-11 Governor v0: the declared write surface of a knowledge source. */
+export interface DescriptorKnowledgeWrite {
+  protocol_version: 1;
+  kinds: ['note'];
 }
 
 export interface ServiceDescriptor {
+  /** Declare only after the installed pull worker supports this protocol. */
+  nativeReview?: { protocolVersion: 1; sourceProduct: string };
+  nativeExecution?: { protocolVersion: 1; sourceProduct: string };
   options: DescriptorOption[];
   /** Declared exposed Tools (D-3): registry data; the Tool surface lands later in Phase 2. */
   tools?: DescriptorTool[];
@@ -411,7 +444,7 @@ export function validateDescriptor(input: unknown): ServiceDescriptor {
   const obj = input as Record<string, unknown>;
   rejectUnknownKeys(
     obj,
-    ['options', 'tools', 'discovery', 'health', 'telemetry', 'knowledgeSource'],
+    ['options', 'tools', 'discovery', 'health', 'telemetry', 'knowledgeSource', 'nativeReview', 'nativeExecution'],
     'descriptor',
   );
 
@@ -514,6 +547,26 @@ export function validateDescriptor(input: unknown): ServiceDescriptor {
     });
   }
 
+  if (obj.nativeReview !== undefined) {
+    if (!isPlainObject(obj.nativeReview)) fail('DESCRIPTOR_INVALID_NATIVE_REVIEW', 'Expected native review capability', 'descriptor.nativeReview');
+    const native = obj.nativeReview as Record<string, unknown>;
+    rejectUnknownKeys(native, ['protocolVersion', 'sourceProduct'], 'descriptor.nativeReview');
+    if (native.protocolVersion !== 1 || typeof native.sourceProduct !== 'string'
+      || !descriptor.telemetry?.products?.includes(native.sourceProduct) || descriptor.telemetry.tier === 'none') {
+      fail('DESCRIPTOR_INVALID_NATIVE_REVIEW', 'Protocol 1 and a declared telemetry product are required', 'descriptor.nativeReview');
+    }
+    descriptor.nativeReview = { protocolVersion: 1, sourceProduct: native.sourceProduct as string };
+  }
+  if (obj.nativeExecution !== undefined) {
+    if (!isPlainObject(obj.nativeExecution)) fail('DESCRIPTOR_INVALID_NATIVE_EXECUTION', 'Expected native execution capability', 'descriptor.nativeExecution');
+    const native = obj.nativeExecution as Record<string, unknown>;
+    rejectUnknownKeys(native, ['protocolVersion', 'sourceProduct'], 'descriptor.nativeExecution');
+    if (native.protocolVersion !== 1 || typeof native.sourceProduct !== 'string'
+      || !descriptor.telemetry?.products?.includes(native.sourceProduct) || descriptor.telemetry.tier === 'none') {
+      fail('DESCRIPTOR_INVALID_NATIVE_EXECUTION', 'Protocol 1 and a declared telemetry product are required', 'descriptor.nativeExecution');
+    }
+    descriptor.nativeExecution = { protocolVersion: 1, sourceProduct: native.sourceProduct as string };
+  }
   if (obj.discovery !== undefined) {
     if (!isPlainObject(obj.discovery)) {
       fail('DESCRIPTOR_INVALID_DISCOVERY', "'discovery' must be an object {optionsEndpoint}", 'descriptor.discovery');
@@ -534,7 +587,7 @@ export function validateDescriptor(input: unknown): ServiceDescriptor {
       fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', "'knowledgeSource' must be an object {classes, compartments}", 'descriptor.knowledgeSource');
     }
     const block = obj.knowledgeSource as Record<string, unknown>;
-    rejectUnknownKeys(block, ['classes', 'compartments'], 'descriptor.knowledgeSource');
+    rejectUnknownKeys(block, ['classes', 'compartments', 'protocol_version', 'compartment_mode', 'categories', 'archiveCategories', 'write'], 'descriptor.knowledgeSource');
 
     if (!Array.isArray(block.classes) || block.classes.length < 1 || block.classes.length > DESCRIPTOR_MAX_KNOWLEDGE_CLASSES) {
       fail(
@@ -572,7 +625,46 @@ export function validateDescriptor(input: unknown): ServiceDescriptor {
       };
     });
 
-    // REQUIRED NON-EMPTY (sol R1-3) — see DescriptorKnowledgeSource.
+    const v2 = block.protocol_version === 2;
+    if (block.protocol_version !== undefined && !v2) fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', 'Unsupported knowledge protocol', 'descriptor.knowledgeSource.protocol_version');
+    if (v2) {
+      if (block.compartment_mode !== 'dynamic-opaque' || (block.compartments !== undefined && (!Array.isArray(block.compartments) || block.compartments.length !== 0))
+        || !Array.isArray(block.categories) || !block.categories.length || block.categories.length > 64
+        || !block.categories.every(c => typeof c === 'string' && c.length <= 128 && /^[a-z][a-z0-9-]*:[a-z][a-z0-9._-]*$/.test(c))
+        || new Set(block.categories).size !== block.categories.length) fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', 'Invalid dynamic Compartment descriptor', 'descriptor.knowledgeSource');
+      descriptor.knowledgeSource = { classes, compartments: [], protocol_version: 2, compartment_mode: 'dynamic-opaque', categories: block.categories as string[] };
+      // Card 40e0e542: the archive is a SUBSET of the declared vocabulary. A
+      // category outside it would be subtracted from nothing while the real
+      // archive stayed in the default search, so it refuses the descriptor.
+      if (block.archiveCategories !== undefined) {
+        const declaredCategories = block.categories as string[];
+        const archive = block.archiveCategories;
+        if (!Array.isArray(archive) || archive.length < 1 || archive.length > 64 || new Set(archive).size !== archive.length
+          || !archive.every((category) => typeof category === 'string' && declaredCategories.includes(category))) {
+          fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', "'archiveCategories' must be a non-empty subset of the declared 'categories', without duplicates", 'descriptor.knowledgeSource.archiveCategories');
+        }
+        descriptor.knowledgeSource.archiveCategories = [...(archive as string[])];
+      }
+      // RB-11 Governor v0: the optional write block, refused unless it is
+      // EXACTLY {protocol_version: 1, kinds: ['note']}. A malformed block is a
+      // refused descriptor, never a silently ignored one (the telemetry-block
+      // precedent above): a source that believes it declared writes and did
+      // not would have every write refused with nothing the owner could read.
+      if (block.write !== undefined) {
+        if (!isPlainObject(block.write)) {
+          fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', "'write' must be an object {protocol_version: 1, kinds: ['note']}", 'descriptor.knowledgeSource.write');
+        }
+        const write = block.write as Record<string, unknown>;
+        rejectUnknownKeys(write, ['protocol_version', 'kinds'], 'descriptor.knowledgeSource.write');
+        if (write.protocol_version !== 1 || !Array.isArray(write.kinds) || write.kinds.length !== 1 || write.kinds[0] !== 'note') {
+          fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', "'write' must be exactly {protocol_version: 1, kinds: ['note']} (RB-11 Governor v0 writes notes only)", 'descriptor.knowledgeSource.write');
+        }
+        descriptor.knowledgeSource.write = { protocol_version: 1, kinds: ['note'] };
+      }
+    } else {
+    if (block.compartment_mode !== undefined || block.categories !== undefined || block.archiveCategories !== undefined) fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', 'V2 fields require protocol_version 2', 'descriptor.knowledgeSource');
+    if (block.write !== undefined) fail('DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE', "'write' requires a protocol_version 2 dynamic-opaque block (RB-11 Governor v0)", 'descriptor.knowledgeSource.write');
+    // REQUIRED NON-EMPTY (review R1-3) — see DescriptorKnowledgeSource.
     if (!Array.isArray(block.compartments) || block.compartments.length < 1 || block.compartments.length > DESCRIPTOR_MAX_KNOWLEDGE_COMPARTMENTS) {
       fail(
         'DESCRIPTOR_INVALID_KNOWLEDGE_SOURCE',
@@ -595,6 +687,7 @@ export function validateDescriptor(input: unknown): ServiceDescriptor {
     });
 
     descriptor.knowledgeSource = { classes, compartments };
+    }
   }
 
   if (obj.health !== undefined) {

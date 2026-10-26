@@ -37,6 +37,7 @@
 // 100's `access_vehicle_links` carries the refcount instead;
 // `created_by_vehicle` is decided ONCE per target, and a target is dropped
 // at refcount zero ONLY when this machinery created it.
+import { RequestFaultError } from '../utils/httpErrors';
 import type { PoolClient } from 'pg';
 import { pool } from '../db/connection';
 import { auditService, type AuditActor } from './AuditService';
@@ -44,11 +45,14 @@ import { feedEventService, type FeedObjectType } from './FeedEventService';
 import { delegationService, type DelegationChain } from './DelegationService';
 import { accessProfileService, type ProfileRule } from './AccessProfileService';
 import { authorizationRepository } from './AuthorizationRepository';
-import { grantAllows, type AuthorizationActor } from './AuthorizationService';
+import { ADMINISTRATOR_ROLES, grantAllows, type AuthorizationActor } from './AuthorizationService';
 import type { GrantResourceType, GrantVerb } from './GrantService';
-import { rulesCovered, sourcesFromEffectiveAccess } from '../utils/authorityContainment';
+import { rulesCovered, rulesCoveredWithCoordinates, sourcesFromEffectiveAccess, sourcesFromRules } from '../utils/authorityContainment';
+import {
+  ROLE_GRANT_DEFAULT_INTERVAL, ROLE_GRANT_EXPIRY_FIELD, ROLE_GRANT_EXPIRY_ISO_FORMAT,
+  type RoleGrantExpiryRequest,
+} from '../utils/roleGrantExpiry';
 
-const ADMINISTRATOR_ROLES = new Set(['admin', 'orchestrator']);
 
 /**
  * The identity a genuine SERVER-SIDE act carries into the R3 cap: the board
@@ -69,14 +73,14 @@ const FEED_OBJECT_TYPES = new Set<string>(['task', 'phase', 'project', 'report',
 /** R2(b) / owner default D5: READ verb only, DIRECT references only. */
 const VEHICLE_VERB: GrantVerb = 'read';
 
-export class AssignmentAccessError extends Error {
+export class AssignmentAccessError extends RequestFaultError {
   constructor(
     public readonly status: number,
     public readonly code: string,
     message: string,
     public readonly field?: string,
   ) {
-    super(message);
+    super(status, code, message);
     this.name = 'AssignmentAccessError';
   }
 }
@@ -90,6 +94,8 @@ export interface VehicleClient {
   query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
 }
 
+export type TaskGrantRole = 'implementer' | 'verifier' | 'shepherd';
+
 export interface VehicleAttachInput {
   taskId: string;
   /** services.id — the Connector registry row the task is assigned to. */
@@ -100,6 +106,26 @@ export interface VehicleAttachInput {
   actor: AuditActor;
   /** Authorization identity of the ASSIGNER — the R3 non-escalation cap. */
   assigner: AuthorizationActor;
+  /**
+   * AZ-A10 clause 6: the date the assigning act set for the rows it writes,
+   * or `undefined` for the default (materialization + 3 months). E62: any
+   * assigner that performs the act may set it, earlier or later; nothing
+   * here asks who the assigner is.
+   */
+  roleGrantExpiry?: RoleGrantExpiryRequest;
+}
+
+/**
+ * AZ-A10 clause 8's audit shape for one assigning act's date: what was asked
+ * for, what this task's links now carry, and whether the date came from the
+ * default or from the assigner.
+ */
+export interface AppliedRoleGrantExpiry {
+  /** The canonical instant asked for, `'unlimited'`, or null when the field was omitted. */
+  requested: string | null;
+  /** The date this task's links carry: a canonical instant, or null = until the task or the assignment ends. */
+  applied: string | null;
+  source: 'default' | 'assigner';
 }
 
 export interface VehicleTarget {
@@ -111,11 +137,13 @@ export interface VehicleTarget {
 }
 
 export interface VehicleAttachResult {
-  vehicleKind: 'warrant' | 'auto-grant';
+  vehicleKind: 'warrant' | 'auto-grant' | 'role';
   warrantId: string | null;
   landedOnPrincipalId: string;
   assigneePrincipalId: string;
   targets: VehicleTarget[];
+  /** null for a warrant-carried assignment, which keeps the warrant's own lifecycle. */
+  roleGrantExpiry: AppliedRoleGrantExpiry | null;
 }
 
 interface ChainResolution {
@@ -156,6 +184,74 @@ export function ownRulesCoverTaskRead(rules: ProfileRule[], taskId: string): boo
 }
 
 export class AccessVehicleService {
+  /** Logical tuple TRY locks cover absent creation and all reference mutations.
+   * Task NOWAIT precedes discovery: every writer stabilizes its own Task.
+   * Target row locks are NOWAIT and every mutation versions the target row.
+   * RC refreshes queries; RR/SERIALIZABLE stale versions fail the WHOLE owner
+   * with ASSIGNMENT_REFERENCE_BUSY, never refresh/weaken a plan snapshot.
+   * Task/tuple/row conflicts add no wait edge after caller Task/warrant/feed
+   * locks. Feed/audit keep their existing order. No internal retry or commit.
+   * Owners must rollback supplied transactions and discard afterCommit effects.
+   */
+  private async referenceQuery(client: VehicleClient, sql: string, values: any[] = []) {
+    try { return await client.query(sql, values); }
+    catch (error: any) {
+      if (['40001', '55P03', '23505'].includes(error?.code)) {
+        throw err(409, 'ASSIGNMENT_REFERENCE_BUSY', 'Assignment reference lifecycle busy; roll back and retry the transaction');
+      }
+      throw error;
+    }
+  }
+  private async lockReferenceTask(client: VehicleClient, taskId: string): Promise<void> {
+    await this.referenceQuery(client, 'SELECT id FROM tasks WHERE id=$1 FOR UPDATE NOWAIT', [taskId]);
+  }
+  private async versionReferenceTarget(client: VehicleClient, kind: string, id: string): Promise<void> {
+    const table = kind === 'grant' ? 'grants' : 'access_profile_assignments';
+    const locked = await this.referenceQuery(client, `SELECT id FROM ${table} WHERE id=$1 FOR UPDATE NOWAIT`, [id]);
+    if (!locked.rows.length) throw err(409, 'ASSIGNMENT_REFERENCE_BUSY', 'Assignment target changed; roll back and retry the transaction');
+    // MVCC fence: even shared-reference changes (no final deletion) invalidate
+    // a higher-isolation stale target/refcount snapshot. Data stays unchanged.
+    await this.referenceQuery(client, `UPDATE ${table} SET id=id WHERE id=$1`, [id]);
+  }
+
+  private async lockReferenceTarget(client: VehicleClient, tuple: unknown[]): Promise<void> {
+    const key = JSON.stringify(tuple.map(value => typeof value === "string" ? value.toLowerCase() : value));
+    const locked = await client.query(
+      `SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked`,
+      ["relayhall:vehicle-reference:" + key],
+    );
+    if (!locked.rows[0]?.locked) {
+      throw err(409, "ASSIGNMENT_REFERENCE_BUSY", "Assignment reference lifecycle busy; roll back and retry the transaction");
+    }
+  }
+
+  /** Resolve the same logical identities creation locks BEFORE removing links.
+   * Only this service changes vehicle links; callers serialize edits of their
+   * own Task. Other Tasks may share these targets and are guarded here.
+   */
+  private async lockTaskReferenceTargets(client: VehicleClient, taskId: string): Promise<void> {
+    await this.lockReferenceTask(client, taskId);
+    const targets = await client.query(
+      `SELECT l.target_kind, l.target_id, g.grantee_type, g.grantee_id, g.resource_type, g.resource_id, g.verb,
+              p.profile_id, p.assignee_type, p.assignee_id
+         FROM access_vehicle_links l
+         LEFT JOIN grants g ON l.target_kind = 'grant' AND g.id = l.target_id
+         LEFT JOIN access_profile_assignments p ON l.target_kind = 'profile_assignment' AND p.id = l.target_id
+        WHERE l.task_id = $1`, [taskId],
+    );
+    const tuples = targets.rows.flatMap(row => row.target_kind === "grant"
+      ? row.grantee_id ? [["grant", row.grantee_type, row.grantee_id, row.resource_type, row.resource_id, row.verb]] : []
+      : row.profile_id ? [["profile_assignment", row.profile_id, row.assignee_type, row.assignee_id]] : []);
+    // Deterministic acquisition aids diagnosis; nonblocking is what prevents
+    // inversion across multi-target attach/recompute/swap operations.
+    for (const key of [...new Set(tuples.map(tuple => JSON.stringify(tuple)))].sort()) {
+      await this.lockReferenceTarget(client, JSON.parse(key));
+    }
+    for (const row of targets.rows) {
+      if (row.grantee_id || row.profile_id) await this.versionReferenceTarget(client, row.target_kind, String(row.target_id));
+    }
+  }
+
   // ── chain resolution ────────────────────────────────────────────────
 
   /** Resolve the assignee Connector principal for a registry row. */
@@ -250,11 +346,23 @@ export class AccessVehicleService {
       resourceType: GrantResourceType;
       resourceId: string | null;
       verb: GrantVerb;
-      vehicleKind: 'warrant' | 'auto-grant';
+      vehicleKind: 'warrant' | 'auto-grant' | 'role';
+      role?: 'implementer' | 'verifier' | 'shepherd';
       warrantId: string | null;
       actor: AuditActor;
+      /** The assigning principal remains the grantor when a later linker adds a reference. */
+      grantorPrincipalId?: string;
+      /** AZ-A10 clause 6: THIS task's date for the row (a canonical
+       * instant), or null = until the task or the assignment ends. A row
+       * created here starts with it; a shared row is recomputed by the
+       * caller once every link of the act is in place. */
+      expiresAt: string | null;
     },
   ): Promise<VehicleTarget> {
+    // Warrants live by their own expiry; assignment and role links carry a date.
+    const expiresAt = input.vehicleKind === 'warrant' ? null : input.expiresAt;
+    await this.lockReferenceTask(client, input.taskId);
+    await this.lockReferenceTarget(client, ["grant", "principal", input.granteeId, input.resourceType, input.resourceId, input.verb]);
     const existing = await client.query(
       `SELECT id FROM grants
         WHERE grantee_type = 'principal' AND grantee_id = $1
@@ -266,25 +374,32 @@ export class AccessVehicleService {
     let createdByVehicle: boolean;
     if (existing.rows.length > 0) {
       grantId = String(existing.rows[0].id);
+      await this.versionReferenceTarget(client, 'grant', grantId);
       createdByVehicle = false;
     } else {
-      const inserted = await client.query(
-        `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id, provenance)
-         VALUES ('principal', $1, $2, $3, $4, $5, $6) RETURNING id`,
+      const inserted = await this.referenceQuery(client,
+        `INSERT INTO grants (grantee_type, grantee_id, resource_type, resource_id, verb, granted_by_principal_id, provenance, expires_at)
+         VALUES ('principal', $1, $2, $3, $4, $5, $6, $7::timestamptz) RETURNING id`,
         [
           input.granteeId, input.resourceType, input.resourceId, input.verb,
-          input.actor.principalId ?? null,
+          input.grantorPrincipalId ?? input.actor.principalId ?? null,
           input.vehicleKind === 'warrant' ? 'assignment:warrant' : 'assignment:grant',
+          expiresAt,
         ],
       );
       grantId = String(inserted.rows[0].id);
       createdByVehicle = true;
+      // AZ-A10 clause 8: grant.create names the assignee and the date. The
+      // `carriedBy: 'role'` and `role` keys of clause 8 arrive with the role
+      // rows of clause 1; these rows are the execution assignment's.
       await auditService.record({
         action: 'grant.create', actor: input.actor, resourceType: 'grant', resourceId: grantId,
         metadata: {
           automatic: true, granteeId: input.granteeId, resourceType: input.resourceType,
           resourceId: input.resourceId, verb: input.verb, taskId: input.taskId,
-          carriedBy: input.vehicleKind === 'warrant' ? 'warrant' : 'grant', warrantId: input.warrantId,
+          carriedBy: input.vehicleKind === 'role' ? 'role' : input.vehicleKind === 'warrant' ? 'warrant' : 'grant',
+          role: input.role ?? null, warrantId: input.warrantId,
+          assigneePrincipalId: input.assigneePrincipalId, expiresAt,
         },
       }, client as PoolClient);
       // RH-P3.C1: an ACL change over a feed object is itself a feed event.
@@ -320,12 +435,12 @@ export class AccessVehicleService {
     await client.query(
       `INSERT INTO access_vehicle_links
          (task_id, assignee_principal_id, landed_on_principal_id, vehicle_kind, warrant_id,
-          target_kind, target_id, created_by_vehicle, created_by_principal_id)
-       VALUES ($1, $2, $3, $4, $5, 'grant', $6, $7, $8)
-       ON CONFLICT (task_id, target_kind, target_id) DO NOTHING`,
+          target_kind, target_id, created_by_vehicle, created_by_principal_id, expires_at, role)
+       VALUES ($1, $2, $3, $4, $5, 'grant', $6, $7, $8, $9::timestamptz, $10)
+       ON CONFLICT DO NOTHING`,
       [
         input.taskId, input.assigneePrincipalId, input.granteeId, input.vehicleKind,
-        input.warrantId, grantId, effectiveFlag, input.actor.principalId ?? null,
+        input.warrantId, grantId, effectiveFlag, input.grantorPrincipalId ?? input.actor.principalId ?? null, expiresAt, input.role ?? null,
       ],
     );
 
@@ -349,6 +464,8 @@ export class AccessVehicleService {
       actor: AuditActor;
     },
   ): Promise<VehicleTarget> {
+    await this.lockReferenceTask(client, input.taskId);
+    await this.lockReferenceTarget(client, ["profile_assignment", input.profileId, "principal", input.granteeId]);
     const existing = await client.query(
       `SELECT id FROM access_profile_assignments
         WHERE profile_id = $1 AND assignee_type = 'principal' AND assignee_id = $2`,
@@ -359,9 +476,10 @@ export class AccessVehicleService {
     let createdByVehicle: boolean;
     if (existing.rows.length > 0) {
       assignmentId = String(existing.rows[0].id);
+      await this.versionReferenceTarget(client, 'profile_assignment', assignmentId);
       createdByVehicle = false;
     } else {
-      const inserted = await client.query(
+      const inserted = await this.referenceQuery(client,
         `INSERT INTO access_profile_assignments (profile_id, assignee_type, assignee_id, assigned_by_principal_id)
          VALUES ($1, 'principal', $2, $3) RETURNING id`,
         [input.profileId, input.granteeId, input.actor.principalId ?? null],
@@ -403,7 +521,7 @@ export class AccessVehicleService {
          (task_id, assignee_principal_id, landed_on_principal_id, vehicle_kind, warrant_id,
           target_kind, target_id, created_by_vehicle, created_by_principal_id)
        VALUES ($1, $2, $3, 'warrant', $4, 'profile_assignment', $5, $6, $7)
-       ON CONFLICT (task_id, target_kind, target_id) DO NOTHING`,
+       ON CONFLICT DO NOTHING`,
       [
         input.taskId, input.assigneePrincipalId, input.granteeId, input.warrantId,
         assignmentId, effectiveFlag, input.actor.principalId ?? null,
@@ -411,6 +529,163 @@ export class AccessVehicleService {
     );
 
     return { targetKind: 'profile_assignment', targetId: assignmentId, createdByVehicle: effectiveFlag };
+  }
+
+  // ── AZ-A10 clause 6: the date an assigning act sets ─────────────────
+  //
+  // Ratified text (E43): "default `expires_at` = materialization + 3 months.
+  // The assigning act may set any later date, or `unlimited` ... Three
+  // months is the DEFAULT, not a floor: an earlier date is admitted". E62:
+  // "whoever performs the assigning act ... may set an EARLIER date as well
+  // as a later one or 'unlimited'". So the date is resolved WITHOUT looking
+  // at who the assigner is, and there is no ceiling and no floor: the only
+  // refusal is a date that is not in the future (D-11's "A past date can be
+  // refused INVALID_EXPIRY ... an implementation choice").
+  //
+  // Each LINK keeps the date its own task's assignment set; the ROW is
+  // "the maximum over its live links, NULL dominating" (clause 6), and is
+  // recomputed whenever a link is added, re-dated or removed. Only a row
+  // this machinery created is ever re-dated: an owner-plane row keeps its
+  // own date (owner default D4 — never adopted, rewritten or reaped).
+
+  /** Resolve one assigning act's date on the act's own transaction. The
+   * default is computed by PostgreSQL, in UTC, from the transaction's own
+   * NOW() — the moment of materialization — never from a JavaScript clock. */
+  private async resolveRoleGrantExpiry(
+    client: VehicleClient,
+    request: RoleGrantExpiryRequest | undefined,
+  ): Promise<AppliedRoleGrantExpiry> {
+    if (request?.kind === 'unlimited') {
+      return { requested: 'unlimited', applied: null, source: 'assigner' };
+    }
+    if (request?.kind === 'instant') {
+      const row = await client.query(
+        `SELECT to_char($1::timestamptz AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS iso,
+                $1::timestamptz > clock_timestamp() AS future`,
+        [request.instant],
+      );
+      if (row.rows[0]?.future !== true) {
+        throw err(422, 'INVALID_EXPIRY',
+          'roleGrantExpiresAt names an instant that is not in the future, so the rows would have expired before the '
+          + 'assignment took effect. A past date is refused (AZ-A10 D-11). An earlier date than the three-month '
+          + "default IS admitted: send any future instant, 'unlimited', or omit the field for the default",
+          ROLE_GRANT_EXPIRY_FIELD);
+      }
+      return { requested: request.instant, applied: String(row.rows[0].iso), source: 'assigner' };
+    }
+    const row = await client.query(
+      `SELECT to_char((NOW() AT TIME ZONE 'UTC') + INTERVAL '${ROLE_GRANT_DEFAULT_INTERVAL}', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS iso`,
+    );
+    return { requested: null, applied: String(row.rows[0].iso), source: 'default' };
+  }
+
+  /**
+   * Re-date ONE row from its links: NULL if any link is unlimited, else the
+   * latest link date. A row with no link, a row whose links say this
+   * machinery did not create it, and a row without provenance (owner plane)
+   * are left exactly as they are. Every change writes `grant.expiry_change`
+   * with the date before and after (clause 8's audit, for a write clause 6
+   * makes possible).
+   */
+  private async recomputeRowExpiry(
+    client: VehicleClient,
+    grantId: string,
+    actor: AuditActor,
+    context: { taskId: string; reason: string },
+  ): Promise<boolean> {
+    const state = await client.query(
+      `SELECT g.provenance,
+              to_char(g.expires_at AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS before_iso,
+              COUNT(l.id)::int AS links,
+              COALESCE(BOOL_OR(l.expires_at IS NULL), FALSE) AS any_unlimited,
+              COALESCE(BOOL_AND(l.created_by_vehicle), FALSE) AS created_here,
+              to_char(MAX(l.expires_at) AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS latest_iso
+         FROM grants g
+         LEFT JOIN access_vehicle_links l ON l.target_kind = 'grant' AND l.target_id = g.id
+        WHERE g.id = $1
+        GROUP BY g.id, g.provenance, g.expires_at`,
+      [grantId],
+    );
+    const row = state.rows[0];
+    if (!row || !row.provenance || row.links === 0 || row.created_here !== true) return false;
+    const before: string | null = row.before_iso ?? null;
+    const after: string | null = row.any_unlimited ? null : (row.latest_iso ?? null);
+    const changed = await this.referenceQuery(client,
+      `UPDATE grants SET expires_at = $2::timestamptz
+        WHERE id = $1 AND provenance IS NOT NULL AND expires_at IS DISTINCT FROM $2::timestamptz
+        RETURNING grantee_id, resource_type, resource_id, verb`,
+      [grantId, after],
+    );
+    if (changed.rows.length === 0) return false;
+    const updated = changed.rows[0];
+    await auditService.record({
+      action: 'grant.expiry_change', actor, resourceType: 'grant', resourceId: grantId,
+      metadata: {
+        automatic: true, before, after, taskId: context.taskId, reason: context.reason,
+        granteeId: String(updated.grantee_id), resourceType: updated.resource_type,
+        resourceId: updated.resource_id ?? null, verb: updated.verb,
+      },
+    }, client as PoolClient);
+    if (updated.resource_id && FEED_OBJECT_TYPES.has(String(updated.resource_type))) {
+      // A changed expiry changes who can read the object and when, so it is
+      // an ACL change like any other (RH-P3.C1); content-free by constraint.
+      await feedEventService.emit(client, {
+        name: `${updated.resource_type}.acl_changed`,
+        objectType: String(updated.resource_type) as FeedObjectType,
+        objectId: String(updated.resource_id),
+        actorPrincipalId: actor.principalId ?? null,
+        actorHandle: actor.handle ?? null,
+        ownerPrincipalId: String(updated.grantee_id),
+        payload: {},
+      });
+    }
+    return true;
+  }
+
+  /** Give every auto-grant link of THIS task the date `expiresAt`, then
+   * recompute each row it links. The task's targets must already be locked
+   * (ensureGrant, or lockTaskReferenceTargets). */
+  private async applyLinkExpiry(
+    client: VehicleClient,
+    taskId: string,
+    expiresAt: string | null,
+    actor: AuditActor,
+    reason: string,
+  ): Promise<void> {
+    await client.query(
+      `UPDATE access_vehicle_links SET expires_at = $2::timestamptz
+        WHERE task_id = $1 AND (vehicle_kind = 'auto-grant' OR (vehicle_kind = 'role' AND role = 'implementer')) AND target_kind = 'grant'
+          AND expires_at IS DISTINCT FROM $2::timestamptz`,
+      [taskId, expiresAt],
+    );
+    const targets = await client.query(
+      `SELECT target_id FROM access_vehicle_links
+        WHERE task_id = $1 AND (vehicle_kind = 'auto-grant' OR (vehicle_kind = 'role' AND role = 'implementer')) AND target_kind = 'grant'
+        ORDER BY target_id`,
+      [taskId],
+    );
+    for (const target of targets.rows) {
+      await this.recomputeRowExpiry(client, String(target.target_id), actor, { taskId, reason });
+    }
+  }
+
+  /** The date THIS task's assignment links carry, read back as the
+   * canonical instant: `undefined` when the task holds no auto-grant link
+   * (unassigned, warrant-carried, or a legacy identity), null when it is
+   * unlimited. The links of one act share one date; if they ever disagreed,
+   * the answer is clause 6's own rule (the latest, NULL dominating). */
+  async assignmentExpiry(taskId: string, client: VehicleClient = pool): Promise<string | null | undefined> {
+    const result = await client.query(
+      `SELECT COUNT(*)::int AS links,
+              COALESCE(BOOL_OR(expires_at IS NULL), FALSE) AS any_unlimited,
+              to_char(MAX(expires_at) AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS latest_iso
+         FROM access_vehicle_links
+        WHERE task_id = $1 AND (vehicle_kind = 'auto-grant' OR (vehicle_kind = 'role' AND role = 'implementer')) AND target_kind = 'grant'`,
+      [taskId],
+    );
+    const row = result.rows[0];
+    if (!row || row.links === 0) return undefined;
+    return row.any_unlimited ? null : String(row.latest_iso);
   }
 
   // ── the D5 reference set ────────────────────────────────────────────
@@ -621,25 +896,6 @@ export class AccessVehicleService {
     }
   }
 
-  // ── R2(b): the auto-grant fallback ──────────────────────────────────
-
-  private async attachAutoGrants(
-    client: VehicleClient,
-    input: { taskId: string; assigneePrincipalId: string; landedOn: string; actor: AuditActor; assigner: AuthorizationActor },
-  ): Promise<VehicleTarget[]> {
-    const references = await this.permittedReferences(client, input.taskId, input.assigner);
-    const targets: VehicleTarget[] = [];
-    for (const reference of references) {
-      targets.push(await this.ensureGrant(client, {
-        taskId: input.taskId, assigneePrincipalId: input.assigneePrincipalId,
-        granteeId: input.landedOn, resourceType: reference.resourceType,
-        resourceId: reference.resourceId, verb: VEHICLE_VERB,
-        vehicleKind: 'auto-grant', warrantId: null, actor: input.actor,
-      }));
-    }
-    return targets;
-  }
-
   /**
    * The D5 reference set, filtered by the R3 non-escalation cap.
    *
@@ -656,6 +912,7 @@ export class AccessVehicleService {
     client: VehicleClient,
     taskId: string,
     actor: AuthorizationActor,
+    auditActor?: AuditActor,
   ): Promise<Array<{ resourceType: GrantResourceType; resourceId: string }>> {
     const references = await this.referenceSet(client, taskId);
     const permitted: Array<{ resourceType: GrantResourceType; resourceId: string }> = [];
@@ -664,10 +921,218 @@ export class AccessVehicleService {
         permitted.push(reference);
         continue;
       }
-      if (!(await this.assignerCovers(client, actor, reference.resourceType, reference.resourceId))) continue;
+      if (!(await this.assignerCovers(client, actor, reference.resourceType, reference.resourceId))) {
+        if (auditActor) await auditService.record({
+          action: 'grant.reference_skipped', actor: auditActor,
+          resourceType: reference.resourceType, resourceId: reference.resourceId,
+          metadata: { taskId, reason: 'AZ-A10: reference exceeds assigner authority' },
+        }, client as PoolClient);
+        continue;
+      }
       permitted.push(reference);
     }
     return permitted;
+  }
+
+  /** The exact rows the role trigger would write, before it writes them.
+   * Warrant mint checks this set against its pinned ceiling in the same
+   * transaction; the trigger uses this very plan so the two cannot drift. */
+  async plannedRoleRules(client: VehicleClient, taskId: string, role: TaskGrantRole,
+    assigner: AuthorizationActor, auditActor?: AuditActor): Promise<Array<{ resourceType: GrantResourceType; resourceId: string; verb: GrantVerb }>> {
+    const task = (await client.query('SELECT phase_id FROM tasks WHERE id = $1', [taskId])).rows[0];
+    if (!task) throw err(404, 'ROLE_TASK_NOT_FOUND', 'the role target task does not exist');
+    const references = await this.permittedReferences(client, taskId, assigner, auditActor);
+    if (task.phase_id && await this.assignerCovers(client, assigner, 'phase', String(task.phase_id))) {
+      references.push({ resourceType: 'phase', resourceId: String(task.phase_id) });
+    } else if (task.phase_id && auditActor) {
+      await auditService.record({ action: 'grant.reference_skipped', actor: auditActor,
+        resourceType: 'phase', resourceId: String(task.phase_id),
+        metadata: { taskId, reason: 'AZ-A10: phase exceeds assigner authority' },
+      }, client as PoolClient);
+    }
+    const self = await authorizationRepository.authorizedIds(
+      assigner, 'task', [taskId], role === 'implementer' ? 'write' : 'read', client,
+    );
+    if (!self.has(taskId)) throw err(403, 'ROLE_EXCEEDS_ASSIGNER',
+      `the ${role} task row exceeds the assigner's effective authority`);
+    return references.flatMap(reference => {
+      const verbs: GrantVerb[] = reference.resourceType === 'task'
+        && reference.resourceId === taskId && role === 'implementer' ? ['read', 'write'] : ['read'];
+      return verbs.map(verb => ({ ...reference, verb }));
+    });
+  }
+
+  /** AZ-A10: one role is one independent set of links. The role marker lives
+   * on the links, while the grants remain ordinary assignment:grant rows. */
+  async materializeRole(client: VehicleClient, input: {
+    taskId: string; principalId: string; role: TaskGrantRole;
+    actor: AuditActor; assigner: AuthorizationActor;
+    roleGrantExpiry?: RoleGrantExpiryRequest;
+    credentialExpiresAt?: string;
+  }): Promise<VehicleTarget[]> {
+    const task = (await client.query(
+      `SELECT phase_id, status FROM tasks WHERE id = $1 FOR UPDATE`, [input.taskId],
+    )).rows[0];
+    if (!task || ['completed', 'archived'].includes(String(task.status))) {
+      throw err(409, 'ROLE_TASK_TERMINAL', 'role rows require a live task');
+    }
+    const principal = (await client.query(
+      `SELECT kind, status, role FROM principals WHERE id = $1`, [input.principalId],
+    )).rows[0];
+    if (!principal || principal.status !== 'active') {
+      throw err(422, 'ROLE_ASSIGNEE_NOT_ACTIVE', 'the role holder must be an active Principal');
+    }
+    if (!input.assigner.authenticated) {
+      throw err(403, 'ASSIGNER_UNKNOWN', 'a role grant requires an identified assigner');
+    }
+    if (!principal.kind || (!['agent', 'human', 'service'].includes(String(principal.kind)))) {
+      throw err(422, 'ROLE_ASSIGNEE_INVALID', 'the role holder must be a Principal identity');
+    }
+    if (principal.kind === 'human' && ADMINISTRATOR_ROLES.has(String(principal.role || '').toLowerCase())) {
+      return [];
+    }
+    if (principal.kind === 'agent' && input.roleGrantExpiry !== undefined) {
+      throw err(422, 'ROLE_AGENT_EXPIRY_FOLLOWS_CREDENTIAL',
+        'an Agent role row follows its credential expiry');
+    }
+    // E15 "agents follow the credential": the rows take the latest expiry of
+    // the Agent's live credentials, and none when a live credential has none
+    // (an owner-issued undated key); they are still reaped at task-terminal,
+    // revoke and disable. Only an Agent with no live credential is refused.
+    const agentCredential = principal.kind === 'agent' && !input.credentialExpiresAt
+      ? (await client.query(
+        `SELECT COUNT(*)::int AS live, COALESCE(BOOL_OR(expires_at IS NULL), FALSE) AS undated,
+                to_char(MAX(expires_at) AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS expires_iso
+           FROM principal_credentials WHERE principal_id = $1 AND revoked_at IS NULL
+             AND (expires_at IS NULL OR expires_at > clock_timestamp())
+             AND (grace_until IS NULL OR grace_until > clock_timestamp())`,
+        [input.principalId],
+      )).rows[0] : null;
+    if (agentCredential && Number(agentCredential.live) === 0) {
+      throw err(409, 'ROLE_AGENT_EXPIRY_MISSING', 'an Agent role grant must follow a live credential');
+    }
+    const agentExpiry: string | null | undefined = agentCredential
+      ? (agentCredential.undated ? null : agentCredential.expires_iso)
+      : input.credentialExpiresAt;
+    const expiry = principal.kind === 'agent'
+      ? agentExpiry
+      : (await this.resolveRoleGrantExpiry(client, input.roleGrantExpiry)).applied;
+    if (principal.kind === 'agent' && expiry === undefined) {
+      throw err(409, 'ROLE_AGENT_EXPIRY_MISSING', 'an Agent role grant must follow a live credential');
+    }
+    const planned = await this.plannedRoleRules(client, input.taskId, input.role, input.assigner, input.actor);
+    const targets: VehicleTarget[] = [];
+    for (const reference of planned) {
+      const verb = reference.verb;
+        targets.push(await this.ensureGrant(client, {
+          taskId: input.taskId, assigneePrincipalId: input.principalId,
+          granteeId: input.principalId, resourceType: reference.resourceType,
+          resourceId: reference.resourceId, verb, vehicleKind: 'role',
+          role: input.role, warrantId: null, actor: input.actor, expiresAt: expiry ?? null,
+        }));
+    }
+    for (const target of targets) {
+      await this.recomputeRowExpiry(client, target.targetId, input.actor,
+        { taskId: input.taskId, reason: 'AZ-A10 role assignment' });
+    }
+    return targets;
+  }
+
+  /** Remove only one role's links. Shared rows survive through other roles or
+   * tasks and keep the maximum date of their remaining links. */
+  async detachRole(client: VehicleClient, taskId: string, role: TaskGrantRole,
+    actor: AuditActor, reason: string, holderId?: string): Promise<void> {
+    await this.lockTaskReferenceTargets(client, taskId);
+    const links = await client.query(
+      `DELETE FROM access_vehicle_links WHERE task_id = $1 AND vehicle_kind = 'role' AND role = $2
+         AND ($3::uuid IS NULL OR landed_on_principal_id = $3)
+       RETURNING target_kind, target_id, created_by_vehicle, landed_on_principal_id`,
+      [taskId, role, holderId ?? null],
+    );
+    for (const link of links.rows) {
+      if (!link.created_by_vehicle) continue;
+      const remaining = await client.query(
+        `SELECT 1 FROM access_vehicle_links WHERE target_kind = $1 AND target_id = $2 LIMIT 1`,
+        [link.target_kind, link.target_id],
+      );
+      if (remaining.rows.length) {
+        if (link.target_kind === 'grant') await this.recomputeRowExpiry(
+          client, String(link.target_id), actor, { taskId, reason });
+      } else {
+        await this.dropTarget(client, link, actor, reason);
+      }
+    }
+  }
+
+  /** Reap every role carried by this identity, without disturbing a sibling
+   * holder of the same role on the task. Used by disable and last-key revoke. */
+  async detachRoleHolder(client: VehicleClient, principalId: string,
+    actor: AuditActor, reason: string): Promise<void> {
+    const roles = await client.query(
+      `SELECT DISTINCT task_id, role FROM access_vehicle_links
+        WHERE vehicle_kind = 'role' AND landed_on_principal_id = $1
+        ORDER BY task_id, role`, [principalId],
+    );
+    for (const row of roles.rows) await this.detachRole(client, String(row.task_id),
+      row.role as TaskGrantRole, actor, reason, principalId);
+  }
+
+  /** An Agent's role links expire with its live credential. Lease extension
+   * and key revocation invoke this inside their own transaction. */
+  async syncAgentRoleExpiry(client: VehicleClient, principalId: string,
+    actor: AuditActor): Promise<void> {
+    const credential = (await client.query(
+      `SELECT COUNT(*)::int AS live, COALESCE(BOOL_OR(c.expires_at IS NULL), FALSE) AS undated,
+              MAX(c.expires_at) AS latest FROM principal_credentials c
+        JOIN principals p ON p.id = c.principal_id
+       WHERE c.principal_id = $1 AND p.kind = 'agent' AND p.status = 'active'
+         AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > clock_timestamp())
+         AND (c.grace_until IS NULL OR c.grace_until > clock_timestamp())`,
+      [principalId],
+    )).rows[0];
+    if (!credential || Number(credential.live) === 0) {
+      await this.detachRoleHolder(client, principalId, actor, 'AZ-A10: bound Agent has no live credential');
+      return;
+    }
+    // An undated live credential leaves the rows undated (E15: they follow it).
+    const expiry = credential.undated ? null : credential.latest;
+    const linkedTasks = await client.query(
+      `SELECT DISTINCT task_id FROM access_vehicle_links WHERE vehicle_kind = 'role'
+        AND landed_on_principal_id = $1 ORDER BY task_id`, [principalId],
+    );
+    for (const row of linkedTasks.rows) {
+      const taskId = String(row.task_id);
+      await this.lockTaskReferenceTargets(client, taskId);
+      const updated = await client.query(
+        `UPDATE access_vehicle_links SET expires_at = $2::timestamptz
+          WHERE vehicle_kind = 'role' AND landed_on_principal_id = $1
+            AND task_id = $3 AND target_kind = 'grant'
+            AND expires_at IS DISTINCT FROM $2::timestamptz
+          RETURNING target_id`, [principalId, expiry, taskId],
+      );
+      for (const target of updated.rows) await this.recomputeRowExpiry(client,
+        String(target.target_id), actor, { taskId, reason: 'AZ-A10 Agent credential expiry moved' });
+    }
+  }
+
+  async redateRole(client: VehicleClient, taskId: string, role: TaskGrantRole,
+    holderId: string, requested: RoleGrantExpiryRequest, actor: AuditActor): Promise<void> {
+    const holder = (await client.query('SELECT kind FROM principals WHERE id = $1', [holderId])).rows[0];
+    if (holder?.kind === 'agent') {
+      throw err(422, 'ROLE_AGENT_EXPIRY_FOLLOWS_CREDENTIAL',
+        'an Agent role row follows its credential expiry');
+    }
+    const expiry = await this.resolveRoleGrantExpiry(client, requested);
+    await this.lockTaskReferenceTargets(client, taskId);
+    const changed = await client.query(
+      `UPDATE access_vehicle_links SET expires_at = $3::timestamptz
+        WHERE task_id = $1 AND vehicle_kind = 'role' AND role = $2
+          AND landed_on_principal_id = $4
+        RETURNING target_id`,
+      [taskId, role, expiry.applied, holderId],
+    );
+    for (const row of changed.rows) await this.recomputeRowExpiry(client, String(row.target_id), actor,
+      { taskId, reason: 'AZ-A10 role assigning act changed its date' });
   }
 
   // ── the public act ──────────────────────────────────────────────────
@@ -680,8 +1145,8 @@ export class AccessVehicleService {
   async attach(client: VehicleClient, input: VehicleAttachInput): Promise<VehicleAttachResult> {
     const assigneePrincipalId = await this.assigneePrincipalFor(client, input.serviceId);
     const resolved = await this.resolveChainForTask(assigneePrincipalId, input.taskId);
-    const landedOn = resolved.root.principalId;
     const warrantId = input.warrantId ?? null;
+    const landedOn = warrantId ? resolved.root.principalId : assigneePrincipalId;
 
     // R3 requires an identified assigner for anything but a system act.
     if (!input.assigner.authenticated) {
@@ -689,8 +1154,21 @@ export class AccessVehicleService {
         'an execution assignment requires an identified assigner so the R3 non-escalation cap can be applied');
     }
 
+    // AZ-A10 clause 6 governs the grant rows an assignment writes. A
+    // warrant-carried assignment writes a profile assignment instead, which
+    // lives and dies with the warrant (§6.2), so a date for it is refused
+    // rather than silently ignored. Resolved BEFORE anything is materialized:
+    // a refused date writes nothing.
+    if (warrantId && input.roleGrantExpiry !== undefined) {
+      throw err(422, 'ROLE_GRANT_EXPIRY_WITH_WARRANT',
+        'roleGrantExpiresAt dates the grant rows an assignment writes (AZ-A10 clause 6); an assignment carried by a '
+        + 'Warrant writes none and follows the Warrant\'s own expiry. Send one or the other',
+        ROLE_GRANT_EXPIRY_FIELD);
+    }
+    const roleGrantExpiry = warrantId ? null : await this.resolveRoleGrantExpiry(client, input.roleGrantExpiry);
+
     let targets: VehicleTarget[] = [];
-    let vehicleKind: 'warrant' | 'auto-grant' = warrantId ? 'warrant' : 'auto-grant';
+    let vehicleKind: 'warrant' | 'auto-grant' | 'role' = warrantId ? 'warrant' : 'role';
 
     // T37: legacy identities are frozen out of BOTH new grants and profile
     // assignment. No vehicle can be materialized for them — the readability
@@ -708,9 +1186,10 @@ export class AccessVehicleService {
         ...input, taskId: input.taskId, assigneePrincipalId, landedOn, warrantId,
       });
     } else {
-      targets = await this.attachAutoGrants(client, {
-        taskId: input.taskId, assigneePrincipalId, landedOn,
+      targets = await this.materializeRole(client, {
+        taskId: input.taskId, principalId: assigneePrincipalId, role: 'implementer',
         actor: input.actor, assigner: input.assigner,
+        roleGrantExpiry: input.roleGrantExpiry,
       });
     }
 
@@ -728,12 +1207,61 @@ export class AccessVehicleService {
       action: 'task.execution_assign', actor: input.actor, resourceType: 'task', resourceId: input.taskId,
       metadata: {
         assigneePrincipalId, landedOnPrincipalId: landedOn,
-        carriedBy: vehicleKind === 'warrant' ? 'warrant' : 'grant',
+        carriedBy: vehicleKind === 'warrant' ? 'warrant' : 'role',
         warrantId, targetCount: targets.length,
+        // AZ-A10 clauses 6 and 8: what the assigning act asked for, what the
+        // rows carry, and where the date came from. null for a warrant.
+        roleGrantExpiresAt: roleGrantExpiry,
       },
     }, client as PoolClient);
 
-    return { vehicleKind, warrantId, landedOnPrincipalId: landedOn, assigneePrincipalId, targets };
+    return { vehicleKind, warrantId, landedOnPrincipalId: landedOn, assigneePrincipalId, targets, roleGrantExpiry };
+  }
+
+  /**
+   * An assigning act that names the assignee the task ALREADY has, with a
+   * new `roleGrantExpiresAt` (AZ-A10 clause 6, E62). Nothing is detached or
+   * re-created: this task's links take the new date, every row they link is
+   * recomputed from its links (clause 6's maximum, owner-plane rows never
+   * touched), and the act is audited with the link date before and after.
+   * The R1 proof runs again on this transaction, so a re-date can never
+   * leave the assignee unable to read its task.
+   */
+  async redate(
+    client: VehicleClient,
+    input: { taskId: string; serviceId: string; roleGrantExpiry: RoleGrantExpiryRequest; actor: AuditActor },
+  ): Promise<AppliedRoleGrantExpiry> {
+    await this.lockTaskReferenceTargets(client, input.taskId);
+    const carried = await client.query(
+      `SELECT 1 FROM access_vehicle_links WHERE task_id = $1 AND vehicle_kind = 'warrant' LIMIT 1`,
+      [input.taskId],
+    );
+    const pointer = await client.query('SELECT execution_warrant_id FROM tasks WHERE id = $1', [input.taskId]);
+    if (carried.rows.length > 0 || pointer.rows[0]?.execution_warrant_id) {
+      throw err(422, 'ROLE_GRANT_EXPIRY_WITH_WARRANT',
+        'this assignment is carried by a Warrant, which writes no grant rows for roleGrantExpiresAt to date '
+        + '(AZ-A10 clause 6); it follows the Warrant\'s own expiry',
+        ROLE_GRANT_EXPIRY_FIELD);
+    }
+    const before = await this.assignmentExpiry(input.taskId, client);
+    const expiry = await this.resolveRoleGrantExpiry(client, input.roleGrantExpiry);
+    await this.applyLinkExpiry(client, input.taskId, expiry.applied, input.actor,
+      'AZ-A10 clause 6: the assigning act set a new date');
+
+    const assigneePrincipalId = await this.assigneePrincipalFor(client, input.serviceId);
+    if (!(await this.canRead(client, assigneePrincipalId, input.taskId))) {
+      throw err(409, 'ASSIGNMENT_NOT_VISIBLE',
+        'the assignee chain cannot read this task with the new date — ruling 7440b579 R1 forbids an assigned-but-invisible task',
+        ROLE_GRANT_EXPIRY_FIELD);
+    }
+    await auditService.record({
+      action: 'task.execution_assign', actor: input.actor, resourceType: 'task', resourceId: input.taskId,
+      metadata: {
+        assigneePrincipalId, carriedBy: 'role', warrantId: null, reasserted: true,
+        roleGrantExpiresAt: { ...expiry, before: before === undefined ? null : before },
+      },
+    }, client as PoolClient);
+    return expiry;
   }
 
   // ── reaping (R2 reference-counting, R4 lifecycle) ───────────────────
@@ -749,6 +1277,7 @@ export class AccessVehicleService {
     actor: AuditActor,
     reason: string,
   ): Promise<{ removedLinks: number; removedTargets: number }> {
+    await this.lockTaskReferenceTargets(client, taskId);
     const links = await client.query(
       `DELETE FROM access_vehicle_links WHERE task_id = $1
         RETURNING target_kind, target_id, created_by_vehicle, landed_on_principal_id`,
@@ -761,7 +1290,14 @@ export class AccessVehicleService {
         `SELECT 1 FROM access_vehicle_links WHERE target_kind = $1 AND target_id = $2 LIMIT 1`,
         [link.target_kind, link.target_id],
       );
-      if (remaining.rows.length > 0) continue;
+      if (remaining.rows.length > 0) {
+        // AZ-A10 clause 7: "A shared row survives only through another live
+        // task's link, with its expiry recomputed over the remaining links."
+        if (link.target_kind === 'grant') {
+          await this.recomputeRowExpiry(client, String(link.target_id), actor, { taskId, reason });
+        }
+        continue;
+      }
       removedTargets += await this.dropTarget(client, link, actor, reason);
     }
     return { removedLinks: links.rows.length, removedTargets };
@@ -835,6 +1371,57 @@ export class AccessVehicleService {
   }
 
   /**
+   * AZ-A10 clauses 7 and 13 for the superseded Account-landed fallback. The
+   * clause-14 backfill replaces an `auto-grant` link only where it could
+   * materialize the implementer's role rows; it leaves the link where the
+   * holder is an administrator Account or the assigner is not provable. Such
+   * a link keeps the AZ-S7 REMOVAL arm: a link edit that drops a reference
+   * still revokes what the fallback carried ("a link edit drops a reference
+   * (recompute)", clause 7). Nothing is ever added to it: clause 13
+   * supersedes the fallback for new materialization. Caller holds the
+   * task's reference-target locks.
+   */
+  private async pruneLegacyAutoGrant(
+    client: VehicleClient,
+    taskId: string,
+    actor: AuditActor,
+  ): Promise<void> {
+    const current = await client.query(
+      `SELECT l.target_kind, l.target_id, l.created_by_vehicle, l.landed_on_principal_id,
+              g.resource_type, g.resource_id
+         FROM access_vehicle_links l
+         JOIN grants g ON g.id = l.target_id
+        WHERE l.task_id = $1 AND l.vehicle_kind = 'auto-grant' AND l.target_kind = 'grant'
+        ORDER BY l.target_id`,
+      [taskId],
+    );
+    if (current.rows.length === 0) return;
+    // The raw reference set, as the role arm's removal uses (review bedc25f3 B2).
+    const stillReferenced = new Set(
+      (await this.referenceSet(client, taskId)).map((r) => `${r.resourceType}:${r.resourceId}`),
+    );
+    const reason = 'AZ-S7 recompute: the task no longer references this object';
+    for (const row of current.rows) {
+      if (stillReferenced.has(`${row.resource_type}:${row.resource_id}`)) continue;
+      await client.query(
+        `DELETE FROM access_vehicle_links WHERE task_id = $1 AND vehicle_kind = 'auto-grant'
+            AND target_kind = 'grant' AND target_id = $2`,
+        [taskId, row.target_id],
+      );
+      if (!row.created_by_vehicle) continue;
+      const remaining = await client.query(
+        `SELECT 1 FROM access_vehicle_links WHERE target_kind = 'grant' AND target_id = $1 LIMIT 1`,
+        [row.target_id],
+      );
+      if (remaining.rows.length > 0) {
+        await this.recomputeRowExpiry(client, String(row.target_id), actor, { taskId, reason });
+        continue;
+      }
+      await this.dropTarget(client, row, actor, reason);
+    }
+  }
+
+  /**
    * R2(b): "recomputed in the SAME transaction as any link edit while
    * assigned". Re-derives the D5 set for a task that currently holds an
    * auto-grant vehicle: newly referenced objects gain their grant, objects
@@ -855,26 +1442,22 @@ export class AccessVehicleService {
     actor: AuditActor,
     linker: AuthorizationActor,
   ): Promise<void> {
-    const existing = await client.query(
-      `SELECT assignee_principal_id, landed_on_principal_id
+    await this.lockTaskReferenceTargets(client, taskId);
+    await this.pruneLegacyAutoGrant(client, taskId, actor);
+    const holders = await client.query(
+      `SELECT role, assignee_principal_id, landed_on_principal_id,
+              CASE WHEN BOOL_OR(expires_at IS NULL) THEN NULL ELSE MAX(expires_at) END AS expires_at
          FROM access_vehicle_links
-        WHERE task_id = $1 AND vehicle_kind = 'auto-grant' LIMIT 1`,
-      [taskId],
+        WHERE task_id = $1 AND vehicle_kind = 'role' AND target_kind = 'grant'
+        GROUP BY role, assignee_principal_id, landed_on_principal_id
+        ORDER BY role, assignee_principal_id, landed_on_principal_id`, [taskId],
     );
-    if (existing.rows.length === 0) return;
-    const assigneePrincipalId = String(existing.rows[0].assignee_principal_id);
-    const landedOn = String(existing.rows[0].landed_on_principal_id);
-
-    const desired = await this.permittedReferences(client, taskId, linker);
-
-    const current = await client.query(
-      `SELECT l.target_kind, l.target_id, l.created_by_vehicle, l.landed_on_principal_id,
-              g.resource_type, g.resource_id
-         FROM access_vehicle_links l
-         JOIN grants g ON g.id = l.target_id
-        WHERE l.task_id = $1 AND l.vehicle_kind = 'auto-grant' AND l.target_kind = 'grant'`,
-      [taskId],
-    );
+    if (holders.rows.length === 0) return;
+    const desired = await this.permittedReferences(client, taskId, linker, actor);
+    const phase = (await client.query('SELECT phase_id FROM tasks WHERE id = $1', [taskId])).rows[0]?.phase_id;
+    if (phase && await this.assignerCovers(client, linker, 'phase', String(phase))) {
+      desired.push({ resourceType: 'phase', resourceId: String(phase) });
+    }
     // The REMOVAL arm works off the raw reference set, not the capped one:
     // a linker who cannot read an object must not be able to REVOKE the
     // assignee's access to it either, and "not permitted to confer" is not
@@ -882,33 +1465,152 @@ export class AccessVehicleService {
     const stillReferenced = new Set(
       (await this.referenceSet(client, taskId)).map((r) => `${r.resourceType}:${r.resourceId}`),
     );
+    if (phase) stillReferenced.add(`phase:${String(phase)}`);
+    for (const holder of holders.rows) {
+    const role = holder.role as TaskGrantRole;
+    const landedOn = String(holder.landed_on_principal_id);
+    const assigneePrincipalId = String(holder.assignee_principal_id);
+    // The task row was written by the assigning act. A later linker may
+    // confer only what BOTH that assigner and the linker currently hold.
+    const taskGrantors = await client.query(
+      `SELECT DISTINCT l.created_by_principal_id AS id
+         FROM access_vehicle_links l JOIN grants g ON g.id = l.target_id
+        WHERE l.task_id = $1 AND l.vehicle_kind = 'role' AND l.role = $2
+          AND l.landed_on_principal_id = $3 AND l.target_kind = 'grant'
+          AND g.resource_type = 'task' AND g.resource_id = $1 AND g.verb = 'read'`,
+      [taskId, role, landedOn],
+    );
+    const grantorId = taskGrantors.rows.length === 1 && taskGrantors.rows[0].id
+      ? String(taskGrantors.rows[0].id) : null;
+    if (!grantorId) throw err(409, 'ROLE_ASSIGNER_UNKNOWN',
+      `the ${role} task row has no provable assigning principal`);
+    const grantorChain = await delegationService.resolveChain(grantorId, client);
+    if (!grantorChain.alive) throw err(403, 'ROLE_EXCEEDS_ASSIGNER',
+      `the ${role} task row's assigner is no longer live`);
+    const originalAssigner: AuthorizationActor = {
+      principalId: grantorId, handle: '', role: grantorChain.links[0].role,
+      scopes: null, authenticated: true,
+      delegation: grantorChain.links.length > 1 ? { links: grantorChain.links } : null,
+    };
+    const selfVerb = role === 'implementer' ? 'write' : 'read';
+    if (!(await authorizationRepository.authorizedIds(
+      originalAssigner, 'task', [taskId], selfVerb, client,
+    )).has(taskId)) throw err(403, 'ROLE_EXCEEDS_ASSIGNER',
+      `the ${role} bound task row exceeds the original assigner's current ${selfVerb} authority`);
+    // A warrant is pinned at mint. Read that version on this transaction;
+    // a later profile publication or an authorized linker cannot widen it.
+    const warrant = (await client.query(
+      `SELECT w.id, w.status, w.expires_at, w.ceiling_profile_version_id,
+              p.own_expression
+         FROM principals p LEFT JOIN warrants w ON w.id = p.minted_under_warrant_id
+        WHERE p.id = $1 AND p.minted_under_warrant_id IS NOT NULL`,
+      [assigneePrincipalId],
+    )).rows[0];
+    if (warrant && (warrant.status !== 'active'
+      || (warrant.expires_at && new Date(warrant.expires_at).getTime() <= Date.now())
+      || !warrant.ceiling_profile_version_id)) {
+      throw err(403, 'CEILING_EXCEEDED', `the ${role} holder's pinned warrant is unavailable`);
+    }
+    const ceilingSources = warrant ? sourcesFromRules((await client.query(
+      `SELECT resource_type, selector_form, selector_ids, verbs
+         FROM access_profile_rules WHERE version_id = $1`,
+      [warrant.ceiling_profile_version_id],
+    )).rows.map(row => ({
+      resourceType: row.resource_type as GrantResourceType,
+      selectorForm: row.selector_form,
+      selectorIds: (row.selector_ids ?? []).map(String),
+      verbs: row.verbs ?? [],
+    } as ProfileRule))) : null;
+    if (ceilingSources) {
+      const own = typeof warrant.own_expression === 'string'
+        ? JSON.parse(warrant.own_expression) : warrant.own_expression;
+      const requested = Array.isArray(own?.objects) ? own.objects as ProfileRule[] : [];
+      const requestCheck = await rulesCoveredWithCoordinates(client, ceilingSources, requested);
+      if (!requestCheck.covered) throw err(403, 'CEILING_EXCEEDED',
+        `the Agent's requested rules exceed its pinned warrant ceiling: ${JSON.stringify(requestCheck.failing)}`);
+    }
+    const withinCeiling = async (resourceType: GrantResourceType, resourceId: string, verb: GrantVerb) =>
+      !ceilingSources || (await rulesCoveredWithCoordinates(client, ceilingSources, [{
+        resourceType, selectorForm: 'exact', selectorIds: [resourceId], verbs: [verb],
+      }])).covered;
+    for (const verb of (role === 'implementer' ? ['read', 'write'] : ['read']) as GrantVerb[]) {
+      if (!(await withinCeiling('task', taskId, verb))) {
+        throw err(403, 'CEILING_EXCEEDED',
+          `the ${role} bound task row exceeds the pinned warrant ceiling: task/${taskId}/${verb}`);
+      }
+    }
+    const current = await client.query(
+      `SELECT l.target_kind, l.target_id, l.created_by_vehicle, l.landed_on_principal_id,
+              g.resource_type, g.resource_id, g.verb
+         FROM access_vehicle_links l JOIN grants g ON g.id = l.target_id
+        WHERE l.task_id = $1 AND l.vehicle_kind = 'role' AND l.role = $2
+          AND l.landed_on_principal_id = $3 AND l.target_kind = 'grant'`,
+      [taskId, role, landedOn],
+    );
     const currentKeys = new Set<string>();
     for (const row of current.rows) {
       const key = `${row.resource_type}:${row.resource_id}`;
       currentKeys.add(key);
-      if (stillReferenced.has(key)) continue;
+      const covered = await withinCeiling(row.resource_type as GrantResourceType,
+        String(row.resource_id), row.verb as GrantVerb);
+      const assignerCovered = row.resource_type === 'task' || await this.assignerCovers(
+        client, originalAssigner, row.resource_type as GrantResourceType, String(row.resource_id));
+      if (stillReferenced.has(key) && covered && assignerCovered) continue;
+      const removalReason = !covered ? 'AZ-A10 recompute: row exceeds pinned warrant ceiling'
+        : !assignerCovered ? 'AZ-A10 recompute: row exceeds original assigner authority'
+          : 'AZ-S7 recompute: the task no longer references this object';
       // No longer referenced: drop the link, then the target at refcount
       // zero — and only when this machinery created it.
       await client.query(
-        `DELETE FROM access_vehicle_links WHERE task_id = $1 AND target_kind = 'grant' AND target_id = $2`,
-        [taskId, row.target_id],
+        `DELETE FROM access_vehicle_links WHERE task_id = $1 AND vehicle_kind = 'role' AND role = $3
+           AND landed_on_principal_id = $4 AND target_kind = 'grant' AND target_id = $2`,
+        [taskId, row.target_id, role, landedOn],
       );
       if (!row.created_by_vehicle) continue;
       const remaining = await client.query(
         `SELECT 1 FROM access_vehicle_links WHERE target_kind = 'grant' AND target_id = $1 LIMIT 1`,
         [row.target_id],
       );
-      if (remaining.rows.length > 0) continue;
-      await this.dropTarget(client, row as any, actor, 'AZ-S7 recompute: the task no longer references this object');
+      if (remaining.rows.length > 0) {
+        // AZ-A10 clause 7: "a link edit drops a reference (recompute)" — the
+        // row lives on through other tasks, at the latest of THEIR dates.
+        await this.recomputeRowExpiry(client, String(row.target_id), actor,
+          { taskId, reason: removalReason });
+        continue;
+      }
+      await this.dropTarget(client, row as any, actor, removalReason);
     }
 
+    // A newly referenced object is linked at the date the assignment
+    // already carries (AZ-A10 clause 6): a link edit is not an assigning act
+    // and never moves the date.
+    const expiresAt: string | null = holder.expires_at ? new Date(holder.expires_at).toISOString() : null;
     for (const reference of desired) {
       if (currentKeys.has(`${reference.resourceType}:${reference.resourceId}`)) continue;
-      await this.ensureGrant(client, {
+      if (!(await this.assignerCovers(client, originalAssigner, reference.resourceType, reference.resourceId))) {
+        await auditService.record({ action: 'grant.reference_skipped', actor,
+          resourceType: reference.resourceType, resourceId: reference.resourceId,
+          metadata: { taskId, role, assigneePrincipalId, reason: 'AZ-A10: reference exceeds original assigner authority' },
+        }, client as PoolClient);
+        continue;
+      }
+      if (!(await withinCeiling(reference.resourceType, reference.resourceId, VEHICLE_VERB))) {
+        await auditService.record({ action: 'grant.reference_skipped', actor,
+          resourceType: reference.resourceType, resourceId: reference.resourceId,
+          metadata: { taskId, role, assigneePrincipalId, warrantId: String(warrant.id),
+            reason: 'AZ-A10: reference exceeds pinned warrant ceiling' },
+        }, client as PoolClient);
+        continue;
+      }
+      const target = await this.ensureGrant(client, {
         taskId, assigneePrincipalId, granteeId: landedOn,
         resourceType: reference.resourceType, resourceId: reference.resourceId,
-        verb: VEHICLE_VERB, vehicleKind: 'auto-grant', warrantId: null, actor,
+        verb: VEHICLE_VERB, vehicleKind: 'role', role, warrantId: null, actor,
+        grantorPrincipalId: grantorId, expiresAt,
       });
+      await this.recomputeRowExpiry(client, target.targetId, actor,
+        { taskId, reason: 'AZ-A10 clause 6: a link edit linked this row' });
+    }
     }
   }
 
@@ -916,8 +1618,12 @@ export class AccessVehicleService {
 
   /** The dependent not-yet-terminal tasks a revoke or suspend would
    * auto-unassign (R4's mandatory warning list). */
-  async dependentOpenTasks(warrantId: string): Promise<Array<{ id: string; title: string; status: string }>> {
-    const result = await pool.query(
+  async dependentOpenTasks(
+    warrantId: string,
+    // AZ-A13 clause 10c: a ceiling edit asks inside its own transaction.
+    queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool,
+  ): Promise<Array<{ id: string; title: string; status: string }>> {
+    const result = await queryable.query(
       `SELECT DISTINCT t.id, t.title, t.status
          FROM tasks t
         WHERE t.status NOT IN ('completed', 'archived')
@@ -969,8 +1675,14 @@ export class AccessVehicleService {
     );
 
     const unassigned: string[] = [];
-    for (const row of carried.rows) {
-      const taskId = String(row.task_id);
+    for (const discovered of carried.rows) {
+      const taskId = String(discovered.task_id);
+      await this.lockReferenceTask(client, taskId);
+      // The warrant lock is not a Task lock: recheck the carried decision.
+      const current = await client.query(`SELECT status, execution_service_id FROM tasks t WHERE id=$1
+        AND EXISTS (SELECT 1 FROM access_vehicle_links l WHERE l.task_id=t.id AND l.warrant_id=$2)`, [taskId, warrantId]);
+      if (!current.rows.length) continue;
+      const row = current.rows[0];
       await this.detach(client, taskId, actor, reason);
       const terminal = ['completed', 'archived'].includes(String(row.status));
       if (terminal || !row.execution_service_id) continue;
@@ -990,26 +1702,24 @@ export class AccessVehicleService {
     // A task can also carry the warrant pointer with its links already
     // reaped (it went terminal, then reopened, then the warrant died).
     // Clear those too, so no pointer outlives its warrant.
-    const stragglers = await client.query(
-      `UPDATE tasks SET execution_service_id = NULL, execution_profile = NULL,
-              execution_descriptor_version = NULL, execution_warrant_id = NULL
-        WHERE execution_warrant_id = $1 AND status NOT IN ('completed', 'archived')
-        RETURNING id`,
-      [warrantId],
-    );
-    for (const row of stragglers.rows) {
-      const taskId = String(row.id);
-      if (unassigned.includes(taskId)) continue;
-      await auditService.record({
-        action: 'task.execution_unassign', actor, resourceType: 'task', resourceId: taskId,
-        metadata: { automatic: true, reason, warrantId },
-      }, client as PoolClient);
-      unassigned.push(taskId);
+    const pointers = await client.query('SELECT id FROM tasks WHERE execution_warrant_id=$1 ORDER BY id', [warrantId]);
+    for (const pointer of pointers.rows) {
+      const taskId = String(pointer.id);
+      await this.lockReferenceTask(client, taskId);
+      const current = await client.query('SELECT status FROM tasks WHERE id=$1 AND execution_warrant_id=$2', [taskId, warrantId]);
+      if (!current.rows.length) continue;
+      const terminal = ['completed', 'archived'].includes(String(current.rows[0].status));
+      if (terminal) await client.query('UPDATE tasks SET execution_warrant_id=NULL WHERE id=$1', [taskId]);
+      else {
+        await client.query(`UPDATE tasks SET execution_service_id=NULL, execution_profile=NULL,
+          execution_descriptor_version=NULL, execution_warrant_id=NULL WHERE id=$1`, [taskId]);
+        if (!unassigned.includes(taskId)) {
+          await auditService.record({action: 'task.execution_unassign', actor, resourceType: 'task', resourceId: taskId,
+            metadata: {automatic:true, reason, warrantId}}, client as PoolClient);
+          unassigned.push(taskId);
+        }
+      }
     }
-    await client.query(
-      `UPDATE tasks SET execution_warrant_id = NULL WHERE execution_warrant_id = $1`,
-      [warrantId],
-    );
 
     return { unassignedTaskIds: unassigned };
   }
@@ -1022,6 +1732,9 @@ export class AccessVehicleService {
               l.assignee_principal_id, l.landed_on_principal_id,
               lp.handle AS landed_on_handle,
               g.resource_type, g.resource_id, g.verb,
+              to_char(l.expires_at AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS link_expires_iso,
+              to_char(g.expires_at AT TIME ZONE 'UTC', ${ROLE_GRANT_EXPIRY_ISO_FORMAT}) AS row_expires_iso,
+              (g.expires_at IS NOT NULL AND g.expires_at <= NOW()) AS row_expired,
               ap.id AS profile_id, ap.name AS profile_name
          FROM access_vehicle_links l
          LEFT JOIN warrants w ON w.id = l.warrant_id
@@ -1040,7 +1753,7 @@ export class AccessVehicleService {
     // whether it may ever remove it (owner default D4).
     return result.rows.map((row) => ({
       id: String(row.id),
-      carriedBy: row.vehicle_kind === 'warrant' ? 'warrant' : 'grant',
+      carriedBy: row.vehicle_kind === 'warrant' ? 'warrant' : row.vehicle_kind === 'role' ? 'role' : 'grant',
       warrantId: row.warrant_id ? String(row.warrant_id) : null,
       warrantName: row.warrant_name ?? null,
       warrantStatus: row.warrant_status ?? null,
@@ -1053,6 +1766,15 @@ export class AccessVehicleService {
       resourceType: row.resource_type ?? null,
       resourceId: row.resource_id ?? null,
       verb: row.verb ?? null,
+      // AZ-A10 clauses 6 and 8. `roleGrantExpiresAt` is the date THIS task's
+      // assigning act set for its link, in the request field's own name (null
+      // = until the task or the assignment ends; always null for a warrant).
+      // `expiresAt` is the row's effective date: the latest over every task
+      // that links it, or an owner-plane row's own date. `expired` is decided
+      // by the database clock, not the reader's.
+      roleGrantExpiresAt: row.link_expires_iso ?? null,
+      expiresAt: row.row_expires_iso ?? null,
+      expired: row.row_expired === true,
       profileId: row.profile_id ? String(row.profile_id) : null,
       profileName: row.profile_name ?? null,
     }));

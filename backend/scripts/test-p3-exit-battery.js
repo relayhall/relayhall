@@ -709,8 +709,6 @@ const result = spawnSync(path.join(__dirname, '..', 'node_modules', '.bin', 'tsx
     RELAYHALL_CREDENTIAL_KEYS: process.env.RELAYHALL_CREDENTIAL_KEYS
       || JSON.stringify({ livekey: Buffer.alloc(32, 9).toString('base64') }),
     RELAYHALL_CREDENTIAL_ACTIVE_KEY: process.env.RELAYHALL_CREDENTIAL_ACTIVE_KEY || 'livekey',
-    TASK_NOTIFICATIONS_FILE: process.env.TASK_NOTIFICATIONS_FILE
-      || path.join(require('os').tmpdir(), 'p3-exit-notifications.json'),
   },
   cwd: path.join(__dirname, '..'),
 });

@@ -135,8 +135,13 @@ export const LENSES_A_MUTATIONS: LensesAMutation[] = [
       // behind when they replace a call and keep the signature.
       + '    void actor;\n'
       + '    return outcome;',
+    // LENSES-c c1-A (card 46cfbd1d) added the seam's line-pinned R-3(ii)
+    // assertion, and the second writer this mutation plants is one more
+    // group_members line in the seam, so it reddens there too. Named here BY
+    // TITLE, because the set is complete or it is nothing.
     expects: ['B-L2: the only WRITER is GroupService, and the seam itself writes none',
-      'R-3: every discovered write has an exact value-scoped exemption'],
+      'R-3: every discovered write has an exact value-scoped exemption',
+      'R-3(ii), the seam: its only non-comment group_members lines are the registered derivation and steward-catalog reads'],
   },
   {
     id: 'L4',
@@ -255,10 +260,18 @@ export const LENSES_A_MUTATIONS: LensesAMutation[] = [
       + "'s projection answers 200 while one that does not exist answers 404 -- an existence "
       + 'oracle over every external group name in the deployment',
     file: SEAM,
+    // Re-anchored BY NAME for LENSES-c c1-A (card 46cfbd1d): the point read
+    // now asks `catalogProjection`, which also answers the steward row, and
+    // the projection's refusal is the `null` it returns. The mutation still
+    // DISABLES the projection: a caller with no projection falls through to
+    // the root SELECT, so an id outside the projection answers 200 while an
+    // absent one answers 404 -- the same oracle, and the same one assertion.
     find: '    if (!UUID_PATTERN.test(String(id))) return null;\n'
-      + '    if (!scope.rootSession) return null;\n',
+      + '    const projection = await this.catalogProjection(scope);\n'
+      + '    if (!projection) return null;\n',
     replace: '    if (!UUID_PATTERN.test(String(id))) return null;\n'
-      + '    if (!scope.rootSession && false) return null;\n',
+      + '    const projection = await this.catalogProjection(scope);\n'
+      + '    if (!projection && false) return null;\n',
     expects: ['A-L17 / R-10: outside the projection is BYTE-IDENTICAL to does-not-exist'],
   },
   {

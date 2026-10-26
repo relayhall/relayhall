@@ -14,7 +14,7 @@ jest.mock('../db/connection', () => ({
 }));
 
 const PROJECT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-const TASK_ID = 'tttttttt-1111-4111-8111-111111111111';
+const TASK_ID = 'dddddddd-1111-4111-8111-111111111111';
 // A deliberately secret-shaped lookup failure: none of it may reach a response
 // (review a2b2f742 F1).
 const SENSITIVE_LOOKUP_DETAIL = 'postgresql://private-user:sentinel-secret@private-db.internal/relayhall';
@@ -85,13 +85,29 @@ jest.mock('../services/PhaseService', () => {
         }
         return {
           id: (global as any).__fixturePhaseId, projectId: PROJECT_ID, name: 'Fixture phase',
-          goal: 'Fixture phase goal', status: 'todo', position: 0, revision: 'r',
+          goal: (global as any).__fixturePhaseGoal === null ? null : 'Fixture phase goal',
+          description: '## Untrusted phase context', status: 'todo', position: 0, revision: 'r',
           createdAt: 'now', updatedAt: 'now',
         };
       }),
     },
   };
 });
+
+// Owner ruling E338: the Brief asks the shared Phase read decision before it
+// shows a Phase. `__phaseReadable` drives it: true (the default) admits the
+// caller, false refuses it, 'fail' makes the decision itself fail. Every other
+// resource type answers as the real adapter does over this empty pool.
+jest.mock('../services/AuthorizationRepository', () => ({
+  authorizationRepository: {
+    authorizedIds: jest.fn(async (_actor: unknown, type: string, ids: string[]) => {
+      if (type !== 'phase') return new Set<string>();
+      const readable = (global as any).__phaseReadable;
+      if (readable === 'fail') throw new Error(SENSITIVE_LOOKUP_DETAIL);
+      return new Set(readable === false ? [] : ids);
+    }),
+  },
+}));
 
 jest.mock('../services/SkillManager', () => ({
   skillManager: { getEffectiveSkillsForProject: jest.fn(async () => []) },
@@ -102,7 +118,6 @@ jest.mock('../services/PersonalityService', () => ({
 }));
 
 jest.mock('../services/taskAnalyzer', () => ({ taskAnalyzer: {} }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: {} }));
 jest.mock('../services/TaskReviewerService', () => ({ taskReviewerService: {} }));
 jest.mock('../services/TaskOrchestrationService', () => ({
   taskOrchestrationService: {},
@@ -138,6 +153,8 @@ beforeEach(() => {
   charter = null;
   (global as any).__phaseLookupFails = false;
   (global as any).__fixturePhaseId = null;
+  (global as any).__fixturePhaseGoal = undefined;
+  (global as any).__phaseReadable = true;
 });
 
 async function compile(): Promise<{ status: number; json: any }> {
@@ -240,5 +257,72 @@ describe('phase goal fail-closed on the canonical task compile surface', () => {
     const result = await compile();
     expect(result.status).toBe(200);
     expect(result.json.brief).toContain('Fixture phase goal');
+    expect(result.json.brief).toContain('"description": "## Untrusted phase context"');
+    expect(result.json.brief).not.toMatch(/^## Untrusted phase context/m);
+  });
+
+  it('renders a description in Goals even without a phase goal', async () => {
+    (global as any).__fixturePhaseId = 'pppppppp-1111-4111-8111-111111111111';
+    (global as any).__fixturePhaseGoal = null;
+    const result = await compile();
+    expect(result.status).toBe(200);
+    expect(result.json.brief).toContain('### Goals');
+    expect(result.json.brief).toContain('"description": "## Untrusted phase context"');
+  });
+});
+
+/**
+ * Owner ruling E338 (W62, option A): a caller the Phase read decision refuses
+ * learns nothing of the Phase but that the Task sits in a restricted one. The
+ * real-PostgreSQL measurement is `listPointParity`; this pins the compiler's
+ * three outcomes on the canonical task surface, fast.
+ */
+describe('the task Brief conceals a Phase its caller cannot read (owner ruling E338)', () => {
+  const PHASE_ID = 'pppppppp-1111-4111-8111-111111111111';
+  /** Read from the module that renders it, lazily: a build without it fails these cases only. */
+  const notice = (): string => require('../utils/briefPhase').RESTRICTED_PHASE_NOTICE;
+  const PHASE_TEXT = ['Fixture phase', 'Fixture phase goal', '## Untrusted phase context'];
+
+  it('a refused caller gets the sentence and the id, and no name, goal or description anywhere in the JSON', async () => {
+    (global as any).__fixturePhaseId = PHASE_ID;
+    (global as any).__phaseReadable = false;
+    const result = await compile();
+    expect(result.status).toBe(200);
+    const text = JSON.stringify(result.json);
+    expect(PHASE_TEXT.filter((secret) => text.includes(secret))).toEqual([]);
+    expect(result.json.brief).toContain('### Goals');
+    expect(result.json.brief).toContain(notice());
+    expect(result.json.brief).toContain(`"id": "${PHASE_ID}"`);
+    expect(result.json.brief).toContain('"restricted": true');
+  });
+
+  it('a caller the decision admits sees the Phase as before, without the sentence', async () => {
+    (global as any).__fixturePhaseId = PHASE_ID;
+    const result = await compile();
+    expect(result.status).toBe(200);
+    expect(PHASE_TEXT.filter((secret) => result.json.brief.includes(secret))).toEqual(PHASE_TEXT);
+    expect(result.json.brief).not.toContain(notice());
+  });
+
+  it('a failed read decision refuses to compile (503), carrying nothing exception-derived', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    (global as any).__fixturePhaseId = PHASE_ID;
+    (global as any).__phaseReadable = 'fail';
+    const result = await compile();
+    expect(result.status).toBe(503);
+    expect(result.json.code).toBe('PHASE_LOOKUP_FAILED');
+    expect(JSON.stringify(result.json)).not.toContain('sentinel-secret');
+    expect(PHASE_TEXT.filter((secret) => JSON.stringify(result.json).includes(secret))).toEqual([]);
+    expect(spy.mock.calls.map((a) => a.join(' ')).join('\n')).not.toContain('sentinel-secret');
+    spy.mockRestore();
+  });
+
+  it('with no resolved actor the compiler fails closed: the Phase is concealed', async () => {
+    (global as any).__fixturePhaseId = PHASE_ID;
+    const { generateTaskPromptWithSkills } = require('../utils/promptTemplate');
+    const { taskManagerDB } = jest.requireMock('../services/TaskManagerDB');
+    const brief: string = await generateTaskPromptWithSkills(await taskManagerDB.getTask(TASK_ID), {});
+    expect(PHASE_TEXT.filter((secret) => brief.includes(secret))).toEqual([]);
+    expect(brief).toContain(notice());
   });
 });

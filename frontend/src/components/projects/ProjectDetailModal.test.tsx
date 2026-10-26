@@ -11,6 +11,9 @@ import type { Task } from '../../types/task';
 import { ProjectDetailModal } from './ProjectDetailModal';
 
 vi.mock('../../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
+vi.mock('../../hooks/useWebSocket', () => ({
+  useWebSocket: () => ({ subscribe: () => () => undefined, connected: false }),
+}));
 const navigate = vi.hoisted(() => vi.fn());
 vi.mock('react-router-dom', async (importOriginal) => ({
   ...await importOriginal<typeof import('react-router-dom')>(),
@@ -24,6 +27,7 @@ const projectFixture = (overrides: Partial<Project> = {}): Project => ({
   name: 'Demo project',
   description: 'The original description',
   status: 'active',
+  ownerPrincipalId: null,
   is_hidden: false,
   revision: 'rev-project-1',
   created_at: '2026-08-01T00:00:00Z',
@@ -39,8 +43,6 @@ const taskFixture: Task = {
   priority: 'normal',
   subtasks: [],
   links: [],
-  sessionRefs: [],
-  autoCreated: false,
   autoStart: false,
   blockedBy: [],
   tags: [],
@@ -137,6 +139,8 @@ describe('project mutations are revision-bound', () => {
     const tree = await renderModal(projectFixture());
 
     expect(statusBadge(tree)).toBeTruthy();
+    const actions = tree.root.findByProps({ className: 'project-detail-actions' });
+    expect(actions.findAll(node => node.type === 'button' && node.props['aria-controls'])).toHaveLength(1);
     expect(tree.root.findAll(node => node.type === 'select' && node.props['aria-label'] === 'Project status')).toHaveLength(0);
 
     act(() => tree.unmount());
@@ -267,6 +271,121 @@ describe('project Task rows use the canonical routed Task details page', () => {
     expect(navigate).toHaveBeenCalledWith(`/tasks/${taskFixture.id}`);
     expect(mutationCalls()).toHaveLength(0);
 
+    act(() => tree.unmount());
+  });
+});
+
+describe('the inbox phase setting (card b13e5ac9, Charter v5 §6.1)', () => {
+  const phases = [
+    { id: 'phase-1', name: 'Release lane', status: 'in-progress', position: 10, restrictedAccess: false },
+    { id: 'phase-inbox', name: 'Inbox - to be sorted', status: 'todo', position: 15, restrictedAccess: false },
+    { id: 'phase-secret', name: 'Blind test', status: 'todo', position: 20, restrictedAccess: true },
+  ];
+  const mockReadsWithPhases = () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/phases')) return jsonResponse({ success: true, phases });
+      if (u.includes('/tasks')) return jsonResponse({ success: true, tasks: [] });
+      if (u.includes('/sessions')) return jsonResponse({ success: true, sessions: [] });
+      if (u.includes('/resources')) return jsonResponse({ success: true, resources: [] });
+      return jsonResponse({ success: true });
+    });
+  };
+  const inboxSelect = (tree: ReactTestRenderer): ReactTestInstance =>
+    tree.root.find(node => node.type === 'select' && node.props.id === `project-inbox-phase-${projectId}`);
+  const optionValues = (select: ReactTestInstance): string[] =>
+    select.findAll(node => node.type === 'option').map(node => String(node.props.value));
+
+  test('offers "No inbox phase" and every Phase that can be the inbox - never a restricted one', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture());
+    const select = inboxSelect(tree);
+    expect(select.props.value).toBe('');
+    expect(optionValues(select)).toEqual(['', 'phase-1', 'phase-inbox']);
+    act(() => tree.unmount());
+  });
+
+  test('choosing a Phase PATCHes inboxPhaseId under If-Match and adopts the returned record', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(jsonResponse({
+      success: true, project: projectFixture({ inboxPhaseId: 'phase-inbox', revision: 'rev-project-2' }),
+    }));
+    await act(async () => {
+      inboxSelect(tree).props.onChange({ target: { value: 'phase-inbox' } });
+      await settle();
+    });
+    expect(mutationCalls()).toHaveLength(1);
+    const [url, options] = mutationCalls()[0];
+    expect(String(url)).toBe(`/api/projects/${projectId}`);
+    expect(options?.method).toBe('PATCH');
+    expect((options?.headers as Record<string, string>)['If-Match']).toBe('rev-project-1');
+    expect(JSON.parse(String(options?.body))).toEqual({ inboxPhaseId: 'phase-inbox' });
+    expect(inboxSelect(tree).props.value).toBe('phase-inbox');
+
+    // Clearing sends null under the rotated revision.
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(jsonResponse({
+      success: true, project: projectFixture({ inboxPhaseId: null, revision: 'rev-project-3' }),
+    }));
+    await act(async () => {
+      inboxSelect(tree).props.onChange({ target: { value: '' } });
+      await settle();
+    });
+    const [, second] = mutationCalls()[1];
+    expect((second?.headers as Record<string, string>)['If-Match']).toBe('rev-project-2');
+    expect(JSON.parse(String(second?.body))).toEqual({ inboxPhaseId: null });
+    act(() => tree.unmount());
+  });
+
+  test('a stale save surfaces the conflict notice', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(jsonResponse({ success: false, code: 'REVISION_MISMATCH' }, 412));
+    await act(async () => {
+      inboxSelect(tree).props.onChange({ target: { value: 'phase-inbox' } });
+      await settle();
+    });
+    expect(conflictNotices(tree)).toHaveLength(1);
+    act(() => tree.unmount());
+  });
+
+  test('a stored inbox phase that is no longer in force stays shown, marked suspended', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture({ inboxPhaseId: 'phase-secret' }));
+    const select = inboxSelect(tree);
+    expect(select.props.value).toBe('phase-secret');
+    const suspended = select.findAll(node => node.type === 'option' && node.props.value === 'phase-secret');
+    expect(suspended).toHaveLength(1);
+    expect(JSON.stringify(suspended[0].children)).toContain('(suspended)');
+    act(() => tree.unmount());
+  });
+
+  test('an archived Project shows the setting read-only', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture({ status: 'archived', inboxPhaseId: 'phase-inbox' }));
+    expect(inboxSelect(tree).props.disabled).toBe(true);
+    act(() => tree.unmount());
+  });
+
+  test('the Work tab quick create sends no status and no phase, so the server files it in the inbox', async () => {
+    mockReadsWithPhases();
+    const tree = await renderModal(projectFixture({ inboxPhaseId: 'phase-inbox' }));
+    const workTab = tree.root.findAll(node =>
+      node.type === 'button' && String(node.props.className || '').split(/\s+/).includes('tab'))[1];
+    await act(async () => { workTab.props.onClick(); await settle(); });
+    const openForm = tree.root.find(node => node.type === 'button' && String(node.props.className || '').includes('btn-create-task'));
+    await act(async () => { openForm.props.onClick(); await settle(); });
+    const title = tree.root.find(node => node.type === 'input' && node.props.className === 'create-task-input');
+    await act(async () => { title.props.onChange({ target: { value: 'Quick card' } }); await settle(); });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(jsonResponse({ success: true, task: { ...taskFixture, title: 'Quick card' } }, 201));
+    const save = tree.root.find(node => node.type === 'button' && String(node.props.className || '').includes('btn-save-link'));
+    await act(async () => { save.props.onClick(); await settle(); });
+    const posts = mutationCalls().filter(([url, options]) => String(url) === '/api/tasks' && options?.method === 'POST');
+    expect(posts).toHaveLength(1);
+    const body = JSON.parse(String(posts[0][1]?.body));
+    expect(body).toMatchObject({ title: 'Quick card', project: 'Demo project' });
+    expect('status' in body).toBe(false);
+    expect('phaseId' in body).toBe(false);
     act(() => tree.unmount());
   });
 });

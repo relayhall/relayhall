@@ -392,3 +392,11 @@
     padding: var(--space-4);
   }
 }
+
+/* `?skill=<id>` named a Skill this session's registry does not hold (card
+   b1e3b16d): said in words, never an empty modal. */
+.skills-page-link-missing {
+  margin: var(--space-3) 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}

@@ -178,8 +178,10 @@ export class AccountPasswordService {
   }
 
   /** Whether an Account currently holds a live password credential. */
-  async has(principalId: string): Promise<boolean> {
-    const result = await pool.query(
+  /** `queryable` (card 72b8fb97): a step-up consumer's held client, so the
+   * SU-14 challenge never waits on a second pool connection. */
+  async has(principalId: string, queryable: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> } = pool): Promise<boolean> {
+    const result = await queryable.query(
       `SELECT 1 FROM principal_credentials
         WHERE principal_id = $1 AND credential_type = 'password' AND revoked_at IS NULL
           AND (expires_at IS NULL OR expires_at > now())

@@ -1,3 +1,5 @@
+jest.mock('../services/ProjectAwarenessService', () => ({ projectAwarenessService: { compile: jest.fn() } }));
+import { projectAwarenessService } from '../services/ProjectAwarenessService';
 /**
  * generate-brief cross-object authorization (task 47ef04a2).
  *
@@ -498,5 +500,21 @@ describe('untrusted resource values stay quoted data in the compiled brief (revi
     const parsed = JSON.parse(fenced![1]);
     expect(parsed.resources[0].name).toBe(HOSTILE_NAME);
     expect(parsed.schemaVersion).toBe(1);
+  });
+});
+
+describe('standalone project awareness route contract', () => {
+  it('routes an empty body to the shared awareness service', async () => {
+    const envelope = { brief: 'Canonical awareness', tokenEstimate: 5, scope: 'project-awareness-v1' };
+    (projectAwarenessService.compile as jest.Mock).mockResolvedValue(envelope);
+    const result = await generateBrief(PROJECT_A, {});
+    expect(result.status).toBe(200);
+    expect(result.json).toEqual({ success: true, ...envelope });
+    expect(projectAwarenessService.compile).toHaveBeenCalledWith(expect.anything(), PROJECT_A);
+  });
+  it.each([[], { unknown: true }, { taskId: null }])('rejects unsupported body %j without compiling awareness', async body => {
+    const result = await generateBrief(PROJECT_A, body);
+    expect(result.status).toBe(400);
+    expect(projectAwarenessService.compile).not.toHaveBeenCalled();
   });
 });

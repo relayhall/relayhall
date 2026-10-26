@@ -2470,3 +2470,8 @@ button.project-detail-description-empty {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* Align the shared context toolbar with the project detail content. */
+.project-detail-modal > .element-context-panel {
+  padding: var(--space-3) var(--space-6) 0;
+}

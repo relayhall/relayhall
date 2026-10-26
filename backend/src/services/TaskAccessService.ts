@@ -20,6 +20,7 @@
 // column (unlike `phases`), so the concurrency control here is the row lock
 // plus the unchanged-value refusal, which is what makes a double submit a 409
 // rather than a second ledger row.
+import type { PoolClient } from 'pg';
 import { pool } from '../db/connection';
 import { feedEventService } from './FeedEventService';
 import { ConflictFault, InvalidRequestFault, NotFoundFault } from '../utils/httpErrors';
@@ -54,8 +55,12 @@ export class TaskAccessService {
    * separate, ordinary field: this method never touches it, and setting
    * `restricted_access` suppresses only the arm the Task INHERITS from its
    * Phase and Project.
+   *
+   * `outer` (T2 S5, card 9ce0b0b0): the open transaction of a change-request
+   * decision applying an approved task.access; its owner commits or rolls
+   * back. Absent, this method opens and commits its own.
    */
-  async setRestrictedAccess(id: string, input: SetTaskAccessInput): Promise<TaskAccessPolicy> {
+  async setRestrictedAccess(id: string, input: SetTaskAccessInput, outer?: PoolClient): Promise<TaskAccessPolicy> {
     if (!UUID_PATTERN.test(String(id))) {
       throw new NotFoundFault('Task not found', 'TASK_NOT_FOUND');
     }
@@ -78,9 +83,9 @@ export class TaskAccessService {
     const reason = input.reason.trim();
     const actorPrincipalId = input.actorPrincipalId;
 
-    const client = await pool.connect();
+    const client = outer ?? await pool.connect();
     try {
-      await client.query('BEGIN');
+      if (!outer) await client.query('BEGIN');
       const found = await client.query(
         'SELECT id, project_id, status, restricted_access FROM tasks WHERE id = $1 FOR UPDATE', [id],
       );
@@ -112,24 +117,29 @@ export class TaskAccessService {
       );
       // RH-P3.C1: flipping restricted access IS the ACL change the contract
       // names, and it is announced CONTENT-FREE — the reason lives in the
-      // ledger, which is read behind the admin route, never in the feed.
+      // trigger ledger (task_access_events, migration 117), never in the feed.
+      // No route reads that ledger today; a change request's apply of
+      // task.access writes its own audit row beside it (change-request design
+      // section 3, slice T2 S5).
       await feedEventService.emit(client, {
         name: 'task.acl_changed',
         objectType: 'task',
         objectId: id,
+        // Card 5854f0d6: the principal that changed access (resolved above).
+        actorPrincipalId,
         projectId: (found.rows[0].project_id as string | null) ?? null,
         payload: {},
       });
-      await client.query('COMMIT');
+      if (!outer) await client.query('COMMIT');
       return {
         taskId: String(result.rows[0].id),
         restrictedAccess: Boolean(result.rows[0].restricted_access),
       };
     } catch (e) {
-      await client.query('ROLLBACK').catch(() => undefined);
+      if (!outer) await client.query('ROLLBACK').catch(() => undefined);
       throw e;
     } finally {
-      client.release();
+      if (!outer) client.release();
     }
   }
 }

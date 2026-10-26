@@ -58,16 +58,28 @@ import { authenticatedFetch } from '../../utils/auth';
 import { TaskCreatePage } from '../../pages/TaskCreatePage';
 import { formatInstantForDateTimeLocal } from '../../utils/dateFormat';
 import { DueAtInput, browserTimeZone } from './taskFieldEditors';
+import TaskAccessVehicle from './TaskAccessVehicle';
 
 vi.mock('../../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
 vi.mock('./ExecutionProfileEditor', () => ({
   __esModule: true,
   default: () => <button type="button">Pick connector</button>,
 }));
-vi.mock('./PhaseSelect', () => ({
-  PhaseSelect: ({ value }: any) => <select aria-label="Phase" value={value} onChange={() => {}}><option value="">No phase</option></select>,
-  PhaseName: ({ phaseId }: any) => <span>{phaseId}</span>,
-}));
+vi.mock('./PhaseSelect', async () => {
+  // The in-force rule is the PRODUCTION function; only the network-backed
+  // pieces are replaced, as in TaskCreatePage.test.tsx. The create page asks
+  // for its Project's Phases (card b13e5ac9) and none is offered, so no inbox
+  // phase is in force and nothing is preselected: no phase and To-Do, the
+  // form these cases measure the deadline on.
+  const actual = await vi.importActual<typeof import('./PhaseSelect')>('./PhaseSelect');
+  const noPhases: ReturnType<typeof actual.usePhaseOptions> = [];
+  return {
+    inboxPhaseInForce: actual.inboxPhaseInForce,
+    usePhaseOptions: () => noPhases,
+    PhaseSelect: ({ value }: any) => <select aria-label="Phase" value={value} onChange={() => {}}><option value="">No phase</option></select>,
+    PhaseName: ({ phaseId }: any) => <span>{phaseId}</span>,
+  };
+});
 
 const ZONE = 'Europe/Warsaw';
 
@@ -475,5 +487,29 @@ describe('the form, on a day the clocks change', () => {
     expect(asWallClock((container.querySelector('input') as HTMLInputElement).value)).toBe(GAP_WALL_CLOCK);
     rerender(<DueAtInput value={SECOND_0230} onChange={onChange} />);
     expect(asWallClock((container.querySelector('input') as HTMLInputElement).value)).toBe(AMBIGUOUS_WALL_CLOCK);
+  });
+});
+
+// Card 785e1eed P2-B (AZ-A10 clause 6). The assignment access view says when a
+// grant row ends. It shows the reader's own clock and puts the instant in UTC
+// in the title, so the two 02:30s of the autumn fold can be told apart here
+// too: two rows that end an hour apart read alike locally and differ in UTC.
+describe('the assignment access view: a row expiry across the autumn fold', () => {
+  test('two rows ending at the two 02:30s read alike locally and differ in UTC', async () => {
+    const link = (id: string, at: string) => ({
+      id, carriedBy: 'grant', warrantName: null, targetKind: 'grant', createdByAssignment: true,
+      landedOnHandle: 'runner-account', resourceType: 'task', resourceId: `${id}aaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
+      verb: 'read', profileName: null, roleGrantExpiresAt: at, expiresAt: at, expired: false,
+    });
+    (authenticatedFetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({
+      ok: true,
+      json: async () => ({
+        assignment: { executionServiceId: 's1', executionServiceName: 'Runner', carriedBy: 'grant', warrantName: null, warrantStatus: null },
+        links: [link('l1', FIRST_0230), link('l2', SECOND_0230)],
+      }),
+    } as Response));
+    render(<TaskAccessVehicle taskId="t1" />);
+    const rows = await screen.findAllByText('expires 25/10/2026, 02:30');
+    expect(rows.map((row) => row.getAttribute('title'))).toEqual(['25/10/2026, 00:30 UTC', '25/10/2026, 01:30 UTC']);
   });
 });

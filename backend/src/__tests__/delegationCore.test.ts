@@ -162,6 +162,33 @@ describe('the SQL chain intersection (§5.1, AZ-26, T36)', () => {
     expect(beforeIntersection).not.toContain("IN ('public'");
   });
 
+  // Owner ruling E462 S4b (design section 6.8, C10 = B): the ONE bounded
+  // exception to AZ-26. A Task role still never inherits down a chain; only
+  // the `verifier-agent` arm admits an acting Agent through its parent, and
+  // only for read and verify, only on a shape that carries the guard column.
+  // The data conditions (wrong parent, wrong role, another Task, a dead
+  // Warrant, a person Verifier) are negative controls in verificationModesLive.
+  it('AZ-26 bounded exception: the verifier-agent arm is the acting Agent\'s, for read and verify only', () => {
+    const guarded = { ...resource, verifier: 't.verifier_principal_id', verificationNone: 't.verification_none' };
+    const agentLinks = [
+      link({ principalId: AGENT, kind: 'agent', parentPrincipalId: CONNECTOR, boundTaskId: TASK }),
+      link({ principalId: CONNECTOR, parentPrincipalId: ACCOUNT }),
+      link({ principalId: ACCOUNT, ownExpression: null }),
+    ];
+    const bases = (links: DelegationActorLink[], action: 'read' | 'verify' | 'write' | 'claim', shape: typeof resource) =>
+      (authorizationService.sqlCondition(actorFor(links, ['tasks:write']), action, shape, 1, { includeSources: true }).sources ?? [])
+        .map((source: { basis: string }) => source.basis);
+    expect(bases(agentLinks, 'verify', guarded)).toContain('verifier-agent');
+    expect(bases(agentLinks, 'read', guarded)).toContain('verifier-agent');
+    expect(bases(agentLinks, 'write', guarded)).not.toContain('verifier-agent');
+    expect(bases(agentLinks, 'claim', guarded)).not.toContain('verifier-agent');
+    // A Connector acting for itself never takes it: the arm is an Agent's.
+    expect(bases(agentLinks.slice(1), 'verify', guarded)).not.toContain('verifier-agent');
+    // A shape without the guard column takes neither the arm nor the exact Verifier's verify.
+    expect(bases(agentLinks, 'verify', { ...resource, verifier: 't.verifier_principal_id' } as typeof resource)).not.toContain('verifier-agent');
+    expect(bases(agentLinks, 'verify', { ...resource, verifier: 't.verifier_principal_id' } as typeof resource)).not.toContain('verifier');
+  });
+
   it('a delegated link without own_expression contributes FALSE (fail closed)', () => {
     const links = [
       link({ principalId: CONNECTOR, parentPrincipalId: ACCOUNT, ownExpression: null }),
@@ -251,6 +278,11 @@ describe('transport classes (§7.5, T26 registration lint)', () => {
     for (const mount of PROTECTED_ROUTE_MOUNTS) {
       if (mount === '/openapi.json') {
         expect(routeTransportClassFor(mount)).toBe('any');
+        continue;
+      }
+      if (mount === '/metrics') {
+        expect(routeTransportClassFor(mount)).toBe('any');
+        expect(routeTransportClassFor(`${mount}/anything`)).toBeUndefined();
         continue;
       }
       expect(routeTransportClassFor(`${mount}/anything`)).toBeDefined();

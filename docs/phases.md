@@ -19,7 +19,9 @@ table.
 | Phase | `goal` | The current focus, tight enough to steer a harness. |
 
 A task has **no goal of its own**: it inherits its phase's. Both goals are rendered into compiled
-briefs, as quoted data.
+briefs, as quoted data. A task's brief shows its phase (name, goal and description) only to a
+caller who may read that phase; any other caller's brief keeps the phase id and says only that the
+task sits in a restricted phase.
 
 ## Lifecycle
 
@@ -85,6 +87,13 @@ convention: a write that would pair a task with a phase from another project is 
 `409 PHASE_PROJECT_MISMATCH`. It is never silently repaired — moving a task between projects means
 clearing or re-setting its phase in the same request.
 
+The dashboard's Tasks board applies the same rule to its filters: the Phase filter lists only the
+phases of the selected projects (every phase, grouped by project, when no project is selected), and
+a selected phase outside the selected projects is cleared, with a notice, rather than left to empty
+the board. As in every list filter on the board, the selected phases lead the list under
+"Selected", and the filter's own clear control (the x beside its button, or Clear in its dropdown)
+empties the Phase filter alone.
+
 ## CLI
 
 ```bash
@@ -98,11 +107,20 @@ relayhall phase brief <phase-uuid>
 relayhall phase archive <phase-uuid>
 relayhall phase unarchive <phase-uuid>
 relayhall phase delete <phase-uuid>
+relayhall phase set-default-verifier <phase-uuid> none
 ```
 
 `relayhall phases` is the bare-plural alias for `relayhall phase list`. Update, archive and
 unarchive read the current revision automatically; pass `--revision` to enforce a strict
 optimistic-concurrency check instead.
+
+A Phase may name a **default Verifier** that new tasks landing in it inherit, ahead of the
+project's default.
+`relayhall phase set-default-verifier <phase-uuid> <principal>` sets it (a
+principal id or handle) and `none` or `--clear` removes it, so the Phase
+inherits the project's default again. It is a login-session act of root, an
+administrator or the person who owns the project; existing tasks never change.
+The rule is in [Authorization](authorization.md#default-verifier).
 
 Task membership:
 

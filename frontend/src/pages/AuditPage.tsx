@@ -82,6 +82,28 @@ const NO_FILTERS: Filters = {
   since: '', until: '', resourceType: '', resourceId: '',
 };
 
+/**
+ * The filters a LINK into this page may pre-set (card 549cc51f: the Access
+ * manager's shared-area writer panel links to its own audit trail). Only the
+ * three text filters are read, each bounded; the request the page then makes
+ * is validated exactly as a typed filter is (`buildQuery`), and the board
+ * decides what the session may read. Nothing else in the URL is honoured.
+ */
+export function filtersFromSearch(search: string): Filters {
+  let params: URLSearchParams;
+  try { params = new URLSearchParams(search); } catch { return NO_FILTERS; }
+  const read = (key: 'actionPrefix' | 'resourceType' | 'resourceId'): string => {
+    const value = params.get(key);
+    return typeof value === 'string' && value.length <= 128 ? value : '';
+  };
+  return { ...NO_FILTERS, actionPrefix: read('actionPrefix'), resourceType: read('resourceType'), resourceId: read('resourceId') };
+}
+
+/** The page URL's own query, where there is a window to read it from. */
+function initialFilters(): Filters {
+  return typeof window === 'undefined' ? NO_FILTERS : filtersFromSearch(window.location.search);
+}
+
 /** The wall-clock grammar an `<input type="datetime-local">` produces. */
 const LOCAL_WALL_CLOCK = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
 
@@ -314,8 +336,8 @@ function buildQuery(filters: Filters, cursor: string | null): string | { error: 
 export const AuditPage: React.FC = () => {
   const { byId: principalsById, principals } = usePrincipals();
 
-  const [draft, setDraft] = useState<Filters>(NO_FILTERS);
-  const [applied, setApplied] = useState<Filters>(NO_FILTERS);
+  const [draft, setDraft] = useState<Filters>(initialFilters);
+  const [applied, setApplied] = useState<Filters>(initialFilters);
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);

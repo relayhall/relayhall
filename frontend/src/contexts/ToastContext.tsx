@@ -43,3 +43,12 @@ export function useToast() {
   }
   return context;
 }
+
+/**
+ * The app shell's toasts where a ToastProvider is mounted, and null where a
+ * page renders without the shell (a test or an embedded preview), so an
+ * announcement is an addition to a page and never a requirement of it.
+ */
+export function useOptionalToast(): ToastContextValue | null {
+  return useContext(ToastContext);
+}

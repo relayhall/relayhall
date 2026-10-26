@@ -131,16 +131,24 @@ describe('direction 1 — an mcp-pinned credential SUCCEEDS through the MCP hand
     expect(result.status).toBe(403);
   });
 
-  it('SETGOV `D-5`: the two SELF endpoints are reachable at `authenticated`, and only those two', async () => {
-    // The declared reachability widening, pinned so it is a decision rather
-    // than a surprise: a bearer caller holding neither `principals:read` nor
-    // `root` now reaches its OWN principal and its OWN effective access — both
-    // disclose the caller to itself and nothing else — while `POST
-    // /principals/me/brief` keeps `principals:read` because it discloses Task,
-    // Personality and Report content.
+  it('SETGOV `D-5` and card 1118fefa: the SELF endpoints are reachable at `authenticated`; the directory is not', async () => {
+    // The declared reachability widenings, pinned so they are decisions rather
+    // than surprises: a bearer caller holding neither `principals:read` nor
+    // `root` reaches its OWN principal and its OWN effective access (D-5) and,
+    // since card 1118fefa, its OWN session brief - the bootstrap - whose
+    // enclosed Task, Personality, Report and skill content is admitted by
+    // scope inside the compiler (c4SessionBrief). Reading OTHER principals
+    // stays behind `principals:read`.
     authenticateAs('mcp', ['tasks:read']);
     expect((await dispatchInProcess({ method: 'GET', path: '/principals/me', authorization: BEARER })).status).not.toBe(403);
-    expect((await dispatchInProcess({ method: 'POST', path: '/principals/me/brief', authorization: BEARER })).status).toBe(403);
+    // The brief passes the ceiling and reaches its HANDLER: with no credential
+    // row behind the stub, the handler answers its own 404 - which only a
+    // request the ceiling admitted can produce.
+    jest.spyOn(principalService, 'getCredentialWithPrincipal').mockResolvedValue(undefined);
+    const brief = await dispatchInProcess({ method: 'POST', path: '/principals/me/brief', body: {}, authorization: BEARER });
+    expect(brief.status).toBe(404);
+    expect(brief.body).toMatchObject({ message: 'No credential resolved for this identity' });
+    expect((await dispatchInProcess({ method: 'GET', path: '/principals', authorization: BEARER })).status).toBe(403);
   });
 
   it('refuses anything that is not an rh_ principal credential', async () => {

@@ -1,10 +1,25 @@
 import type { CreationTransaction } from '../db/creationTransaction';
 import crypto from 'crypto';
+import { nativeExecutionService } from './NativeExecutionService';
+import { RequestFaultError } from '../utils/httpErrors';
 import { Pool, PoolClient } from 'pg';
 import { pool as defaultPool } from '../db/connection';
 import { feedEventService } from './FeedEventService';
 import { accessVehicleService } from './AccessVehicleService';
+import { authorizationRepository } from './AuthorizationRepository';
+import { taskAuthoritySnapshot } from './TaskAuthoritySnapshot';
+import { explicitTaskActionCaps } from './ExplicitTaskActionCaps';
+import { delegationService } from './DelegationService';
+import { sessionIdleMs } from './LoginSessionService';
+import { scopesSatisfy } from '../utils/scopeMap';
 import type { AuthorizationActor } from './AuthorizationService';
+import { taskReportRequestHash } from '../utils/taskReportRequestHash';
+import { lifecyclePolicyService } from './LifecyclePolicyService';
+import { auditService, type AuditActor } from './AuditService';
+import { taskHistoryService } from './TaskHistoryService';
+import { runTaskTerminalEffects } from './TaskTerminalEffects';
+import { syncDependentsReadiness, syncTaskReadiness } from '../utils/taskReadiness';
+import { assertVerificationNoneFinishable, VERIFICATION_NONE_REASON, VerificationModeError } from './VerificationModes';
 
 /**
  * The LINKER's authorization identity for the AZ-S7 R3/R8 cap (review
@@ -45,6 +60,8 @@ export const TASK_ELEMENT_INPUT_SCHEMA = Object.freeze({
   },
   finish: {
     targetStatus: 'review',
+    // Section 6.8 (E462 S4b): a `none` Task's finish completes it directly.
+    targetStatusWhenVerificationNone: 'completed',
     atomic: ['handover-entry', 'report-link', 'status-transition'],
     requiresReport: true,
   },
@@ -79,6 +96,17 @@ export function compileTaskOperatingContract(): string {
   ].join('\n');
 }
 
+/**
+ * Which Report a Task write may link, as SQL over `reports` with the
+ * parameters ($1 Task, $2 Report, $3 root, $4 owner claim). One text serves
+ * the `linkReport` UPDATE and the finish dry run's read of the same question
+ * (card 19dd180c), so the preview cannot answer a different predicate.
+ */
+const LINKABLE_REPORT_PREDICATE = `id = $2 AND deleted_at IS NULL AND status = 'active'
+          AND ($3::boolean OR author_principal_id = $4::uuid OR $1::uuid = ANY(task_ids))`;
+const REPORT_NOT_LINKABLE_MESSAGE = 'reportId must name an active Report';
+const REPORT_LINK_MISSING_MESSAGE = 'Atomic finish did not produce a Report';
+
 export class TaskElementError extends Error {
   constructor(
     public readonly status: number,
@@ -93,8 +121,10 @@ export class TaskElementError extends Error {
 
 export interface TaskElementActor {
   principalId: string;
+  credentialId?: string | null;
   handle: string;
   root?: boolean;
+  sessionId?: string;
   /**
    * RH-P3.AZ-S7 (review bedc25f3 B2): the LINKER's authorization identity.
    * A link edit on an assigned Task recomputes its access, and R3/R8 cap
@@ -116,10 +146,19 @@ export interface AppendTaskEntryInput {
 }
 
 export interface FinishTaskInput {
+  nativeGeneration?: {schemaVersion:2;generationId:string;executionId:string;publicationKey:string;requestSha256:string};
   handover?: string;
   reportId?: string;
   report?: { title: string; content: string; summary?: string };
   dryRun?: boolean;
+}
+
+export interface SaveTaskReportInput {
+  reportId?: string;
+  title: string;
+  content: string;
+  summary?: string;
+  expectedContentHash?: string;
 }
 
 export interface CreateTaskReferenceInput {
@@ -141,6 +180,11 @@ interface TaskContext {
   claimant_principal_id: string | null;
   shepherd_principal_id: string;
   verifier_principal_id: string | null;
+  /** Section 6.8 (E462 S4b, migration 170). */
+  verification_none?: boolean;
+  verification_none_set_by?: string | null;
+  verification_none_basis?: string | null;
+  updated_at?: string | null;
 }
 
 function sha256(value: string): string {
@@ -173,6 +217,21 @@ export function maskUnambiguousSecrets(content: string): { content: string; mask
   return { content, masked };
 }
 
+/**
+ * Card e5240c73: how long GET /tasks/:id (and MCP relayhall_task_get, which
+ * composes it) waits for the Task row lock its reportMaintenanceAccess
+ * projection takes. A transaction that holds the Task longer refuses the
+ * read with 409 TASK_READ_BUSY instead of queueing a dashboard behind it.
+ */
+export const TASK_READ_LOCK_TIMEOUT_MS = 2000;
+export const TASK_READ_BUSY_MESSAGE =
+  `Another operation held this Task for more than ${TASK_READ_LOCK_TIMEOUT_MS} ms, so it was not read; retry the read`;
+
+/** lock_not_available: here only the statement-level lock_timeout raises it. */
+function lockTimedOut(error: unknown): boolean {
+  return !!error && typeof error === 'object' && (error as { code?: unknown }).code === '55P03';
+}
+
 export class TaskElementService {
   constructor(private readonly pool: Pool = defaultPool) {}
 
@@ -180,7 +239,9 @@ export class TaskElementService {
     const result = await client.query(
       `SELECT t.id, t.title, t.status, t.visibility, t.project_id,
               COALESCE(p.task_stream_masking_enabled, TRUE) AS masking_enabled,
-              a.claimant_principal_id, a.shepherd_principal_id, a.verifier_principal_id
+              a.claimant_principal_id, a.shepherd_principal_id, a.verifier_principal_id,
+              t.verification_none, t.verification_none_set_by::text AS verification_none_set_by,
+              t.verification_none_basis, t.updated_at
          FROM tasks t
          JOIN task_assignments a ON a.task_id = t.id
          LEFT JOIN projects p ON p.id = t.project_id
@@ -251,11 +312,14 @@ export class TaskElementService {
       ],
     );
     // RH-P3.C1 (round 2, F2): every Report the finish/stream surface creates
-    // announces itself in the creating transaction.
+    // announces itself in the creating transaction. Card 5854f0d6 (design
+    // section 4.3): the acting principal is recorded, so the Timeline's person
+    // filter finds it.
     await feedEventService.emit(client, {
       name: 'report.created',
       objectType: 'report',
       objectId: result.rows[0].id,
+      ...this.feedActor(actor),
       projectId: task.project_id ?? null,
       ownerPrincipalId: await feedEventService.resolveOwnerPrincipalUuid(client, actor.principalId),
       payload: {},
@@ -276,6 +340,41 @@ export class TaskElementService {
    */
   private ownerClaim(actor: TaskElementActor): string | null {
     return actor.principalId && UUID.test(actor.principalId) ? actor.principalId : null;
+  }
+
+  /**
+   * The acting principal and handle a feed row records (card 5854f0d6, design
+   * section 4.3: the Timeline's person filter matches `actor_principal_id`).
+   * The owner-claim rule applies: a value that is not a UUID records NULL.
+   */
+  private feedActor(actor: TaskElementActor): { actorPrincipalId: string | null; actorHandle: string | null } {
+    return { actorPrincipalId: this.ownerClaim(actor), actorHandle: actor.handle ?? null };
+  }
+
+  /**
+   * Whether a stream entry may announce itself in the feed (card 5854f0d6,
+   * design section 4.2): only an `authored` entry that is not `assigned-only`
+   * and does not reference, through its chain, an `assigned-only` entry - the
+   * rule `listStream` hides entries by, so a feed row never reveals an entry a
+   * reader of the Task cannot list.
+   */
+  private async streamEntryAnnounceable(client: PoolClient, entry: any): Promise<boolean> {
+    if (!entry || entry.provenance !== 'authored' || entry.outpost_visibility_tier === 'assigned-only') return false;
+    if (!entry.referenced_entry_id) return true;
+    const restricted = await client.query(
+      `WITH RECURSIVE reference_chain(current_id, tier, path) AS (
+         SELECT e.referenced_entry_id, NULL::text, ARRAY[e.id]
+           FROM task_stream_entries e WHERE e.id = $1
+         UNION ALL
+         SELECT parent.referenced_entry_id, parent.outpost_visibility_tier, chain.path || parent.id
+           FROM reference_chain chain
+           JOIN task_stream_entries parent ON parent.id = chain.current_id
+          WHERE NOT parent.id = ANY(chain.path)
+       )
+       SELECT 1 FROM reference_chain WHERE tier = 'assigned-only' LIMIT 1`,
+      [entry.id],
+    );
+    return restricted.rows.length === 0;
   }
 
   private async linkReport(client: PoolClient, task: TaskContext, reportId: string, actor: TaskElementActor): Promise<void> {
@@ -319,16 +418,16 @@ export class TaskElementService {
       `UPDATE reports
           SET task_ids = CASE WHEN $1::uuid = ANY(task_ids) THEN task_ids ELSE array_append(task_ids, $1::uuid) END,
               updated_at = NOW()
-        WHERE id = $2 AND deleted_at IS NULL AND status = 'active'
-          AND ($3::boolean OR author_principal_id = $4::uuid OR $1::uuid = ANY(task_ids))
+        WHERE ${LINKABLE_REPORT_PREDICATE}
         RETURNING id, project_id, author_principal_id`,
       [task.id, reportId, actor.root === true, this.ownerClaim(actor)],
     );
-    if (report.rows.length === 0) throw new TaskElementError(400, 'REPORT_NOT_LINKABLE', 'reportId must name an active Report', 'reportId');
+    if (report.rows.length === 0) throw new TaskElementError(400, 'REPORT_NOT_LINKABLE', REPORT_NOT_LINKABLE_MESSAGE, 'reportId');
     await feedEventService.emit(client, {
       name: 'report.updated',
       objectType: 'report',
       objectId: reportId,
+      ...this.feedActor(actor),
       projectId: report.rows[0].project_id ?? null,
       // Review `99ba9444` B1: the owner is the canonical author column, not
       // the untagged provenance string. Absent, it is NULL - never a guess.
@@ -476,6 +575,7 @@ export class TaskElementService {
           name: 'report.updated',
           objectType: 'report',
           objectId: reportId,
+          ...this.feedActor(actor),
           projectId: linked.rows[0].project_id ?? null,
           // Review `99ba9444` B1: the canonical author column, or NULL.
           ownerPrincipalId: linked.rows[0].author_principal_id ?? null,
@@ -504,6 +604,21 @@ export class TaskElementService {
       await client.query('BEGIN');
       const task = await this.taskContext(client, taskId);
       const result = await this.appendWithClient(client, task, input, actor);
+      // Card 5854f0d6 (design section 4.2, choice C6): the PUBLIC append
+      // announces an authored, non-restricted entry as ONE task.updated naming
+      // the entry TYPE, never its content. System entries (claim, recovery,
+      // wake receipts, the safety mirror) are not written through here.
+      if (await this.streamEntryAnnounceable(client, result.entry)) {
+        await feedEventService.emit(client, {
+          name: 'task.updated',
+          objectType: 'task',
+          objectId: task.id,
+          ...this.feedActor(actor),
+          projectId: task.project_id ?? null,
+          ownerPrincipalId: task.claimant_principal_id ?? null,
+          payload: { stream: { entryType: String(result.entry.event_type) } },
+        });
+      }
       await client.query('COMMIT');
       return { valid: true, ...result };
     } catch (error) {
@@ -527,12 +642,182 @@ export class TaskElementService {
     if ((input.reportId || input.report) && handover.length > TASK_STREAM_ENTRY_LIMIT) {
       throw new TaskElementError(400, 'HANDOVER_TOO_LARGE', `handover must be at most ${TASK_STREAM_ENTRY_LIMIT} characters when a Report is supplied`, 'handover');
     }
-    if (input.dryRun) return { valid: true, dryRun: true, targetStatus: 'review' };
-
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const task = await this.taskContext(client, taskId);
+      await this.assertFinishable(client, task, input, actor, taskId);
+      // Card 19dd180c: a dry run is the SAME finish up to its first write. It
+      // used to answer valid straight after the input-shape checks above, so
+      // an assigned Verifier, a principal with no Task role, a Task that was
+      // not In Progress and a Task with open Subtasks were all told "valid"
+      // by the preview while the identical real call was refused. It now
+      // reads the same locked Task, runs every refusal above, then asks the
+      // write path's own remaining refusals as reads, and rolls back.
+      if (input.dryRun) {
+        await this.previewFinishWrites(client, task, input, actor, handover, taskId);
+        await client.query('ROLLBACK');
+        return { valid: true, dryRun: true, targetStatus: task.verification_none === true ? 'completed' : 'review' };
+      }
+
+      let reportId = input.reportId;
+      if (input.report) {
+        const content = this.maskingEnabled(task) ? maskUnambiguousSecrets(input.report.content).content : input.report.content;
+        reportId = await this.createReport(client, task, actor, input.report.title.trim(), content, input.report.summary, false, null);
+      }
+
+      const appended = await this.appendWithClient(
+        client,
+        task,
+        {
+          content: handover || (reportId ? `Report filed: ${reportId}` : input.handover || ''),
+          eventType: 'handover.finish',
+          provenance: 'authored',
+          reportId,
+        },
+        actor,
+      );
+      reportId = reportId || appended.reportId;
+      if (!reportId) throw new TaskElementError(500, 'REPORT_LINK_MISSING', REPORT_LINK_MISSING_MESSAGE);
+      try {
+        await nativeExecutionService.finishGenerationWithClient(client,taskId,reportId,input.nativeGeneration,actor);
+      } catch(error) {
+        if(error instanceof RequestFaultError) throw new TaskElementError(error.status,error.code,error.message);
+        throw error;
+      }
+      await this.linkReport(client, task, reportId, actor);
+      if (task.verification_none === true) {
+        const completed = await this.completeWithoutVerification(client, task, actor, reportId, appended.entry);
+        if (input.nativeGeneration) await this.assertNativeGenerationFinal(client, task.id, input.nativeGeneration.generationId);
+        await client.query('COMMIT');
+        return { success: true, taskId: task.id, status: 'completed', reportId, entry: appended.entry,
+          verification: 'none', subtasksCompleted: completed.subtasksCompleted };
+      }
+      const reviewed = await client.query(
+        `UPDATE tasks SET status = 'review', updated_at = NOW() WHERE id = $1
+         RETURNING project_id, owner_principal_id`,
+        [task.id],
+      );
+      // Card 5854f0d6 (design sections 4.2 and 4.3): the finish's handover
+      // rides THIS status move as `stream` (never a second row), with the field
+      // name and the acting principal.
+      const handoverAnnounced = await this.streamEntryAnnounceable(client, appended.entry);
+      await feedEventService.emit(client, {
+        name: 'task.updated',
+        objectType: 'task',
+        objectId: task.id,
+        ...this.feedActor(actor),
+        projectId: reviewed.rows[0]?.project_id ?? null,
+        ownerPrincipalId: reviewed.rows[0]?.owner_principal_id ?? null,
+        payload: {
+          status: 'review',
+          previousStatus: 'in-progress',
+          fields: ['status'],
+          ...(handoverAnnounced ? { stream: { entryType: String(appended.entry.event_type) } } : {}),
+        },
+      });
+      await client.query(
+        `INSERT INTO task_stream_entries (task_id, provenance, event_type, content, report_id, metadata)
+         VALUES ($1,'system','task.transitioned','in-progress -> review',$2,$3)`,
+        [task.id, reportId, { from: 'in-progress', to: 'review', authoredEntryId: appended.entry.id }],
+      );
+      if (input.nativeGeneration) await this.assertNativeGenerationFinal(client, task.id, input.nativeGeneration.generationId);
+      await client.query('COMMIT');
+      return { success: true, taskId: task.id, status: 'review', reportId, entry: appended.entry };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async assertNativeGenerationFinal(client: PoolClient, taskId: string, generationId: string): Promise<void> {
+    const finalAuthority=await client.query(`SELECT 1 FROM task_native_generations g JOIN task_native_executions e ON e.id=g.execution_id
+      WHERE g.id=$1 AND g.task_id=$2 AND g.state='finished' AND clock_timestamp()<g.expires_at AND clock_timestamp()<e.hard_deadline`,[generationId,taskId]);
+    if(finalAuthority.rowCount!==1) throw new TaskElementError(409,'NATIVE_GENERATION_EXPIRED','Original generation authority expired before joint commit');
+  }
+
+  /**
+   * Section 6.8 (E462 S4b, check VM-B4/VM-B5): a `none` Task's finish
+   * completes it in the finish's own transaction. Subtasks in Review are
+   * completed with the reason `verification: none`; the Task moves straight
+   * to `completed` with the same terminal effects a status move to
+   * `completed` has (`runTaskTerminalEffects`, `announceStatusMove`: the
+   * dependents get `task.ready` and the `implement` ring), the lifecycle
+   * policy is asked, and the completion is recorded with its reason in the
+   * stream, the audit log and the history.
+   */
+  private async completeWithoutVerification(client: PoolClient, task: TaskContext, actor: TaskElementActor,
+    reportId: string, entry: any): Promise<{ subtasksCompleted: string[] }> {
+    await lifecyclePolicyService.evaluate(client, {
+      action: 'task.transition',
+      subject: { kind: 'task', id: task.id, revision: task.updated_at ?? null },
+      current: { status: 'in-progress', archived: false },
+      proposed: { status: 'completed', archived: false },
+    });
+    const subtasks = await client.query(
+      `UPDATE subtasks SET status = 'completed', completed_at = COALESCE(completed_at, NOW())
+        WHERE task_id = $1 AND status = 'review' RETURNING id`, [task.id]);
+    const subtasksCompleted = subtasks.rows.map((row: any) => String(row.id));
+    const completed = await client.query(
+      `UPDATE tasks SET status = 'completed', completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+        WHERE id = $1 AND verification_none AND verifier_principal_id IS NULL
+        RETURNING project_id, owner_principal_id, title`,
+      [task.id],
+    );
+    if (completed.rows.length !== 1) {
+      throw new TaskElementError(409, 'VERIFICATION_NONE_CHANGED', 'The verification mode of this Task changed during finish');
+    }
+    const auditActor: AuditActor = { principalId: actor.principalId, handle: actor.handle,
+      authMethod: actor.credentialId ? 'principal_api_key' : actor.sessionId ? 'session' : 'unknown', credentialId: actor.credentialId ?? null };
+    await runTaskTerminalEffects(client, { taskId: task.id, to: 'completed', via: 'finish', actor: auditActor, detachVehicle: true });
+    const handoverAnnounced = await this.streamEntryAnnounceable(client, entry);
+    await feedEventService.emit(client, {
+      name: 'task.updated',
+      objectType: 'task',
+      objectId: task.id,
+      ...this.feedActor(actor),
+      projectId: completed.rows[0]?.project_id ?? null,
+      ownerPrincipalId: completed.rows[0]?.owner_principal_id ?? null,
+      payload: {
+        status: 'completed',
+        previousStatus: 'in-progress',
+        fields: ['status'],
+        verification: 'none',
+        ...(handoverAnnounced ? { stream: { entryType: String(entry.event_type) } } : {}),
+      },
+    });
+    await client.query(
+      `INSERT INTO task_stream_entries (task_id, provenance, event_type, content, report_id, metadata)
+       VALUES ($1,'system','task.transitioned','in-progress -> completed (verification: none)',$2,$3)`,
+      [task.id, reportId, { from: 'in-progress', to: 'completed', authoredEntryId: entry.id,
+        reason: VERIFICATION_NONE_REASON, subtasksCompleted }],
+    );
+    await auditService.record({
+      action: 'task.complete', actor: auditActor, resourceType: 'task', resourceId: task.id,
+      metadata: { reason: VERIFICATION_NONE_REASON, basis: 'verification-none', reportId,
+        setByPrincipalId: task.verification_none_set_by ?? null, setterBasis: task.verification_none_basis ?? null,
+        subtasksCompleted, independentVerification: false },
+    }, client);
+    await taskHistoryService.recordChange(task.id, String(completed.rows[0]?.title ?? task.title), 'status', 'in-progress',
+      'completed', actor.handle || 'user', actor.principalId ?? null, client);
+    // The readiness boundary, as updateTask crosses it on a status move: this
+    // Task, then its dependents (they get `task.ready` and the implement ring).
+    const readinessActor = { principalId: actor.principalId, handle: actor.handle };
+    await syncTaskReadiness(client, task.id, readinessActor);
+    await syncDependentsReadiness(client, task.id, readinessActor);
+    return { subtasksCompleted };
+  }
+
+  /**
+   * Every refusal finish makes before its first write, in finish order, under
+   * the Task row lock `taskContext` took. Execution and the dry run both run
+   * exactly this (card 19dd180c), so the preview cannot drift from the act.
+   */
+  private async assertFinishable(
+    client: PoolClient, task: TaskContext, input: FinishTaskInput, actor: TaskElementActor, taskId: string,
+  ): Promise<void> {
       // RH-P3.C3: never-self-review at the FINISH altitude.
       //
       // Strategy 4e40f06f §2.6.4 hands lifecycle moves to the claimant
@@ -565,6 +850,31 @@ export class TaskElementService {
       if (task.status !== 'in-progress') {
         throw new TaskElementError(409, 'TASK_NOT_FINISHABLE', `Task must be in-progress before finish (current: ${task.status})`);
       }
+      // Section 6.8 (E462 S4b): a `none` Task re-runs the chain guard between
+      // the stored setter and the finishing actor, the claimer and the
+      // execution connector (VERIFICATION_NONE_SELF_SET).
+      if (task.verification_none === true) {
+        try {
+          await assertVerificationNoneFinishable(client, task, actor.principalId);
+        } catch (error) {
+          if (error instanceof VerificationModeError) throw new TaskElementError(error.status, error.code, error.message);
+          throw error;
+        }
+      }
+      // Only the new Task-report producer has this immutable provenance and
+      // transactional operation mapping. Legacy inline/API finish is unchanged.
+      if (input.reportId) {
+        const saved=(await client.query('SELECT origin,source_task_id,author_principal_id,content_hash,status,deleted_at FROM reports WHERE id=$1',[input.reportId])).rows[0];
+        if (saved?.origin==='task-report') {
+          const mapped=await client.query(`SELECT 1 FROM task_report_operations WHERE task_id=$1 AND author_principal_id=$2
+            AND report_id=$3 AND content_hash=$4 LIMIT 1`,[taskId,actor.principalId,input.reportId,saved.content_hash]);
+          if (saved.source_task_id!==taskId || saved.author_principal_id!==actor.principalId
+            || saved.status!=='active' || saved.deleted_at || mapped.rows.length!==1)
+            throw new TaskElementError(409,'TASK_REPORT_HANDOFF_PROVENANCE','Saved Task Report provenance or current operation mapping changed');
+          if (!actor.authorization) throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Saved Task Report handoff requires current authenticated authority');
+          await this.currentReportAuthority(client,taskId,actor,'write');
+        }
+      }
       const unfinished = await client.query(
         `SELECT id, index, status FROM subtasks
           WHERE task_id = $1 AND status NOT IN ('review','completed','skipped')
@@ -575,53 +885,229 @@ export class TaskElementService {
         const row = unfinished.rows[0];
         throw new TaskElementError(409, 'SUBTASK_NOT_HANDED_BACK', `Subtask ${row.id} (display index ${row.index}) is ${row.status}; every Subtask must be in review, completed, or skipped`);
       }
+  }
 
-      let reportId = input.reportId;
-      if (input.report) {
-        const content = this.maskingEnabled(task) ? maskUnambiguousSecrets(input.report.content).content : input.report.content;
-        reportId = await this.createReport(client, task, actor, input.report.title.trim(), content, input.report.summary, false, null);
+  /**
+   * The refusals finish's WRITE path can still make after `assertFinishable`,
+   * asked as reads, in the order the writes would meet them (card 19dd180c).
+   * Nothing here inserts, updates or deletes; the caller rolls back.
+   *
+   *   1. a named `reportId` must pass `linkReport`'s predicate - the same
+   *      SQL text, `LINKABLE_REPORT_PREDICATE`, read instead of written;
+   *   2. with no Report named or inline, the handover must auto-promote: a
+   *      masked handover at or under the stream limit, or one the hourly
+   *      promotion cap sends to quarantine, leaves finish without a Report and
+   *      the real call answers REPORT_LINK_MISSING, so the dry run does too;
+   *   3. the native-generation gate runs in its own dry-run mode, which stops
+   *      before its one UPDATE and reads that UPDATE's deadline predicate.
+   *      A Report the dry run would create has no id yet, so the gate meets
+   *      `null` where the real call meets an id no publication can name;
+   *      both are refused alike.
+   *
+   * Not rehearsed: the access-vehicle recompute `linkReport` runs after it
+   * links. It recomputes the Task's role Grants rather than deciding whether
+   * this principal may finish, and it writes as it goes.
+   */
+  private async previewFinishWrites(
+    client: PoolClient, task: TaskContext, input: FinishTaskInput, actor: TaskElementActor, handover: string, taskId: string,
+  ): Promise<void> {
+    if (input.reportId) {
+      const linkable = await client.query(
+        `SELECT 1 FROM reports WHERE ${LINKABLE_REPORT_PREDICATE}`,
+        [task.id, input.reportId, actor.root === true, this.ownerClaim(actor)],
+      );
+      if (linkable.rows.length === 0) throw new TaskElementError(400, 'REPORT_NOT_LINKABLE', REPORT_NOT_LINKABLE_MESSAGE, 'reportId');
+    } else if (!input.report) {
+      const streamContent = this.maskingEnabled(task) ? maskUnambiguousSecrets(handover).content : handover;
+      if (streamContent.length <= TASK_STREAM_ENTRY_LIMIT || !(await this.promotionAllowed(client, actor))) {
+        throw new TaskElementError(500, 'REPORT_LINK_MISSING', REPORT_LINK_MISSING_MESSAGE);
       }
-
-      const appended = await this.appendWithClient(
-        client,
-        task,
-        {
-          content: handover || (reportId ? `Report filed: ${reportId}` : input.handover || ''),
-          eventType: 'handover.finish',
-          provenance: 'authored',
-          reportId,
-        },
-        actor,
-      );
-      reportId = reportId || appended.reportId;
-      if (!reportId) throw new TaskElementError(500, 'REPORT_LINK_MISSING', 'Atomic finish did not produce a Report');
-      await this.linkReport(client, task, reportId, actor);
-      const reviewed = await client.query(
-        `UPDATE tasks SET status = 'review', updated_at = NOW() WHERE id = $1
-         RETURNING project_id, owner_principal_id`,
-        [task.id],
-      );
-      await feedEventService.emit(client, {
-        name: 'task.updated',
-        objectType: 'task',
-        objectId: task.id,
-        projectId: reviewed.rows[0]?.project_id ?? null,
-        ownerPrincipalId: reviewed.rows[0]?.owner_principal_id ?? null,
-        payload: { status: 'review', previousStatus: 'in-progress' },
-      });
-      await client.query(
-        `INSERT INTO task_stream_entries (task_id, provenance, event_type, content, report_id, metadata)
-         VALUES ($1,'system','task.transitioned','in-progress -> review',$2,$3)`,
-        [task.id, reportId, { from: 'in-progress', to: 'review', authoredEntryId: appended.entry.id }],
-      );
-      await client.query('COMMIT');
-      return { success: true, taskId: task.id, status: 'review', reportId, entry: appended.entry };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
     }
+    try {
+      await nativeExecutionService.finishGenerationWithClient(
+        client, taskId, input.reportId ?? null, input.nativeGeneration, actor, { dryRun: true },
+      );
+    } catch (error) {
+      if (error instanceof RequestFaultError) throw new TaskElementError(error.status, error.code, error.message);
+      throw error;
+    }
+  }
+
+  private async currentReportAuthority(client: PoolClient, taskId: string, actor: TaskElementActor, action: 'read' | 'write'): Promise<void> {
+    if (!actor.authorization) return; // Internal server callers still require the locked claimant below.
+    const chain = await delegationService.resolveChain(actor.principalId, client);
+    if (!chain.alive) throw new TaskElementError(403, 'TASK_REPORT_AUTHORITY_REVOKED', 'Current Report authority is no longer live');
+    for (const link of chain.links) if (link.parentPrincipalId) {
+      const live = await client.query(`SELECT 1 FROM principal_credentials WHERE principal_id=$1 AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at>clock_timestamp()) AND (grace_until IS NULL OR grace_until>clock_timestamp()) LIMIT 1`, [link.principalId]);
+      if (!live.rows.length) throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Delegation authority expired');
+    }
+    if (actor.credentialId) {
+      const credential = await client.query(`SELECT scopes FROM principal_credentials WHERE id=$1 AND principal_id=$2 AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at>clock_timestamp()) AND (grace_until IS NULL OR grace_until>clock_timestamp())`,[actor.credentialId,actor.principalId]);
+      if (!credential.rows.length || !scopesSatisfy(credential.rows[0].scopes, action==='write'?'tasks:write':'tasks:read'))
+        throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Credential authority changed');
+    }
+    if (actor.sessionId) {
+      const session = await client.query(`SELECT 1 FROM auth_sessions WHERE id=$1 AND principal_id=$2 AND revoked_at IS NULL
+        AND expires_at>clock_timestamp() AND last_seen_at>clock_timestamp()-($3::bigint*INTERVAL '1 millisecond')`,[actor.sessionId,actor.principalId,sessionIdleMs()]);
+      if (!session.rows.length) throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Session authority changed');
+    }
+    const snapshots=await taskAuthoritySnapshot(client,actor,taskId,action==='write'?'tasks:write':'tasks:read');
+    if(!snapshots)throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Current identity or delegation scope changed');
+    const capTask=(await client.query('SELECT project_id FROM tasks WHERE id=$1',[taskId])).rows[0];
+    if (!capTask) throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Task authority changed');
+    for(const snapshot of snapshots)if (!explicitTaskActionCaps(snapshot,{type:'task',id:taskId,projectId:capTask.project_id},action)
+      || !(await authorizationRepository.authorizedIds(snapshot,'task',[taskId],action,client)).has(taskId))
+      throw new TaskElementError(403,'TASK_REPORT_AUTHORITY_REVOKED','Task authority changed');
+  }
+
+  private assertReportClaimant(task: TaskContext, actor: TaskElementActor): void {
+    if (!this.ownerClaim(actor) || task.claimant_principal_id !== actor.principalId || task.verifier_principal_id === actor.principalId)
+      throw new TaskElementError(403, "TASK_CLAIMANT_REQUIRED", "Only the current independent claimant may maintain its Task Report");
+    if (task.status !== "in-progress") throw new TaskElementError(409, "TASK_REPORT_FROZEN", "Task Reports may be maintained only while the Task is in progress");
+  }
+
+  /** Display-only snapshot of the same locked policy as save. No grant or mutation.
+   * Missing identity and unexpected errors are denied; saves always check again.
+   * The Task lock is waited for at most TASK_READ_LOCK_TIMEOUT_MS (card e5240c73):
+   * when that expires the read is refused with TASK_READ_BUSY rather than shown
+   * a decision this projection could not take. */
+  async taskReportMaintenanceAccess(taskId: string, actor: TaskElementActor): Promise<{allowed: boolean; reason: string | null}> {
+    if (!actor.authorization?.authenticated || actor.authorization.principalId !== actor.principalId || !this.ownerClaim(actor))
+      return {allowed: false, reason: "TASK_REPORT_AUTHORITY_REVOKED"};
+    let client: PoolClient | undefined;
+    let decision: {allowed: boolean; reason: string | null} = {allowed: false, reason: "TASK_REPORT_ACCESS_UNAVAILABLE"};
+    let busy = false;
+    try {
+      client = await this.pool.connect();
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL lock_timeout = '${TASK_READ_LOCK_TIMEOUT_MS}ms'`);
+      const task = await this.taskContext(client, taskId);
+      this.assertReportClaimant(task, actor);
+      await this.currentReportAuthority(client, taskId, actor, "write");
+      await client.query("COMMIT");
+      decision = {allowed: true, reason: null};
+    } catch (error) {
+      busy = lockTimedOut(error);
+      decision = {allowed: false, reason: error instanceof TaskElementError ? error.code : "TASK_REPORT_ACCESS_UNAVAILABLE"};
+      if (client) {
+        try { await client.query("ROLLBACK"); } catch { /* Display-only cleanup cannot break a readable Task. */ }
+      }
+    } finally {
+      if (client) {
+        try { client.release(); } catch {
+          // Even a successful lookup is not an enable signal when cleanup fails.
+          if (decision.allowed) decision = {allowed: false, reason: "TASK_REPORT_ACCESS_UNAVAILABLE"};
+        }
+      }
+    }
+    if (busy) throw new TaskElementError(409, "TASK_READ_BUSY", TASK_READ_BUSY_MESSAGE);
+    return decision;
+  }
+
+  private reportRequestHash(input: SaveTaskReportInput): string {
+    return taskReportRequestHash(input);
+  }
+
+  private async operationResult(client: PoolClient, taskId: string, key: string, actor: TaskElementActor, expectedHash?: string): Promise<any | null> {
+    const operation=(await client.query('SELECT * FROM task_report_operations WHERE task_id=$1 AND author_principal_id=$2 AND operation_key=$3',[taskId,actor.principalId,key])).rows[0];
+    if (!operation) return null;
+    if (expectedHash && operation.request_hash!==expectedHash) throw new TaskElementError(409,'TASK_REPORT_OPERATION_CHANGED','The logical operation names different input');
+    const report=(await client.query(`SELECT * FROM reports WHERE id=$1 AND source_task_id=$2 AND author_principal_id=$3 AND origin='task-report' AND status='active' AND deleted_at IS NULL`,[operation.report_id,taskId,actor.principalId])).rows[0];
+    if (!report || report.content_hash!==operation.content_hash) throw new TaskElementError(409,'TASK_REPORT_RESULT_CHANGED','The committed Report changed; read its current state');
+    return {success:true,taskId,report,operation:{key,requestHash:operation.request_hash,contentHash:operation.content_hash}};
+  }
+
+  async readTaskReportOperation(taskId: string, key: string, actor: TaskElementActor, expectedHash: string): Promise<any> {
+    const client=await this.pool.connect();
+    try {
+      await client.query('BEGIN');const task=await this.taskContext(client,taskId);
+      if (!this.ownerClaim(actor) || task.claimant_principal_id!==actor.principalId || task.verifier_principal_id===actor.principalId || task.status!=='in-progress')
+        throw new TaskElementError(403,'TASK_CLAIMANT_REQUIRED','Exact operation reconciliation requires the current independent claimant');
+      await this.currentReportAuthority(client,taskId,actor,'read');
+      const result=await this.operationResult(client,taskId,key,actor,expectedHash);
+      if (!result) throw new TaskElementError(404,'TASK_REPORT_OPERATION_UNKNOWN','No committed operation is known; do not blindly create again');
+      await client.query('COMMIT');return result;
+    } catch(error) {await client.query('ROLLBACK');throw error;} finally {client.release();}
+  }
+
+  /** A claimant's mutable progress Report; finish freezes it by moving the Task to Review.
+   * Authority and assignment are checked again under the same Task row lock as finish. */
+  async saveTaskReport(taskId: string, input: SaveTaskReportInput, actor: TaskElementActor, operationKey?: string): Promise<any> {
+    const allowed = new Set(['reportId', 'title', 'content', 'summary', 'expectedContentHash']);
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+      || Object.keys(input).some(key => !allowed.has(key))
+      || typeof input.title !== 'string' || !input.title.trim() || input.title.length > 500
+      || typeof input.content !== 'string' || !input.content.trim()
+      || (input.summary !== undefined && (typeof input.summary !== 'string' || input.summary.length > 500))
+      || (input.reportId !== undefined && !UUID.test(input.reportId))
+      || (input.reportId && !/^[a-f0-9]{64}$/.test(input.expectedContentHash || ''))) {
+      throw new TaskElementError(400, 'INVALID_TASK_REPORT', 'Provide title/content and the current content hash when editing');
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const task = await this.taskContext(client, taskId);
+      this.assertReportClaimant(task, actor);
+      await this.currentReportAuthority(client,taskId,actor,'write');
+      const requestHash=this.reportRequestHash(input);
+      if (operationKey) {
+        const known=await this.operationResult(client,taskId,operationKey,actor,requestHash);
+        if (known) {await client.query('COMMIT');return known;}
+      }
+      const content = this.maskingEnabled(task) ? maskUnambiguousSecrets(input.content).content : input.content;
+      // Source binding is server-written; task_ids is never used as editing authority.
+      let reportId = input.reportId;
+      if (reportId) {
+        const updated = await client.query(
+          `UPDATE reports SET title=$3, content=$4, content_hash=$5, summary=$6, updated_at=NOW()
+             WHERE id=$1 AND source_task_id=$2 AND origin='task-report'
+               AND author_principal_id=$7 AND status='active' AND deleted_at IS NULL
+               AND content_hash=$8 RETURNING id`,
+          [reportId, task.id, input.title.trim(), content, sha256(content), input.summary || summarize(content), actor.principalId, input.expectedContentHash],
+        );
+        if (!updated.rows.length) throw new TaskElementError(409, 'TASK_REPORT_CONFLICT', 'The Report is foreign, frozen, or changed; read it before editing');
+      } else {
+        reportId = await this.createReport(client, task, actor, input.title.trim(), content, input.summary, false, null);
+        await client.query("UPDATE reports SET origin='task-report', visibility='private' WHERE id=$1", [reportId]);
+      }
+      await this.linkReport(client, task, reportId!, actor);
+      const report = await client.query('SELECT * FROM reports WHERE id=$1', [reportId]);
+      if (operationKey) await client.query('INSERT INTO task_report_operations(task_id,author_principal_id,operation_key,request_hash,report_id,content_hash) VALUES($1,$2,$3,$4,$5,$6)',[taskId,actor.principalId,operationKey,requestHash,reportId,report.rows[0].content_hash]);
+      await client.query('COMMIT');
+      return { success: true, taskId: task.id, report: report.rows[0], operation: operationKey ? {key:operationKey,requestHash,contentHash:report.rows[0].content_hash} : undefined };
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  }
+
+  /**
+   * The candidate set of the `progress` Report context scope: server-bound
+   * task progress Reports of this Task that carry their genuine Reference.
+   * Ids only — the bounded context (`TaskReportContext`) authorizes, orders,
+   * pages and summarises them, so this read never returns a Report body.
+   */
+  async taskReportIds(taskId: string): Promise<string[]> {
+    const result = await this.pool.query(
+      `SELECT r.id::text AS id FROM reports r WHERE r.source_task_id=$1 AND r.origin='task-report'
+         AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM task_references tr
+           WHERE tr.task_id=$1 AND tr.kind='report' AND tr.target_id=r.id)`, [taskId]);
+    return result.rows.map(row => String(row.id));
+  }
+
+  /**
+   * One server-bound task progress Report of this Task — the same binding as
+   * `taskReportIds` — as the full row the save answers with: body and
+   * content_hash included. Binding only, no authorization:
+   * `TaskReportContext.readTaskProgressReport` decides first whether the
+   * caller may read it (card 50b5e9c4 round-1 B1).
+   */
+  async taskProgressReport(taskId: string, reportId: string): Promise<Record<string, unknown> | null> {
+    const result = await this.pool.query(
+      `SELECT r.* FROM reports r WHERE r.id=$2 AND r.source_task_id=$1 AND r.origin='task-report'
+         AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM task_references tr
+           WHERE tr.task_id=$1 AND tr.kind='report' AND tr.target_id=r.id)`, [taskId, reportId]);
+    return result.rows[0] ?? null;
   }
 
   async listStream(taskId: string, actor: TaskElementActor): Promise<any[]> {
@@ -840,6 +1326,9 @@ export class TaskElementService {
               name: 'report.updated',
               objectType: 'report',
               objectId: entry.report_id,
+              // Card 5854f0d6: a redaction records NO acting principal. An
+              // author-erasure ordered by the author would otherwise re-attach
+              // the erased person to the Report it was erased from.
               projectId: redacted.rows[0].project_id ?? null,
               // Review `99ba9444` B1: the canonical author column, or NULL.
               ownerPrincipalId: redacted.rows[0].author_principal_id ?? null,

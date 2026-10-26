@@ -1,3 +1,4 @@
+import { ContextPreview, ContextPreviewTrigger, ContextPreviewPanel } from '../components/BriefContextPreview';
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { ArrowLeft, Check, Copy, Download, Folder, Link2, Pencil, Pin, X } from 'lucide-react';
@@ -26,6 +27,8 @@ interface Report {
   project_id: string | null;
   project_name?: string | null;
   task_ids: string[];
+  origin?: string;
+  source_task_id?: string | null;
   /** Free-form label the CALLER supplied. Unverified and spoofable - never the
    * attribution (card 91599cd2). */
   author: string | null;
@@ -67,6 +70,9 @@ export function ReportDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const routeGeneration = useRef(0);
+  const taskReportId = report?.origin === 'task-report' ? report.source_task_id : null;
+
   // Copy ID state
   const [copied, setCopied] = useState(false);
 
@@ -82,9 +88,13 @@ export function ReportDetailPage() {
   const editTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
+    const generation=++routeGeneration.current;
+    let current=true;
     if (!id) return;
+    setReport(null);setSaving(false);
     setLoading(true);
     setError(null);
+    setShowEdit(false);
 
     authenticatedFetch(`${API_BASE_URL}/reports/${id}`)
       .then(res => {
@@ -93,13 +103,14 @@ export function ReportDetailPage() {
       })
       .then(data => {
         const r = data.report || data;
-        setReport(r);
+        if(current && generation===routeGeneration.current)setReport(r);
       })
       .catch(err => {
         if (!isIntentionalAbort(err)) console.error('Failed to fetch report:', err);
-        setError(err.message || 'Failed to load report');
+        if(current && generation===routeGeneration.current)setError(err.message || 'Failed to load report');
       })
-      .finally(() => setLoading(false));
+      .finally(() => {if(current && generation===routeGeneration.current)setLoading(false);});
+    return () => {current=false;++routeGeneration.current;};
   }, [id]);
 
   const handleCopyId = async () => {
@@ -115,7 +126,7 @@ export function ReportDetailPage() {
   };
 
   const openEdit = () => {
-    if (!report) return;
+    if (!report || report.id!==id || taskReportId) return;
     setEditState({
       title: report.title,
       content: report.content,
@@ -132,7 +143,8 @@ export function ReportDetailPage() {
   };
 
   const handleSave = async () => {
-    if (!report) return;
+    if (!report || report.id!==id || taskReportId) return;
+    const generation=routeGeneration.current;
     setSaving(true);
     setSaveError(null);
     try {
@@ -165,12 +177,13 @@ export function ReportDetailPage() {
         throw new Error(d.error || `HTTP ${res.status}`);
       }
       const data = await res.json();
+      if(generation!==routeGeneration.current) return;
       setReport(data.report || data);
       setShowEdit(false);
     } catch (err: any) {
-      setSaveError(err.message || 'Failed to save');
+      if(generation===routeGeneration.current)setSaveError(err.message || 'Failed to save');
     } finally {
-      setSaving(false);
+      if(generation===routeGeneration.current)setSaving(false);
     }
   };
 
@@ -203,6 +216,7 @@ export function ReportDetailPage() {
   const shortId = report.id.substring(0, 8);
 
   return (
+    <ContextPreview kind="report" elementId={report.id} elementName={report.title}>
     <div className="report-detail-page fade-in">
       {/* Navigation */}
       <nav className="report-detail-nav" aria-label="Report">
@@ -213,6 +227,7 @@ export function ReportDetailPage() {
 
         {/* Action buttons */}
         <div className="report-detail-actions">
+          <ContextPreviewTrigger />
           <div className="report-detail-id-container">
             <code className="report-detail-id">{shortId}</code>
             <button
@@ -257,14 +272,17 @@ export function ReportDetailPage() {
             <Download size={16} />
             Download
           </button>
-          <button
+          {taskReportId ? <Link
+            className="report-detail-edit-btn"
+            to={`/tasks/${taskReportId}?report=${encodeURIComponent(report.id)}#task-detail-reports-heading`}
+          >Open task report</Link> : <button
             onClick={openEdit}
             className="report-detail-edit-btn"
             title="Edit report"
           >
             <Pencil size={16} />
             Edit
-          </button>
+          </button>}
         </div>
       </nav>
 
@@ -324,6 +342,8 @@ export function ReportDetailPage() {
           </Link>
         )}
       </header>
+
+      <ContextPreviewPanel />
 
       {/* Summary */}
       {report.summary && (
@@ -395,7 +415,7 @@ export function ReportDetailPage() {
       </div>
 
       {/* Edit Modal */}
-      {showEdit && (
+      {showEdit && !taskReportId && (
         <div className="report-edit-overlay" onClick={(e) => { if (e.target === e.currentTarget) setShowEdit(false); }}>
           <div className="report-edit-modal">
             <div className="report-edit-header">
@@ -514,5 +534,6 @@ export function ReportDetailPage() {
         </div>
       )}
     </div>
+    </ContextPreview>
   );
 }

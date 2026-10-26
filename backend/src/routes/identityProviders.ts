@@ -37,8 +37,17 @@ import { identityLinkService } from '../services/identity/IdentityLinkService';
 import { ssoDiscoveryService } from '../services/identity/SsoDiscoveryService';
 import { SsoDiscoveryError } from '../services/identity/SsoDiscoveryService';
 import { SsoOutboundError } from '../services/identity/ssoOutbound';
+import { pathUuidParam } from '../middleware/validate';
 
 const router = Router();
+
+// Card bc847bd0: every path id here names a uuid column (identity_providers,
+// identity_links, groups), and a malformed one reached its read and answered
+// 500. Each is refused by name before any handler reads it; the route ceiling
+// (root) runs first, so a caller without root keeps its 403.
+router.param('id', pathUuidParam('INVALID_IDENTITY_PROVIDER_ID', 'identity provider'));
+router.param('linkId', pathUuidParam('INVALID_IDENTITY_LINK_ID', 'identity link'));
+router.param('groupId', pathUuidParam('INVALID_GROUP_ID', 'group'));
 
 /** SS-2's sibling: the owner-plane surface enumerated for the same reason. */
 export const IDENTITY_PROVIDER_ROUTE_CENSUS = [
@@ -165,6 +174,9 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
         scimHeartbeatIntervalHours: body.scimHeartbeatIntervalHours === null || typeof body.scimHeartbeatIntervalHours === 'number'
           ? body.scimHeartbeatIntervalHours
           : undefined,
+        // Card 7a99d63e (SU-17): handed through untouched; the service's one
+        // validator (`validateStepUpPolicy`) refuses any bad shape by name.
+        stepUpPolicy: body.stepUpPolicy,
       },
       auditActorFor(req),
     );

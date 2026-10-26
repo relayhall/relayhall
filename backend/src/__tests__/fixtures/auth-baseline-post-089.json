@@ -293,7 +293,7 @@
     "path": "/reports",
     "status": 403,
     "content_type": "application/json; charset=utf-8",
-    "body": "{\"success\":false,\"error\":\"This identity is not authorized for the requested operation\",\"code\":\"FORBIDDEN\",\"message\":\"This identity is not authorized for the requested operation\"}"
+    "body": "{\"success\":false,\"error\":\"This identity is not authorized for the requested operation\",\"code\":\"FORBIDDEN\",\"message\":\"This identity is not authorized for the requested operation\",\"details\":{\"requiredScopes\":[\"reports:read\"]}}"
   },
   {
     "id": "100-login-empty-body",

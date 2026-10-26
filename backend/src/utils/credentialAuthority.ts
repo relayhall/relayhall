@@ -15,11 +15,22 @@ export interface IssuerAuthority {
   reason?: string;
 }
 
-/** The role vocabulary migration 062 allows on principals.role. */
-export const ASSIGNABLE_ROLES = new Set([
+/**
+ * The role vocabulary migration 062 allows on principals.role, in the order
+ * every surface lists it. A tuple so the role catalogue
+ * (`utils/roleCatalogue.ts`) can type its descriptions as a record over
+ * exactly these names: a role added here without a description is a compile
+ * error, not a blank line on a screen (card a2d1e317).
+ */
+export const ASSIGNABLE_ROLE_NAMES = [
   'admin', 'operator', 'editor', 'user', 'viewer',
   'orchestrator', 'reviewer', 'qa', 'agent',
-]);
+] as const;
+
+export type AssignableRole = typeof ASSIGNABLE_ROLE_NAMES[number];
+
+/** The same vocabulary as a set, for membership checks. */
+export const ASSIGNABLE_ROLES = new Set<string>(ASSIGNABLE_ROLE_NAMES);
 
 /**
  * The roles that DERIVE administrative authority.
@@ -134,6 +145,11 @@ export function validateNewHandle(handle: unknown): { ok: true; handle: string }
   }
   if (value.startsWith('agent:')) {
     return { ok: false, error: 'The agent: prefix is reserved for spawn principals' };
+  }
+  if (value.toLowerCase().startsWith('group:')) {
+    // AZ-A12 clause 15: principals_group_handle reserves the prefix for kind
+    // 'group', whose handle is 'group:' || id. Named here, never a raw CHECK.
+    return { ok: false, error: 'The group: prefix is reserved for Group principals' };
   }
   if (RESERVED_HANDLES.has(value.toLowerCase())) {
     return { ok: false, error: `'${value}' is a reserved handle` };

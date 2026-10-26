@@ -15,9 +15,27 @@ in hand — nobody has to remember to send them.
 
 - **One Charter per project.** Creating a second is impossible by schema.
 - **Owner-plane writes.** Reading a Charter needs only `projects:read`;
-  writing one is reserved for the deployment's human authority (the `root`
+  direct PUT is reserved for the deployment's human authority (the `root`
   sentinel — not grantable to agent credentials). Agents propose changes
   through Reports; the owner applies them.
+- **Human project approval.** The GUI submits a named approval action. An active,
+  parentless human Account in a login session may approve its own Project's
+  Charter, or a Project it is authorized to administer. The request and current
+  Account must both retain project-write authority. A generic write Grant,
+  Connector or Agent bearer credential cannot perform this approval.
+- **Audited approval.** Each successful named approval, including identical
+  content, appends one `charter.approve` audit event in the same transaction
+  as the Charter head and version history. It records the authenticated actor,
+  the Project resource, and only `charterVersion`, `sha` (the stored SHA-256)
+  and `previousVersion` (null for the first version). Identical content keeps
+  its version and records that version as the previous version. Charter text
+  never enters the audit metadata. An audit failure rolls the approval back.
+  An authenticated refused approval appends one denied event without changing
+  Charter rows; its three metadata fields are null. Existing scope, concealed
+  Project, body/query, authority, revision and archived refusals are preserved.
+  Invalid Project paths have a null audit resource id. A failed denial audit
+  is logged with redacted diagnostics while the original refusal is retained.
+  Root-only PUT has no new audit behavior. No pending Approval row is created.
 - **Versioned.** Every content change bumps a version counter and records the
   full content with attribution. Restoring an old version is an ordinary
   write of that version's content.
@@ -46,7 +64,8 @@ is a no-op: no version churn.
 REST:
 
 - `GET /projects/{id}/charter` — the head: content, `version`, `revision`
-- `PUT /projects/{id}/charter` — create (201) or replace (200, `If-Match`)
+- `PUT /projects/{id}/charter` — root-only create (201) or replace (200, `If-Match`)
+- `POST /projects/{id}/charter/approve` — human Project owner/admin approval; same revision contract
 - `GET /projects/{id}/charter/versions` — version metadata, newest first
 - `GET /projects/{id}/charter/versions/{n}` — one version, with content
 

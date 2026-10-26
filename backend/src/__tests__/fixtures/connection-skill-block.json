@@ -1,0 +1,14 @@
+{
+  "purpose": "The managed block cli/relayhall_connection_skill.py render_block() writes for these synthetic inputs. cli/test_connection_skill.py proves the renderer still produces exactly this block; backend/src/__tests__/connectorSkillRevalidation.test.ts sends its ifNoneMatch value through relayhall_skill_get to the content route and expects not modified.",
+  "inputs": {
+    "alias": "relayhall",
+    "origin": "https://board.example/api/mcp",
+    "credentialRef": "the RELAYHALL_TOKEN environment variable",
+    "skill": {
+      "id": "5a1e7c0d-3b2f-4c8e-9d61-0f2a4b6c8e10",
+      "version": 4,
+      "sha256": "f747f398e067f06d2f8fd04748406bdccaa8eb20171fe57beb55e8999e65383e"
+    }
+  },
+  "block": "<!-- relayhall-connection:begin (managed by `relayhall connection-skill install`; edit outside this block) -->\n# RelayHall connection\n\n- MCP server alias: `relayhall`\n- MCP origin: https://board.example/api/mcp\n- Credential: kept in the RELAYHALL_TOKEN environment variable. This file never holds it.\n- Registry Skill: `relayhall-connector-bootstrap`, id `5a1e7c0d-3b2f-4c8e-9d61-0f2a4b6c8e10`, version 4, sha256 `f747f398e067f06d2f8fd04748406bdccaa8eb20171fe57beb55e8999e65383e`\n\n## Refresh and discovery\n\n1. Call `relayhall_brief_compile` with `{\"session\": true}` through the `relayhall` server.\n2. Revalidate the Skill: `relayhall_skill_get` with the id above, `fullContent: true` and `ifNoneMatch` set to `\"f747f398e067f06d2f8fd04748406bdccaa8eb20171fe57beb55e8999e65383e\"`: the etag, which is the sha256 above in double quotes; the bare digest never matches. \"not modified\" means this pointer is current; new content means a newer Version is published, so follow it and re-run `relayhall connection-skill install`.\n3. Follow the registry Skill. This file points at it and never replaces it.\n4. If the server is missing or refuses the credential, stop and report; never search for, paste or store a credential.\n<!-- relayhall-connection:end -->"
+}

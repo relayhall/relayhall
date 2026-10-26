@@ -1,11 +1,12 @@
 import crypto from 'crypto';
 import { NextFunction, Request, Response } from 'express';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { pool as housePool } from '../db/connection';
 import { AuthRequest } from './auth';
 import { sendApiError } from '../utils/apiErrors';
 import { stableJson } from '../utils/stableJson';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import { taskReportRequestHash } from '../utils/taskReportRequestHash';
 
 /**
  * The mutating-tool retry contract — card fb06c930, design record bf8928ee v5
@@ -83,6 +84,7 @@ export interface IdempotentOperationDeclaration {
 export const IDEMPOTENT_OPERATIONS = {
   // Credential-scoped BECAUSE the handler applies a field-level authority check
   // the guard chain does not (the amendment above).
+  'task.report.save':        { scope: 'credential', replay: 'refuse' },
   'task.create':             { scope: 'credential', replay: 'return' },
   'task.stream.append':      { scope: 'credential', replay: 'return' },
   'task.patch':              { scope: 'credential', replay: 'return' },
@@ -92,9 +94,79 @@ export const IDEMPOTENT_OPERATIONS = {
   'report.create':           { scope: 'principal',  replay: 'return' },
   'project.create':          { scope: 'principal',  replay: 'return' },
   'project.resource.create': { scope: 'principal',  replay: 'return' },
+  // Phase creation (planning slice; `POST /phases`, composed by
+  // `relayhall_phase_create`). CREDENTIAL-scoped by ruling 3's DEFAULT for any
+  // operation added after the closed set was ratified. The route also
+  // checks Project readability before replay; the credential-bound default
+  // keeps the narrower identity even as that field gate evolves. A wrongly
+  // credential-scoped operation merely creates two
+  // records after a rotation, a wrongly principal-scoped one can serve a
+  // replay to a second credential. Declaring `principal` here would need the
+  // §3.5 argument made afresh, and this candidate does not make it.
+  //
+  // Forward migration 133 extends the closed SQL operation/policy/scope set.
+  'phase.create':            { scope: 'credential', replay: 'return' },
   // Credential-bound by ruling 3, and refuse-replay by ruling 2.
   'agent.mint.request':      { scope: 'credential', replay: 'refuse' },
   'agent.mint.collect':      { scope: 'credential', replay: 'refuse' },
+  // RB-11 Governor v0 (card b796067e, D-8): `POST /knowledge-writes/commit`,
+  // composed by `relayhall_knowledge_note_commit`. CREDENTIAL-scoped by
+  // ruling 3's default for an operation added after the closed set; replay
+  // `return`, because the stored answer is a sealed handle, a sha256 and a
+  // compartment id — never note content. Propose and preview are not keyed:
+  // their answer IS the rendered note. Forward migration 147 extends the
+  // closed SQL operation/policy/scope set.
+  'knowledge.note.commit':   { scope: 'credential', replay: 'return' },
+  // AZ-A12 clause 10(b) (card 311229fd): `POST /projects` with the three Group
+  // owner keys of the create form's selector. That shape reads the caller's
+  // session and credential - the clause 9(e) standing test and the
+  // step-up bound to them - so it is its OWN operation, CREDENTIAL-scoped by
+  // ruling 3's default: under `project.create`'s principal scope a second
+  // credential of the same principal would be served the stored Group-owned
+  // create without meeting the standing test itself (the B4 class). The plain
+  // create keeps `project.create`, principal-scoped, and never reads the
+  // credential. Forward migration 156 extends the closed SQL
+  // operation/policy/scope set.
+  'project.groupowned.create': { scope: 'credential', replay: 'return' },
+  // Card 549cc51f (E298, E299): `POST /knowledge-shared-writers` and
+  // `POST /knowledge-shared-writers/remove`, the shared-area writer list.
+  // CREDENTIAL-scoped: the handler decides standing from the login session
+  // (root, or an administrator through administratorSessionOf) and burns a
+  // step-up, neither of which the guard chain does, so a second identity of
+  // the same principal must never be served the first one's answer. A login
+  // session has no credential id, so its scope is `user:<handle>`. Replay
+  // `return`: the stored answer is the before and after membership. Forward
+  // migration 157 extends the closed SQL operation/policy/scope set.
+  'knowledge.sharedwriter.add':    { scope: 'credential', replay: 'return' },
+  'knowledge.sharedwriter.remove': { scope: 'credential', replay: 'return' },
+  // Card 2bc7b303 (owner ruling E374): the Subtask structure verbs,
+  // `POST /tasks/:id/subtasks`, `POST /tasks/:id/subtasks/reorder` and
+  // `PATCH /tasks/:id/subtasks/by-id/:subtaskId/text`, composed by
+  // `relayhall_subtask_create`, `_reorder` and `_update_text`. CREDENTIAL-scoped
+  // by ruling 3's default for an operation added after the closed set, replay
+  // `return`: the stored answer is the Task with its Subtasks and, for a
+  // create, the new Subtask's stable id. Forward migration 163 extends the
+  // closed SQL operation/policy/scope set.
+  'task.subtask.create':     { scope: 'credential', replay: 'return' },
+  'task.subtask.reorder':    { scope: 'credential', replay: 'return' },
+  'task.subtask.text':       { scope: 'credential', replay: 'return' },
+  // Card bedf50cc (plugin availability and settings, stage 1; owner ruling
+  // E380): `PUT /plugin-host/:name/settings/account` and
+  // `PUT /plugin-host/:name/choice` (the Account's own session),
+  // `PUT /plugin-admin/:name/policy`, `PUT /plugin-admin/:name/settings` and
+  // `POST /plugin-admin/:name/settings/cleanup` (an administrator's session
+  // with a step-up). CREDENTIAL-scoped by ruling 3's default: each handler
+  // decides from the login session itself (and the administrator acts burn a
+  // step-up), which the guard chain does not, so a second identity of the same
+  // principal is never served the first one's answer; a login session scopes
+  // as `user:<handle>`. Replay `return`: the stored answer is a receipt (the
+  // plugin, the new revision and the changed keys), never a setting value.
+  // Forward migration 166 extends the closed SQL operation/policy/scope set.
+  'plugin.settings.account.put':    { scope: 'credential', replay: 'return' },
+  'plugin.choice.put':              { scope: 'credential', replay: 'return' },
+  'plugin.policy.put':              { scope: 'credential', replay: 'return' },
+  'plugin.settings.deployment.put': { scope: 'credential', replay: 'return' },
+  'plugin.settings.cleanup':        { scope: 'credential', replay: 'return' },
 } as const satisfies Record<string, IdempotentOperationDeclaration>;
 
 export type IdempotentOperation = keyof typeof IDEMPOTENT_OPERATIONS;
@@ -159,6 +231,19 @@ export function resolveScope(req: Request, kind: ScopeKind): string | null {
   return null;
 }
 
+/** Shared initial/re-read decision; no writes or response side effects. */
+function classifyRetryRow(row: IdempotencyRow | null, hash: string, now: number):
+  'absent' | 'expired' | 'reused' | 'refuse' | 'replay' | 'in_flight' | 'takeover' {
+  if (!row) return 'absent';
+  if (row.expires_at.getTime() <= now) return 'expired';
+  if (row.state === 'completed') {
+    if (row.request_hash !== hash) return 'reused';
+    return row.replay_policy === 'refuse' ? 'refuse' : 'replay';
+  }
+  return now - row.created_at.getTime() <= IDEMPOTENCY_IN_FLIGHT_TAKEOVER_MS
+    ? 'in_flight' : 'takeover';
+}
+
 async function readRow(
   pool: Pool, scope: string, operation: string, key: string,
 ): Promise<IdempotencyRow | null> {
@@ -221,6 +306,56 @@ export async function sweepExpiredIdempotencyRecords(): Promise<number> {
  * of Express's serializer to drift from — and the completion row is written
  * BEFORE those bytes leave.
  */
+interface ReportCreateReservation {
+  scope: string; key: string; hash: string; requestId: string;
+  committed: boolean;
+}
+const reportCreateReservations = new WeakMap<Response, ReportCreateReservation>();
+
+/** Only the standalone Report route opts into a receipt committed with its data.
+ * Lock the existing reservation before effects; a disconnected caller cannot
+ * delete it while this transaction is preparing its canonical response. */
+export async function lockReportCreateReceipt(req: Request, res: Response, client: PoolClient): Promise<void> {
+  const key = req.headers[IDEMPOTENCY_HEADER];
+  if (key === undefined || key === '') return;
+  const reservation = reportCreateReservations.get(res);
+  if (!reservation) throw new Error('Report creation retry reservation unavailable');
+  const result = await client.query(
+    `SELECT request_id FROM operation_idempotency_records
+      WHERE scope=$1 AND operation='report.create' AND idempotency_key=$2
+        AND request_hash=$3 AND request_id=$4 AND state='in_flight'
+        AND expires_at>clock_timestamp() FOR UPDATE`,
+    [reservation.scope, reservation.key, reservation.hash, reservation.requestId]);
+  if (result.rows.length !== 1) throw new Error('Report creation retry reservation changed');
+}
+
+/** Use Express's own serializer, then persist those exact bytes in the owning
+ * transaction. The returned publisher MUST run only after its COMMIT succeeds.
+ * Unkeyed REST creation still publishes only after the Report/grants commit. */
+export async function prepareReportCreateResponse(res: Response, client: PoolClient, body: unknown): Promise<() => void> {
+  const send = res.send;
+  let text: string | undefined;
+  res.send = ((value: unknown) => { if (typeof value !== 'string') throw new Error('Report response is not JSON'); text = value; return res; }) as Response['send'];
+  try { res.status(201).json(body); } finally { res.send = send; }
+  if (text === undefined) throw new Error('Report response serialization unavailable');
+  const bytes = text;
+  const reservation = reportCreateReservations.get(res);
+  if (reservation) {
+    const result = await client.query(
+      `UPDATE operation_idempotency_records SET state='completed', response_status=201,
+        response_body=$5, response_content_type=$6
+        WHERE scope=$1 AND operation='report.create' AND idempotency_key=$2
+          AND request_hash=$3 AND request_id=$4 AND state='in_flight'`,
+      [reservation.scope, reservation.key, reservation.hash, reservation.requestId,
+        bytes, String(res.getHeader('Content-Type'))]);
+    if (result.rowCount !== 1) throw new Error('Report creation retry completion changed');
+  }
+  return () => {
+    if (reservation) reservation.committed = true;
+    res.status(201).send(bytes);
+  };
+}
+
 function captureAndComplete(
   res: Response, pool: Pool,
   scope: string, operation: string, key: string, policy: ReplayPolicy,
@@ -272,6 +407,9 @@ function captureAndComplete(
   }
 
   (res as Response).send = ((body?: unknown) => {
+    if (operation === 'report.create' && reportCreateReservations.get(res)?.committed) {
+      resolved = true; return originalSend(body as never);
+    }
     if (intercepted) return originalSend(body as never);
     intercepted = true;
 
@@ -323,6 +461,34 @@ function captureAndComplete(
   });
 }
 
+/**
+ * What a refused same-key replay tells the caller. Every refuse-replay
+ * operation names its OWN recovery: an Agent mint's one-time pack is never
+ * stored, while a Task Report save's committed result is read back through
+ * the exact operation route (card e5240c73, owner ruling D22). The refusal
+ * itself, and that nothing is stored or repeated, is the same for both.
+ */
+function refusedReplay(req: Request, operation: IdempotentOperation, key: string):
+  { message: string; suggestion: string; details?: Record<string, unknown> } {
+  if (operation === 'task.report.save') {
+    const requestHash = taskReportRequestHash((req.body ?? {}) as Record<string, unknown>);
+    const path = `/tasks/${encodeURIComponent(String(req.params.id))}/report-operations/`
+      + `${encodeURIComponent(key)}?requestHash=${requestHash}`;
+    return {
+      message: 'This Task Report save has already been committed under that key, and a committed save is '
+        + 'never repeated or replayed. Read the committed Report with GET ' + path
+        + ' (MCP: relayhall_task_report_reconcile with the same idempotencyKey and that requestHash).',
+      suggestion: 'Read the committed Report first. Save a further change with a new key and the '
+        + 'Report\'s current content hash.',
+      details: { recovery: { method: 'GET', path, requestHash, mcpTool: 'relayhall_task_report_reconcile' } },
+    };
+  }
+  return {
+    message: 'This mint has already been committed under that key. The one-time pack is never stored, so it cannot be returned again; use relayhall_agent_reveal for the credential\'s secret, or mint again with a new key.',
+    suggestion: 'Mint again with a new retry token if you need a second credential.',
+  };
+}
+
 function serveReplay(res: Response, row: IdempotencyRow): void {
   res.setHeader(REPLAYED_HEADER, 'true');
   res.setHeader(REQUEST_ID_HEADER, row.request_id);
@@ -369,59 +535,54 @@ export function idempotent(operation: IdempotentOperation) {
     const pool = activePool;
     const hash = canonicalRequestHash(req);
 
+    let acquiredReservation = false;
     try {
-      // 5. Reserve.
+      // A finite acquisition budget bounds contention, but the final fresh
+      // observation still classifies a committed outcome before refusing.
+      const MAX_ACQUISITION_WRITES = 4;
+      let writes = 1;
       let requestId = await reserve(pool, scope, operation, key, hash, declaration.replay);
-
-      if (requestId === null) {
-        let row = await readRow(pool, scope, operation, key);
-
-        if (row && row.expires_at.getTime() <= Date.now()) {
-          // A row past expires_at is an ABSENT row (§3.6's read rule is what
-          // makes the contract true regardless of sweep timing).
+      acquiredReservation = requestId !== null;
+      while (requestId === null) {
+        const row = await readRow(pool, scope, operation, key);
+        const decision = classifyRetryRow(row, hash, Date.now());
+        if (decision === 'replay') { serveReplay(res, row!); return; }
+        if (decision === 'reused') {
+          res.setHeader(REQUEST_ID_HEADER, row!.request_id);
+          sendApiError(res, 409, 'IDEMPOTENCY_KEY_REUSED',
+            'That retry token has already been used for a different request',
+            'Use a fresh token for a new act, or resend the identical request to retry the first one.');
+          return;
+        }
+        if (decision === 'refuse') {
+          res.setHeader(REQUEST_ID_HEADER, row!.request_id);
+          const refusal = refusedReplay(req, operation, key);
+          sendApiError(res, 409, 'IDEMPOTENCY_REPLAY_UNAVAILABLE', refusal.message, refusal.suggestion, refusal.details);
+          return;
+        }
+        if (decision === 'in_flight' || writes >= MAX_ACQUISITION_WRITES) {
+          if (row) res.setHeader(REQUEST_ID_HEADER, row.request_id);
+          sendApiError(res, 409, 'IDEMPOTENCY_KEY_IN_FLIGHT',
+            'The first call carrying that retry token is still running',
+            'Wait for it to answer, then retry with the same token.');
+          return;
+        }
+        if (decision === 'expired') {
+          writes++;
+          // Recheck CURRENT expiry at the write, so a refreshed competitor
+          // survives the interval between observation and deletion.
           await pool.query(
             `DELETE FROM operation_idempotency_records
-              WHERE scope = $1 AND operation = $2 AND idempotency_key = $3`,
+              WHERE scope = $1 AND operation = $2 AND idempotency_key = $3
+                AND expires_at <= now()`,
             [scope, operation, key],
           );
-          requestId = await reserve(pool, scope, operation, key, hash, declaration.replay);
-          row = requestId === null ? await readRow(pool, scope, operation, key) : null;
+          continue;
         }
-
-        if (requestId === null) {
-          if (!row) { next(); return; }
-
-          if (row.state === 'completed') {
-            if (row.request_hash !== hash) {
-              res.setHeader(REQUEST_ID_HEADER, row.request_id);
-              sendApiError(res, 409, 'IDEMPOTENCY_KEY_REUSED',
-                'That retry token has already been used for a different request',
-                'Use a fresh token for a new act, or resend the identical request to retry the first one.');
-              return;
-            }
-            if (row.replay_policy === 'refuse') {
-              res.setHeader(REQUEST_ID_HEADER, row.request_id);
-              sendApiError(res, 409, 'IDEMPOTENCY_REPLAY_UNAVAILABLE',
-                'This mint has already been committed under that key. The one-time pack is never stored, so it cannot be returned again; use relayhall_agent_reveal for the credential\'s secret, or mint again with a new key.',
-                'Mint again with a new retry token if you need a second credential.');
-              return;
-            }
-            serveReplay(res, row);
-            return;
-          }
-
-          // state = 'in_flight'
-          const age = Date.now() - row.created_at.getTime();
-          if (age <= IDEMPOTENCY_IN_FLIGHT_TAKEOVER_MS) {
-            res.setHeader(REQUEST_ID_HEADER, row.request_id);
-            sendApiError(res, 409, 'IDEMPOTENCY_KEY_IN_FLIGHT',
-              'The first call carrying that retry token is still running',
-              'Wait for it to answer, then retry with the same token.');
-            return;
-          }
-
-          // Older than the take-over threshold: the stated one-statement crash
-          // window (§3.2). Take the row over and proceed.
+        writes++;
+        if (decision === 'absent') {
+          requestId = await reserve(pool, scope, operation, key, hash, declaration.replay);
+        } else {
           const takeover = await pool.query<{ request_id: string }>(
             `UPDATE operation_idempotency_records
                 SET request_hash = $4, created_at = now(),
@@ -433,30 +594,18 @@ export function idempotent(operation: IdempotentOperation) {
             [scope, operation, key, hash, String(IDEMPOTENCY_RETENTION_MS),
              String(IDEMPOTENCY_IN_FLIGHT_TAKEOVER_MS)],
           );
-          if (takeover.rowCount === 0) {
-            // Somebody else moved it while we looked: re-read and re-branch once.
-            const fresh = await readRow(pool, scope, operation, key);
-            if (fresh && fresh.state === 'completed' && fresh.request_hash === hash
-                && fresh.replay_policy === 'return') {
-              serveReplay(res, fresh);
-              return;
-            }
-            res.setHeader(REQUEST_ID_HEADER, fresh?.request_id ?? row.request_id);
-            sendApiError(res, 409, 'IDEMPOTENCY_KEY_IN_FLIGHT',
-              'The first call carrying that retry token is still running',
-              'Wait for it to answer, then retry with the same token.');
-            return;
-          }
-          requestId = takeover.rows[0].request_id;
+          requestId = takeover.rows[0]?.request_id ?? null;
         }
+        acquiredReservation = requestId !== null;
       }
 
       // 6-7. Run the handler, capturing the bytes it sends.
       res.setHeader(REQUEST_ID_HEADER, requestId);
+      if (operation === 'report.create') reportCreateReservations.set(res, {scope, key, hash, requestId, committed: false});
       captureAndComplete(res, pool, scope, operation, key, declaration.replay);
       next();
     } catch (err) {
-      await releaseReservation(pool, scope, operation, key).catch(() => undefined);
+      if (acquiredReservation) await releaseReservation(pool, scope, operation, key).catch(() => undefined);
       const errorId = logCaughtFailure('[idempotency] retry-record handling failed', err);
       sendApiError(res, 500, 'INTERNAL_ERROR', 'Unexpected server error',
         'Retry once; if it persists check backend logs.', { errorId });

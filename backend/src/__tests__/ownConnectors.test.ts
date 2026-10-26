@@ -31,6 +31,7 @@ jest.mock('../db/connection', () => ({
 import { pool } from '../db/connection';
 import principalsRouter from '../routes/principals';
 import { credentialState } from '../services/OwnConnectorsService';
+import { composeBootstrapPrompt, composeConfigurationGuidance } from '../utils/onboardingPack';
 
 const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -42,6 +43,10 @@ let baseUrl: string;
 let statements: Array<{ sql: string; params: unknown[] }>;
 /** Whose session the next request runs as. */
 let actingPrincipalId: string;
+let actingRole: string;
+let actingAuthMethod: string;
+let actingScopes: string[];
+let actingSessionRole: string | null;
 /** Rows the armed pool hands back for the connector query. */
 let connectorRows: Array<Record<string, unknown>>;
 
@@ -109,9 +114,11 @@ beforeAll(async () => {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).principal = { id: actingPrincipalId, handle: 'someone', kind: 'human', role: 'user' };
-    (req as any).scopes = ['tasks:read', 'principals:read', 'services:write'];
-    (req as any).authMethod = 'session';
+    (req as any).principal = { id: actingPrincipalId, handle: 'someone', kind: 'human', role: actingRole };
+    (req as any).userId = 'someone';
+    (req as any).scopes = actingScopes;
+    (req as any).authMethod = actingAuthMethod;
+    (req as any).sessionRole = actingSessionRole;
     next();
   });
   app.use('/principals', principalsRouter);
@@ -127,6 +134,10 @@ afterAll(async () => {
 beforeEach(() => {
   statements = [];
   actingPrincipalId = ALICE;
+  actingRole = 'user';
+  actingAuthMethod = 'session';
+  actingScopes = ['tasks:read', 'principals:read', 'services:write'];
+  actingSessionRole = null;
   connectorRows = [CONNECTOR_ROW];
   (pool.query as jest.Mock).mockImplementation(async (text: string, params: unknown[]) => {
     const sql = String(text).replace(/\s+/g, ' ').trim();
@@ -143,6 +154,21 @@ beforeEach(() => {
 const get = () => fetch(`${baseUrl}/principals/me/connectors`);
 
 describe('GET /principals/me/connectors — the caller own chain', () => {
+  it('returns a server-verified transport standing for root and administrator sessions only', async () => {
+    const viewer = async () => (await (await get()).json() as any).mayLoosenCredentialTransport;
+    expect(await viewer()).toBe(false);
+    actingRole = 'admin';
+    expect(await viewer()).toBe(true);
+    actingRole = 'operator';
+    expect(await viewer()).toBe(true);
+    actingSessionRole = 'user';
+    expect(await viewer()).toBe(false);
+    actingSessionRole = null;
+    actingAuthMethod = 'principal_api_key';
+    expect(await viewer()).toBe(false);
+    actingRole = 'user'; actingScopes = ['root'];
+    expect(await viewer()).toBe(true);
+  });
   it('returns the Connector, its credentials and the Agents minted beneath it', async () => {
     const response = await get();
     expect(response.status).toBe(200);
@@ -221,6 +247,12 @@ describe('GET /principals/me/connectors — the caller own chain', () => {
     expect(body.instructions.bootstrapLine).toContain(body.instructions.boardEndpoint);
     expect(JSON.stringify(body.instructions.mcpConfig)).toContain(placeholder);
     expect(body.instructions.cliEnv.join('\n')).toContain(placeholder);
+    // Card 94e8bb0b: the bootstrap prompt and the guidance are re-shown verbatim,
+    // composed from the endpoint alone, so the placeholder never reaches them.
+    const mcpEndpoint = `${body.instructions.boardEndpoint}/mcp`;
+    expect(body.instructions.bootstrapPrompt).toBe(composeBootstrapPrompt(mcpEndpoint));
+    expect(body.instructions.configurationGuidance).toEqual(composeConfigurationGuidance(mcpEndpoint));
+    expect(body.instructions.bootstrapPrompt).not.toContain(placeholder);
     // The placeholder must not be mistakable for a credential: the auth
     // middleware parses `rh_<env>_<id>_<secret>`, and this parses as nothing.
     expect(placeholder).not.toMatch(/^rh_/);

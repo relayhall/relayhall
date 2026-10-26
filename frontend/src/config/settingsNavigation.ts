@@ -1,4 +1,4 @@
-import { KeyRound, Palette, Plug, ShieldCheck, SlidersHorizontal, Users, LucideIcon } from 'lucide-react';
+import { KeyRound, Palette, Plug, Server, ShieldCheck, SlidersHorizontal, Users, LucideIcon } from 'lucide-react';
 
 /**
  * THE SETTINGS INFORMATION ARCHITECTURE, as data.
@@ -33,11 +33,13 @@ export type SettingsNavGroupId = 'preferences' | 'access' | 'deployment';
  */
 export type SettingsNavEntryId =
   | 'preferences'
+  | 'plugins'
   | 'connections'
   | 'access-manager'
   | 'access-grants'
   | 'identities'
-  | 'appearance';
+  | 'appearance'
+  | 'services';
 
 export interface SettingsNavGroupMeta {
   id: SettingsNavGroupId;
@@ -93,6 +95,11 @@ export const settingsNavGroups: SettingsNavGroupMeta[] = [
  * the router census in `settingsRouteCensus.test.ts`.
  */
 export const settingsNavEntries: SettingsNavEntry[] = [
+  {
+    id: 'plugins', path: '/settings/plugins', label: 'Plugin settings',
+    description: 'Personal preferences and permitted deployment settings.',
+    icon: Plug, group: 'preferences', order: 2, surfaceKey: null, fallback: 'self',
+  },
   {
     id: 'preferences',
     path: '/settings/preferences',
@@ -157,6 +164,24 @@ export const settingsNavEntries: SettingsNavEntry[] = [
     group: 'deployment',
     order: 0,
     surfaceKey: 'settings.appearance',
+    fallback: 'root',
+  },
+  {
+    // Card 08792425 (member N6, the default-store design's choice C7): the
+    // Services page, where an administrator registers a knowledge source from
+    // its installer's bundle. No Access-surface key: its one route family
+    // (`/knowledge-source-registrations`) is gated in the handler by the
+    // authentication KIND and a role (root or an administrator login
+    // session), which the catalogue cannot state, so the entry falls back to
+    // the root predicate and the page renders what the board answers.
+    id: 'services',
+    path: '/settings/services',
+    label: 'Services',
+    description: 'Knowledge sources and their registration.',
+    icon: Server,
+    group: 'deployment',
+    order: 1,
+    surfaceKey: null,
     fallback: 'root',
   },
 ];

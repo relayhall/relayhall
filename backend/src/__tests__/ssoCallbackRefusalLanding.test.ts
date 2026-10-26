@@ -21,6 +21,11 @@ jest.mock('../db/connection', () => ({
 }));
 
 const completeAuthentication = jest.fn();
+// Card a3e76724: the route calls the kind-dispatching `completeCallback`. A
+// login is `{ kind: 'login' }` around what the login double answers, so the
+// login cases below read exactly as they did; the step-up cases override it.
+const completeCallback = jest.fn();
+const asLoginOutcome = async (...args: unknown[]) => ({ kind: 'login', login: await completeAuthentication(...args) });
 jest.mock('../services/identity/SsoAuthenticationService', () => {
   const actual = jest.requireActual('../services/identity/SsoAuthenticationService');
   return {
@@ -28,12 +33,13 @@ jest.mock('../services/identity/SsoAuthenticationService', () => {
     ssoAuthenticationService: {
       startAuthentication: jest.fn(),
       completeAuthentication: (...args: unknown[]) => completeAuthentication(...args),
+      completeCallback: (...args: unknown[]) => completeCallback(...args),
     },
   };
 });
 
 import { createSsoRouter } from '../routes/sso';
-import { SsoAuthenticationError } from '../services/identity/SsoAuthenticationService';
+import { SsoAuthenticationError, SsoStepUpCallbackError } from '../services/identity/SsoAuthenticationService';
 import { IdTokenError } from '../services/identity/idTokenValidation';
 
 let server: http.Server;
@@ -55,6 +61,8 @@ afterAll(async () => {
 
 beforeEach(() => {
   completeAuthentication.mockReset();
+  completeCallback.mockReset();
+  completeCallback.mockImplementation(asLoginOutcome);
   issueBrowserAccessCookie.mockReset();
 });
 
@@ -126,5 +134,85 @@ describe('everything that is not a person keeps the JSON envelope', () => {
     expect(response.headers.get('location')).toBe('/');
     expect(response.headers.get('set-cookie') ?? '').toContain('relayhall_session=tok');
     expect(issueBrowserAccessCookie).toHaveBeenCalledWith(expect.anything(), 'p1');
+  });
+});
+
+// ── Card a3e76724 · a STEP-UP callback lands in the step-up window ─────────
+describe('a step-up re-authentication lands in the window that asked for it', () => {
+  const REQUEST_ID = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f';
+
+  it('a proven step-up redirects to the step-up landing — no login session, no capability cookie, no token', async () => {
+    completeCallback.mockResolvedValue({
+      kind: 'step_up',
+      stepUp: { requestId: REQUEST_ID, principalId: 'p1', action: 'approval.decide', targetId: 't1', identityProviderId: 'i1' },
+    });
+    const response = await callback(BROWSER_ACCEPT);
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toBe(`/dashboard/?step_up=complete&request=${REQUEST_ID}`);
+    const setCookie = response.headers.get('set-cookie') ?? '';
+    expect(setCookie).not.toContain('relayhall_session=');
+    expect(setCookie).toContain('rh_sso_state=;');
+    expect(issueBrowserAccessCookie).not.toHaveBeenCalled();
+    // The landing names the request, never a token.
+    expect(response.headers.get('location')).not.toMatch(/rhsu_|token/i);
+  });
+
+  // Card 7a99d63e (SU-10): repaired BY NAME. A stale auth_time on a STEP-UP
+  // row now lands with its own named cause, SSO_STEP_UP_NOT_FRESH; every
+  // other ID-token refusal keeps SSO_ID_TOKEN_REFUSED (the vector below), and
+  // the login arm keeps the one collapsed code for all of them.
+  it('a refused step-up lands in the step-up window with the NAMED code (stale auth_time is SSO_STEP_UP_NOT_FRESH)', async () => {
+    completeCallback.mockRejectedValue(new SsoStepUpCallbackError(REQUEST_ID,
+      new IdTokenError('AUTH_TIME_STALE', 'the ID token auth_time predates the step-up request')));
+    const response = await callback(BROWSER_ACCEPT);
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location'))
+      .toBe(`/dashboard/?step_up=refused&request=${REQUEST_ID}&code=SSO_STEP_UP_NOT_FRESH`);
+    expect(response.headers.get('location')).not.toContain('predates');
+    expect(response.headers.get('set-cookie') ?? '').not.toContain('relayhall_session=');
+    const fetchReply = await callback('*/*');
+    expect(fetchReply.status).toBe(400);
+    const body = await fetchReply.json() as Record<string, unknown>;
+    expect(body.code).toBe('SSO_STEP_UP_NOT_FRESH');
+    expect(JSON.stringify(body)).not.toContain('predates');
+  });
+
+  it('any other ID-token refusal on a step-up row keeps SSO_ID_TOKEN_REFUSED (card 7a99d63e)', async () => {
+    completeCallback.mockRejectedValue(new SsoStepUpCallbackError(REQUEST_ID,
+      new IdTokenError('NONCE_MISMATCH', 'the ID token nonce does not match the pending authentication request')));
+    const response = await callback(BROWSER_ACCEPT);
+    expect(response.headers.get('location'))
+      .toBe(`/dashboard/?step_up=refused&request=${REQUEST_ID}&code=SSO_ID_TOKEN_REFUSED`);
+  });
+
+  it('a stale auth_time on a LOGIN still lands as SSO_ID_TOKEN_REFUSED (card 7a99d63e: the login arm is unchanged)', async () => {
+    completeCallback.mockRejectedValue(new IdTokenError('AUTH_TIME_STALE', 'the ID token auth_time predates the step-up request'));
+    const response = await callback(BROWSER_ACCEPT);
+    expect(response.headers.get('location')).toBe('/dashboard/?sso_refused=SSO_ID_TOKEN_REFUSED');
+  });
+
+  it('a different Account at the Identity provider is refused by its own code', async () => {
+    completeCallback.mockRejectedValue(new SsoStepUpCallbackError(REQUEST_ID,
+      new SsoAuthenticationError('SSO_STEP_UP_SUBJECT_MISMATCH', 'the Identity provider authenticated a different Account')));
+    const browser = await callback(BROWSER_ACCEPT);
+    expect(browser.headers.get('location'))
+      .toBe(`/dashboard/?step_up=refused&request=${REQUEST_ID}&code=SSO_STEP_UP_SUBJECT_MISMATCH`);
+    const fetchReply = await callback('*/*');
+    expect(fetchReply.status).toBe(400);
+    const body = await fetchReply.json() as Record<string, unknown>;
+    expect(body.code).toBe('SSO_STEP_UP_SUBJECT_MISMATCH');
+    expect(body.message).toBe('the Identity provider authenticated a different Account than the one stepping up');
+  });
+
+  it('an untyped failure behind a step-up row is a 500 envelope for a fetch and carries none of its text', async () => {
+    completeCallback.mockRejectedValue(new SsoStepUpCallbackError(REQUEST_ID, new Error('the database fell over')));
+    const response = await callback('*/*');
+    expect(response.status).toBe(500);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.code).toBe('SSO_STEP_UP_FAILED');
+    expect(JSON.stringify(body)).not.toContain('fell over');
+    const browser = await callback(BROWSER_ACCEPT);
+    expect(browser.headers.get('location'))
+      .toBe(`/dashboard/?step_up=refused&request=${REQUEST_ID}&code=SSO_STEP_UP_FAILED`);
   });
 });

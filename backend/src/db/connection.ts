@@ -1,8 +1,14 @@
 import { Pool, PoolConfig } from 'pg';
 import dotenv from 'dotenv';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import { refusePlaceholderDatabasePassword } from '../config/placeholderSecrets';
 
 dotenv.config();
+
+// The .env.example POSTGRES_PASSWORD placeholder is public: a backend (or a
+// migration run) started with it refuses here, before any pool exists, in
+// every mode (config/placeholderSecrets).
+refusePlaceholderDatabasePassword(process.env);
 
 // Boot-check mode (RELAYHALL_BOOT_CHECK=1) exists so a boot gate can prove the
 // server constructs and binds without ever reaching a database — even when the
@@ -76,6 +82,52 @@ export const databasePoolConfig: PoolConfig = BOOT_CHECK_MODE
         connectionTimeoutMillis: 15000,
       };
 
+// D11 containment: reject inherited source-database configuration before
+// constructing any pool. Keep the exact legacy names below: these are denied
+// targets, not product defaults or supported deployment names. An unset name
+// is also refused so a missing variable cannot silently choose a database.
+// The host denial cannot be released by the explicit database-name opt-in.
+export const REFUSED_DB_NAMES: readonly string[] = ['clawboard', 'clawboard_dev'];
+export const REFUSED_DB_HOSTS: readonly string[] = ['clawboard-db', 'clawboard-dev-db'];
+
+export function assertDatabaseTargetAllowed(env: NodeJS.ProcessEnv = process.env): void {
+  const name = (env.DB_NAME ?? '').trim();
+  const host = (env.DB_HOST ?? '').trim();
+  const allow = (env.RELAYHALL_ALLOW_DB_NAME ?? '').trim();
+
+  const refuse = (target: string, what: string): never => {
+    throw new Error(
+      `[db] refusing to create a connection pool: ${what} (${target || '<unset>'}). `
+      + 'RelayHall must not inherit a foreign database environment (incident D11, '
+      + 'reference 47718b8f). Set DB_NAME to the RelayHall database you mean, or set '
+      + `RELAYHALL_ALLOW_DB_NAME=${target || '<name>'} to allow that exact name explicitly.`,
+    );
+  };
+
+  // The HOST rule is checked FIRST, above the opt-in, and nothing releases it.
+  // The incident was reached by a session on the source database SERVER; an
+  // opt-in that released this would let one environment variable rebuild that
+  // exact configuration under a sibling database name, which is the shape of
+  // `relayhall_w2_r4_review` (W1d 4). Reaching that server is never a naming
+  // mistake to be waived — it needs a different host.
+  if (REFUSED_DB_HOSTS.includes(host)) refuse(host, 'DB_HOST names a refused database server');
+
+  // The single escape hatch, and it releases the NAME rules only: an operator
+  // naming the exact database they mean. An unset DB_NAME can never match it,
+  // so the opt-in cannot re-open the "no environment at all" case either.
+  if (name !== '' && allow !== '' && allow === name) return;
+
+  if (name === '') refuse('', 'DB_NAME is unset, so the pool would choose a database nobody named');
+  if (REFUSED_DB_NAMES.includes(name)) refuse(name, 'DB_NAME names a refused database');
+}
+
+// Boot-check mode is exempt because its configuration above is pinned, at
+// construction, to 127.0.0.1:59998 / relayhall_boot_check_none and therefore
+// cannot reach any server the environment names — there is no target to refuse.
+if (!BOOT_CHECK_MODE) {
+  assertDatabaseTargetAllowed();
+}
+
 // Database connection pool
 export const pool = new Pool(databasePoolConfig);
 
@@ -85,8 +137,11 @@ pool.on('connect', () => {
 });
 
 pool.on('error', (err) => {
+  // pg-pool has already removed the failed idle client before emitting this
+  // event. Keep the server alive so requests can report database unavailability
+  // and later acquisitions can create a replacement after PostgreSQL recovers.
+  // Startup schema/canary failures remain fatal at their existing gates.
   logCaughtFailure('[Database] unexpected pool failure', err);
-  process.exit(-1);
 });
 
 // Helper function to query database

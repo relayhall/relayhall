@@ -3,8 +3,7 @@
         "name": "Relay",
         "displayName": "My RelayHall",
         "emoji": "\ud83e\udd16",
-        "description": "My governed human and AI work hub",
-        "avatarUrl": "/assets/avatar-placeholder.png"
+        "description": "My governed human and AI work hub"
     },
     "branding": {
         "primaryColor": "#6366f1",

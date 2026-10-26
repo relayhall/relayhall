@@ -110,7 +110,7 @@ describe('canonical orchestrator runtime signals', () => {
     expect(sql).toContain("e.event_kind IN ('message','tool_call','tool_result','control')");
     expect(sql).toContain("o.ownership_kind='writer'");
     expect(sql).toContain("l.link_state NOT IN ('released','superseded')");
-    expect(params).toEqual([evidence().taskId, now]);
+    expect(params).toEqual([[evidence().taskId], now]);
   });
 
   it('rejects invalid decision windows', () => {

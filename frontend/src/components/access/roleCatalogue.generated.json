@@ -1,0 +1,393 @@
+{
+  "roles": [
+    {
+      "role": "admin",
+      "purpose": "Administers the whole deployment: settings, identities, credentials and every role.",
+      "meantFor": [
+        "human"
+      ],
+      "meantForText": "Meant for humans.",
+      "elevated": true,
+      "ceiling": [
+        "root"
+      ],
+      "mayReach": "Everything: it holds root, which satisfies every scope check, owner-plane routes included.",
+      "neverReaches": "No scope is out of reach; root itself is never put on a bearer credential, so keys stay below it.",
+      "sameCeilingAs": [
+        "orchestrator"
+      ],
+      "assignedBy": [
+        "admin"
+      ],
+      "assignedByText": "Assigned by admin."
+    },
+    {
+      "role": "operator",
+      "purpose": "Administers product objects and ordinary Accounts, without the owner plane.",
+      "meantFor": [
+        "human"
+      ],
+      "meantForText": "Meant for humans.",
+      "elevated": true,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "blueprints:admin",
+        "tasks:read",
+        "tasks:write",
+        "tasks:admin",
+        "projects:read",
+        "projects:write",
+        "projects:admin",
+        "phases:read",
+        "phases:write",
+        "phases:admin",
+        "reports:read",
+        "reports:write",
+        "reports:admin",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "skills:admin",
+        "personalities:read",
+        "personalities:write",
+        "personalities:admin",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "services:admin",
+        "principals:read",
+        "principals:admin",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write, invoke and admin scope (all 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route.",
+      "sameCeilingAs": [],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "editor",
+      "purpose": "Creates and changes the objects the Account is permitted to work on.",
+      "meantFor": [
+        "human"
+      ],
+      "meantForText": "Meant for humans.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "phases:read",
+        "phases:write",
+        "reports:read",
+        "reports:write",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "personalities:read",
+        "personalities:write",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "principals:read",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write and invoke scope (26 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no admin scope.",
+      "sameCeilingAs": [
+        "user",
+        "reviewer",
+        "qa",
+        "agent"
+      ],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "user",
+      "purpose": "Everyday work on the objects the Account is permitted to work on.",
+      "meantFor": [
+        "human"
+      ],
+      "meantForText": "Meant for humans.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "phases:read",
+        "phases:write",
+        "reports:read",
+        "reports:write",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "personalities:read",
+        "personalities:write",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "principals:read",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write and invoke scope (26 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no admin scope.",
+      "sameCeilingAs": [
+        "editor",
+        "reviewer",
+        "qa",
+        "agent"
+      ],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "viewer",
+      "purpose": "Reads permitted objects without changing them: observers and read-only integrations.",
+      "meantFor": [
+        "human",
+        "service"
+      ],
+      "meantForText": "Meant for humans and services.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "tasks:read",
+        "projects:read",
+        "phases:read",
+        "reports:read",
+        "skills:read",
+        "personalities:read",
+        "services:read",
+        "principals:read",
+        "audit:read",
+        "metrics:read",
+        "knowledge-contents:read"
+      ],
+      "mayReach": "Every read scope (12 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no use, write, invoke or admin scope.",
+      "sameCeilingAs": [],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "orchestrator",
+      "purpose": "Coordinates the board and its automation from a person’s Account.",
+      "meantFor": [
+        "human"
+      ],
+      "meantForText": "Meant for humans.",
+      "elevated": true,
+      "ceiling": [
+        "root"
+      ],
+      "mayReach": "Everything: it holds root, which satisfies every scope check, owner-plane routes included.",
+      "neverReaches": "No scope is out of reach; root itself is never put on a bearer credential, so keys stay below it.",
+      "sameCeilingAs": [
+        "admin"
+      ],
+      "assignedBy": [
+        "admin"
+      ],
+      "assignedByText": "Assigned by admin."
+    },
+    {
+      "role": "reviewer",
+      "purpose": "Checks other identities’ work and records evidence; the Task’s Verifier assignment still decides who verifies.",
+      "meantFor": [
+        "human",
+        "service",
+        "agent"
+      ],
+      "meantForText": "Meant for humans, services and agents.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "phases:read",
+        "phases:write",
+        "reports:read",
+        "reports:write",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "personalities:read",
+        "personalities:write",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "principals:read",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write and invoke scope (26 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no admin scope.",
+      "sameCeilingAs": [
+        "editor",
+        "user",
+        "qa",
+        "agent"
+      ],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "qa",
+      "purpose": "Runs quality checks and records test evidence under the same Task verification rules.",
+      "meantFor": [
+        "service",
+        "agent"
+      ],
+      "meantForText": "Meant for services and agents.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "phases:read",
+        "phases:write",
+        "reports:read",
+        "reports:write",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "personalities:read",
+        "personalities:write",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "principals:read",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write and invoke scope (26 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no admin scope.",
+      "sameCeilingAs": [
+        "editor",
+        "user",
+        "reviewer",
+        "agent"
+      ],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    },
+    {
+      "role": "agent",
+      "purpose": "Automation that performs assigned work inside its credential and delegation limits.",
+      "meantFor": [
+        "service",
+        "agent"
+      ],
+      "meantForText": "Meant for services and agents.",
+      "elevated": false,
+      "ceiling": [
+        "blueprints:read",
+        "blueprints:use",
+        "blueprints:write",
+        "tasks:read",
+        "tasks:write",
+        "projects:read",
+        "projects:write",
+        "phases:read",
+        "phases:write",
+        "reports:read",
+        "reports:write",
+        "skills:read",
+        "skills:use",
+        "skills:write",
+        "personalities:read",
+        "personalities:write",
+        "services:read",
+        "services:invoke",
+        "services:write",
+        "principals:read",
+        "audit:read",
+        "telemetry:write",
+        "metrics:read",
+        "directory-provisioning:write",
+        "knowledge-contents:read",
+        "knowledge-contents:write"
+      ],
+      "mayReach": "Every read, use, write and invoke scope (26 of the 35 scopes below root).",
+      "neverReaches": "Root, so no owner-plane route and no admin scope.",
+      "sameCeilingAs": [
+        "editor",
+        "user",
+        "reviewer",
+        "qa"
+      ],
+      "assignedBy": [
+        "admin",
+        "operator",
+        "orchestrator"
+      ],
+      "assignedByText": "Assigned by admin, operator or orchestrator."
+    }
+  ]
+}

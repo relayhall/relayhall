@@ -8,7 +8,7 @@
 .grants-boundary svg { flex: 0 0 auto; color: var(--text-accent); }
 .grants-refresh { width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid var(--border-default); border-radius: var(--radius-md); color: var(--text-secondary); background: var(--bg-surface); cursor: pointer; }
 .grants-refresh:hover { color: var(--text-primary); background: var(--bg-surface-hover); }
-.grants-refresh:focus-visible, .grants-revoke:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.grants-refresh:focus-visible, .grants-action:focus-visible, .grants-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .grants-error, .grants-notice { margin: var(--space-3) 0; padding: var(--space-3); border-radius: var(--radius-md); }
 .grants-error { border: 1px solid var(--status-danger); color: var(--text-error); background: var(--status-danger-soft); }
 .grants-notice { border: 1px solid var(--status-success); color: var(--text-success); background: var(--status-success-soft); }
@@ -20,18 +20,58 @@
 .grants-list-header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
 .grants-list-header label { display: flex; align-items: center; gap: var(--space-2); color: var(--text-secondary); font-size: var(--text-sm); }
 .grants-table { border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden; }
-.grants-row { display: grid; grid-template-columns: minmax(180px, 1.25fr) minmax(80px, .55fr) minmax(210px, 1.25fr) minmax(160px, 1fr) minmax(110px, .6fr); align-items: center; gap: var(--space-3); min-height: 60px; padding: var(--space-3); border-bottom: 1px solid var(--border-subtle); font-size: var(--text-sm); }
+.grants-row { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(72px, .45fr) minmax(190px, 1.25fr) minmax(170px, 1fr) minmax(130px, .8fr) minmax(200px, .9fr); align-items: center; gap: var(--space-3); min-height: 60px; padding: var(--space-3); border-bottom: 1px solid var(--border-subtle); font-size: var(--text-sm); }
 .grants-row:last-child { border-bottom: 0; }
 .grants-row--head { min-height: 42px; color: var(--text-tertiary); background: var(--bg-elevated); font-size: var(--text-xs); font-weight: var(--font-semibold); text-transform: uppercase; letter-spacing: .04em; }
 .grants-row span { min-width: 0; }
 .grants-row strong, .grants-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .grants-row small { margin-top: var(--space-1); color: var(--text-tertiary); }
 .grants-verb { width: max-content; padding: var(--space-1) var(--space-2); border: 1px solid var(--border-accent); border-radius: var(--radius-full); color: var(--text-accent); background: var(--accent-soft); font-family: var(--font-mono); font-size: var(--text-xs); }
-.grants-revoke { min-height: 40px; display: inline-flex; align-items: center; gap: var(--space-2); border: 1px solid var(--status-danger); border-radius: var(--radius-md); padding: var(--space-2); color: var(--text-error); background: transparent; cursor: pointer; }
-.grants-revoke:hover:not(:disabled) { background: var(--status-danger-soft); }
-.grants-revoke:disabled { opacity: .6; cursor: not-allowed; }
+/* Card ff410dc4 (owner ruling E407 item 1): Edit and Revoke are ONE inline
+   pair of equal controls - two equal grid tracks, the same height, padding,
+   border and type - at every width, instead of two unlike buttons stacked. */
+.grants-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2); width: 100%; max-width: 240px; }
+.grants-action { width: 100%; min-width: 0; min-height: var(--control-compact); display: inline-flex; align-items: center; justify-content: center; gap: var(--space-1); padding: 0 var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); color: var(--text-primary); background: var(--bg-surface); font: inherit; font-size: var(--text-sm); font-weight: var(--font-semibold); line-height: 1; white-space: nowrap; cursor: pointer; }
+.grants-action:hover:not(:disabled) { background: var(--bg-surface-hover); }
+.grants-action--danger { border-color: var(--status-danger); color: var(--text-error); }
+.grants-action--danger:hover:not(:disabled) { background: var(--status-danger-soft); }
+.grants-action:disabled { opacity: .6; cursor: not-allowed; }
+.grants-list-summary { color: var(--text-secondary); font-size: var(--text-sm); }
+.grants-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); margin-bottom: var(--space-3); }
+.grants-filters label { display: flex; flex-direction: column; gap: var(--space-1); color: var(--text-secondary); font-size: var(--text-sm); }
+.grants-search { position: relative; display: flex; align-items: center; flex: 1 1 260px; min-width: 0; }
+.grants-search svg { position: absolute; left: var(--space-3); color: var(--text-tertiary); pointer-events: none; }
+.grants-search input { width: 100%; padding-left: var(--space-8); }
+.grants-link { padding: var(--space-1) 0; border: 0; color: var(--text-accent); background: transparent; font: inherit; font-size: var(--text-sm); text-decoration: underline; cursor: pointer; }
+.grants-hidden-note { margin: 0 0 var(--space-3); color: var(--text-secondary); font-size: var(--text-sm); }
+.grants-origin { font-weight: var(--font-semibold); }
+.grants-origin--hand { color: var(--text-accent); }
+.grants-origin--system { color: var(--text-secondary); }
+.grants-origin--unknown { color: var(--text-warning); }
+.grants-more { display: flex; justify-content: center; margin-top: var(--space-3); }
 .grants-state, .grants-empty { min-height: 120px; display: flex; align-items: center; justify-content: center; gap: var(--space-2); color: var(--text-secondary); }
 .grants-spin { animation: grants-spin var(--transition-slower) linear infinite; }
 @keyframes grants-spin { to { transform: rotate(360deg); } }
-@media (max-width: 1024px) { .grants-row--head { display: none; } .grants-row { grid-template-columns: 1fr 1fr; } .grants-row > span:last-child { grid-column: 1 / -1; } }
-@media (max-width: 640px) { .grants-editor-grid { grid-template-columns: 1fr; } .grants-span-two { grid-column: auto; } .grants-list-header { align-items: stretch; flex-direction: column; } .grants-list-header label { align-items: stretch; flex-direction: column; } .grants-row { grid-template-columns: 1fr; } .grants-row > span:last-child { grid-column: auto; } }
+@media (max-width: 1024px) { .grants-row--head { display: none; } .grants-row { grid-template-columns: 1fr 1fr; } .grants-row > span:last-child { grid-column: 1 / -1; } .grants-actions { max-width: none; } }
+@media (max-width: 640px) { .grants-editor-grid { grid-template-columns: 1fr; } .grants-span-two { grid-column: auto; } .grants-list-header { align-items: stretch; flex-direction: column; } .grants-list-header label { align-items: stretch; flex-direction: column; } .grants-filters label { flex: 1 1 100%; } .grants-row { grid-template-columns: 1fr; } .grants-row > span:last-child { grid-column: auto; } }
+
+.grants-editor[aria-label="Edit grant"] { display: grid; gap: 0.75rem; }
+.grants-editor[aria-label="Edit grant"] h2, .grants-editor[aria-label="Edit grant"] p { margin: 0; }
+
+/* Owner ruling E413: the clean-up of grants that change nobody's access,
+   opened beside the list's paging: a dry run's counts and sample, then one
+   step-up per revoke batch. */
+.grants-list-header { flex-wrap: wrap; }
+.grants-cleanup { margin: var(--space-3) 0; padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-elevated); }
+.grants-cleanup h3 { margin: 0 0 var(--space-2); font-size: var(--text-xl); }
+.grants-cleanup h4 { margin: var(--space-3) 0 var(--space-2); font-size: var(--text-sm); font-weight: var(--font-semibold); }
+.grants-cleanup-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.grants-cleanup-result { margin-top: var(--space-3); }
+.grants-cleanup-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-2); margin: 0; }
+.grants-cleanup-counts div { display: flex; justify-content: space-between; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); font-size: var(--text-sm); }
+.grants-cleanup-counts dt { color: var(--text-secondary); }
+.grants-cleanup-counts dd { margin: 0; font-weight: var(--font-semibold); }
+.grants-cleanup-sample, .grants-cleanup-outcomes { margin: 0; padding-left: var(--space-5); font-size: var(--text-sm); }
+.grants-cleanup-sample li { margin-bottom: var(--space-1); overflow-wrap: anywhere; }
+.grants-cleanup-sample small { display: block; color: var(--text-tertiary); }
+.grants-cleanup-sample code { font-family: var(--font-mono); font-size: var(--text-xs); }

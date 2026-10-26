@@ -22,6 +22,9 @@ interface IconButtonProps {
      weakens the APG disclosure pattern (task 482e21fa). */
   ariaControls?: string;
   ariaHaspopup?: React.AriaAttributes['aria-haspopup'];
+  /* E469: opt in to the phone long-press / focus label (ui/LabelTip.tsx). Inert
+     unless the control sits in a row that calls useLabelTips. */
+  labelTip?: boolean;
 }
 
 export const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>(({
@@ -36,7 +39,8 @@ export const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>((
   ariaPressed,
   ariaExpanded,
   ariaControls,
-  ariaHaspopup
+  ariaHaspopup,
+  labelTip = false
 }, ref) => {
   return (
     <button
@@ -50,6 +54,7 @@ export const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>((
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
       aria-haspopup={ariaHaspopup}
+      data-label-tip={labelTip ? '' : undefined}
       className={`icon-btn icon-btn-${variant} ${size === 'standard' ? 'icon-btn-standard' : ''} ${className}`}
     >
       {icon}

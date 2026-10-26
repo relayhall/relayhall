@@ -86,11 +86,31 @@ describe('boot-check mode — pool construction (unit)', () => {
     DB_PASSWORD: 'live-looking-secret',
   } as const;
 
+  // D11 (card 47718b8f): DB_NAME and DB_HOST are RESTORED, not deleted. The
+  // guard in db/connection.ts refuses an unset DB_NAME, and process.env is
+  // shared by every test file in this worker - deleting the two here would
+  // leave a later file's `jest.resetModules()` + `require('../db/connection')`
+  // throwing, for a reason that has nothing to do with that file. These are the
+  // values jest.config.js sets at config load; restoring them puts the worker
+  // back the way it was found. The other three are not read by the guard and
+  // are still cleared.
+  // Read back from the config rather than restating its literals: two copies of
+  // a value can be edited into agreement, and this one must track the config.
+  // Requiring it is idempotent - it assigns with `||`, so it never overwrites
+  // what the caller (or CI) already set, and after it both values are non-empty.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require('../../jest.config.js');
+  const JEST_CONFIG_DEFAULTS: Record<string, string> = {
+    DB_NAME: String(process.env.DB_NAME), DB_HOST: String(process.env.DB_HOST),
+  };
+
   afterEach(() => {
     delete process.env.RELAYHALL_BOOT_CHECK;
     for (const key of Object.keys(LIVE_LOOKING_ENV)) {
+      if (key in JEST_CONFIG_DEFAULTS) continue;
       delete process.env[key];
     }
+    Object.assign(process.env, JEST_CONFIG_DEFAULTS);
     jest.resetModules();
   });
 
@@ -119,6 +139,11 @@ describe('boot-check mode — pool construction (unit)', () => {
 
   it('only the exact value 1 enables the mode', () => {
     process.env.RELAYHALL_BOOT_CHECK = 'true';
+    // D11 (card 47718b8f): with boot-check mode OFF this case really builds the
+    // pool, and the guard in db/connection.ts refuses an unset DB_NAME. The
+    // afterEach above deletes DB_NAME, so name the same unreachable database
+    // jest.config.js defaults to. It is not reachable and nothing connects.
+    process.env.DB_NAME = 'relayhall_test_unreachable';
     jest.isolateModules(() => {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { BOOT_CHECK_MODE } = require('../db/connection');

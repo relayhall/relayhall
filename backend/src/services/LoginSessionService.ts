@@ -294,8 +294,10 @@ export class LoginSessionService {
     principalId: string,
     reason: RevokeReason,
     exceptSessionId?: string | null,
+    /** A caller's transaction (the account-status seam, E325 section 3 F16): the revoke commits or rolls back with it. */
+    queryable: { query: (text: string, params?: unknown[]) => Promise<{ rowCount?: number | null }> } = pool,
   ): Promise<number> {
-    const result = await pool.query(
+    const result = await queryable.query(
       `UPDATE auth_sessions
           SET revoked_at = now(), revoke_reason = $2, id_token_ct = NULL, id_token_key_id = NULL
         WHERE principal_id = $1 AND revoked_at IS NULL

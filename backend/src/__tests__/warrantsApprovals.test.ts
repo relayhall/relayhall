@@ -127,6 +127,11 @@ beforeEach(() => {
   jest.clearAllMocks();
   db.queries.length = 0;
   db.script.length = 0;
+  // Card 502fb19e slice S2 (change-request design section 5.1 (2), section 12
+  // Q20 (a)): the decide route reads the deciding Account's liveness for EVERY
+  // kind before the step-up is spent. The sessions here are live Accounts.
+  db.script.push((text) => (/SELECT status, legacy_identity, parent_principal_id FROM principals WHERE id = \$1/.test(text)
+    ? { rows: [{ status: 'active', legacy_identity: false, parent_principal_id: null }] } : null));
   authShape = {};
 });
 
@@ -175,7 +180,7 @@ describe('session-only surfaces (T3/T7)', () => {
   it('a session decide without a live step-up token refuses STEP_UP_REQUIRED (T7/T16 shape)', async () => {
     asRootSession();
     db.script.push((text) => {
-      if (/FROM approvals a/.test(text)) {
+      if (/FROM approvals(?: a)?/.test(text)) {
         return { rows: [{ id: APPROVAL, status: 'pending', requester_principal_id: CONNECTOR, requester_handle: 'conn', requesting_credential_id: CRED, session_evidence: null, target_task_id: TASK, target_task_title: 't', requested_scopes: '["tasks:read"]', requested_rules: '[]', approved_scopes: null, approved_rules: null, decided_by_principal_id: null, decided_at: null, denial_reason: null, lapse_reason: null, requested_at: new Date().toISOString(), pending_expires_at: new Date(Date.now() + 86400000).toISOString(), collect_expires_at: null, collected_at: null, minted_principal_id: null }] };
       }
       if (/UPDATE step_up_tokens/.test(text)) return { rows: [] }; // no live token
@@ -242,11 +247,42 @@ function scriptHealthyConnectorRequest(): void {
       return { rows: [{ revoked_at: null, expires_at: null, grace_until: null }] };
     }
     if (/SELECT status FROM tasks/.test(text)) return { rows: [{ status: 'todo' }] };
+    // T2 at filing (card 785e1eed P1-C) reads the requesting credential's scopes.
+    if (/SELECT scopes FROM principal_credentials/.test(text)) return { rows: [{ scopes: '["tasks:read","tasks:write"]' }] };
     return null;
   });
 }
 
 describe('POST /delegation/agent-mints — bearer dispatch (§6.1/§6.2)', () => {
+  it('T2 runs at FILING: scopes beyond the requester\'s current effective set refuse 403 before the quota (card 785e1eed)', async () => {
+    asBearer(CONNECTOR);
+    // The requester's own() scope cap is tasks:read; the credential still says
+    // read+write. Decide would refuse this; filing now refuses it first.
+    db.script.push((text) => {
+      if (/WITH RECURSIVE chain/.test(text)) {
+        return { rows: [
+          { id: CONNECTOR, kind: 'service', role: null, status: 'active', parent_principal_id: ROOT, bound_task_id: null, legacy_identity: false, own_expression: JSON.stringify({ scopes: ['tasks:read'], objects: 'parent' }), live_credential_count: 1, depth: 0 },
+          { id: ROOT, kind: 'human', role: 'admin', status: 'active', parent_principal_id: null, bound_task_id: null, legacy_identity: false, own_expression: null, live_credential_count: 0, depth: 1 },
+        ] };
+      }
+      return null;
+    });
+    scriptHealthyConnectorRequest();
+    db.script.push((text) => (/COUNT\(\*\) FILTER/.test(text) ? { rows: [{ pending: 0, daily: 0 }] } : null));
+    const { status, json } = await call('POST', '/delegation/agent-mints', {
+      via: 'approval', targetTaskId: TASK, requestedScopes: ['tasks:read', 'tasks:write'],
+    });
+    expect(status).toBe(403);
+    expect(json.code).toBe('MINT_EXCEEDS_REQUESTER');
+    expect(json.message).toContain('tasks:write');
+    expect(db.queries.some((q) => /COUNT\(\*\) FILTER/.test(q.text))).toBe(false);
+    expect(db.queries.some((q) => /INSERT INTO approvals/.test(q.text))).toBe(false);
+    const denial = auditRecord.mock.calls.find(
+      (c: any[]) => c[0].action === 'approval.request' && c[0].outcome === 'denied' && c[0].metadata?.refusal === 'MINT_EXCEEDS_REQUESTER',
+    );
+    expect(denial).toBeDefined();
+  });
+
   it("via:'approval' creates the pending quota-bound Approval (202)", async () => {
     asBearer(CONNECTOR);
     scriptHealthyConnectorRequest();
@@ -501,7 +537,7 @@ describe('mintUnderWarrant (T4/T17/T18/T23 shapes)', () => {
     expect(db.queries.some((q) => /FROM warrants WHERE id = \$1 FOR UPDATE/.test(q.text))).toBe(true);
   });
 
-  it('auto-select refuses on multiplicity (sol M8) — the error names AMBIGUOUS_WARRANT', async () => {
+  it('auto-select refuses on multiplicity (review M8) — the error names AMBIGUOUS_WARRANT', async () => {
     db.script.push((text) => {
       if (/SELECT w\.id FROM warrants w/.test(text)) {
         return { rows: [{ id: 'ababaaba-abab-4aba-8aba-abababababab' }, { id: 'cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd' }] };

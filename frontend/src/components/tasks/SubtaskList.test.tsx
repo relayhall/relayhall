@@ -51,6 +51,68 @@ describe('SubtaskList lifecycle controls', () => {
     expect(onStatusChange).toHaveBeenCalledWith('subtask-1', 'review', { reviewNote: 'Fresh screenshots attached' });
   });
 
+  // E388 Subtasks: each subtask is its own container, the state selector sits
+  // ABOVE the text so the text gets the full card width, and the review note
+  // sits on a distinct background. Markup order plus the owning stylesheet.
+  test('E388: each subtask is a card with its state selector above full-width text and a note block below', async () => {
+    const fs = await import('fs');
+    const css = fs.readFileSync('src/components/tasks/SubtaskList.css', 'utf8');
+    const tree = renderer.create(
+      <SubtaskList
+        onStatusChange={vi.fn()}
+        onEditText={vi.fn()}
+        subtasks={[subtask({ status: 'review', reviewNote: 'Check the exact candidate' })]}
+      />,
+    );
+    const item = tree.root.find(node => node.type === 'li');
+    expect(String(item.props.className)).toContain('subtask-item');
+    const order = item.children
+      .filter((child): child is renderer.ReactTestInstance => typeof child !== 'string')
+      .map(child => String(child.props.className || child.type));
+    expect(order[0]).toContain('subtask-list-status');
+    expect(order[1]).toContain('subtask-text');
+    expect(order[2]).toContain('subtask-lifecycle-context');
+    expect(item.findByProps({ role: 'note' }).props.className).toBe('subtask-review-note');
+
+    const block = (selector: string) => css.match(new RegExp(`(^|\\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\{[^}]*\\}`))?.[0] ?? '';
+    expect(css).not.toMatch(/190px|calc\(100% - 214px\)/);
+    expect(block('.subtask-item')).toContain('display: grid');
+    expect(block('.subtask-item')).toMatch(/grid-template-areas:\s*"status actions"\s*"text text"\s*"context context"/);
+    expect(block('.subtask-item')).toContain('border: 1px solid var(--border-subtle)');
+    expect(block('.subtask-item')).toContain('border-inline-start: var(--space-1) solid');
+    expect(block('.subtask-status-select')).toContain('grid-area: status');
+    expect(block('.subtask-text')).toContain('grid-area: text');
+    expect(block('.subtask-review-note,\n.subtask-blocked-reason,\n.subtask-skipped-note')).toContain('background: var(--bg-elevated)');
+    expect(block('.subtask-review-note,\n.subtask-blocked-reason,\n.subtask-skipped-note')).toContain('border-inline-start: var(--space-1) solid');
+  });
+
+  test('E388: row actions take no row of their own and show on hover, focus and coarse pointers', async () => {
+    const fs = await import('fs');
+    const css = fs.readFileSync('src/components/tasks/SubtaskList.css', 'utf8');
+    expect(css).toMatch(/\.subtask-actions \{[^}]*grid-area: actions/);
+    expect(css).not.toMatch(/\.subtask-actions \{[^}]*margin-left: auto/);
+    expect(css).toMatch(/\.subtask-item:hover \.subtask-actions,\s*\.subtask-item:focus-within \.subtask-actions \{[^}]*opacity: 1/);
+    expect(css).toMatch(/@media \(pointer: coarse\), \(max-width: 767px\) \{\s*\.subtask-actions \{[^}]*opacity: 1/);
+  });
+
+  test('E388: progress counts carry words for screen readers', () => {
+    const tree = renderer.create(
+      <SubtaskList
+        readOnly
+        subtasks={[
+          subtask({ id: 'a', status: 'completed' }),
+          subtask({ id: 'b', status: 'completed' }),
+          subtask({ id: 'c', status: 'in-progress' }),
+          subtask({ id: 'd', status: 'review' }),
+          subtask({ id: 'e', status: 'empty' }),
+        ]}
+      />,
+    );
+    const summary = tree.root.find(node => node.props.className === 'subtask-progress-text');
+    const words = summary.findAll(node => node.props.className === 'sr-only').map(node => node.children.join(''));
+    expect(words).toEqual([' completed', ' to be reviewed', ' in progress', ' not started']);
+  });
+
   test('shows server transition failures instead of silently changing local state', async () => {
     vi.stubGlobal('window', { prompt: vi.fn() });
     const onStatusChange = vi.fn(async () => { throw new Error('Only an independent Verifier can approve.'); });

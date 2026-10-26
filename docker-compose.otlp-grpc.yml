@@ -1,0 +1,23 @@
+# Opt-in overlay: the OTLP/gRPC receiver (docs/observability.md, "OTLP/gRPC").
+#
+#   docker compose -f docker-compose.yml -f docker-compose.otlp-grpc.yml up -d
+#
+# The backend opens a SECOND listener, on container port 4317 (the OTLP/gRPC
+# default), beside the HTTP API: gRPC needs HTTP/2 end to end, which the
+# frontend's HTTP/1.1 proxy does not carry, so the receiver is published
+# directly. It is bound to loopback by default, like every other port in the
+# base file; set OTLP_GRPC_BIND_ADDRESS to expose it on another interface.
+#
+# The listener speaks plaintext HTTP/2 (h2c) and every call carries an rh_
+# principal credential in its metadata: beyond loopback or a trusted network,
+# put a TLS-terminating proxy that supports gRPC in front of it.
+#
+# Without this overlay the receiver is off (RELAYHALL_OTLP_GRPC_PORT empty), or,
+# when .env sets RELAYHALL_OTLP_GRPC_PORT, reachable only from containers on the
+# compose network (for example a collector beside the backend).
+services:
+  relayhall-backend:
+    environment:
+      RELAYHALL_OTLP_GRPC_PORT: "4317"
+    ports:
+      - "${OTLP_GRPC_BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_HOST_PORT:-4317}:4317"

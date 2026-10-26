@@ -36,7 +36,8 @@ const createForProjectCreator = jest
   .spyOn(grantService, 'createForProjectCreator')
   .mockResolvedValue(undefined);
 function fixture() {
-  const query = jest.fn(async (sql: string, _values?: any[]) => ({ rows: sql.startsWith('SELECT * FROM projects') ? [{ id: 'project', name: 'Project', status: 'active' }] : [] }));
+  // AZ-A12 clause 12 (card a9b1e69c): the point read joins the owner's kind and name onto `p.*`.
+  const query = jest.fn(async (sql: string, _values?: any[]) => ({ rows: sql.startsWith('SELECT * FROM projects') || sql.startsWith('SELECT p.*, ') ? [{ id: 'project', name: 'Project', status: 'active' }] : [] }));
   const client = { query, release: jest.fn() };
   const transaction = { client, actor, afterCommit: jest.fn() } as unknown as CreationTransaction;
   return { client, transaction };

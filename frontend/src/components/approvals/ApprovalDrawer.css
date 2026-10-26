@@ -1,0 +1,181 @@
+/* The approval item drawer (design T11; card b1e3b16d, lane L1). The same
+   shape as the Audit log's detail drawer: a right-hand panel over a scrim, the
+   full width of a phone. Theme tokens only, so each Theme draws it. */
+
+.approval-drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.approval-drawer {
+  width: min(520px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-5);
+  border-left: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-3);
+}
+
+.approval-drawer:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.approval-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-block-end: var(--space-4);
+}
+
+.approval-drawer-head h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+}
+
+.approval-drawer-facts {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-5);
+  font-size: var(--text-sm);
+}
+
+.approval-drawer-facts dt {
+  color: var(--text-tertiary);
+}
+
+.approval-drawer-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The drawer's in-app links (card 6dc53ea0): the dashboard's token link ink
+   (--text-accent on --bg-surface is a gated pair in every Theme,
+   docs/design-system.md), an underline so a link is not told by colour alone,
+   a heavier underline on hover and the shared focus ring on keyboard focus.
+   Never the browser's default blue, which is 1.99:1 on the dark surface. */
+.approval-drawer-link {
+  color: var(--text-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.approval-drawer-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.approval-drawer-link:focus-visible {
+  outline: none;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--focus-ring);
+}
+
+.approval-drawer-history-heading {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.approval-drawer-source {
+  margin: var(--space-1) 0 var(--space-3);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.approval-drawer-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.approval-drawer-event {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-sm);
+}
+
+.approval-drawer-event:last-child {
+  border-bottom: 0;
+}
+
+.approval-drawer-event-action {
+  font-weight: 600;
+}
+
+.approval-drawer-event-actor {
+  color: var(--text-secondary);
+}
+
+.approval-drawer-event-time {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.approval-drawer-event-detail {
+  flex-basis: 100%;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.approval-drawer-event-detail pre {
+  max-height: 220px;
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-drawer-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.approval-drawer-failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+  color: var(--text-error);
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 640px) {
+  .approval-drawer {
+    width: 100%;
+    padding: var(--space-4);
+    border-left: 0;
+  }
+
+  .approval-drawer-facts {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+
+  .approval-drawer-facts dd {
+    margin-block-end: var(--space-2);
+  }
+}

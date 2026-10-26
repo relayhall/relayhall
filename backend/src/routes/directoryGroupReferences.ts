@@ -11,18 +11,22 @@
  * login. This family is the list, and `POST /:id/use` is the one click that
  * makes the Group and populates it in the same transaction.
  *
- * ── THE VISIBILITY, AS NARROWED BY DBD-14 ────────────────────────────────
+ * ── THE VISIBILITY (design §5.3; the steward row since LENSES-c c1-A) ────
  *
  * Design §5.3's table has three live rows: root session, STEWARD, everyone
- * else. `group_stewards` defers to LENSES-c with migration 126's successor, so
- * **in v1 the steward row has no subject** and the projection is:
+ * else. In v1 the steward row had no subject (register row DBD-14). LENSES-c
+ * c1-A (card 46cfbd1d; design delta C.9, D-17) gives it one, so the
+ * projection is:
  *
  *     a ROOT LOGIN SESSION            -> every row, counts over the whole store
+ *     a non-root LOGIN SESSION that   -> the rows carried by an active member
+ *     holds a LIVE Group role row        of a Group it live-stewards, counts
+ *     (owner or manager)                 over that projected set, no identities
  *     every other caller, bearer      -> `200` with an EMPTY LIST
  *     or session
  *
- * That is NARROWER than the design and than owner decision 5, never wider, and
- * it is register row **DBD-14** rather than a silent omission.
+ * The steward test is the shared fragment (utils/liveStewardCondition), run
+ * by the service; this route only classifies the request.
  *
  * **An empty list, not a `403`.** A 403 on a list route discloses that the
  * surface exists and is populated; an empty list discloses that the caller has
@@ -52,21 +56,30 @@ import { sendApiError } from '../utils/apiErrors';
 import { logCaughtFailure } from '../utils/secretSafeLog';
 import { auditActorFromRequest } from '../utils/auditActor';
 import { isLoginSessionKind } from '../utils/administratorSession';
-import { directoryCarriageService, DirectoryCarriageError } from '../services/DirectoryCarriageService';
+import {
+  directoryCarriageService,
+  DirectoryCarriageError,
+  type CatalogScope,
+} from '../services/DirectoryCarriageService';
 
 const router = Router();
 
 /**
- * The v1 projection scope, in one place.
+ * The projection scope, in one place.
  *
- * BOTH halves are required and neither is sufficient: `root` alone is held by
- * bearer credentials this surface must not disclose to, and a login session
- * alone is held by every signed-in person. `A-L16` asserts the second half and
- * the catalog drill asserts the first.
+ * `rootSession` needs BOTH halves and neither is sufficient: `root` alone is
+ * held by bearer credentials this surface must not disclose to, and a login
+ * session alone is held by every signed-in person. `A-L16` asserts the second
+ * half and the catalog drill asserts the first. `stewardSessionPrincipalId`
+ * is the Account of a LOGIN SESSION only, so a bearer, however scoped, never
+ * reaches the steward row; whether that Account holds a live Group role is the
+ * service's question, asked through the shared fragment.
  */
-function projectionScope(req: AuthRequest): { rootSession: boolean } {
+function projectionScope(req: AuthRequest): CatalogScope {
+  const session = isLoginSessionKind(req.authMethod);
   return {
-    rootSession: isLoginSessionKind(req.authMethod) && Boolean(req.scopes?.includes('root')),
+    rootSession: session && Boolean(req.scopes?.includes('root')),
+    stewardSessionPrincipalId: session ? req.principal?.id ?? null : null,
   };
 }
 

@@ -65,6 +65,15 @@ These files were broken when replayed on a fresh PG16 database and were fixed
 
 ## Rules going forward
 
+Migration 151 retires the six writer-less Task columns declared in E108 (3b).
+It does not copy legacy JSON into canonical session records or alter immutable
+review-history receipts. The application must switch to the corresponding
+column-free read/write contract in the same release. A production snapshot and
+dump must precede the drop; rollback restores that before-state and its matching
+application, rather than recreating empty columns and calling the data restored.
+An unexpected dependent view must fail the migration: it deliberately uses no
+`CASCADE`. Disposable fixture tests cover transaction rollback and that refusal.
+
 - Never renumber or delete existing migration files. Extracted-subsystem
   migrations move to `RETIRED`; they do not disappear.
 - Never edit a `BASELINE`-listed file's *behavior* expecting it to run — it

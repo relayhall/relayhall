@@ -131,7 +131,7 @@ describe('LifecyclePolicyService contract', () => {
       ...baseInput,
       exception: {
         id: '11111111-1111-4111-8111-111111111111',
-        owner: 'wadera',
+        owner: 'river',
         expiresAt: '2026-08-14T11:00:00Z',
         controlIds: ['backup.required', 'change.freeze'],
       },
@@ -139,16 +139,16 @@ describe('LifecyclePolicyService contract', () => {
     expect(validStore.transactional[0]).toMatchObject({
       effectiveDecision: 'allow',
       exceptionDisposition: 'applied',
-      exceptionOwner: 'wadera',
+      exceptionOwner: 'river',
     });
 
     for (const exception of [
       {
-        id: '22222222-2222-4222-8222-222222222222', owner: 'wadera',
+        id: '22222222-2222-4222-8222-222222222222', owner: 'river',
         expiresAt: '2026-08-14T09:59:59Z', controlIds: ['change.freeze', 'backup.required'],
       },
       {
-        id: '33333333-3333-4333-8333-333333333333', owner: 'wadera',
+        id: '33333333-3333-4333-8333-333333333333', owner: 'river',
         expiresAt: '2026-08-14T11:00:00Z', controlIds: ['change.freeze'],
       },
     ]) {

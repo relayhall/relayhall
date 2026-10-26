@@ -13,7 +13,8 @@ Usage: scripts/configure-github-repository.sh [--plan|--prepare|--protect]
 
 --plan     Print the intended public-repository policy; no authentication/write.
 --prepare  Create or update the empty public repository before first publication.
---protect  After first publication, require PR review and CI on main.
+--protect  After first publication, require PR review and the main CI jobs on main
+           (not the Frontend unit-test shards; see docs/publishing.md).
 
 Write modes require GITHUB_TOKEN and RELAYHALL_GITHUB_CONFIGURATION_APPROVED=1.
 They never push Git content.
@@ -35,7 +36,7 @@ default_branch=main
 canonical_public_remote=https://github.com/relayhall/relayhall.git
 working_remote=private_gitea
 merge_policy=pull_requests_with_merge_commits
-main_protection=one_approval+four_required_CI_jobs+no_force_push+no_deletion
+main_protection=one_approval+main_CI_jobs_required+no_force_push+no_deletion
 issues=enabled
 security_advisories=private_reporting_enabled
 publication=allowlisted_gitleaks_gate_with_exact_owner_approved_SHA
@@ -143,13 +144,23 @@ PY
   exit 0
 fi
 
+# The required contexts are the main, non-matrix jobs of the fast tier,
+# .github/workflows/ci.yml, by their job names: the repository contract, the
+# backend, the frontend and the CLI (owner ruling E506). The Frontend unit-test
+# shards are NOT required: a matrix job that is skipped reports under its
+# unexpanded name, a context that can never be satisfied, so requiring the
+# shards would let one skipped matrix block every merge. They still run and
+# still show red. "Changed areas" is not required either. The list is the
+# one the owner named; scripts/test-github-config.sh derives the non-matrix
+# jobs from the workflow and fails when this list differs, so a renamed or
+# added job cannot leave main protected by a context that no longer reports.
 cat > "$TMP/protection.json" <<'EOF'
 {
   "required_status_checks": {
     "strict": true,
     "contexts": [
       "Repository and deployment contract",
-      "Backend build and tests",
+      "Backend type check and mocked tests",
       "Frontend build and tests",
       "CLI tests"
     ]
@@ -179,7 +190,7 @@ import json, sys
 protection = json.load(open(sys.argv[1]))
 expected_contexts = {
     "Repository and deployment contract",
-    "Backend build and tests",
+    "Backend type check and mocked tests",
     "Frontend build and tests",
     "CLI tests",
 }

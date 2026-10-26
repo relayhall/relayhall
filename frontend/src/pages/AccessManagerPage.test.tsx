@@ -19,7 +19,7 @@
  *  - a suspended warrant renders its loud suspension flag (AZ-31a).
  */
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -101,6 +101,25 @@ describe('AccessManagerPage', () => {
     expect(await screen.findByText('conn-alpha')).toBeInTheDocument();
   });
 
+  test('the Group roles sub-panel: read-only for a principals:read session, absent without it, with appoint for root (LENSES-c c1-A)', async () => {
+    usePrincipals.mockReturnValue({ principals: [] });
+    seedRoutes();
+    useMyPrincipal.mockReturnValue({ me: { id: 'p1', role: 'user' }, scopes: ['tasks:read'], loading: false });
+    renderPage();
+    expect(await screen.findByRole('heading', { name: /Pending approvals/ })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Group roles/ })).not.toBeInTheDocument();
+    cleanup();
+    useMyPrincipal.mockReturnValue({ me: { id: 'p2', role: 'editor' }, scopes: ['tasks:read', 'principals:read'], loading: false });
+    renderPage();
+    expect(await screen.findByRole('heading', { name: /Group roles/ })).toBeInTheDocument();
+    expect(screen.getByText(/Only a root login session appoints or removes a role/)).toBeInTheDocument();
+    cleanup();
+    useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
+    renderPage();
+    expect(await screen.findByRole('heading', { name: /Group roles/ })).toBeInTheDocument();
+    expect(screen.getByText(/Appointing and removing are root login-session acts/)).toBeInTheDocument();
+  });
+
   test('renders the five card surfaces for a root session', async () => {
     useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
     usePrincipals.mockReturnValue({ principals: [] });
@@ -127,6 +146,40 @@ describe('AccessManagerPage', () => {
     expect(fetchCalls.some((call) => call.url.includes('/approve') || call.url.includes('/deny'))).toBe(false);
   });
 
+  test('a request with no object rule says what "none" grants and which switch withholds it (c334177b)', async () => {
+    useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
+    usePrincipals.mockReturnValue({ principals: [] });
+    seedRoutes();
+    renderPage(`/settings/access-manager?approval=${APPROVAL_ID}`);
+    await screen.findByText('conn-alpha');
+    const none = await screen.findByText(/^None\. With tasks:write the agent can claim, move, report on and finish its bound task/);
+    expect(none).toHaveTextContent('that task only, and never beyond what the requesting connector may do there');
+    expect(none).toHaveTextContent('Untick tasks:write to withhold it.');
+    // The retired claim that a rule-less agent "works purely through its role" is gone.
+    expect(screen.queryByText(/works purely through its bound-task role/)).not.toBeInTheDocument();
+  });
+
+  test('unticking every requested rule says the agent is approved with none, and what that still grants (c334177b)', async () => {
+    useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
+    usePrincipals.mockReturnValue({ principals: [] });
+    seedRoutes();
+    const approvals = (routes.get('/approvals') as { approvals: Array<Record<string, unknown>> }).approvals;
+    approvals[0].requestedRules = [{
+      resourceType: 'task', selectorForm: 'exact', selectorIds: ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'], verbs: ['read', 'write'],
+    }];
+    renderPage(`/settings/access-manager?approval=${APPROVAL_ID}`);
+    await screen.findByText('conn-alpha');
+    const rule = await screen.findByRole('checkbox', { name: /read\/write on 1 exact task/ });
+    expect(screen.queryByText(/^Every rule unticked/)).not.toBeInTheDocument();
+    await userEvent.click(rule);
+    expect(await screen.findByText(/^Every rule unticked: approved with none, the agent can still claim, move, report on and/))
+      .toHaveTextContent('Untick tasks:write to withhold that too.');
+    expect(screen.getByRole('button', { name: 'Approve narrowed' })).toBeInTheDocument();
+    // Ticked again, the note goes: it describes the edit, not the request.
+    await userEvent.click(rule);
+    expect(screen.queryByText(/^Every rule unticked/)).not.toBeInTheDocument();
+  });
+
   test('approving demands step-up FIRST: the dialog opens and no /approve call leaves without it (T7/§7.6)', async () => {
     useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
     usePrincipals.mockReturnValue({ principals: [] });
@@ -147,6 +200,46 @@ describe('AccessManagerPage', () => {
     });
     const decide = fetchCalls.find((call) => call.url.includes('/approve'));
     expect(String(decide!.options?.body)).toContain('rhsu_test_token');
+  });
+
+  test('an Identity-provider-only owner approves through single sign-on: no password, and the collected token reaches /approve (a3e76724)', async () => {
+    useMyPrincipal.mockReturnValue({ me: { role: 'orchestrator' }, scopes: ['root'], loading: false });
+    usePrincipals.mockReturnValue({ principals: [] });
+    seedRoutes();
+    const REQUEST = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f';
+    // Insertion order matters to this double (first prefix wins): the two
+    // longer step-up paths go in before the start route they extend.
+    routes.set('/auth/step-up/methods', { success: true, methods: ['sso'], preferred: 'sso' });
+    routes.set('/auth/step-up/collect', { success: true, method: 'sso', stepUpToken: 'rhsu_sso_token', action: 'approval.decide', targetId: APPROVAL_ID });
+    routes.set('/auth/step-up', { success: true, method: 'sso', authorizeUrl: 'https://idp.example.test/authorize', requestId: REQUEST });
+    const popup = { location: { href: '' }, close: vi.fn() };
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => popup as unknown as Window);
+    try {
+      renderPage(`/settings/access-manager?approval=${APPROVAL_ID}`);
+      await screen.findByText('conn-alpha');
+      await userEvent.click(await screen.findByRole('button', { name: /^Approve$/ }));
+      expect(await screen.findByRole('dialog')).toBeInTheDocument();
+      await userEvent.click(await screen.findByRole('button', { name: 'Continue with single sign-on' }));
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+      await waitFor(() => expect(popup.location.href).toBe('https://idp.example.test/authorize'));
+      const start = fetchCalls.find((call) => call.url.endsWith('/auth/step-up'));
+      expect(JSON.parse(String(start!.options?.body))).toEqual({ method: 'sso', action: 'approval.decide', targetId: APPROVAL_ID });
+      // Nothing is decided until the Identity provider window lands.
+      expect(fetchCalls.some((call) => call.url.includes('/approve'))).toBe(false);
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          origin: window.location.origin,
+          data: { type: 'relayhall:step-up', outcome: 'complete', requestId: REQUEST, code: null },
+        }));
+      });
+      await waitFor(() => {
+        expect(fetchCalls.some((call) => call.url.includes(`/approvals/${APPROVAL_ID}/approve`))).toBe(true);
+      });
+      const decide = fetchCalls.find((call) => call.url.includes('/approve'));
+      expect(String(decide!.options?.body)).toContain('rhsu_sso_token');
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   test('a revealed one-time secret stays visible after the counter refresh until dismissed (B4)', async () => {

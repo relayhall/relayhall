@@ -24,6 +24,21 @@ that way. It is permanent by design — no identity-provider configuration can
 disable it — and it is there for lockouts, not for daily work. Using it while an
 administrator account exists is audited and announced on the dashboard.
 
+The server **refuses to start without its deployment identity**. Before the API
+opens its listener it resolves the named local administrator, the account the
+break-glass password signs in: the handle `RELAYHALL_LOCAL_ADMIN_HANDLE` names,
+or the seeded `dashboard_user` when that variable is unset or empty. It requires
+the handle to be well formed, an account to hold it, and that account to be
+active, a human account with no parent, and to carry the root sentinel through
+the role sign-in derives for it (`admin` or `orchestrator`). If any of these fails, the process exits
+with status 1 after one log line, `[DeploymentIdentity] refusing to serve`,
+naming the failed condition by code — for example
+`LOCAL_ADMINISTRATOR_ACCOUNT_MISSING` — and never a password hash, a secret or
+the raw configured value. Boot-check mode, which has no database, checks only
+that the handle is well formed. Once the identity resolves nothing about sign-in
+changes: the break-glass login, its fallback to the seeded account and the role
+and password rules below behave as before.
+
 ### With single sign-on
 
 Two paths, and both start with an administrator that exists before anyone
@@ -47,8 +62,11 @@ page. It asks four things in order:
 
 1. **What are you creating?** A *Human* who signs in, a *Service* that acts on
    its own, or an *Agent* — an agent, editor or script connected to the board.
-2. **Name it.** A handle, a display name and a role, each role carrying one line
-   of what it is for. A Service must also declare a **purpose**: what the
+2. **Name it.** A handle, a display name and a role. The role selector offers
+   the roles meant for the kind you chose that your session may assign, and
+   under it shows the chosen role's entry from the role catalogue: its purpose,
+   what it may reach, what it never reaches and who it is meant for (the same
+   text as [roles.md](roles.md)). A Service must also declare a **purpose**: what the
    service is for. That is a rule of the substrate, not of the form — a service
    Account with no purpose is refused with `422 PURPOSE_REQUIRED` (A17.1).
 3. **Access.** Optionally mint a credential in the same act. What that means
@@ -66,24 +84,90 @@ page. It asks four things in order:
    screen and nowhere else, in a tab per harness (Claude Code, Codex, generic
    MCP, CLI). It is not stored on the board and cannot be re-read.
 
-My connections is the same wizard with the kind preset to Agent: it is your own
-filtered view of the identities you own and their credentials. Use Identities
-when the identity is not your own connection — a service account, a colleague,
-an agent that belongs to somebody else — and to disable identities.
+### Create identity or My connections?
+
+Neither is legacy; they answer different questions.
+
+- **My connections** is for *your own* agents. It is the same wizard with the
+  kind preset to Agent: the connection belongs to you, acts inside your own
+  authority, and its credential is minted in the same act. It is also your own
+  filtered view of the identities you own and their credentials.
+- **Create identity** on the Identities page is the administrator's act for an
+  identity that is *not* your own connection: a service account (a CI bot, a
+  Connector, an integration), a colleague when no identity provider is
+  configured, or an agent that belongs to somebody else. It is also where
+  identities are disabled.
+
+Choosing *Agent* in Create identity says so: for your own agent, My connections
+is the same act. For somebody else's agent, create their identity and let them
+connect it from their own My connections. Credentials stay separately scoped
+and revocable whichever door made the identity.
 
 Both acts are audited separately: the identity is created, and the credential is
 minted, exactly as they were before they shared a screen.
 
+`POST /principals` commits its `principal.create` audit row with the Account
+write, recording only its kind, handle and role. `PATCH /principals/:id`
+commits `principal.update` with changed field names and, for a status change,
+the previous and resulting status. A disable also revokes the principal's stored
+login sessions and lapses the pending requests naming it as grantee, in the same
+transaction, and records `sessionsRevoked` and `lapsedApprovalIds`; an approved
+`identity.status` change request runs the same seam. Display names and purpose text are omitted.
+Both use the request's resolved actor and authentication evidence. Audit-write
+failure rolls back the Account change; read caches publish only after commit.
+Other identity-provider, first-run and role-management writers keep their
+existing behavior and audit contracts.
+
+## Open an identity
+
+Every row on the **Identities** page opens that identity's own page
+(`/settings/principals?identity=<id>`, behind the same Identities entry). It
+shows, read-only:
+
+- its directory facts: handle, display name, kind, status, the identity it
+  belongs to, harness, provenance, when it was last seen, and its id;
+- its role, explained by the role catalogue entry ([roles.md](roles.md));
+- the identities under it — an Account's Connectors, or a Connector's Agents —
+  each with its credentials, their scopes, transport and state;
+- its own credentials (an Account holds none: Accounts are keyless);
+- the grant rows that name it, the Warrants it holds, and the newest ten audit
+  rows about it or by it, with a link into the audit log filtered to it.
+
+Every fact comes from a route that already exists: the directory row from
+`GET /principals`, then `GET /principals/{id}/credentials` (for it and for each
+identity under it), `GET /principals/{id}/grants`, `GET /warrants` (narrowed to
+the Warrants it holds) and `GET /audit` with `resourceType=principal&resourceId`
+and with `actorPrincipalId`. The board decides each read for your session, and a
+refused one says so in its own section without hiding the others. Some facts
+have no read route, so the page does not show them: there is no single-identity
+read (`GET /principals/{id}`), a principal's creation time and a service's
+declared purpose are not in the public principal shape, and authority that
+reaches an identity through a Group or an access profile is on the Access
+manager's granted-access inventory rather than in its grant rows.
+
+For an administrator the page also carries the role change (below) as an action
+on the identity itself. It is offered on the same identities and bounded by the
+same rule as the Access manager's **Roles** section, which stays the bulk view.
+
 ## Change a role
 
-Roles are assigned at creation and changed afterwards with one act:
+Roles are assigned at creation and changed afterwards with one act (a person
+without that authority files an `identity.role` change request instead, for its own
+role up to an editor-class one, and an administrator decides it on the approvals
+hub with step-up; the decision runs the same act, with the decider as the issuer):
 
 ```bash
 relayhall principal role casey editor
 ```
 
-The same act is on the Access manager's **Roles** section. It is bounded in four
-ways, and the same bounds apply on every surface:
+The same act is on the Access manager's **Roles** section, which lists every
+role's catalogue entry ([roles.md](roles.md)), and on each identity's own page
+(**Identities**, open a row). Both show the chosen role's entry under the
+selector and ask for confirmation with that entry before they change anything.
+The act asks for no step-up today; if the board ever answers it with the
+step-up challenge, the dashboard asks you to confirm it is you once for exactly
+that identity and repeats the request. It is bounded in four ways, and the same
+bounds apply on every surface:
 
 - it is a **login-session act**: it is performed with the credential
   `relayhall login` caches or with a dashboard session, never with an `rh_` API
@@ -164,6 +248,16 @@ The dashboard shows safe provenance labels:
 
 ## Manage principals
 
+**Termination and Group roles.** Terminating an Account never removes its
+Group roles (`owner` or `manager`, LENSES-c c1-A). The rows stay, **inert**
+from the moment of termination — they confer nothing and read
+`principal_inactive` in `GET /groups/{id}/stewards` — and they never become live
+again. A root login session removes them with
+`DELETE /groups/{id}/stewards/{principalId}`; until it does, deleting the Group
+is refused `GROUP_HAS_STEWARDS`. Promotion to `admin`, `operator` or
+`orchestrator` likewise makes a role row inert (an elevated Account cannot hold
+one), and a demotion makes it live again.
+
 Use the **Identities** dashboard page (**Create identity**, above) or the
 primary CLI:
 
@@ -183,6 +277,19 @@ Account that declares none (`422 PURPOSE_REQUIRED`, A17.1), and the verb
 refuses it before the request. `--kind agent` is refused for the same
 reason the dashboard form does not offer it: agent identities arrive through
 the delegation machinery, so connect the agent instead.
+
+**Group principals.** Every Group is also a principal of kind `group` with the
+Group's id and the handle `group:<id>` (AZ-A12). It never signs in, holds no
+credential and never acts. It is not listed by `relayhall principals`, the
+**Identities** page, `GET /principals` or `relayhall_principal_list` unless you
+ask for `kind=group` on the REST route, and it is managed only through
+`/groups`: every `/principals/{id}` change refuses it with
+`GROUP_PRINCIPAL_MANAGED_BY_GROUPS`. Handles starting `group:` are reserved for
+it. A Project's owner, or a Task's or Report's account owner, may name a Group:
+its members then read and use the object and its live owners and managers edit
+it, never with `admin`, Shepherd or Verifier authority ([authorization,
+Group ownership](authorization.md)). See [the Groups section of the API
+reference](api.md).
 
 MCP provides `relayhall_principal_list` and `relayhall_principal_whoami`, both
 read-only. Principal creation and update were removed from the MCP surface at

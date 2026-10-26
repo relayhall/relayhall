@@ -664,3 +664,155 @@ describe('7 · the evaluator closure, with the SQL half REMOVED', () => {
     )).rejects.toThrow(/access_profile_rules_project_bounded_types/);
   });
 });
+
+// Project awareness uses the same live router/DB harness. These tests measure
+// the selected rows and counts, rather than asserting the spelling of SQL.
+describe('project awareness preserves point visibility before counts and bounded selection', () => {
+  async function grantRead(who: Caller, type: string, id: string): Promise<void> {
+    await pool.query(
+      'INSERT INTO grants(grantee_type,grantee_id,resource_type,resource_id,verb,granted_by_principal_id) VALUES($1,$2,$3,$4,$5,$6)',
+      ['principal', who.principalId, type, id, 'read', ROOT_PRINCIPAL],
+    );
+  }
+  async function awareness(who: Caller, projectId: string): Promise<any> {
+    const response = await fetch(origin + '/projects/' + projectId + '/brief', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...who.headers }, body: '{}',
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.scope).toBe('project-awareness-v1');
+    expect(body.tokenEstimate).toBe(Math.ceil(body.brief.length / 4));
+    expect(body.brief.length).toBeLessThanOrEqual(24000);
+    const start = body.brief.indexOf('{'), end = body.brief.lastIndexOf('}');
+    expect(start).toBeGreaterThan(0);
+    return { body, data: JSON.parse(body.brief.slice(start, end + 1)) };
+  }
+
+  it('counts only point-readable Tasks/Phases and fills windows past higher-ranked concealed rows', async () => {
+    const projectId = await makeProject('awareness-count-' + tag());
+    const reader = await sessionCallerFor('awareness-reader', await makeAccount('user'));
+    await grantRead(reader, 'project', projectId);
+    const visibleTaskIds: string[] = [], hiddenTaskIds: string[] = [];
+    const visiblePhaseIds: string[] = [], hiddenPhaseIds: string[] = [];
+    for (let i = 0; i < 16; i++) {
+      const readable = i % 2 === 1;
+      const phase = (await pool.query(
+        'INSERT INTO phases(project_id,name,restricted_access,position) VALUES($1,$2,TRUE,$3) RETURNING id',
+        [projectId, (readable ? 'visible-phase-' : 'concealed-phase-') + i, readable ? i : -100 + i],
+      )).rows[0].id;
+      (readable ? visiblePhaseIds : hiddenPhaseIds).push(phase);
+      if (readable) await grantRead(reader, 'phase', phase);
+      const task = (await pool.query(
+        'INSERT INTO tasks(title,status,visibility,project_id,phase_id,restricted_access,creator_principal_id) VALUES($1,$2,$3,$4,$5,TRUE,$6) RETURNING id',
+        [(readable ? 'visible-task-' : 'concealed-task-') + i, readable ? 'todo' : 'stuck',
+          'private', projectId, phase, ROOT_PRINCIPAL],
+      )).rows[0].id;
+      (readable ? visibleTaskIds : hiddenTaskIds).push(task);
+      if (readable) await grantRead(reader, 'task', task);
+    }
+    // Independent point-route oracle proves fixture visibility, including
+    // the restricted child opt-out from the reader's Project grant.
+    for (const id of visibleTaskIds) expect((await call(reader, 'GET', '/tasks/' + id)).status).toBe(200);
+    for (const id of hiddenTaskIds) expect((await call(reader, 'GET', '/tasks/' + id)).status).toBe(404);
+    for (const id of visiblePhaseIds) expect((await call(reader, 'GET', '/phases/' + id)).status).toBe(200);
+    for (const id of hiddenPhaseIds) expect((await call(reader, 'GET', '/phases/' + id)).status).toBe(404);
+    const { body, data } = await awareness(reader, projectId);
+    expect(data.tasks.visibleTotal).toBe(8);
+    expect(data.tasks.byStatus).toEqual([{ status: 'todo', count: 8 }]);
+    expect(data.tasks.entries).toHaveLength(6);
+    expect(data.tasks.omittedVisibleUnfinished).toBe(2);
+    for (const row of data.tasks.entries) expect(visibleTaskIds).toContain(row.id);
+    expect(data.phases.visibleTotal).toBe(8);
+    expect(data.phases.entries).toHaveLength(6);
+    expect(data.phases.omittedVisible).toBe(2);
+    for (const row of data.phases.entries) {
+      expect(visiblePhaseIds).toContain(row.id);
+      expect(row.visibleTaskCounts).toEqual([{ status: 'todo', count: 1 }]);
+    }
+    expect(body.brief).not.toContain('concealed-task-');
+    expect(body.brief).not.toContain('concealed-phase-');
+    const repeated = await awareness(reader, projectId);
+    expect(repeated.body.brief).toBe(body.brief);
+    const outsider = await call(STRANGER, 'POST', '/projects/' + projectId + '/brief');
+    expect(outsider.status).toBe(404);
+  });
+
+  it('skips higher-ranked denied Reports in SQL and applies source-task and assignment disclosure rules', async () => {
+    const projectId = await makeProject('awareness-reports-' + tag());
+    const reader = await sessionCallerFor('awareness-report-reader', await makeAccount('user'));
+    await grantRead(reader, 'project', projectId);
+    const sources: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const task = (await pool.query(
+        'INSERT INTO tasks(title,status,visibility,project_id,restricted_access,creator_principal_id) VALUES($1,$2,$3,$4,TRUE,$5) RETURNING id',
+        ['awareness-source-' + i, 'todo', 'private', projectId, ROOT_PRINCIPAL],
+      )).rows[0].id;
+      sources.push(task);
+    }
+    await grantRead(reader, 'task', sources[1]);
+    expect((await call(reader, 'GET', '/tasks/' + sources[0])).status).toBe(404);
+    expect((await call(reader, 'GET', '/tasks/' + sources[1])).status).toBe(200);
+    async function report(label: string, readable: boolean, source: string | null = null, tier: string | null = null) {
+      const row = (await pool.query(
+        'INSERT INTO reports(title,content,summary,author,author_actor_id,author_principal_id,visibility,project_id,pinned,auto_promoted,source_task_id,source_outpost_visibility_tier) VALUES($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id',
+        [label, 'full-report-body-never-inline-' + label, 'summary-' + label, 'awareness-live', ROOT_PRINCIPAL,
+          'private', projectId, !readable, source !== null, source, tier],
+      )).rows[0].id;
+      if (readable) await grantRead(reader, 'report', row);
+      return row;
+    }
+    // More than the 30-candidate cap; all denied and pinned above the rows
+    // the caller can see. LIMIT before authorization would starve the window.
+    const denied: string[] = [];
+    for (let i = 0; i < 31; i++) denied.push(await report('concealed-report-' + i, false));
+    const ordinary = await report('ordinary-visible', true);
+    const hiddenSource = await report('concealed-source-summary', true, sources[0], 'unrestricted');
+    const assignmentOnly = await report('concealed-assignment-summary', true, sources[1], 'assigned-only');
+    expect((await call(reader, 'GET', '/reports/' + ordinary)).status).toBe(200);
+    expect((await call(reader, 'GET', '/reports/' + denied[0])).status).toBe(404);
+    expect((await call(reader, 'GET', '/reports/' + hiddenSource)).status).toBe(404);
+    expect((await call(reader, 'GET', '/reports/' + assignmentOnly)).status).toBe(404);
+    const { body, data } = await awareness(reader, projectId);
+    expect(data.reports.entries.map((row: any) => row.id)).toEqual([ordinary]);
+    expect(data.reports.entries[0].summary).toBe('summary-ordinary-visible');
+    expect(body.brief).not.toContain('concealed-report-');
+    expect(body.brief).not.toContain('concealed-source-summary');
+    expect(body.brief).not.toContain('concealed-assignment-summary');
+    expect(body.brief).not.toContain('full-report-body-never-inline');
+    expect(data.reports).not.toHaveProperty('total');
+    expect(data.reports).not.toHaveProperty('omitted');
+  });
+  it('keeps resource kinds and the primary repository represented in a bounded stable window', async () => {
+    const projectId = await makeProject('awareness-diversity-' + tag());
+    const reader = await sessionCallerFor('awareness-resource-reader', await makeAccount('user'));
+    await grantRead(reader, 'project', projectId);
+    async function resource(kind: string, name: string, details: object, visibility = 'available', state = 'active') {
+      return (await pool.query(
+        `INSERT INTO project_resources(project_id,kind,name,normalized_name,details,agent_visibility,state,archived_at)
+         VALUES($1,$2,$3,$3,$4,$5,$6,CASE WHEN $6 = 'archived' THEN NOW() ELSE NULL END) RETURNING id`,
+        [projectId, kind, name, JSON.stringify(details), visibility, state],
+      )).rows[0].id;
+    }
+    for (let i = 0; i < 8; i++) {
+      await resource('reference', 'a-reference-' + i, { url: 'https://example.test/ref/' + i, category: 'documentation' });
+      await resource('environment', 'a-environment-' + i, { url: 'https://example.test/env/' + i, stage: 'dev' });
+      await resource('repository', 'a-additional-' + i, { url: 'https://example.test/repo/' + i, role: 'additional' });
+    }
+    const primary = await resource('repository', 'zz-primary', { url: 'https://example.test/primary', role: 'primary' });
+    await resource('reference', 'concealed-resource', { url: 'https://example.test/concealed' }, 'hidden');
+    await resource('environment', 'archived-resource', { url: 'https://example.test/archived', stage: 'dev' }, 'available', 'archived');
+    const { body, data } = await awareness(reader, projectId);
+    expect(data.resources).toHaveLength(6);
+    expect(data.resources[0].id).toBe(primary);
+    expect(data.resources[0].details.role).toBe('primary');
+    expect(data.resources.map((row: any) => row.kind)).toEqual([
+      'repository', 'environment', 'reference', 'repository', 'environment', 'reference',
+    ]);
+    expect(data.resourceOmissions.additionalAvailable).toBe(19);
+    expect(body.brief).not.toContain('concealed-resource');
+    expect(body.brief).not.toContain('example.test/concealed');
+    expect(body.brief).not.toContain('archived-resource');
+    expect(body.brief).not.toContain('example.test/archived');
+    expect((await awareness(reader, projectId)).body.brief).toBe(body.brief);
+  });
+});

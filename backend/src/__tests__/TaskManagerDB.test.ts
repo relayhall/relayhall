@@ -11,9 +11,23 @@ jest.mock('../db/connection', () => ({
     connect: jest.fn(async () => ({
       query: (...args: any[]) => {
         const sql = String(args[0]);
+        // Claim now locks first and reads a fresh decision-time Task snapshot.
+        // This legacy transaction shim supplies those reads; new authority is
+        // measured in assignedClaimLive against actual PostgreSQL.
+        if (sql === 'SELECT id FROM tasks WHERE id=$1 FOR UPDATE' || sql.startsWith('SELECT t.*, e.epoch::text')) {
+          return Promise.resolve({rows: [{id: args[1][0], owner_principal_id: null}]});
+        }
         if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK'
-          || sql.includes('pg_advisory_xact_lock') || sql.startsWith('INSERT INTO feed_events')) {
+          || sql.includes('pg_advisory_xact_lock') || sql.startsWith('INSERT INTO feed_events')
+          || sql.trim().startsWith('INSERT INTO task_stream_entries')) {
           return Promise.resolve({ rows: [] });
+        }
+        // Card 3fc32dd1: a claim that assigns writes its task.claim row on
+        // this client; the shim answers the ledger insert so the positional
+        // expectations keep addressing the pinned claim queries.
+        if (sql.includes('INSERT INTO audit_events')) {
+          return Promise.resolve({ rows: [{ id: 'audit-row', occurred_at: '2026-10-08T00:00:00.000Z', action: 'task.claim',
+            outcome: 'success', actor_handle: 'system', auth_method: 'system', resource_type: 'task', resource_id: args[1]?.[7] ?? null }] });
         }
         return mockQuery(...args);
       },
@@ -33,14 +47,10 @@ const baseRow = {
   thinking_auto_estimated: false,
   model: null,
   execution_mode: 'interactive',
-  auto_created: false,
   auto_start: true,
   blocked_reason: null,
   status_reason: null,
-  active_agent: null,
-  completed_by: null,
   attempt_count: 0,
-  session_refs: [],
   parent_id: null,
   personality_id: null,
   created_at: '2026-04-10T00:00:00.000Z',

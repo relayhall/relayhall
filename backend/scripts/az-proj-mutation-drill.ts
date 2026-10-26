@@ -5,8 +5,8 @@
  *   cd backend && npx tsx scripts/az-proj-mutation-drill.ts M4 M7   # a subset
  *
  * It EDITS files under `backend/src` one at a time and restores each one
- * immediately, including on failure. It is therefore a developer tool, never a
- * CI step: never point it at a tree with uncommitted work you care about, and
+ * immediately, including on failure. The full tier runs it in a throwaway checkout (job drill_controls, machinery queue 9b761f09);
+ * locally, never point it at a tree with uncommitted work you care about, and
  * never run two copies against the same worktree.
  *
  * Exit code 0 only when every mutation reddened EXACTLY what the drill table

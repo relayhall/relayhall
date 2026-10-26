@@ -66,6 +66,7 @@ import http from 'http';
 import path from 'path';
 import ts from 'typescript';
 import { AddressInfo } from 'net';
+import { BUILT_IN_WORKFLOW_GUIDANCE } from '../utils/workflowGuidance';
 import { Server } from '@modelcontextprotocol/server';
 
 import {
@@ -73,6 +74,8 @@ import {
 } from './support/astStrings';
 import * as authModule from '../middleware/auth';
 import * as serverModule from '../mcp/server';
+import * as restModule from '../mcp/rest';
+import * as bootstrapService from '../services/McpBootstrapService';
 import mcpRoutes from '../mcp/httpRoute';
 import { MCP_ROUTE_PATH } from '../mcp/httpRoute';
 import { MCP_TRANSPORT_STAMP } from '../mcp/provenance';
@@ -630,6 +633,11 @@ const EXPECTED_STATE: StateBinding[] = [
   // here — a `const` object literal with no caller input near it.
   { file: 'registry.ts', name: 'EXECUTION_PROFILE_SCHEMA', kind: 'const', shape: '{}' },
   { file: 'registry.ts', name: 'EXECUTION_WARRANT_SCHEMA', kind: 'const', shape: '{}' },
+  // Card 785e1eed P2-B (AZ-A10 clause 6): the assigning act's date, shared by
+  // the same two tools. A `const` object literal with no caller input near it.
+  { file: 'registry.ts', name: 'ROLE_GRANT_EXPIRY_SCHEMA', kind: 'const', shape: '{}' },
+  { file: 'registry.ts', name: 'TASK_DEPENDENCY_UUID_PATTERN', kind: 'const', shape: 'new RegExp()' },
+  { file: 'registry.ts', name: 'TASK_DEPENDENCY_UUID_SCHEMA', kind: 'const', shape: '{}' },
   { file: 'registry.ts', name: 'BLUEPRINT_TARGET_SCHEMA', kind: 'const', shape: '{}' },
   { file: 'registry.ts', name: 'BLUEPRINT_REQUEST_PROPERTIES', kind: 'const', shape: '{}' },
   { file: 'registry.ts', name: 'BLUEPRINT_UUID_SCHEMA', kind: 'const', shape: '{}' },
@@ -642,6 +650,8 @@ const EXPECTED_STATE: StateBinding[] = [
   { file: 'server.ts', name: 'INSTRUCTIONS', kind: 'const', shape: '[].join()' },
   { file: 'shape.ts', name: 'READ_TOOL_PROPERTIES', kind: 'const', shape: '{}' },
   { file: 'shape.ts', name: 'CONTINUE_FROM_PROPERTY', kind: 'const', shape: '{}' },
+  // Card 233d8959: fixed response marker, no caller-derived process state.
+  { file: 'toolResultBoundary.ts', name: 'UNTRUSTED_FIELDS_MARKER', kind: 'const', shape: '{}' },
 ];
 
 /** The only module-level bindings allowed to be mutable, and why. */
@@ -662,6 +672,29 @@ const DECLARED_DURABLE_STATE: Record<string, string> = {
     'credential-keyed bootstrap TTL records (C4 ii) — expire, cannot bypass authorization, one row per credential',
   operation_idempotency_records:
     'operation retry records (fb06c930) — scope-keyed, expire, served only behind the same guard chain, and refuse-policy rows store no response at all',
+  // Card 35b73092 (MCP-derived sessions): every admitted tools/call is
+  // observed, and the observation writes the CALLER's own telemetry through the
+  // reporters' write paths. These four are the only tables it can reach. None
+  // is read back by any tool, none feeds an authorization decision (telemetry
+  // is displayed, never authority), and every row is owned by the principal
+  // whose credential made the call — so nothing here correlates one caller's
+  // request with another's.
+  session_events:
+    'MCP-derived session envelopes (35b73092) — the caller\'s own start/heartbeat/end rows, deduped by the UNIQUE idempotency key per heartbeat bucket, never read by a tool or an authorization decision',
+  telemetry_raw_blobs:
+    'the governed raw blob written by the SAME statement as each new envelope (35b73092) — connector-namespaced, never read by a tool',
+  telemetry_frames:
+    'MCP-derived Task-link frames (35b73092) — the caller\'s own principal only, short retention, displayed and never authority',
+  telemetry_rate_limits:
+    'the deployment-wide frame gate the link frames pass through (35b73092) — a per-principal counter, never read by a tool',
+  // Card ab8f78e9 (owner ruling E91): the session's action log. One row per
+  // admitted call inside a live session, owned by the caller's derived chain,
+  // holding a tool name, an allowlisted target UUID, a closed outcome code, a
+  // duration and a time — never arguments. Never read by a tool and never an
+  // authorization input; the Agent sessions page reads it on the session's own
+  // point route under the session's own narrowing.
+  mcp_action_log:
+    "the MCP-derived session's action log (ab8f78e9) — the caller's own tool, target, closed outcome and time per call, never arguments, never read by a tool or an authorization decision",
 };
 
 /**
@@ -673,6 +706,15 @@ const DECLARED_DURABLE_STATE: Record<string, string> = {
 const DECLARED_DURABLE_WRITERS: Record<string, string[]> = {
   mcp_bootstrap_records: ['services/McpBootstrapService.ts'],
   operation_idempotency_records: ['middleware/idempotency.ts'],
+  // The surface reaches these only through `services/McpSessionTelemetry`,
+  // which writes through the store and the frame service and holds no SQL
+  // write of its own — so it is ABSENT here, and a raw write added to it would
+  // make the census disagree.
+  session_events: ['services/TelemetryEnvelopeStore.ts', 'services/TelemetryRetentionService.ts'],
+  telemetry_raw_blobs: ['services/TelemetryRawStore.ts', 'services/TelemetryRetentionService.ts'],
+  telemetry_frames: ['services/TelemetryService.ts'],
+  telemetry_rate_limits: ['services/TelemetryRateLimitService.ts'],
+  mcp_action_log: ['services/McpActionLog.ts', 'services/TelemetryRetentionService.ts'],
 };
 
 /**
@@ -742,15 +784,33 @@ const EXPECTED_TRANSPORT_OPTIONS: OptionEntry[] = [
  * than derived so the probe's SCOPE is a reviewed list, and asserted against
  * the live registry so it cannot silently fall behind it.
  */
+// Content-read semantics do not exempt these tools from bootstrap admission.
+const BOOTSTRAP_GATED_READ_TOOLS = ['relayhall_knowledge_source_search', 'relayhall_knowledge_source_get'];
 const READ_PLANE_TOOLS = [
+  ...BOOTSTRAP_GATED_READ_TOOLS,
+  'relayhall_task_account_owner_get',
   'relayhall_principal_whoami', 'relayhall_access_preview', 'relayhall_warrant_list',
   'relayhall_principal_list', 'relayhall_task_list', 'relayhall_task_get',
-  'relayhall_task_reference_list', 'relayhall_brief_compile', 'relayhall_report_search',
+  // Owner ruling E467: the read-only Action Center queue. Under the probe's
+  // principals:read-only credentials the route refuses it 403 at the ceiling
+  // (tasks:read) before any pool access, symmetrically per caller.
+  'relayhall_action_items_list',
+  // The Map's scoped bulk read: a pure GET /tasks/graph composition on the
+  // introspection plane. Under the probe's principals:read-only credentials
+  // the route refuses it 403 before any pool access, symmetrically per caller.
+  'relayhall_task_graph',
+  'relayhall_task_stream_list', 'relayhall_task_timeline_get',
+  'relayhall_task_reference_list', 'relayhall_task_report_list', 'relayhall_task_report_get', 'relayhall_task_report_reconcile', 'relayhall_brief_compile', 'relayhall_report_search',
   'relayhall_report_get', 'relayhall_project_list', 'relayhall_project_get',
   'relayhall_project_resource_list', 'relayhall_project_resource_get',
   'relayhall_project_context_get', 'relayhall_charter_get', 'relayhall_phase_list',
   'relayhall_phase_get', 'relayhall_skill_list', 'relayhall_skill_get',
   'relayhall_personality_list', 'relayhall_service_list', 'relayhall_service_get',
+  // Card 549cc51f (E298 section 4, E310): the shared-area writer list, a pure
+  // GET /knowledge-shared-writers composition on the introspection plane. Under
+  // the probe's principals:read-only credentials the route refuses it 403
+  // (services:read) before any pool access, symmetrically per caller.
+  'relayhall_knowledge_shared_writers_list',
 ];
 
 /**
@@ -760,16 +820,27 @@ const READ_PLANE_TOOLS = [
  * partition above is exhaustive.
  */
 const MUTATING_TOOLS_NOT_PROBED = [
+  'relayhall_task_account_owner_change',
   // Ratified companion5.3 classifies all four Blueprint tools as work.
   // Their caller forwarding/read isolation is asserted in mcpBlueprintContract.
   'relayhall_blueprint_list', 'relayhall_blueprint_get',
   'relayhall_blueprint_preview', 'relayhall_blueprint_instantiate',
   // Owner decision9fc7fad4 adds the separate, explicitly confirmed setup pair.
   'relayhall_blueprint_setup_preview', 'relayhall_blueprint_setup',
-  'relayhall_task_create', 'relayhall_task_update', 'relayhall_task_move',
+  'relayhall_task_create', 'relayhall_task_update',
+  'relayhall_task_success_criteria_set',
+  'relayhall_task_dependency_add', 'relayhall_task_dependency_remove', 'relayhall_task_move',
+  'relayhall_task_archive', 'relayhall_task_archive_bulk', 'relayhall_task_restore',
   'relayhall_subtask_set', 'relayhall_task_stream_append', 'relayhall_task_finish',
   'relayhall_task_reference_create', 'relayhall_review_run', 'relayhall_review_reject',
+  'relayhall_task_arm', 'relayhall_task_park',
   'relayhall_task_claim', 'relayhall_task_release', 'relayhall_task_recover',
+  // Native review GET/POST and service request GET remain on the work plane;
+  // mcpNativeReview exercises their forwarding and refusal contracts.
+  'relayhall_task_native_review', 'relayhall_service_review_requests',
+  // Ordinary participation uses the work plane even for its list action;
+  // mcpNativeExecution verifies canonical routes and unchanged caller forwarding.
+  'relayhall_task_native_execution', 'relayhall_task_native_generation', 'relayhall_task_report_save',
   'relayhall_lease_claim', 'relayhall_lease_renew', 'relayhall_lease_release',
   'relayhall_report_create', 'relayhall_report_update', 'relayhall_project_create',
   'relayhall_project_update', 'relayhall_project_archive', 'relayhall_project_restore',
@@ -777,6 +848,28 @@ const MUTATING_TOOLS_NOT_PROBED = [
   'relayhall_project_resource_archive', 'relayhall_project_resource_restore',
   'relayhall_project_resource_replace', 'relayhall_agent_mint', 'relayhall_agent_reveal',
   'relayhall_agent_revoke',
+  // AZ-A9 clause 10 (card 785e1eed P1-B): the access-request filing tool. Its
+  // `file` and `withdraw` actions write an Approval row, so the read probe
+  // does not drive it; its forwarding and refusals are asserted through the
+  // MCP ingress against a real PostgreSQL in accessRequestsGrantLive.
+  'relayhall_access_request',
+  // Planning slice: the four Phase content writers over the phases:write
+  // routes. Their forwarding and refusals are asserted in c4McpDispatchMapping
+  // (mocked dispatcher) and their retry/revision contracts against a real
+  // PostgreSQL in idempotencyContract; excluded from the read probe for the
+  // same reason as every other mutating tool.
+  'relayhall_phase_create', 'relayhall_phase_update', 'relayhall_phase_archive', 'relayhall_phase_restore',
+  // RB-11 Governor v0 (card b796067e): the three knowledge note relays. Each
+  // dials a source's write surface and writes a fail-closed audit row, so the
+  // read probe does not drive them; their forwarding, refusals and audit are
+  // asserted through the MCP ingress against a real PostgreSQL and a stub
+  // source in knowledgeWriteDoorLive.
+  'relayhall_knowledge_note_propose', 'relayhall_knowledge_note_preview', 'relayhall_knowledge_note_commit',
+  // Card 2bc7b303 (owner ruling E374): the three Subtask structure writers.
+  // Each writes Subtask rows, so the read probe does not drive them; their
+  // forwarding, retry receipts and refusals are asserted through the MCP
+  // ingress against a real PostgreSQL in subtaskStructureLive.
+  'relayhall_subtask_create', 'relayhall_subtask_reorder', 'relayhall_subtask_update_text',
 ];
 
 /**
@@ -825,7 +918,286 @@ const MUTATING_TOOLS_NOT_PROBED = [
 // sentence is drilled through the tool against the real route in
 // `mcpTaskRecoverContract.test.ts`, so the digest is not the only evidence
 // that it is true. Re-derived from a live run.
-const MODEL_FACING_TEXT_DIGEST = 'sha256-7cdf86fdf59b6ff9f27d0f8c676d37bbe1edca4192198055551216f4bee43d62';
+// Context awareness: independently reviewed against 97e7e1d. The only
+// model-facing delta is brief_compile's projectId description: bounded
+// awareness requires projects:read and tasks:read; phase/report sections use
+// their own read scopes. Server instructions and all other descriptions are
+// unchanged. projectAwareness/projectBoundedSelectorLive and dispatch tests
+// prove the route and disclosure contract behind this wording.
+// Native read slice: reviewed against upstream c93310a. Only the two knowledge
+// descriptions are added; instructions and existing descriptions are unchanged.
+// Search truthfully declares hard narrowing, source grouping, coverage-first and
+// query disclosure. GET requires a cited sealed address, with no authority from
+// possession and optional sealed continuation. Neither promises mutation/retry
+// safety. Both retain work-plane bootstrap admission and knowledge read scope.
+// Positive forwarding/rendering and per-caller fixture probes below bind the text.
+// Card 991f8dff: explicit keyed Arm/Park verbs expose bounded activation and
+// retained-receipt semantics; assertions below keep the retry claims concrete.
+// Combined candidate also corrects claim documentation: ownership is separate
+// from task_move. Dispatcher mapping tests pin that unchanged server behavior.
+//
+// MOVES with `relayhall_task_graph`, for ONE added description: the Map's
+// scoped bulk read on the introspection plane. Server instructions and every
+// existing description are unchanged. The new text declares the route's
+// filters, the project LOD, the delta and taxonomy semantics, the absence of
+// tombstones, the etag revalidation, that concise is counts-only and detailed
+// is the complete untruncated envelope, and that titles, names and goals are
+// untrusted data. It makes no retry-safety claim. The behaviour behind the
+// wording is measured by c4McpDispatchMapping (mocked dispatcher),
+// scaleReadContracts (handler -> in-process ingress -> real route, mocked
+// query layer) and listPointParity (real PostgreSQL). The value below is
+// deliberately NOT re-derived by hand: it must be taken from a live run of
+// this suite by the integrator, so the digest bump is a reviewed event
+// rather than arithmetic.
+//
+// MOVES with the planning slice's four Phase writers (`relayhall_phase_create`,
+// `_update`, `_archive`, `_restore`) and ONE corrected existing description:
+// `relayhall_phase_list` said "Phase mutation stays on CLI/REST", which is no
+// longer true for content writes and now names the four tools while keeping
+// the access-policy and delete verbs on CLI/REST. Server instructions and
+// every other description are unchanged. The four new descriptions declare
+// the route's constraints (name 1–200, goal string-or-null at most 8192,
+// settable statuses, position 0–100000 as the only ordering control), that
+// the revision travels in the BODY, the named refusals, and each carries a
+// retry-contract sentence measured in idempotencyContract. None makes an
+// unqualified retry-safety claim (the lints above hold as they stand). The
+// Native execution adds one reviewed work-plane description: participation
+// after claim, no ownership acquisition, verdict or provider replay, and
+// authority-filtered session links. All other model-facing text remains pinned.
+// Integration: reviewed claim epoch, task-report retry/readback and native-generation descriptions.
+// Owner-ratified transfer descriptions independently reviewed; real transfer tested in taskAccountOwnershipLive.
+// MOVES with card 50b5e9c4 slice 3 (bounded Report context): three
+// descriptions change. `relayhall_task_report_list` now says
+// it lists bounded summaries, never bodies (5 newest by default, limit up to
+// 50, pinned separately, authorized total, hasMore, nextCursor, scope
+// "progress", pinned: true) and points at relayhall_report_get for a body;
+// `relayhall_task_get` names its bounded Report context; `relayhall_brief_compile`
+// replaces "Reports you cannot read are listed by id only" with the bounded
+// context and "neither listed nor counted". `relayhall_task_report_list` also
+// gained inputSchema property descriptions (scope, limit, cursor, pinned),
+// which this digest does not cover. Server instructions are unchanged.
+// MOVES again with the 50b5e9c4 round-1 correction (blocker B1, a claimant
+// without reports:read lost its read of its own progress Report): one new
+// introspection tool, `relayhall_task_report_get` (name and description), the
+// Task-authority read of one progress Report's body and content_hash under
+// tasks:read; `relayhall_task_report_list` names it beside relayhall_report_get;
+// `relayhall_task_report_save` says relayhall_task_report_get returns the
+// content hash an edit needs. Nothing else, and server instructions are
+// unchanged. The value is taken from a live run of this suite on the candidate.
+// MOVES with card b13e5ac9 (new-card defaults, Charter v5 §6.1): two
+// descriptions change. `relayhall_task_create` no longer claims "status
+// defaults to Ideas" unconditionally - which was not true for a project with
+// no inbox phase, where the route has always defaulted to To-Do - and says
+// where a Task without phaseId lands: the project's inbox phase with status
+// Ideas when it names one, otherwise unphased with To-Do, an explicit phaseId
+// (null = backlog) or status always winning. `relayhall_project_update` names
+// inboxPhaseId and its three refusals. Server instructions are unchanged. The
+// value is taken from a live run of this suite on the candidate.
+// MOVES with card 785e1eed P1-B (AZ-A9 grant requests, draft), for ONE added
+// description: `relayhall_access_request`, the work-plane filing tool over the
+// bearer-only /delegation/access-requests routes. Server instructions and every
+// existing description are unchanged. The new text declares what may be asked
+// for (one rule per type, exact or all-of-type, never admin or the surface
+// type), that filing changes no authority and a person decides after step-up,
+// that the rows expire and are revoked at task-terminal, the named refusals,
+// and what a repeated `file` and `withdraw` do. It makes no retry-safety claim.
+// The behaviour behind the wording is measured through the MCP ingress and the
+// REST routes against a real PostgreSQL in accessRequestsGrantLive. The value
+// is taken from a live run of this suite on the candidate.
+// MOVES with card 785e1eed P1-B-2 (AZ-A9 ratified 2026-10-10, E43; the
+// credential kind, clause 13), for ONE changed description:
+// `relayhall_access_request`. It drops the draft status word and the
+// KIND_NOT_AVAILABLE sentence, and says what a credential request asks for (a
+// Connector's own new credential with scopes it lacks, never root or
+// *:admin, the pin and label), that the same credential collects it within 24
+// hours and receives the key once, that the previous credential stays live,
+// and what a repeated collect answers. Server instructions and every other
+// description are unchanged. The behaviour behind the wording is measured
+// through the MCP ingress and the REST routes against a real PostgreSQL in
+// accessRequestsCredentialLive. The value is taken from a live run of this
+// suite on the candidate.
+// MOVES with card b796067e (RB-11 Governor v0, ratified E97, answer E1), for
+// THREE added descriptions and nothing else: `relayhall_knowledge_note_propose`,
+// `_preview` and `_commit`, the door relays to a knowledge source's write
+// surface under knowledge-contents:write. Server instructions and every
+// existing description are unchanged. Each new text says what the tool returns
+// (the exact bytes and the audience; a sealed handle and sha256), that nothing
+// is written before commit, and that RelayHall stores no note content; the
+// commit text carries its retry sentence, which says what a same-key and a
+// new-key retry do and makes no safety claim. The exact texts are pinned by
+// value below. The behaviour behind the wording is measured through the MCP
+// ingress and the REST routes against a real PostgreSQL and a stub source in
+// knowledgeWriteDoorLive. The value is taken from a live run of this suite on
+// the candidate.
+// MOVES with card 1a38270d (AZ-A13 stage 2, ratified 2026-10-11, E95; clause
+// 7 P-5 and clause 15b), for ONE changed description: `relayhall_access_request`
+// gains kind `authority-edit` (scopes the caller's OWN credential lacks, added to
+// that credential in place on approval, so the configuration and key do not
+// change; no transport, no other object, one pending edit per credential), and
+// says that kind `credential` is for a NEW credential. Its schema gains
+// `object` and `addScopes`. Server instructions and every other description are
+// unchanged. The behaviour behind the wording is measured through the REST
+// routes and the MCP ingress against a real PostgreSQL in authorityEditLive.
+// The value is taken from a live run of this suite on the candidate.
+// MOVES with card 40e0e542 (owner ruling E127 (5), the default search scope),
+// for ONE changed description and nothing else:
+// `relayhall_knowledge_source_search` gains one sentence saying that current
+// knowledge is searched by default, that the archive categories a source
+// declares are searched only with includeArchive: true, and that every answer
+// states which was searched. Server instructions and every other description
+// are unchanged; the new `includeArchive` argument lives in the inputSchema,
+// which this digest does not cover. The behaviour behind the wording is
+// measured through the MCP ingress and the REST route against a real
+// PostgreSQL and a stub source in knowledgeDefaultScopeLive. The value is
+// taken from a live run of this suite on the candidate.
+// beta.37 integration: main (Train 35/36 guidance + E108(3a) criteria tool)
+// combined with Train 33 (P2-B, archive parity, P2-C history readers), T34
+// (P2-D preview, shared all_string_leaves result boundary in INSTRUCTIONS)
+// and RET. Every tool description equals the one input that changed it;
+// INSTRUCTIONS = T34's text + main's guidance suffix. Re-pinned from a live
+// run of this suite on the integrated head; the integration review verifies.
+// Card 41e24358 (default Verifier): three descriptions changed - task_create
+// names the inherited default Verifier and the optional verifierPrincipalId
+// (accepted only when it equals a Project or Phase default), task_list names
+// the "without a usable Verifier" filter, and task_graph lists verifierUnusable
+// among its filters. Server instructions and every other description are
+// unchanged. Re-pinned from a live run of this suite on the candidate.
+// MOVES with card 549cc51f (owner rulings E298 section 4, E299, E310), for ONE
+// added description and nothing else: `relayhall_knowledge_shared_writers_list`
+// says it lists the Accounts that may write a knowledge source's
+// organisation-wide shared area and whether the caller's own Account is one
+// (youCanWrite), that everything written there is readable by everyone the
+// source admits, and that it is read-only: only an administrator changes the
+// list, in the dashboard or the CLI, never over MCP. Server instructions and
+// every other description, `relayhall_access_request` included, are unchanged
+// (E310: no new request kind). The behaviour behind the wording is measured
+// through the MCP ingress and the REST routes against a real PostgreSQL in
+// knowledgeSharedWritersLive. The value is taken from a live run of this suite
+// on the candidate.
+// The beta.44 integration (cards 311229fd and 549cc51f on 1.0.0-beta.43): the
+// model-facing text is beta.43's (the three default-Verifier descriptions) plus
+// the one added `relayhall_knowledge_shared_writers_list` description; AZ-A12
+// build 3 changes no description or instruction (its registry edit is a source
+// comment). Re-pinned from a live run of this suite on the integrated head.
+// MOVES with card 502fb19e slice S3 (the universal change request, owner ruling
+// E325, design sections 4.3 and 9.1), for ONE changed description and nothing
+// else: `relayhall_access_request` gains action `preview` ("what may I request
+// here": writes nothing, an unreadable object answers as an absent one) and
+// kind `change` (one typed change for any Account or Group the caller's
+// standing may name, the seven built target types and their change fields, the
+// named refusals, CHANGE_PENDING for a repeated change filing, decided by root,
+// an administrator or the owner of every object on the signed-in board, never
+// over MCP), and `status` now lists every kind, agent-mint included, with a
+// status filter, a change showing its fields before and after and never its
+// decider. The "repeated file files a second request" sentence is narrowed to
+// the three legacy kinds, which keep it. Server instructions and every other
+// description are unchanged; the bootstrap packs name relayhall_access_preview,
+// not this tool, so c9BootstrapPacks is unchanged. The behaviour behind the
+// wording is measured through the MCP ingress and the REST routes against a
+// real PostgreSQL in changeRequestsLive (section C) and by c4McpDispatchMapping;
+// the value is taken from a live run of this suite on the candidate.
+// MOVES again with the slice S3 repair round (card 502fb19e, design section
+// 5.1), for ONE sentence of the same description and nothing else: "a change
+// is decided by root, an administrator or the owner of every object it names"
+// now says who decides each built target type: a grant.rows or
+// knowledge.compartment change by root, an administrator or the owner of
+// every object it names; a credential.scopes, credential.issue or
+// knowledge.shared_writer change by root or an administrator; a grant.edit or
+// grant.revoke change by a root session only (changeTargets.ts
+// ROOT_SESSION_ONLY_TARGETS and OWNER_TIER_TARGETS, which the decide route's
+// changeDeciderArm reads). Server instructions, every other description and
+// the bootstrap packs are unchanged; the value is taken from a live run of
+// this suite on the repaired candidate.
+// MOVES with card 76369965, for ONE changed description and nothing else:
+// `relayhall_lease_claim`. The tool sent only `{leaseSeconds}` to
+// `POST /tasks/orchestration/:id/claim`, which requires snapshotUpdatedAt,
+// harness and resourceKey, so no call through it could take a Lease. Its
+// schema now carries the route's fields (leaseSeconds forwarded as the route's
+// ttlSeconds), and the description says what the route already decides: the
+// claim is a compare-and-set on the snapshot the caller read
+// (STALE_TASK_SNAPSHOT), one active Lease per Task and per resourceKey
+// (ACTIVE_LEASE_CONFLICT), the route admits a principal whose Task-lifecycle
+// role is reviewer, qa or orchestrator (over MCP: the reviewer or qa role an
+// administrator set on the Connector or the Agent, or, with no role, the one a
+// legacy handle maps to; with neither, role agent and 403), and the Task's own
+// Verifier is refused with CLAIMANT_VERIFIER_CONFLICT. The card's first
+// review found the first wording ("every Agent is refused") untrue, so the
+// value was re-recorded once for the corrected text. (The leaseSeconds
+// property description, which this digest does not cover, now names the
+// tool-side refusal LEASE_SECONDS_INVALID.)
+// Who may claim is unchanged; the description names it. Server instructions,
+// every other description and the bootstrap packs are unchanged. The behaviour
+// behind the wording is measured through the MCP ingress against a real
+// PostgreSQL in mcpLeaseClaimLive and by c4McpDispatchMapping; the value is
+// taken from a live run of this suite on the candidate.
+// MOVES again with train T2 slice S4 (card 9ce0b0b0, design sections 3 and
+// 9.1), for relayhall_access_request's text and nothing else: its description
+// and its targetType and targetId parameters name the identity targets
+// (credential.revoke, identity.role, identity.create, identity.status and the
+// four warrant targets), their change shapes, who may file the root-ceiling
+// ones, and who decides each (changeTargets.ts ROOT_SESSION_ONLY_TARGETS, the
+// decide route's changeDeciderArm). Server instructions, every other
+// description and the bootstrap packs are unchanged; the value is taken from a
+// live run of this suite on the S4 candidate.
+// beta.56 integration (cards 19dd180c, 9ce0b0b0 and d67e6990 on 1.0.0-beta.55):
+// the model-facing text is beta.55's (card 76369965's relayhall_lease_claim
+// description) plus card 9ce0b0b0's relayhall_access_request description, each
+// tool description equal to the one input that changed it. Card 19dd180c
+// changes only the finish tool's answer text, which this digest does not
+// cover; card d67e6990 changes no description or instruction. Server
+// instructions and the bootstrap packs are unchanged. Re-pinned from a live
+// run of this suite on the integrated head.
+// MOVES with card 2bc7b303 (owner ruling E374), for THREE added descriptions
+// and nothing else: `relayhall_subtask_create` (add one Subtask at a 1-based
+// position, default append, with an optional initial state among the six
+// relayhall_subtask_set accepts; returns the new stable subtaskId; the same
+// authority as relayhall_subtask_set, completed needing owner/Main authority,
+// and a completed Task refusing an unfinished Subtask with
+// TASK_REOPEN_REQUIRED), `relayhall_subtask_reorder` (every current Subtask id
+// exactly once, ids, states and text unchanged, SUBTASK_ORDER_MISMATCH
+// otherwise) and `relayhall_subtask_update_text` (one Subtask's text by stable
+// id, as the dashboard's Subtask edit does). Each carries its keyed retry
+// sentence in the arm/park shape (a stored receipt within the 24-hour
+// retention window, IDEMPOTENCY_KEY_REUSED for a changed request); none makes
+// an unqualified retry-safety claim, and the lints above hold as they stand.
+// Server instructions, every existing description and the bootstrap packs are
+// unchanged. The behaviour behind the wording is measured through the MCP
+// ingress and the REST routes against a real PostgreSQL in
+// subtaskStructureLive, and the retry contract in idempotencyContract; the
+// value is taken from a live run of this suite on the candidate.
+// beta.57 integration (1.0.0-beta.56, card 2bc7b303, merged into the
+// integration of cards 19dd180c, 9ce0b0b0 and d67e6990): the model-facing
+// text is beta.56's (card 2bc7b303's three added Subtask structure
+// descriptions) plus card 9ce0b0b0's relayhall_access_request description,
+// each tool description equal to the one input that changed it and the tool
+// order as each input left it. Server instructions and the bootstrap packs
+// are unchanged. Re-pinned from a live run of this suite on the integrated
+// head.
+// Owner ruling E462 S4b: relayhall_task_create's verificationNone and relayhall_task_finish's `none` completion.
+// MOVES with owner ruling E467 (the Action Center queue for agents), for ONE
+// added description and nothing else: `relayhall_action_items_list` (read only,
+// introspection plane, placed after `relayhall_principal_list`): the open items
+// waiting on the person behind the connection plus the caller's own, each with
+// its kind, the Task or approval id, how long it has waited and the board link,
+// the title and reasons only where the caller can read the object (a Decision
+// gives just the title of its Task: the approval's kind and requester need the
+// approval itself, which a bearer cannot open), the seen mark named by owner,
+// and no way to decide, mark seen or change anything. It makes no retry claim. Server
+// instructions, every other description and the bootstrap packs are unchanged.
+// The behaviour behind the wording is measured through the MCP ingress against
+// a real PostgreSQL in actionItemsOwnerLive; the value is taken from a live run
+// of this suite on the candidate.
+// beta.92 integration (E462 S4b on beta.90 + E467): the model-facing text is S4b's
+// plus E467's one added description, each equal to the one input that changed it.
+// Re-derived from a live run of this suite on the merged tree, not picked from a side.
+// Card 9ce0b0b0 (T2 S5): relayhall_access_request's description, and only it,
+// names the eleven object targets, their change fields, who files and who decides
+// them, and that the decider applies them only within its own authority on the
+// object (filed over MCP, never applied there). Server instructions, every other
+// description and the bootstrap packs are unchanged. The behaviour behind the
+// wording is measured through the router against a real PostgreSQL in
+// changeRequestObjectTargetsLive; the value is taken from a live run of this suite.
+const MODEL_FACING_TEXT_DIGEST = 'sha256-b9c44a3efd24264f93a62f0321e0f39e2b4cec8a0b937af208fa32faf3b20a02';
 
 const EXPECTED_REQUEST_HANDLERS = ['tools/list', 'tools/call'];
 /**
@@ -970,8 +1342,8 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
   it('is not vacuous: the surface it censuses is actually there', () => {
     expect(sources.map((entry) => entry.file)).toEqual([
       'bootstrapGate.ts', 'contract/protocolRevision.ts', 'httpRoute.ts', 'inProcess.ts',
-      'provenance.ts', 'registry.ts', 'rest.ts', 'server.ts', 'shape.ts', 'stdio.ts',
-      'webBridge.ts',
+      'provenance.ts', 'registry.ts', 'rest.ts', 'server.ts', 'shape.ts', 'stdio.ts', 'taskHistoryRead.ts',
+      'toolResultBoundary.ts', 'webBridge.ts',
     ]);
     expect(census.state.length).toBeGreaterThanOrEqual(10);
   });
@@ -1164,6 +1536,20 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       ].join('\n---\n');
       const digest = `sha256-${crypto.createHash('sha256').update(manifest, 'utf8').digest('hex')}`;
       expect(digest).toBe(MODEL_FACING_TEXT_DIGEST);
+      const preview = MCP_TOOLS.find((tool: { name: string }) => tool.name === 'relayhall_access_preview');
+      expect(preview.description).toContain('Self-only GET /principals/me/effective-access');
+      expect(preview.description).toContain('task-state, step-up and handler checks still gate real acts');
+      expect(preview.inputSchema.properties.limit.maximum).toBe(50);
+      expect(preview.inputSchema.properties).not.toHaveProperty('principalId');
+      for (const name of ['relayhall_task_arm', 'relayhall_task_park']) {
+        const description = MCP_TOOLS.find((tool: { name: string }) => tool.name === name).description;
+        expect(description).toContain('24-hour retention window');
+        expect(description).toContain('original receipt without applying the write again');
+        expect(description).toContain('IDEMPOTENCY_KEY_REUSED (409)');
+        expect(description).toContain('After retention expires the call is a new act');
+        expect(description).toContain('Read the Task for current state');
+      }
+      expect(manifest).toContain('projectId for bounded project awareness (requires projects:read and tasks:read; visible phase/report sections additionally require their read scopes)');
       // Not vacuous: the instructions block really is in the manifest, and it
       // is the real text — the one carrying the untrusted-data doctrine.
       expect(serverModule.INSTRUCTIONS.length).toBeGreaterThan(200);
@@ -1173,7 +1559,24 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       // is a number someone updated to make a test pass.
       expect(serverModule.INSTRUCTIONS).toContain('bootstrap first');
       expect(serverModule.INSTRUCTIONS).toContain('relayhall_brief_compile');
+      expect(serverModule.INSTRUCTIONS).toContain(BUILT_IN_WORKFLOW_GUIDANCE);
       expect(manifest.startsWith('INSTRUCTIONS\n')).toBe(true);
+      const native = new Map((MCP_TOOLS as Array<{name:string;description:string;plane:string;scope:string}>).map(t=>[t.name,t]));
+      // MOVES with card 40e0e542: the default-scope sentence, by value.
+      expect(native.get('relayhall_knowledge_source_search')?.description).toBe('Search authorized knowledge sources with hard source, kind and category narrowing. Read-only; results grouped by source, coverage first. Query text is sent to selected sources. Current knowledge is searched by default; the archive categories a source declares are searched only with includeArchive: true, and every answer states which was searched.');
+      expect(native.get('relayhall_knowledge_source_get')?.description).toBe('Fetch an authorized cited revision using its sealed address. Optional sealed continuation retrieves the next byte window; address possession grants no authority.');
+      // RB-11 Governor v0 (b796067e): the three write relays, by value.
+      expect(native.get('relayhall_knowledge_note_propose')?.description).toBe('Propose a note for a registered knowledge source to write. Returns the exact bytes the source would write (content_base64, sha256) and who could read them (audience); nothing is written until commit. Default target: the Task project when you work in a Task context, else your personal notes. RelayHall relays the note and stores no note content.');
+      expect(native.get('relayhall_knowledge_note_preview')?.description).toBe('Re-resolve an open note proposal against current grants: the same exact bytes and audience, with a new previewDigest when the audience changed. Commit only with the digest of the preview you showed. RelayHall relays the preview and stores no note content.');
+      expect(native.get('relayhall_knowledge_note_commit')?.description).toBe('Commit an open note proposal with the previewDigest you showed and its expectedRevision ("absent" for a new note). Returns a sealed handle and the sha256 of the written bytes; read them back with relayhall_knowledge_source_get. Requires idempotencyKey (16-128 characters), generated once per commit. Retry contract: within the 24-hour retention window, the same key and request return the original commit receipt without contacting the source again; a different request with that key is refused with IDEMPOTENCY_KEY_REUSED (409). A new key for an already committed proposal reaches the source, which answers with its stored commit.');
+      for (const name of ['relayhall_knowledge_note_propose', 'relayhall_knowledge_note_preview', 'relayhall_knowledge_note_commit']) {
+        expect(native.get(name)?.scope).toBe('knowledge-contents:write');
+        expect(native.get(name)?.plane).toBe('work');
+      }
+      for (const name of BOOTSTRAP_GATED_READ_TOOLS) {
+        expect(native.get(name)?.plane).toBe('work');
+        expect(native.get(name)?.scope).toBe('knowledge-contents:read');
+      }
       // Card fb06c930: the digest moved BECAUSE the retry sentences landed, and
       // this is what says so. Each declared sentence is present in the live
       // description of the tool it names — so a digest that matched with the
@@ -1436,7 +1839,7 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       // Named for exactly what it measures (owner ruling, 2026-08-27). What it
       // does NOT measure — body-level CROSS-caller normalisation (a marker
       // stable per caller but caused by another), schema-valid non-empty
-      // arguments, and the mutating plane — needs per-caller clean-lifetime
+      // arguments for legacy tools, and the mutating plane — needs per-caller clean-lifetime
       // baselines and an in-memory board double: the isolation-harness
       // candidate ruled to ride with `fb06c930`, where the sanctioned state
       // (bootstrap TTL records, idempotency records) lands and the contract
@@ -1488,9 +1891,38 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
         return `${wire.status}|${headers}|${wire.body.replace(/"id":\d+/g, '"id":N')}`;
       };
 
+      // Isolate transport behaviour with a caller-specific read-only REST boundary
+      // fixture. Real bootstrap dispatch still resolves each credential; only its
+      // persisted live-record lookup is supplied. Native route/crypto semantics
+      // are covered by the knowledge contract suites, not invented by this double.
+      jest.spyOn(bootstrapService, 'isBootstrapLive').mockResolvedValue(true);
+      const sourceId = '55555555-5555-4555-8555-555555555555';
+      const nativeArgs: Record<string, Record<string, unknown>> = {
+        relayhall_task_account_owner_get: {task:sourceId},
+        relayhall_task_report_list: {task:sourceId},
+        relayhall_task_report_get: {task:sourceId,reportId:sourceId},
+        relayhall_task_report_reconcile: {task:sourceId,idempotencyKey:'isolation-report-key',requestHash:'a'.repeat(64)},
+        relayhall_knowledge_source_search: {q:'posture fixture',sources:[sourceId],kinds:['docs'],categories:['relaybrain:note'],limitPerSource:2},
+        relayhall_knowledge_source_get: {handle:'fixture.sealed.address',continuation:'fixture.sealed.next',ifNoneMatch:'a'.repeat(64)},
+      };
+      const originalBoard = restModule.board;
+      const nativeCalls: Array<{name:string;authorization:string}> = [];
+      jest.spyOn(restModule, 'board').mockImplementation(async (ctx, call) => {
+        if (!BOOTSTRAP_GATED_READ_TOOLS.includes(ctx.toolName)) return originalBoard(ctx, call);
+        const caller = CALLERS.find(c=>ctx.authorization==='Bearer '+c.token);
+        expect(caller).toBeDefined();
+        nativeCalls.push({name:ctx.toolName,authorization:ctx.authorization});
+        expect(call.requiredScope).toBe('knowledge-contents:read');
+        if (ctx.toolName==='relayhall_knowledge_source_search') {
+          expect(call).toMatchObject({method:'POST',path:'/knowledge-queries',body:{...nativeArgs[ctx.toolName],protocol_version:2}});
+          return {coverage:{consulted:[sourceId],answered:[sourceId],timedOut:[],unavailable:[],refusedBySource:[],refusedByPolicy:[],skipped:[],partialSources:[],truncatedResults:[],invalidResults:[]},groups:[{sourceId,sourceSlug:'fixture',results:[{handle:'fixture.sealed.address',title:caller!.handle,snippet:'Synthetic caller-specific read',compartment:'fixture',contentKind:'docs',category:'relaybrain:note',score:1}]}],auditRef:'ka_'+'a'.repeat(32)};
+        }
+        expect(call).toMatchObject({method:'GET',path:'/knowledge-contents',query:nativeArgs[ctx.toolName]});
+        return {status:'content',content_base64:Buffer.from(caller!.handle).toString('base64')};
+      });
       let sequence = 100;
       const callTool = (name: string, token: string) => request({
-        jsonrpc: '2.0', id: (sequence += 1), method: 'tools/call', params: { name, arguments: {} },
+        jsonrpc: '2.0', id: (sequence += 1), method: 'tools/call', params: { name, arguments: nativeArgs[name] ?? {} },
       }, token);
 
       /**
@@ -1582,6 +2014,19 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       expect(round1.keyid01.relayhall_principal_whoami)
         .not.toEqual(round1.keyid02.relayhall_principal_whoami);
       expect(Object.keys(round1.keyid01).length).toBe(READ_PLANE_TOOLS.length + 4);
+      for (const caller of CALLERS) {
+        const search = round1[caller.keyId].relayhall_knowledge_source_search;
+        expect(search).toContain(caller.handle);
+        expect(search).toContain('# Knowledge search coverage');
+        expect(search).toContain('# Results');
+        expect(search.indexOf('# Knowledge search coverage')).toBeLessThan(search.indexOf('# Results'));
+        expect(round1[caller.keyId].relayhall_knowledge_source_get).toContain(Buffer.from(caller.handle).toString('base64'));
+        for (const otherCaller of CALLERS.filter(c=>c.keyId!==caller.keyId)) {
+          expect(search).not.toContain(otherCaller.handle);
+          expect(round1[caller.keyId].relayhall_knowledge_source_get).not.toContain(Buffer.from(otherCaller.handle).toString('base64'));
+        }
+        for (const name of BOOTSTRAP_GATED_READ_TOOLS) expect(nativeCalls.some(c=>c.name===name&&c.authorization==='Bearer '+caller.token)).toBe(true);
+      }
     });
 
     it('the probe drives EVERY read-plane tool, and the rest is inventoried', () => {
@@ -1591,8 +2036,8 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { MCP_TOOLS } = require('../mcp/registry');
       const registry = (MCP_TOOLS as Array<{ name: string; plane: string }>);
-      const readPlane = registry.filter((tool) => tool.plane !== 'work').map((tool) => tool.name);
-      const mutating = registry.filter((tool) => tool.plane === 'work').map((tool) => tool.name);
+      const readPlane = registry.filter((tool) => tool.plane !== 'work' || BOOTSTRAP_GATED_READ_TOOLS.includes(tool.name)).map((tool) => tool.name);
+      const mutating = registry.filter((tool) => tool.plane === 'work' && !BOOTSTRAP_GATED_READ_TOOLS.includes(tool.name)).map((tool) => tool.name);
 
       expect([...READ_PLANE_TOOLS].sort()).toEqual([...readPlane].sort());
       expect([...MUTATING_TOOLS_NOT_PROBED].sort()).toEqual([...mutating].sort());
@@ -1626,6 +2071,15 @@ describe('the MCP stateless posture gate (S-A6 / de73f9f8 §1.3, items 1–6)', 
       const second = await post(rpc('tools/list', 6));
       expect(first.headers['mcp-session-id']).toBeUndefined();
       expect(second.headers['mcp-session-id']).toBeUndefined();
+      // The real initial wire response carries product guidance without a
+      // Project, Charter, or local Skill configured for this caller.
+      const initialized = await post({ jsonrpc: '2.0', id: 7, method: 'initialize', params: {
+        protocolVersion: serverModule.MCP_PROTOCOL_REVISION,
+        capabilities: {}, clientInfo: { name: 'fresh-client', version: '1.0.0' },
+      } });
+      const instructions = JSON.parse(initialized.body).result.instructions as string;
+      expect(instructions).toContain(BUILT_IN_WORKFLOW_GUIDANCE);
+      expect(instructions).not.toContain('Project Charter');
     });
   });
 

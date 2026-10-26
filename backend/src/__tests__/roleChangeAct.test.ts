@@ -99,6 +99,7 @@ jest.mock('../services/PrincipalService', () => {
   const find = (id: string) => ALL.find((p) => p.id === id);
   Object.assign(stub, real, {
     getPrincipalById: jest.fn(async (id: string) => find(id)),
+    getPrincipalByIdStrict: jest.fn(async (id: string) => find(id)),
     getPrincipalByHandle: jest.fn(async (handle: string) => ALL.find((p) => p.handle === handle)),
     resolveHandle: jest.fn(async (handle: string) => ({
       principal: ALL.find((p) => p.handle === handle), degraded: false,

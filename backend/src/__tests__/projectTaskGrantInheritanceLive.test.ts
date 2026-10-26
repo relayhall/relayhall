@@ -123,7 +123,7 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
     }
   });
 
-  it('exact-only source excludes wildcard Project Grants, Project Profiles and Project ownership', async () => {
+  it('exact-only source excludes wildcard Project Grants and Profiles; explicit Task ownership wins over Project ownership', async () => {
     const p = await project(); const t = await task(p); const wild = await account();
     await grant(wild.id, null, 'write'); await expectHidden(wild, t);
     const profiled = await account();
@@ -136,7 +136,12 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
     await expectHidden(profiled, t);
     const owner = await account(); const owned = await project(owner.id);
     expect((await request(owner, 'GET', `/projects/${owned}/context`)).status).toBe(200);
-    await expectHidden(owner, await task(owned));
+    const inheritedOwnedTask = await task(owned);
+    expect((await read(owner, inheritedOwnedTask)).status).toBe(200);
+    // An explicit different account owner is authoritative; Project ownership
+    // must not become a second path around that account boundary.
+    await pool.query('UPDATE tasks SET account_owner_principal_id=$1 WHERE id=$2', [root.id, inheritedOwnedTask]);
+    await expectHidden(owner, inheritedOwnedTask);
     const stranger = await account(); await grant(stranger.id, await project(), 'write'); await expectHidden(stranger, t);
   });
 
@@ -169,7 +174,9 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
     // Canonical schema rejects contradictory ancestry; do not disable it for a fixture.
     await expect(task(other, String(phase.rows[0].id))).rejects.toMatchObject({ code: '23503' });
     await expectHidden(f.caller, await task(null));
-    const created = await request(root, 'POST', '/tasks', { title: tag(), project: f.projectId, visibility: 'private' });
+    // Card c3880767: visibility is a server-written column (refused by name);
+    // a new Task is private by the column default.
+    const created = await request(root, 'POST', '/tasks', { title: tag(), project: f.projectId });
     expect(created.status).toBe(201);
     const later = String(created.json.task.id); expect((await read(f.caller, later)).status).toBe(200);
     expect((await request(root, 'PATCH', `/tasks/${later}`, { project: other })).status).toBe(200);
@@ -200,8 +207,8 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
 
   it('Group membership is live and a disabled principal loses resource access', async () => {
     const caller = await account(); const p = await project(); const t = await task(p);
-    const group = await pool.query('INSERT INTO groups(name) VALUES($1) RETURNING id', [tag()]);
-    const groupId = String(group.rows[0].id);
+    // AZ-A12 build 1: a raw Group row needs its kind='group' principal first.
+    const groupId = String(await require('./support/groupRows').insertGroupRow(pool, { name: tag() }));
     const unrelatedMember = await account();
     await pool.query('INSERT INTO group_members(group_id,account_principal_id) VALUES($1,$2)', [groupId, unrelatedMember.id]);
     await grant(groupId, p, 'write', 'project', 'group');
@@ -242,10 +249,11 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
 
   it('ordinary Agent mint retains its bound Task write cap after live parent authority changes', async () => {
     const f = await fixture('write'); const other = await task(f.projectId);
-    // Credential issuance is unchanged: exact Task grants prove the request at mint.
-    // Revoke them after legitimate issuance; subsequent resource checks use only Project authority.
-    // The unchanged conservative mint algebra proves each exact selector and
-    // verb separately; it does not infer read from write or union exact Grants.
+    // Exact Task grants back the request at mint. Revoke them after legitimate
+    // issuance; subsequent resource checks use only Project authority. (Since
+    // card 785e1eed P1-C the mint ceiling is the live predicate, so the Project
+    // write grant alone would admit these exact rules; the temporaries stay so
+    // this test keeps measuring the post-issuance revocation it was written for.)
     const temporary = await Promise.all([f.taskId, other].flatMap(id => ['read','write'].map(verb => grant(f.caller.id, id, verb, 'task'))));
     const step = await stepUpService.mint(f.caller.id, 'agent.mint', f.taskId, 'password');
     const minted = await request(f.caller, 'POST', '/delegation/agent-mints', {
@@ -293,6 +301,18 @@ describe('exact Project Grant inheritance (approved 0e6f09a0)', () => {
     expect((await write(agent, f.taskId)).status).toBe(200);
     await expectHidden(agent, other);
     await pool.query('DELETE FROM grants WHERE id=$1', [f.grantId]);
+    // AZ-A10 clause 4: once the Project Grant is gone, the Agent's own implementer
+    // role rows on its bound Task satisfy the Account side for exactly that Task.
+    expect((await write(agent, f.taskId)).status).toBe(200);
+    // Every delegated own() cap stays a final AND over those rows: the
+    // intermediate Connector still bounds them.
+    await pool.query('UPDATE principals SET own_expression=$2::jsonb WHERE id=$1',
+      [parent.id, JSON.stringify({ scopes: 'parent', objects: rules.slice(1) })]);
+    expect((await write(agent, f.taskId)).status).toBe(403);
+    // With the Connector restored and the role rows removed, no source remains.
+    await pool.query('UPDATE principals SET own_expression=$2::jsonb WHERE id=$1',
+      [parent.id, JSON.stringify({ scopes: 'parent', objects: rules.slice(0, 1) })]);
+    await pool.query("DELETE FROM grants WHERE grantee_type='principal' AND grantee_id=$1", [agent.id]);
     expect((await write(agent, f.taskId)).status).toBe(403);
   });
 

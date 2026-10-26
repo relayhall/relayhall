@@ -10,7 +10,10 @@
 //     (definitionOfDone/constraints as lists) and the F4 connector gating
 //     (a serviceId profile strips board-native model/personality/thinking);
 //   - success navigates to the created Task's canonical URL;
-//   - Cancel guards unsaved changes.
+//   - Cancel guards unsaved changes;
+//   - card b13e5ac9: the Project's inbox phase is preselected with status
+//     Ideas while no phase is chosen, an explicit phase/status/backlog choice
+//     wins, and an inbox that is not in force is not preselected.
 
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -22,6 +25,11 @@ import { authenticatedFetch } from '../utils/auth';
 import { TaskCreatePage } from './TaskCreatePage';
 
 vi.mock('../utils/auth', () => ({ authenticatedFetch: vi.fn() }));
+// The Project list and the Phase options each test sees (card b13e5ac9).
+const fixtures = vi.hoisted(() => ({
+  projects: [] as Array<Record<string, unknown>>,
+  phases: [] as Array<Record<string, unknown>>,
+}));
 vi.mock('../components/tasks/ExecutionProfileEditor', () => ({
   __esModule: true,
   default: ({ value, onChange }: any) => (
@@ -30,15 +38,23 @@ vi.mock('../components/tasks/ExecutionProfileEditor', () => ({
     </button>
   ),
 }));
-vi.mock('../components/tasks/PhaseSelect', () => ({
-  PhaseSelect: ({ value, onChange }: any) => (
-    <select aria-label="Phase" value={value} onChange={(event: any) => onChange(event.target.value)}>
-      <option value="">No phase</option>
-      <option value="phase-1">Phase one</option>
-    </select>
-  ),
-  PhaseName: ({ phaseId }: any) => <span>{phaseId}</span>,
-}));
+vi.mock('../components/tasks/PhaseSelect', async () => {
+  // The in-force rule is the PRODUCTION function; only the network-backed
+  // pieces are replaced.
+  const actual = await vi.importActual<typeof import('../components/tasks/PhaseSelect')>('../components/tasks/PhaseSelect');
+  return {
+    inboxPhaseInForce: actual.inboxPhaseInForce,
+    usePhaseOptions: (projectId: string | null) => (projectId ? fixtures.phases : []),
+    PhaseSelect: ({ value, onChange }: any) => (
+      <select aria-label="Phase" value={value} onChange={(event: any) => onChange(event.target.value)}>
+        <option value="">No phase</option>
+        <option value="phase-1">Phase one</option>
+        <option value="phase-inbox">Inbox - to be sorted</option>
+      </select>
+    ),
+    PhaseName: ({ phaseId }: any) => <span>{phaseId}</span>,
+  };
+});
 
 const created: Array<Record<string, unknown>> = [];
 
@@ -64,10 +80,15 @@ const renderCreate = (entry = '/tasks/new') => {
 
 beforeEach(() => {
   created.length = 0;
+  fixtures.projects = [{ id: 'p1', name: 'RelayHall' }];
+  fixtures.phases = [
+    { id: 'phase-1', name: 'Phase one', status: 'in-progress', position: 1, restrictedAccess: false },
+    { id: 'phase-inbox', name: 'Inbox - to be sorted', status: 'todo', position: 15, restrictedAccess: false },
+  ];
   vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
     const url = String(input);
     if (url.endsWith('/projects')) {
-      return new Response(JSON.stringify({ success: true, projects: [{ id: 'p1', name: 'RelayHall' }] }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, projects: fixtures.projects }), { status: 200 });
     }
     if (url.endsWith('/personalities')) {
       return new Response(JSON.stringify({ success: true, personalities: [{ id: 'per1', slug: 'generalist', name: 'Generalist' }] }), { status: 200 });
@@ -207,6 +228,98 @@ describe('routed create mode (§7)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent(/\/tasks$/));
     confirmSpy.mockRestore();
+  });
+});
+
+describe('the inbox phase is the default placement (card b13e5ac9, Charter v5 §6.1)', () => {
+  const withInbox = () => { fixtures.projects = [{ id: 'p1', name: 'RelayHall', inboxPhaseId: 'phase-inbox' }]; };
+  const phaseValue = () => (screen.getByLabelText('Phase') as HTMLSelectElement).value;
+  const statusValue = () => (screen.getByLabelText('Status') as HTMLSelectElement).value;
+
+  test('no phase chosen: the inbox phase is preselected with status Ideas, and the POST files the Task there', async () => {
+    withInbox();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    renderCreate('/tasks/new?project=RelayHall');
+    await waitFor(() => expect(phaseValue()).toBe('phase-inbox'));
+    expect(statusValue()).toBe('ideas');
+    // A default nobody touched is not unsaved work: Cancel leaves without asking.
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  test('the create POST carries the inbox phase and Ideas', async () => {
+    withInbox();
+    renderCreate('/tasks/new?project=RelayHall');
+    await waitFor(() => expect(phaseValue()).toBe('phase-inbox'));
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Inbox card' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Task' }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0]).toMatchObject({ project: 'RelayHall', phaseId: 'phase-inbox', status: 'ideas' });
+  });
+
+  test('picking the project in the form preselects ITS inbox phase', async () => {
+    withInbox();
+    renderCreate();
+    await screen.findByRole('option', { name: 'RelayHall' });
+    expect(phaseValue()).toBe('');
+    expect(statusValue()).toBe('todo');
+    fireEvent.change(screen.getByLabelText('Project'), { target: { value: 'p1' } });
+    await waitFor(() => expect(phaseValue()).toBe('phase-inbox'));
+    expect(statusValue()).toBe('ideas');
+  });
+
+  test('an explicit phase wins: the board-context phase is kept and status stays To-Do', async () => {
+    withInbox();
+    renderCreate('/tasks/new?project=RelayHall&phaseId=phase-1');
+    await waitFor(() => expect((screen.getByLabelText('Project') as HTMLSelectElement).value).toBe('p1'));
+    expect(phaseValue()).toBe('phase-1');
+    expect(statusValue()).toBe('todo');
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Follow-up' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Task' }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0]).toMatchObject({ phaseId: 'phase-1', status: 'todo' });
+  });
+
+  test('an explicit status wins in the inbox', async () => {
+    withInbox();
+    renderCreate('/tasks/new?project=RelayHall&status=todo');
+    await waitFor(() => expect(phaseValue()).toBe('phase-inbox'));
+    expect(statusValue()).toBe('todo');
+  });
+
+  test('choosing "No phase" sends the explicit backlog (null), which the server honours over the inbox', async () => {
+    withInbox();
+    renderCreate('/tasks/new?project=RelayHall');
+    await waitFor(() => expect(phaseValue()).toBe('phase-inbox'));
+    fireEvent.change(screen.getByLabelText('Phase'), { target: { value: '' } });
+    expect(statusValue()).toBe('todo');
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Backlog card' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Task' }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0].phaseId).toBeNull();
+    expect(created[0].status).toBe('todo');
+  });
+
+  test('an inbox phase that is not in force (restricted, or not offered) is not preselected', async () => {
+    withInbox();
+    fixtures.phases = fixtures.phases.map(phase => (phase.id === 'phase-inbox' ? { ...phase, restrictedAccess: true } : phase));
+    renderCreate('/tasks/new?project=RelayHall');
+    await waitFor(() => expect((screen.getByLabelText('Project') as HTMLSelectElement).value).toBe('p1'));
+    expect(phaseValue()).toBe('');
+    expect(statusValue()).toBe('todo');
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Plain card' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create Task' }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    // Not chosen, not sent: the server decides, and it suspends the default too.
+    expect('phaseId' in created[0]).toBe(false);
+  });
+
+  test('a project with no inbox phase keeps the old form: no phase, To-Do', async () => {
+    renderCreate('/tasks/new?project=RelayHall');
+    await waitFor(() => expect((screen.getByLabelText('Project') as HTMLSelectElement).value).toBe('p1'));
+    expect(phaseValue()).toBe('');
+    expect(statusValue()).toBe('todo');
   });
 });
 

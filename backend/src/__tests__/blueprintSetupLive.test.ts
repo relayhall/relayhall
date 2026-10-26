@@ -14,6 +14,8 @@ let server:http.Server;let origin:string;let author:{id:string;headers:Record<st
 const tag=()=>crypto.randomBytes(8).toString('hex');
 async function account(role="admin"){const id=(await pool.query("INSERT INTO principals(kind,handle,display_name,status,role) VALUES('human',$1,$1,'active',$2) RETURNING id",['setup-'+tag(),role])).rows[0].id;const {token}=await loginSessionService.mint({principalId:id});return {id,headers:{Cookie:`${SESSION_COOKIE_NAME}=${token}`}};}
 async function call(who:typeof author,method:string,path:string,body?:unknown,key?:string){const response=await fetch(origin+path,{method,headers:{'Content-Type':'application/json',...who.headers,...(key?{'Idempotency-Key':key}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:response.status,body:await response.json() as any};}
+// Owner ruling E418(b): a grant DELETE carries a step-up bound to (grant.revoke, id).
+async function revoke(who:typeof author,grantId:string){const {stepUpService}=require('../services/StepUpService');const {token}=await stepUpService.mint(who.id,'grant.revoke',String(grantId).toLowerCase(),'password');return call(who,'DELETE',`/grants/${grantId}`,{stepUpToken:token});}
 function ok(result:{status:number;body:any},status=200){expect(result.status===status?{status:result.status}:result).toEqual({status});return result.body;}
 function document(service:string):any{return {schemaVersion:'rh.blueprint/1.0',blueprint:{key:'descriptor-'+tag(),name:'Descriptor proof',version:1,summary:'',description:'',tags:[],provenance:'human-authored'},parameters:[{key:'answer',label:'Answer',promptText:'Text?',type:'string',required:false,default:'Inspect'}],references:[{kind:'service',name:service,requirement:'required',minVersion:2}],target:{mode:'new-project',project:{name:'Descriptor '+tag()}},phases:[],tasks:[{key:'inspect',title:'Inspect',defaults:{executionProfile:{service,options:{command:'Run {{answer}}'} as any}}}],humanGates:[],reports:[],dependencies:[]};}
 async function publish(doc:any){const id=ok(await call(author,'POST','/blueprints',doc),201).blueprint.id;ok(await call(author,'POST',`/blueprints/${id}/versions/1/submit`,{}));ok(await call(reviewer,'POST',`/blueprints/${id}/versions/1/publish`,{}));return id;}
@@ -49,16 +51,18 @@ async function existingWarrant(f:any,holder?:string){
 }
 async function displayed(f:any,warrantId:string){return ok(await call(author,'POST',`/instantiations/${f.result.instantiationId}/setup/preview`,{warrantId})).plan;}
 const confirm=(plan:any)=>({warrantId:plan.warrantId,tasks:plan.tasks.map((t:any)=>({id:t.id,revision:t.revision})),confirmationHash:plan.confirmationHash});
-async function stored(f:any){return (await pool.query("SELECT id,execution_service_id,execution_warrant_id,auto_start,owner_principal_id FROM tasks WHERE instantiation_id=$1 ORDER BY id",[f.result.instantiationId])).rows;}
+async function stored(f:any){return (await pool.query("SELECT id,execution_service_id,execution_warrant_id,execution_profile,execution_descriptor_version,auto_start,owner_principal_id FROM tasks WHERE instantiation_id=$1 ORDER BY id",[f.result.instantiationId])).rows;}
 afterEach(()=>jest.restoreAllMocks());
-test('ordinary authenticated Project creation gets exactly creator read/write; revocation is not healed by reads',async()=>{
+test('ordinary authenticated Project creation records durable ownership; removed Grants are not recreated by reads',async()=>{
  const user=await account('user');const project=ok(await call(user,'POST','/projects',{name:'Creator '+tag()}),201).project;
  const rows=(await pool.query("SELECT grantee_type,grantee_id,resource_type,resource_id,verb,granted_by_principal_id,provenance FROM grants WHERE resource_type='project' AND resource_id=$1 ORDER BY verb",[project.id])).rows;
  expect(rows).toEqual(['read','write'].map(verb=>({grantee_type:'principal',grantee_id:user.id,resource_type:'project',resource_id:project.id,verb,granted_by_principal_id:user.id,provenance:null})));
- expect((await pool.query("SELECT owner_principal_id FROM projects WHERE id=$1",[project.id])).rows[0].owner_principal_id).toBeNull();
+ expect((await pool.query("SELECT owner_principal_id FROM projects WHERE id=$1",[project.id])).rows[0].owner_principal_id).toBe(user.id);
  ok(await call(user,'GET',`/projects/${project.id}/phases`));
- for(const row of (await pool.query("SELECT id FROM grants WHERE resource_type='project' AND resource_id=$1",[project.id])).rows)ok(await call(author,'DELETE',`/grants/${row.id}`));
- expect(await call(user,'GET',`/projects/${project.id}/phases`)).toMatchObject({status:404});
+ for(const row of (await pool.query("SELECT id FROM grants WHERE resource_type='project' AND resource_id=$1",[project.id])).rows)ok(await revoke(author,row.id));
+ ok(await call(user,'GET',`/projects/${project.id}/phases`));
+ const stranger=await account('user');
+ expect(await call(stranger,'GET',`/projects/${project.id}/phases`)).toMatchObject({status:404});
  expect((await pool.query("SELECT count(*)::int AS n FROM grants WHERE resource_type='project' AND resource_id=$1",[project.id])).rows[0].n).toBe(0);
 });
 test('creator policy audit failure rolls back Project and both Grants',async()=>{
@@ -147,31 +151,95 @@ test('same setup key with a different confirmation is refused without additional
  expect(await stored(f)).toEqual(before);
  expect((await pool.query('SELECT count(*)::int AS n FROM blueprint_setup_requests WHERE instantiation_id=$1',[f.result.instantiationId])).rows[0].n).toBe(1);
 });
-test('parallel exact setup attempts converge on one receipt after any serialization retry',async()=>{
+async function parallelSetup(forceConflict=false){
  const f=await created();const {warrant}=await existingWarrant(f);const plan=await displayed(f,warrant.id);const key=tag();const route=`/instantiations/${f.result.instantiationId}/setup`;
- const answers=await Promise.all([call(author,'POST',route,confirm(plan),key),call(author,'POST',route,confirm(plan),key)]);
- expect(answers.some(answer=>answer.status===200)).toBe(true);expect(answers.every(answer=>[200,503].includes(answer.status))).toBe(true);
+ const counts=async()=> (await pool.query(`SELECT
+  (SELECT count(*)::int FROM blueprint_setup_requests) AS receipts,
+  (SELECT count(*)::int FROM access_vehicle_links) AS links,
+  (SELECT count(*)::int FROM audit_events WHERE action='blueprint.setup') AS audits`)).rows[0];
+ const before=await counts();let blockedPid:number|undefined;
+ // Observe an actual PostgreSQL wait, not synthetic responses or SQL errors.
+ // The first real assignment stays uncommitted until the other HTTP owner has
+ // established its REPEATABLE READ snapshot and is blocked on the instance.
+ const observer=forceConflict?await pool.connect():null;
+ if(observer){
+  const original=taskManagerDB.updateTask.bind(taskManagerDB);let held=false;
+  jest.spyOn(taskManagerDB,'updateTask').mockImplementation(async(...args:any[])=>{
+   const value=await original(...args);
+   if(!held&&args[4]?.source==='ordinary'){
+    held=true;const pid=(await args[4].client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    const deadline=Date.now()+4000;
+    do{
+     const waits=(await observer.query(`SELECT pid FROM pg_stat_activity
+      WHERE $1=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock'
+      AND query LIKE '%FROM blueprint_instantiations i%'`,[pid])).rows;
+     if(waits.length){blockedPid=waits[0].pid;break;}
+     await new Promise(resolve=>setTimeout(resolve,10));
+    }while(Date.now()<deadline);
+    expect(blockedPid).toBeDefined();
+   }
+   return value;
+  });
+ }
+ let answers:any[];
+ try{
+  answers=await Promise.all([call(author,'POST',route,confirm(plan),key),call(author,'POST',route,confirm(plan),key)]);
+  expect(answers.some(answer=>answer.status===200)).toBe(true);
+  // A retryable owner conflict is ONLY this typed refusal. Changed confirmation,
+  // wrong holder and reused keys are non-retryable 409s, not successful setup.
+  for(const answer of answers)if(answer.status!==200)expect(answer).toMatchObject({status:409,body:{code:'ASSIGNMENT_REFERENCE_BUSY'}});
+  if(forceConflict){
+   expect(answers.map(answer=>answer.status).sort()).toEqual([200,409]);
+   // The refused owner has completed ROLLBACK and returned its connection idle.
+   expect((await observer.query('SELECT state,xact_start FROM pg_stat_activity WHERE pid=$1',[blockedPid])).rows).toEqual([{state:'idle',xact_start:null}]);
+  }
+ }finally{observer?.release();jest.restoreAllMocks();}
  const receipt=answers.find(answer=>answer.status===200)!.body;
+ expect(receipt).toMatchObject({assigned:true,armed:false,warrantId:warrant.id});
+ expect(receipt.taskIds.sort()).toEqual(Object.values(f.result.tasks).sort());
+ const tasks=await stored(f);const links=(await pool.query('SELECT * FROM access_vehicle_links WHERE task_id=ANY($1::uuid[]) ORDER BY id',[Object.values(f.result.tasks)])).rows;
+ expect(links).toHaveLength(2);expect(links.every((link:any)=>link.warrant_id===warrant.id&&link.target_kind==='profile_assignment')).toBe(true);
+ const expectedTaskIds=Object.values(f.result.tasks).sort();
+ expect(expectedTaskIds).toHaveLength(2);
+ expect(tasks).toHaveLength(2);
+ expect(tasks.map((task:any)=>task.id).sort()).toEqual(expectedTaskIds);
+ expect(plan.tasks.map((task:any)=>task.id).sort()).toEqual(expectedTaskIds);
+ for(const task of tasks){
+  const displayed=plan.tasks.find((item:any)=>item.id===task.id);
+  expect(task.execution_profile).toEqual(displayed.executionProfile);
+  expect(task).toMatchObject({execution_service_id:f.service.id,execution_warrant_id:warrant.id,execution_descriptor_version:displayed.executionProfile.descriptorVersion,auto_start:false,owner_principal_id:null});
+ }
+ // Reconcile the exact original body/key only after the owner refusal has
+ // rolled back. Even two-success schedules legitimately return one receipt.
  for(const answer of answers)expect(answer.status===200?answer.body:ok(await call(author,'POST',route,confirm(plan),key))).toEqual(receipt);
  expect((await pool.query('SELECT count(*)::int AS n FROM blueprint_setup_requests WHERE instantiation_id=$1',[f.result.instantiationId])).rows[0].n).toBe(1);
  expect((await pool.query('SELECT count(*)::int AS n FROM access_vehicle_links WHERE task_id=ANY($1::uuid[])',[Object.values(f.result.tasks)])).rows[0].n).toBe(2);
- expect((await stored(f)).every((t:any)=>t.execution_service_id===f.service.id&&!t.auto_start)).toBe(true);
-});
+ expect(await counts()).toEqual({receipts:before.receipts+1,links:before.links+2,audits:before.audits+1});
+ expect(await stored(f)).toEqual(tasks);expect((await pool.query('SELECT * FROM access_vehicle_links WHERE task_id=ANY($1::uuid[]) ORDER BY id',[Object.values(f.result.tasks)])).rows).toEqual(links);
+}
+test('parallel exact setup attempts converge on one receipt after any serialization retry',async()=>{await parallelSetup();});
+test('real blocked setup owner rolls back with typed busy and reconciles the original key',async()=>{await parallelSetup(true);});
+
 
 test('composed ordinary home-group plus creator policy and Blueprint channel have exact disjoint Grant sets',async()=>{
- const group=(await pool.query("INSERT INTO groups(name,description,featured) VALUES($1,'Composed policy proof',true) RETURNING id",['Composed '+tag()])).rows[0].id;
+ const group=await require('./support/groupRows').insertGroupRow(pool,{name:'Composed '+tag(),description:'Composed policy proof',featured:true});
  const member=await account('user');for(const id of [author.id,member.id])await pool.query("INSERT INTO group_members(group_id,account_principal_id,source) VALUES($1,$2,'local')",[group,id]);
  await pool.query("INSERT INTO account_home_groups(account_principal_id,group_id,source) VALUES($1,$2,'self')",[author.id,group]);
  const grantRows=async(id:string)=>(await pool.query("SELECT grantee_type,grantee_id,verb,origin,provenance FROM grants WHERE resource_type='project' AND resource_id=$1 ORDER BY grantee_type,verb",[id])).rows;
- const creator=(id:string)=>['read','write'].map(verb=>({grantee_type:'principal',grantee_id:id,verb,origin:'manual',provenance:null}));
+ // Owner ruling E407 item 2: the creator pair is written only when it changes access or a delegation source. The
+ // author is an administrator whose role derives root, so its pair is HELD (no rows; its policy audit says so);
+ // the member's pair is written.
+ const creator=(id:string,held=false)=>held?[]:['read','write'].map(verb=>({grantee_type:'principal',grantee_id:id,verb,origin:'manual',provenance:null}));
+ const creatorPolicy=async(id:string)=>(await pool.query("SELECT metadata FROM audit_events WHERE resource_type='project' AND resource_id=$1 AND action='project.creator_access'",[id])).rows.map((row:any)=>[row.metadata.verb,row.metadata.alreadyHeld===true,row.metadata.grantId]).sort();
  try{
   const ordinary=ok(await call(author,'POST','/projects',{name:'Composed ordinary '+tag()}),201).project;
   expect((await pool.query("SELECT action FROM audit_events WHERE resource_type='project' AND resource_id=$1 AND action IN ('project.access_default_apply','project.access_default_skip')",[ordinary.id])).rows).toEqual([{action:'project.access_default_apply'}]);
-  expect(await grantRows(ordinary.id)).toEqual([...['read','write'].map(verb=>({grantee_type:'group',grantee_id:group,verb,origin:'creation-default',provenance:null})),...creator(author.id)]);
+  expect(await grantRows(ordinary.id)).toEqual([...['read','write'].map(verb=>({grantee_type:'group',grantee_id:group,verb,origin:'creation-default',provenance:null})),...creator(author.id,true)]);
+  expect(await creatorPolicy(ordinary.id)).toEqual([['read',true,null],['write',true,null]]);
   const task=ok(await call(author,'POST','/tasks',{title:'Inherited Task',project:ordinary.id,autoStart:false}),201).task;
   ok(await call(member,'GET',`/tasks/${task.id}`));ok(await call(member,'PATCH',`/tasks/${task.id}`,{title:'Inherited write'}));
-  for(const grant of (await pool.query("SELECT id FROM grants WHERE resource_type='project' AND resource_id=$1 AND grantee_type='group'",[ordinary.id])).rows)ok(await call(author,'DELETE',`/grants/${grant.id}`));
-  expect(await grantRows(ordinary.id)).toEqual(creator(author.id));expect(await call(member,'GET',`/tasks/${task.id}`)).toMatchObject({status:404});
+  for(const grant of (await pool.query("SELECT id FROM grants WHERE resource_type='project' AND resource_id=$1 AND grantee_type='group'",[ordinary.id])).rows)ok(await revoke(author,grant.id));
+  expect(await grantRows(ordinary.id)).toEqual(creator(author.id,true));expect(await call(member,'GET',`/tasks/${task.id}`)).toMatchObject({status:404});
   const skipped=ok(await call(member,'POST','/projects',{name:'Composed skip '+tag()}),201).project;expect(await grantRows(skipped.id)).toEqual(creator(member.id));
   const f=await created();expect(await grantRows(f.result.projectId)).toEqual([]);
   expect((await pool.query("SELECT action FROM audit_events WHERE resource_type='project' AND resource_id=$1 AND action IN ('project.access_default_apply','project.access_default_skip')",[f.result.projectId])).rows).toEqual([]);

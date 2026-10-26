@@ -35,6 +35,7 @@
  * called by a session that could already call it.
  */
 import type { ConnectionTransport } from './connections';
+import type { RoleCatalogueEntry } from './roleCatalogue';
 
 export type IdentityKind = 'human' | 'service' | 'agent';
 
@@ -70,50 +71,25 @@ export const IDENTITY_KINDS: IdentityKindChoice[] = [
     label: 'Agent',
     blurb:
       'An agent, editor or script acting inside your own authority — Claude Code, Codex, a script. '
-      + 'This is the same act as Connect an agent in My connections.',
+      + 'For your own agent, prefer My connections: it is the same act, and lists the connection afterwards. '
+      + 'For an agent that belongs to somebody else, create their identity and let them connect it.',
   },
 ];
-
-export interface RoleChoice {
-  value: string;
-  label: string;
-  /** One line: what this role is for. */
-  line: string;
-}
 
 /**
- * The roles this form offers, each with one line of purpose.
- *
- * DELIBERATELY A SHORT STATIC LIST, NOT A CATALOGUE. Card `a2d1e317` asks for a
- * backend-served role catalogue with the full scope ceiling per role, rendered
- * everywhere a role is named and gated by a doc-equals-catalogue test. That is
- * its work, not this one's. What is written here is the one-line purpose only,
- * derived from `backend/src/utils/identityScopes.ts` (`scopesForRole`) and
- * `backend/src/utils/credentialAuthority.ts` (`canAssignRole`), and it says
- * nothing a fuller catalogue would have to contradict.
+ * The roles this form offers for one kind (card a2d1e317): the role
+ * catalogue's entries MEANT FOR that kind, narrowed to the roles this session
+ * may assign (`assignableBy`, the display half of `canAssignRole`), in the
+ * catalogue's order. Nothing about a role is written here: its explanation is
+ * the board's catalogue entry, rendered by `RoleExplanation`.
  */
-export const ROLE_CHOICES: RoleChoice[] = [
-  {
-    value: 'user',
-    label: 'User',
-    line: 'Ordinary work on the board: read and write tasks, reports and projects. No administration.',
-  },
-  {
-    value: 'agent',
-    label: 'Agent',
-    line: 'The same reach as User, meant for automation rather than a person.',
-  },
-  {
-    value: 'reviewer',
-    label: 'Verifier',
-    line: 'The same reach as User, for identities whose job is checking somebody else’s work.',
-  },
-  {
-    value: 'orchestrator',
-    label: 'Orchestrator',
-    line: 'Administers the board, identities and credentials included. Only an administrator may assign it.',
-  },
-];
+export function rolesOfferedFor(
+  kind: IdentityKind,
+  catalogue: RoleCatalogueEntry[],
+  assignable: string[],
+): RoleCatalogueEntry[] {
+  return catalogue.filter((entry) => entry.meantFor.includes(kind) && assignable.includes(entry.role));
+}
 
 /** The default role per kind — the working set, never an elevated one. */
 export function defaultRoleFor(kind: IdentityKind): string {

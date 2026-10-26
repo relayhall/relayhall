@@ -54,7 +54,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ConnectAgentWizard } from './ConnectAgentWizard';
-import { AGENT_WORKING_SCOPES, API_SCRIPT_SCOPES } from '../../types/connections';
+import { AGENT_WORKING_SCOPES, API_SCRIPT_SCOPES, HARNESS_CONNECTOR_SCOPES } from '../../types/connections';
 
 const fetchMock = vi.fn();
 vi.mock('../../utils/auth', () => ({
@@ -79,8 +79,8 @@ const ADMIN_DELEGABLE = [
 
 /**
  * The scope card `07d09eaf` is about: `relayhall_brief_compile {session: true}`
- * requires it, every MCP harness must make that call before the work plane
- * opens, and no template working set names it. It is in the fixture above so
+ * required it then (card 1118fefa has since made that call a self-identity
+ * read), and no template working set names it. It is in the fixture above so
  * "the default is the delegable catalogue" is a claim with teeth here — a
  * wizard that fell back to the template set would visibly drop this one.
  */
@@ -172,7 +172,7 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
 
-    await connect('Claude Code', 'Laptop');
+    await connect('Generic MCP client', 'Laptop');
     await waitFor(() => expect(posted).toHaveLength(1));
 
     const requested: string[] = posted[0].issueCredential.scopes;
@@ -211,7 +211,7 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     session({ role: 'admin', scopes: ['root'], delegableScopes: ADMIN_DELEGABLE });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
 
     // The default is the ceiling on this arm now, so the control only narrows —
     // and says so. It read "Choose what it can do" while UX-A1 made the default
@@ -233,11 +233,11 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     session({ role: 'admin', scopes: ['root'], delegableScopes: ADMIN_DELEGABLE });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
     await waitFor(() => expect(offeredScopes()).toHaveLength(ADMIN_DELEGABLE.length));
 
-    await userEvent.click(screen.getByRole('button', { name: 'Use the recommended set for Claude Code' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Use the recommended set for Generic MCP client' }));
     const expected = AGENT_WORKING_SCOPES.filter((scope) => ADMIN_DELEGABLE.includes(scope));
     expect(checkedScopes().sort()).toEqual([...expected].sort());
     // And it is genuinely narrower than the default, so the click did something.
@@ -252,7 +252,7 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     session({ role: 'admin', scopes: ['root'], delegableScopes: ADMIN_DELEGABLE });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
     await waitFor(() => expect(offeredScopes()).toHaveLength(ADMIN_DELEGABLE.length));
 
@@ -270,7 +270,7 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     session({ role: 'admin', scopes: ['root'], delegableScopes: ADMIN_DELEGABLE });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
     await waitFor(() => expect(checkedScopes().length).toBe(ADMIN_DELEGABLE.length));
 
@@ -291,7 +291,7 @@ describe('an administrator completes the wizard (cards 6e25ae48, 07d09eaf)', () 
     });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await connect('Claude Code', 'Laptop');
+    await connect('Generic MCP client', 'Laptop');
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Your own authority is never given to a connection.');
@@ -309,7 +309,7 @@ describe('CONTROL — a Member session is untouched by either repair', () => {
     await waitFor(() => {
       expect(screen.getByText(/^By default this connection can do everything you can do/)).toBeInTheDocument();
     });
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
     expect(offeredScopes()).toHaveLength(MEMBER_SCOPES.length);
     expect(scopeBoxes().every((box) => box.input.checked)).toBe(true);
@@ -323,7 +323,7 @@ describe('CONTROL — a Member session is untouched by either repair', () => {
     session({ role: 'user', scopes: MEMBER_SCOPES, delegableScopes: MEMBER_SCOPES });
     render(<ConnectAgentWizard />);
     await screen.findByText(/everything you can do/);
-    await connect('Claude Code', 'Laptop');
+    await connect('Generic MCP client', 'Laptop');
     await waitFor(() => expect(posted).toHaveLength(1));
 
     const requested: string[] = posted[0].issueCredential.scopes;
@@ -346,8 +346,228 @@ describe('CONTROL — a board that answers no delegable set', () => {
     session({ role: 'admin', scopes: ['root', 'tasks:read'] });
     render(<ConnectAgentWizard />);
     await screen.findByText(/never given to a connection/);
-    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
     expect(offeredScopes()).toEqual(['tasks:read']);
+  });
+});
+
+/**
+ * THE HARNESS ARM (E462 slice S1; universal harness connector design v1.5
+ * section 3.1). Claude Code, Codex, VS Code and Antigravity make ONE token with
+ * the harness scope set, and the request that makes it also carries the first
+ * descriptor. The assertions are on the REQUEST, as everywhere in this file: a
+ * menu that looks right while the body asks for `tasks:admin` is the defect.
+ */
+describe('a harness template makes the one-token harness connector (E462 S1)', () => {
+  /** An administrator who may delegate far more than a harness token carries. */
+  const FULL_DELEGABLE = [
+    ...ADMIN_DELEGABLE, 'telemetry:write', 'services:read', 'services:write', 'services:admin',
+    'blueprints:read', 'blueprints:write', 'blueprints:use',
+    'personalities:read', 'personalities:write', 'knowledge-contents:read', 'knowledge-contents:write',
+    // E480: the two write verbs the harness set now carries, and their :admin neighbours, which it never does.
+    'projects:write', 'projects:admin', 'phases:write', 'phases:admin',
+  ];
+  const HARNESS_EXPECTED = HARNESS_CONNECTOR_SCOPES.filter((scope) => FULL_DELEGABLE.includes(scope));
+
+  const TOKEN = 'rh_dev_ab12cd34ef56.SECRETVALUE0000000000';
+  const TOKEN_PACK = {
+    ...PACK,
+    cliEnv: ['export RELAYHALL_API_URL=https://board.example/api', `export RELAYHALL_TOKEN=${TOKEN}`],
+    credential: { ...PACK.credential, secretOnce: TOKEN, transport: 'any' },
+  };
+
+  it.each([
+    ['Claude Code', 'full', 'claude-code'],
+    ['Codex', 'full', 'openai-codex'],
+    ['VS Code', 'presence', 'vscode'],
+    ['Antigravity', 'presence', 'antigravity'],
+  ])('%s: one any-pinned token with exactly the harness set, and the descriptor in the same call', async (label, tier, product) => {
+    session({ role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+
+    await connect(label, 'Workstation');
+    await waitFor(() => expect(posted).toHaveLength(1));
+
+    const body = posted[0];
+    expect(body.kind).toBe('connector');
+    expect(body.issueCredential.transport).toBe('any');
+    const requested: string[] = body.issueCredential.scopes;
+    expect([...requested].sort()).toEqual([...HARNESS_EXPECTED].sort());
+    // The shape the design forbids, each stated as its own failing assertion.
+    expect(requested).not.toContain('root');
+    expect(requested).not.toContain('services:write');
+    expect(requested.filter((scope) => scope.endsWith(':admin'))).toEqual([]);
+    // Not vacuous: the administrator MAY delegate every one of those.
+    expect(FULL_DELEGABLE).toEqual(expect.arrayContaining(['services:write', 'tasks:admin', 'services:admin']));
+    // The extra jobs of the one token are on it.
+    expect(requested).toEqual(expect.arrayContaining(['telemetry:write', 'services:read', 'principals:read']));
+    // E475 (1): the wizard mints the three additions, and none of their wider
+    // neighbours, though this administrator may delegate every one of them.
+    expect(requested).toEqual(expect.arrayContaining(['knowledge-contents:read', 'personalities:read', 'blueprints:use']));
+    for (const wider of ['blueprints:read', 'blueprints:write', 'personalities:write', 'knowledge-contents:write',
+      'projects:admin', 'phases:admin']) {
+      expect(FULL_DELEGABLE).toContain(wider);
+      expect(requested).not.toContain(wider);
+    }
+    // E480: and the two write verbs instantiating a Blueprint needs.
+    expect(requested).toEqual(expect.arrayContaining(['projects:write', 'phases:write']));
+    expect(requested).toHaveLength(16);
+    // And the connector is registered WITH its declaration, in this request.
+    expect(body.descriptor).toEqual({ options: [], telemetry: { tier, products: [product] } });
+    expect(await screen.findByText('Set up Workstation')).toBeInTheDocument();
+  });
+
+  it('the menu IS the harness set: nothing above it is offered, and the sentence says what it is', async () => {
+    session({ role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+
+    expect(screen.getByText(
+      `This connection gets one token for the board's tools, reporting and wake: ${HARNESS_EXPECTED.length} of the ${HARNESS_EXPECTED.length} things a harness connection can be given. It is never given administrator rights or the right to change services.`,
+    )).toBeInTheDocument();
+    // The decision-1 sentence would be false here and is not shown.
+    expect(screen.queryByText(/never given to a connection, so this one starts/)).not.toBeInTheDocument();
+    // Nothing of the harness set is out of reach, so there is no warning (E462 S2).
+    expect(HARNESS_EXPECTED).toHaveLength(HARNESS_CONNECTOR_SCOPES.length);
+    expect(screen.queryByTestId('harness-delegation-warning')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
+    expect([...offeredScopes()].sort()).toEqual([...HARNESS_EXPECTED].sort());
+    expect(checkedScopes().sort()).toEqual([...HARNESS_EXPECTED].sort());
+    // The menu is its own recommended set, so the redundant button is absent.
+    expect(screen.queryByRole('button', { name: /Use the recommended set/ })).not.toBeInTheDocument();
+  });
+
+  it('narrowing still works inside the harness set, and the request carries only what is ticked', async () => {
+    session({ role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await userEvent.click(screen.getByRole('radio', { name: /Codex/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
+    await userEvent.click(boxFor('skills:use'));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await userEvent.type(screen.getByLabelText('Name'), 'Workstation');
+    await userEvent.click(screen.getByRole('button', { name: 'Create connection' }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+
+    const requested: string[] = posted[0].issueCredential.scopes;
+    expect(requested).not.toContain('skills:use');
+    expect([...requested].sort()).toEqual(HARNESS_EXPECTED.filter((scope) => scope !== 'skills:use').sort());
+  });
+
+  it('a Member gets the harness set cut down to what THEY may delegate, never more', async () => {
+    const member = ['tasks:read', 'tasks:write', 'reports:read', 'telemetry:write', 'principals:read'];
+    session({ role: 'user', scopes: member, delegableScopes: member });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/everything you can do/);
+    await connect('Antigravity', 'Mac');
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect([...posted[0].issueCredential.scopes].sort()).toEqual([...member].sort());
+    expect(posted[0].descriptor.telemetry.products).toEqual(['antigravity']);
+  });
+
+  it('a Member is told BY NAME which harness scopes the token will lack, and the count is against the whole set (E462 S2)', async () => {
+    const member = ['tasks:read', 'tasks:write', 'reports:read', 'telemetry:write', 'principals:read'];
+    session({ role: 'user', scopes: member, delegableScopes: member });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/everything you can do/);
+    await userEvent.click(screen.getByRole('radio', { name: /Codex/ }));
+    const warning = await screen.findByTestId('harness-delegation-warning');
+    expect(warning).toHaveAttribute('role', 'status');
+    expect(warning.textContent).toBe(
+      'You cannot pass on reports:write, projects:read, phases:read, skills:read, skills:use, services:read, '
+      + 'knowledge-contents:read, personalities:read, blueprints:use, projects:write and phases:write, '
+      + 'so this token will not have them. The connector needs the whole harness set: relayhall connector check '
+      + 'will fail until someone who can delegate them widens the token on the Credentials page.',
+    );
+    expect(screen.getByText(
+      `This connection gets one token for the board's tools, reporting and wake: 5 of the ${HARNESS_CONNECTOR_SCOPES.length} things a harness connection can be given. It is never given administrator rights or the right to change services.`,
+    )).toBeInTheDocument();
+    // CONTROL: an ordinary template has no harness set to fall short of.
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
+    expect(screen.queryByTestId('harness-delegation-warning')).not.toBeInTheDocument();
+  });
+
+  it('changing between a harness and an ordinary template re-defaults the selection to that menu', async () => {
+    session({ role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await userEvent.click(screen.getByRole('radio', { name: /Generic MCP client/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Narrow it' }));
+    await waitFor(() => expect(offeredScopes()).toHaveLength(FULL_DELEGABLE.length));
+    await userEvent.click(boxFor('tasks:admin'));
+    expect(checkedScopes()).not.toContain('tasks:admin');
+
+    // A selection made against the wide menu is not carried onto the harness menu.
+    await userEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+    await waitFor(() => expect([...offeredScopes()].sort()).toEqual([...HARNESS_EXPECTED].sort()));
+    expect(checkedScopes().sort()).toEqual([...HARNESS_EXPECTED].sort());
+
+    // And back: the ordinary template's decision-1 default returns whole.
+    await userEvent.click(screen.getByRole('radio', { name: /API script/ }));
+    await waitFor(() => expect(offeredScopes()).toHaveLength(FULL_DELEGABLE.length));
+    expect(checkedScopes().sort()).toEqual([...FULL_DELEGABLE].sort());
+  });
+
+  it('CONTROL: an ordinary template sends no descriptor and keeps its own pin', async () => {
+    session({ role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await connect('API script', 'CI runner');
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect('descriptor' in posted[0]).toBe(false);
+    expect(posted[0].issueCredential.transport).toBe('api');
+  });
+
+  it('step 3 leads with the install line and the token for its hidden prompt; the line carries no credential', async () => {
+    session({
+      role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE,
+      serviceAnswer: () => ok({ success: true, service: { id: 's1' }, onboarding: TOKEN_PACK }),
+    });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await connect('Codex', 'Workstation');
+
+    const line = await screen.findByTestId('install-line');
+    expect(line.textContent).toBe('relayhall connector install --harness codex --board https://board.example');
+    expect(line.textContent).not.toContain(TOKEN);
+    expect(screen.getByTestId('installer-token').textContent).toBe(TOKEN);
+    expect(screen.getByRole('button', { name: 'Copy the install line' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy the token for the installer' })).toBeInTheDocument();
+    // The manual setup is still there, folded under one closed disclosure (E462 S2).
+    const manual = screen.getByTestId('manual-setup');
+    expect(manual.tagName).toBe('DETAILS');
+    expect(manual).not.toHaveAttribute('open');
+    expect(manual).toContainElement(screen.getByText('Paste this into your agent and let it configure itself.'));
+    expect(screen.queryByTestId('install-note')).not.toBeInTheDocument();
+  });
+
+  it('Antigravity says where the installer writes its MCP config (E475 (2))', async () => {
+    session({
+      role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE,
+      serviceAnswer: () => ok({ success: true, service: { id: 's1' }, onboarding: TOKEN_PACK }),
+    });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await connect('Antigravity', 'Mac');
+    const note = (await screen.findByTestId('install-note')).textContent;
+    expect(note).toContain('~/.gemini/config/mcp_config.json');
+    expect(note).not.toMatch(/does not edit Antigravity's configuration/);
+  });
+
+  it('CONTROL: an ordinary template shows no install section at all', async () => {
+    session({
+      role: 'admin', scopes: ['root'], delegableScopes: FULL_DELEGABLE,
+      serviceAnswer: () => ok({ success: true, service: { id: 's1' }, onboarding: TOKEN_PACK }),
+    });
+    render(<ConnectAgentWizard />);
+    await screen.findByText(/never given to a connection/);
+    await connect('Generic MCP client', 'Plain');
+    await screen.findByText('Set up Plain');
+    expect(screen.queryByTestId('install-line')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('installer-token')).not.toBeInTheDocument();
   });
 });

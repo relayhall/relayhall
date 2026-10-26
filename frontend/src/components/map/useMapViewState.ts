@@ -46,10 +46,11 @@ export const DEFAULT_VIEW: MapViewState = {
 };
 
 export const SCALE_MIN = 0.12;
-export const PLANE_SCALE_MIN = 0.05;
+// Keep scale positive for inverse transforms, while allowing estate-wide overviews.
+export const PLANE_SCALE_MIN = 0.0001;
 export const SCALE_MAX = 2.5;
 
-const STORAGE_KEY = 'relayhall_map_view';
+const STORAGE_KEY = 'relayhall_map_view_v2';
 
 export const clampScale = (scale: number, floor = SCALE_MIN) =>
   Math.min(SCALE_MAX, Math.max(floor, Number.isNaN(scale) ? floor : scale));
@@ -69,7 +70,10 @@ export function planeFitScale(
 /** Reads defensively: a corrupt or partial entry falls back, never throws. */
 export function readPersistedView(): MapViewState | null {
   try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
+    const current = sessionStorage.getItem(STORAGE_KEY);
+    // Restore the released camera only before this density revision has its
+    // own record. Do not turn corrupt/present v2 state into an old-view reset.
+    const raw = current === null ? sessionStorage.getItem('relayhall_map_view') : current;
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<MapViewState>;
     const organization = parsed.organization === 'radial' ? 'organic' : AVAILABLE_ORGANIZATIONS.includes(parsed.organization as MapOrganization)
@@ -167,6 +171,7 @@ export function useMapViewState(): UseMapViewStateResult {
   );
 
   const zoomTo = useCallback((scale: number, anchor?: { x: number; y: number }) => {
+    pendingFitRef.current = false;
     setView(previous => {
       const next = clampScale(scale, floorRef.current);
       if (next === previous.scale) return previous;
@@ -185,6 +190,7 @@ export function useMapViewState(): UseMapViewStateResult {
   }, []);
 
   const zoomBy = useCallback((factor: number, anchor?: { x: number; y: number }) => {
+    pendingFitRef.current = false;
     setView(previous => {
       const next = clampScale(previous.scale * factor, floorRef.current);
       if (next === previous.scale) return previous;
@@ -201,6 +207,7 @@ export function useMapViewState(): UseMapViewStateResult {
   }, []);
 
   const panBy = useCallback((dx: number, dy: number) => {
+    pendingFitRef.current = false;
     setView(previous => ({ ...previous, offsetX: previous.offsetX + dx, offsetY: previous.offsetY + dy }));
   }, []);
 

@@ -96,14 +96,15 @@ describe('Report handover REST create/update', () => {
       expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ handover: {
         schema_version: 1, decisions: ['D'], assumptions: [],
         alternatives_rejected: [], unresolved_questions: [],
-      } }));
+      } }), expect.objectContaining({ principalId: null }));
 
       const patch = await fetch(`${base}/reports/${RID}`, {
         method: 'PATCH', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ handover: null }),
       });
       expect(patch.status).toBe(200);
-      expect(manager.update).toHaveBeenCalledWith(RID, expect.objectContaining({ handover: null }));
+      // Card 5854f0d6: the third argument is the acting principal for the feed row.
+      expect(manager.update).toHaveBeenCalledWith(RID, expect.objectContaining({ handover: null }), expect.objectContaining({ principalId: null }));
     });
   });
 
@@ -141,7 +142,7 @@ describe('ReportManager handover persistence and Brief projection', () => {
     }) } as { query: jest.Mock; connect?: unknown };
     pool.connect = async () => ({ query: pool.query, release: () => undefined });
     const subject = new ReportManager(pool as never);
-    expect((await subject.create({ title: 'T', content: 'C', handover: fullHandover })).handover).toEqual(fullHandover);
+    expect((await subject.create({ title: 'T', content: 'C', handover: fullHandover }, {})).handover).toEqual(fullHandover);
     const insert = queries.find(query => /INSERT INTO reports/i.test(query.text))!;
     expect(insert.text).toContain('handover');
     expect(insert.params).toContain(JSON.stringify(fullHandover));

@@ -1,0 +1,45 @@
+/* RouteUnavailablePage — the generic state for any dashboard path no route
+   claims. Every class here is declared standalone so the rendered-class
+   ownership gate can attribute it to this sheet. */
+
+.route-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  min-height: 60vh;
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.route-unavailable-icon {
+  color: var(--text-tertiary);
+}
+
+.route-unavailable-title {
+  margin: 0;
+  font-size: var(--text-2xl);
+  color: var(--text-primary);
+}
+
+.route-unavailable-body {
+  margin: 0;
+  max-width: 42ch;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.route-unavailable-action {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.route-unavailable-action:hover {
+  border-color: var(--border-accent);
+}

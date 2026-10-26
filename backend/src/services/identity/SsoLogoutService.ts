@@ -158,7 +158,7 @@ export class SsoLogoutService {
   }
 
   /**
-   * Back-channel logout. Validate, CONSUME BY INSERT, then revoke.
+   * Back-channel logout. Validate, then atomically consume, revoke and audit.
    *
    * The order is the contract. Consumption is the INSERT into
    * `sso_logout_token_uses` (SS-23), so two concurrent replays cannot both
@@ -194,60 +194,70 @@ export class SsoLogoutService {
     // by the COMPOSITE PRIMARY KEY itself, so two Identity providers may
     // legitimately emit the same `jti`.
     const replayKey = validated.jti ?? crypto.createHash('sha256').update(rawToken).digest('hex');
+    const client = await pool.connect();
     try {
-      await pool.query(
-        `INSERT INTO sso_logout_token_uses (identity_provider_id, replay_key, token_expires_at)
-         VALUES ($1, $2, $3)`,
-        [provider.id, replayKey, validated.expiresAt],
-      );
-    } catch (error) {
-      if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '23505') {
-        refuse('LOGOUT_TOKEN_REPLAYED', 'that logout token has already been used');
+      await client.query('BEGIN');
+      try {
+        await client.query(
+          `INSERT INTO sso_logout_token_uses (identity_provider_id, replay_key, token_expires_at)
+           VALUES ($1, $2, $3)`,
+          [provider.id, replayKey, validated.expiresAt],
+        );
+      } catch (error) {
+        if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '23505') {
+          refuse('LOGOUT_TOKEN_REPLAYED', 'that logout token has already been used');
+        }
+        throw error;
       }
+
+      // Resolution is ALWAYS provider-scoped first. `identity_provider_id` is in
+      // both WHERE clauses, so the scoping is structural.
+      let revoked = 0;
+      let scope: 'sid' | 'subject';
+      if (validated.sid) {
+        scope = 'sid';
+        const result = await client.query(
+          `UPDATE auth_sessions
+              SET revoked_at = now(), revoke_reason = 'idp_backchannel',
+                  id_token_ct = NULL, id_token_key_id = NULL
+            WHERE identity_provider_id = $1 AND oidc_sid = $2 AND revoked_at IS NULL`,
+          [provider.id, validated.sid],
+        );
+        revoked = result.rowCount ?? 0;
+      } else {
+        scope = 'subject';
+        const result = await client.query(
+          `UPDATE auth_sessions
+              SET revoked_at = now(), revoke_reason = 'idp_backchannel',
+                  id_token_ct = NULL, id_token_key_id = NULL
+            WHERE identity_provider_id = $1 AND revoked_at IS NULL
+              AND identity_link_id IN (
+                SELECT id FROM identity_links
+                 WHERE link_kind = 'sso' AND identity_provider_id = $1 AND subject = $2
+              )`,
+          [provider.id, validated.subject],
+        );
+        revoked = result.rowCount ?? 0;
+      }
+
+      await auditService.record({
+        action: 'sso.backchannel_logout',
+        // `system`: the act IS authenticated — by the logout token itself — but
+        // by no board principal. `none` is not a permitted `auth_method` value.
+        actor: { principalId: null, handle: 'identity-provider', authMethod: 'system' } as unknown as AuditActor,
+        resourceType: 'identity_provider',
+        resourceId: provider.id,
+        metadata: { scope, sessions_revoked: revoked, sid: validated.sid, subject: validated.subject },
+      }, client);
+
+      await client.query('COMMIT');
+      return { identityProviderId: provider.id, sessionsRevoked: revoked, scope };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
+    } finally {
+      client.release();
     }
-
-    // Resolution is ALWAYS provider-scoped first. `identity_provider_id` is in
-    // both WHERE clauses, so the scoping is structural.
-    let revoked = 0;
-    let scope: 'sid' | 'subject';
-    if (validated.sid) {
-      scope = 'sid';
-      const result = await pool.query(
-        `UPDATE auth_sessions
-            SET revoked_at = now(), revoke_reason = 'idp_backchannel',
-                id_token_ct = NULL, id_token_key_id = NULL
-          WHERE identity_provider_id = $1 AND oidc_sid = $2 AND revoked_at IS NULL`,
-        [provider.id, validated.sid],
-      );
-      revoked = result.rowCount ?? 0;
-    } else {
-      scope = 'subject';
-      const result = await pool.query(
-        `UPDATE auth_sessions
-            SET revoked_at = now(), revoke_reason = 'idp_backchannel',
-                id_token_ct = NULL, id_token_key_id = NULL
-          WHERE identity_provider_id = $1 AND revoked_at IS NULL
-            AND identity_link_id IN (
-              SELECT id FROM identity_links
-               WHERE link_kind = 'sso' AND identity_provider_id = $1 AND subject = $2
-            )`,
-        [provider.id, validated.subject],
-      );
-      revoked = result.rowCount ?? 0;
-    }
-
-    await auditService.record({
-      action: 'sso.backchannel_logout',
-      // `system`: the act IS authenticated — by the logout token itself — but
-      // by no board principal. `none` is not a permitted `auth_method` value.
-      actor: { principalId: null, handle: 'identity-provider', authMethod: 'system' } as unknown as AuditActor,
-      resourceType: 'identity_provider',
-      resourceId: provider.id,
-      metadata: { scope, sessions_revoked: revoked, sid: validated.sid, subject: validated.subject },
-    });
-
-    return { identityProviderId: provider.id, sessionsRevoked: revoked, scope };
   }
 
   /**

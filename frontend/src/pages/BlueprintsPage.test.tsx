@@ -107,6 +107,14 @@ describe('Blueprint confirmation and request lifecycle', () => {
 });
 
 describe('Blueprint audience and complete preview', () => {
+  test('the page header links the public authoring guide in every build', async () => {
+    mount();
+    const guide = await screen.findByRole('link', { name: 'Blueprint guide' });
+    expect(guide.getAttribute('href')).toBe('https://github.com/relayhall/relayhall/blob/main/docs/blueprints/README.md');
+    expect(guide.getAttribute('target')).toBe('_blank');
+    expect(guide.getAttribute('rel')?.split(/\s+/).sort()).toEqual(['noopener', 'noreferrer']);
+    expect(screen.queryByText(/Guide: docs\/blueprints/)).toBeNull();
+  });
   test('the server root scope exposes authoring entry points for an administrator session', async () => {
     session.scopes = ['root'];
     mount(); await screen.findByRole('button', { name: 'Describe Incident investigation' });

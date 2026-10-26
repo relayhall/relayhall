@@ -1,0 +1,373 @@
+{
+ "status": "healthy",
+ "ready": true,
+ "readiness_status": "ready",
+ "services": {
+  "comfyui": "disabled",
+  "tts": "ok",
+  "ollama": "ok",
+  "secondary_node": "decommissioned"
+ },
+ "comfyui_capability": {
+  "status": "disabled",
+  "readiness": "not_ready",
+  "reason_code": "IMPOSSIBLE_FIT",
+  "profile_id": "comfyui-imagegen-candidate-20.00gib",
+  "peak_vram_mb": 20480,
+  "gpu_id": 1,
+  "usable_vram_mb": 12288,
+  "replacement": "Use a LiteLLM-managed cloud image route or qualify a measured local model below 12288MB peak VRAM."
+ },
+ "tts_backends": {
+  "gpu0-speech": "ready",
+  "gpu1-speech": "ready",
+  "cpu-speech": "ready",
+  "gpu1-voice": "unavailable"
+ },
+ "model_catalogue": {
+  "version": "1.6",
+  "loaded_at": 1792624405.6886587,
+  "models": {
+   "speech-model-a-0.6b": {
+    "family": "speech-family-a",
+    "display_name": "Speech Model A 0.6B CustomVoice",
+    "description": "Fast custom voice TTS with 600M parameters. Supports 9 named speakers with OpenAI-compatible voice remapping. Lower latency than 1.7B variant, ideal for real-time applications.",
+    "param_size": "0.6B",
+    "use_cases": [
+     "Quick voice replies",
+     "Real-time TTS",
+     "Chatbot responses"
+    ],
+    "type": "customvoice",
+    "capabilities": [
+     "speech"
+    ],
+    "fallback_available": true,
+    "voices": [
+     "voice-a",
+     "voice-b",
+     "voice-c",
+     "voice-d",
+     "voice-e",
+     "voice-f",
+     "voice-g",
+     "voice-h",
+     "voice-i"
+    ],
+    "voice_remap": {
+     "alloy": "voice-c",
+     "echo": "voice-b",
+     "fable": "voice-d",
+     "onyx": "voice-f",
+     "nova": "voice-a",
+     "shimmer": "voice-h"
+    },
+    "backends": [
+     {
+      "backend_id": "gpu0-speech",
+      "actual_model": "speech-model-a-0.6b",
+      "device": 0,
+      "readiness": "not_ready",
+      "readiness_reason": "not_qualified",
+      "residency": "loaded"
+     }
+    ],
+    "params": {
+     "input": {
+      "type": "string",
+      "required": true,
+      "description": "Text to synthesize (max ~2000 chars)"
+     },
+     "voice": {
+      "type": "string",
+      "required": true,
+      "default": "voice-d",
+      "options": [
+       "voice-a",
+       "voice-b",
+       "voice-c",
+       "voice-d",
+       "voice-e",
+       "voice-f",
+       "voice-g",
+       "voice-h",
+       "voice-i"
+      ],
+      "description": "Named speaker voice"
+     },
+     "language": {
+      "type": "string",
+      "required": false,
+      "default": "Auto",
+      "options": [
+       "Auto",
+       "english",
+       "chinese",
+       "japanese",
+       "korean",
+       "french",
+       "german",
+       "spanish",
+       "italian",
+       "portuguese",
+       "russian"
+      ],
+      "description": "Language of the text"
+     },
+     "response_format": {
+      "type": "string",
+      "required": false,
+      "default": "wav",
+      "options": [
+       "wav",
+       "mp3"
+      ],
+      "description": "Audio output format"
+     },
+     "speed": {
+      "type": "number",
+      "required": false,
+      "default": 1,
+      "min": 0.25,
+      "max": 4,
+      "description": "Speech speed multiplier"
+     }
+    },
+    "vram_mb": {
+     "idle": 1200,
+     "peak": 2000
+    },
+    "pinned": false,
+    "idle_timeout_s": 300,
+    "peak_vram_gb": 1.95,
+    "idle_vram_gb": 1.17,
+    "vram_delta_mb": 800,
+    "priority": 75,
+    "qualification": {
+     "status": "pending_live_candidate",
+     "backend_id": "gpu0-speech",
+     "reason": "No live candidate transport receipt is committed for this exact variant"
+    },
+    "id": "speech-model-a-0.6b",
+    "lifecycle": "active",
+    "readiness": "not_ready",
+    "readiness_reason": "not_qualified",
+    "residency": "loaded"
+   }
+  },
+  "data": [
+   {
+    "id": "speech-model-a-0.6b",
+    "object": "model",
+    "owned_by": "speech-family-a",
+    "metadata": {
+     "family": "speech-family-a",
+     "type": "customvoice",
+     "capabilities": [
+      "speech"
+     ],
+     "readiness": "not_ready",
+     "readiness_reason": "not_qualified",
+     "residency": "loaded",
+     "backends": [
+      {
+       "backend_id": "gpu0-speech",
+       "actual_model": "speech-model-a-0.6b",
+       "device": 0,
+       "readiness": "not_ready",
+       "readiness_reason": "not_qualified",
+       "residency": "loaded"
+      }
+     ]
+    }
+   }
+  ],
+  "aliases": {
+   "openai/speech-model-a-0.6b": "speech-model-a-0.6b"
+  },
+  "deprecated_models": {},
+  "quarantined_models": {},
+  "decommissioned_models": {}
+ },
+ "secondary_node": {
+  "status": "decommissioned",
+  "reason": "Secondary node decommissioned 2026-01-15",
+  "routing": "disabled"
+ },
+ "architecture": {
+  "devices": [
+   {
+    "backend_id": "gpu0-speech",
+    "device": 0,
+    "type": "gateway-native",
+    "capabilities": [
+     "speech",
+     "clone",
+     "voicedesign"
+    ]
+   },
+   {
+    "backend_id": "gpu1-speech",
+    "device": 1,
+    "type": "gateway-native",
+    "capabilities": [
+     "speech",
+     "stt"
+    ]
+   },
+   {
+    "backend_id": "cpu-speech",
+    "device": -1,
+    "type": "openai",
+    "capabilities": [
+     "speech"
+    ]
+   },
+   {
+    "backend_id": "gpu1-voice",
+    "device": 1,
+    "type": "reference-tts",
+    "capabilities": [
+     "speech",
+     "reference_audio",
+     "polish"
+    ]
+   }
+  ]
+ },
+ "queue": {
+  "queue_depth": 0,
+  "current_jobs": {},
+  "running_jobs": [],
+  "pending_jobs": [],
+  "total_jobs": 0,
+  "completed_jobs": 0,
+  "failed_jobs": 0,
+  "cancelled_jobs": 0,
+  "timed_out_jobs": 0,
+  "state_counts": {
+   "queued": 0,
+   "admitted": 0,
+   "running": 0,
+   "succeeded": 0,
+   "failed": 0,
+   "cancelled": 0,
+   "timed_out": 0
+  },
+  "accounted_jobs": 0,
+  "counters_reconciled": true,
+  "terminal_counters": {
+   "succeeded": 0,
+   "failed": 0,
+   "cancelled": 0,
+   "timed_out": 0
+  },
+  "reconciliation": {
+   "total_jobs": 0,
+   "accounted_jobs": 0,
+   "counter_mismatch": 0,
+   "counters_reconciled": true
+  },
+  "diagnostics": {
+   "identity_mismatches_total": 0,
+   "orphan_jobs_total": 0,
+   "late_completions_total": 0,
+   "late_failures_total": 0
+  },
+  "last_errors": [],
+  "duration_stats": {
+   "tts_clone": {
+    "count": 20,
+    "average": 16.81,
+    "last": [
+     5.08,
+     4.17,
+     90.89,
+     84.8,
+     60.53
+    ]
+   },
+   "tts": {
+    "count": 20,
+    "average": 59.94,
+    "last": [
+     64.53,
+     31.91,
+     72.55,
+     36.45,
+     76.33
+    ]
+   },
+   "ollama_chat": {
+    "count": 20,
+    "average": 0.12,
+    "last": [
+     0.12,
+     0.11,
+     0.11,
+     0.1,
+     0.09
+    ]
+   },
+   "image_gen": {
+    "count": 20,
+    "average": 10.95,
+    "last": [
+     10.83,
+     10.77,
+     10.81,
+     10.76,
+     11.12
+    ]
+   },
+   "video_encode": {
+    "count": 6,
+    "average": 99.12,
+    "last": [
+     2.22,
+     21.02,
+     2.26,
+     3.17,
+     563.76
+    ]
+   },
+   "video_gen": {
+    "count": 20,
+    "average": 829.24,
+    "last": [
+     856.09,
+     662.13,
+     639.99,
+     639.4,
+     692.47
+    ]
+   },
+   "llm_chat": {
+    "count": 19,
+    "average": 11.98,
+    "last": [
+     9.17,
+     7.9,
+     9.55,
+     7.99,
+     20.66
+    ]
+   }
+  },
+  "recent_history": []
+ },
+ "gpus": [
+  {
+   "gpu_id": 0,
+   "utilization": 0,
+   "memory_used": 11264,
+   "memory_total": 24576
+  },
+  {
+   "gpu_id": 1,
+   "utilization": 0,
+   "memory_used": 6144,
+   "memory_total": 24576
+  }
+ ]
+}

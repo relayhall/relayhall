@@ -97,7 +97,7 @@ is never mistaken for the real thing.
 
 REST:
 
-- `GET /services` (+`?kind=`, `?status=`, `?includeRetired=true`) · `POST /services`
+- `GET /services` (+`?kind=`, `?status=`, `?includeRetired=true`) · `POST /services` (a connector registration may carry its first `descriptor`; see below)
 - `GET /services/{id}` · `PATCH /services/{id}` · `DELETE /services/{id}` — `{id}` is a UUID or slug
 - `GET /services/{id}/descriptor` — the current version
 - `PUT /services/{id}/descriptor` — publish a new immutable version (`If-Match`)
@@ -132,6 +132,21 @@ What an external system's author does, end to end:
    retirement is the admin verb and existing work fails closed rather than
    silently running against a changed contract.
 
+**Registering and publishing in one call.** `POST /services` with
+`kind: "connector"` also accepts `descriptor`: the connector's first
+descriptor. The board validates it and publishes it as version 1 in the same
+transaction as the registration, and the service ends `published`. If any
+step fails, nothing is written. `telemetryTier` defaults to the tier the
+descriptor declares (an explicit value wins). A descriptor on a non-connector
+registration is refused (`INVALID_SERVICE_VALUE`), and `?dryRun=true`
+rehearses the whole act. The dashboard's Connect your agent wizard uses this
+for the four harness templates (see
+[connector-onboarding.md](connector-onboarding.md#one-connector-per-harness)),
+because a connector the wake and the telemetry can use must be published and
+must declare its tier and product; those steps are no longer separate calls
+that could stop half-way. The second and third steps above remain the way to
+evolve a descriptor after registration.
+
 What the board will do with each field today, honestly: options and
 parameters drive the dynamic execution-profile form and are validated at
 profile-set against the pinned version (see
@@ -143,3 +158,98 @@ the telemetry tier is stored, consumed by the Phase-3 ingest; the visibility
 tier is stored, enforced by the Phase-2 shared authorization predicate.
 Descriptor text shown to agents renders as delimited, provenance-labelled
 data — never in instruction position.
+
+## Registering a knowledge source from an installer bundle
+
+A knowledge source installed with its own installer joins the board in two
+steps, with no new credential type. Registration is a human act on the
+**Services** page (Settings → Services): root or an administrator, signed in
+to the dashboard. Bearer credentials, root bearers included, are refused, and
+no MCP tool offers it.
+
+1. **The installer prints a registration bundle**
+   (`rh.knowledge-source.registration/1`): `name`, optional `slug` and
+   `description`, `endpoint` (the search URL), optional `getEndpoint` and
+   `writeEndpoint`, a `descriptor` whose `knowledgeSource` block is
+   `protocol_version: 2`, and `certificateSha256`, the sha256 fingerprint of
+   the endpoint's TLS certificate.
+2. **An administrator uploads it** on the Services page, compares the
+   fingerprint the page shows with the one the installer printed on its
+   console, ticks that they match, and confirms it is them (a single-use
+   step-up bound to `knowledge.source.register` and the fingerprint). If the
+   endpoint's address is private, the administrator also gives its allowed
+   networks (CIDRs). In one transaction the board creates and publishes the
+   Service with the bundle's descriptor, records the endpoints, the allowed
+   networks and the channel credential reference name
+   `knowledge-source/<slug>`, records the fingerprint as confirmed, and writes
+   one audit row (`knowledge.source.register`) carrying the fingerprint and
+   how it was confirmed. A duplicate endpoint, fingerprint or slug, an invalid
+   bundle and an unconfirmed fingerprint are each refused by name, and a
+   refused registration leaves nothing behind.
+
+   The reference name must be **free**, because a new source cannot have had
+   step 4 yet: a bearer already placed under the name would reach the new
+   endpoint at once. The act refuses `REGISTRATION_CREDENTIAL_REFERENCE_TAKEN`
+   (409, `field: slug`), before the step-up is spent and before anything is
+   written, with a `reason`:
+   - `resolves`: the exact name already resolves in
+     `RELAYHALL_KNOWLEDGE_SOURCE_CREDENTIALS`;
+   - `environment-entry`: an entry of that variable, resolving or not, is the
+     same name once case, Unicode compatibility forms, accents, invisible
+     characters, whitespace and the separators `.` `_` `:` `-` are folded
+     (for example `Knowledge_Source/Team.Notes` and `knowledge-source/team-notes`);
+   - `service-reference`: any Service, draft, published or retired, records the
+     same folded name as its channel credential reference.
+
+   Choose another slug (the `slug` field of the request), or, if the entry is
+   left over from a source that no longer exists, remove it on the core host
+   and restart first. A hard-deleted Service leaves no row behind, so its old
+   entry is caught only while it is still in the environment.
+3. **The page offers the return bundle** (`rh.knowledge-source.return/1`) to
+   download or copy for the installer: the Service id (the audience), the
+   issuer, the board's assertion public keys and, once the lifecycle exporter
+   signs snapshots for this Service, its lifecycle public key. It is public
+   material only.
+4. **The operator places the channel bearer on the core host.** This is one
+   root act and a restart; the value never passes through the browser and is
+   never stored on the board:
+   - add an entry named `knowledge-source/<slug>` (the name the page shows) to
+     the JSON in `RELAYHALL_KNOWLEDGE_SOURCE_CREDENTIALS`, of the form
+     `{"bearer": "<the channel bearer the installer printed>"}`, keeping every
+     other entry;
+   - restart the core.
+
+   Until then every search of the source answers `unavailable:transport`,
+   and the page says so. Once the core finds the reference, the page says
+   **Channel credential in place**: the board now tries the source on a
+   search. That is not yet a successful connection; the certificate rule below
+   still decides it.
+
+The board reaches a knowledge source only through Node's default trust store,
+so the certificate at the endpoint must chain to a public certificate
+authority for the endpoint's name. The fingerprint is checked by a person at
+upload; it is not pinned when the board dials, and no installer certificate
+authority is trusted.
+
+People who search the source need `knowledge-contents:read` and a read grant
+on its Service. The grant is made on Settings → Access grants (`POST /grants`:
+resource type `service`, the Service id, verb `read`). That route's ceiling is
+the `root` scope, so root, or an `admin` or `orchestrator` Account signed in to
+the dashboard, makes it; an `operator` is refused there (the live suite proves
+both an `admin` session's 201 and an `operator` session's 403). The page offers
+no change request for this grant: today a `grant.rows` filing for a Service
+read grant by an administrator is refused `ALREADY_HELD`, so the page links to
+Access grants only.
+
+REST (root or an administrator login session; every bearer is refused
+`KNOWLEDGE_SOURCE_REGISTER_REQUIRES_SESSION`). A refused registration is
+audited as denied with its code; a refused read (the three `GET` routes) is
+not audited, by design, because it changes nothing:
+
+- `GET /knowledge-source-registrations` — every registered source with its state
+- `POST /knowledge-source-registrations` — `{bundle, confirmedFingerprint, confirmation, allowedNetworks?, slug?, stepUpToken}`
+- `GET /knowledge-source-registrations/{id}` — one source's state and the operator's step, by name
+- `GET /knowledge-source-registrations/{id}/return-bundle` — the return bundle;
+  it carries Ed25519 (OKP) public keys only and answers 503
+  `RETURN_BUNDLE_KEY_UNSUPPORTED` for a key of any other type rather than
+  cutting it down

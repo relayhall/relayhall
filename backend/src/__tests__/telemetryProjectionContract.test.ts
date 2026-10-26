@@ -603,3 +603,147 @@ describe('the session reference is refused by SHAPE before it reaches a query', 
     expect(isTelemetryPseudonym(12345)).toBe(false);
   });
 });
+
+// ─────────── short sessions, the filter and paging: the statement ───────────
+
+/**
+ * Card `0ac41d40` (owner ruling E89 (b)). What is decidable from the SQL
+ * alone: WHERE the short filter sits relative to the row cut, what the counts
+ * are read from, where the filters bind, and that the rule is written once.
+ * Whether the rows that come back are the right ones is measured against a
+ * real PostgreSQL in `telemetryProjectionAuthorization.test.ts`.
+ *
+ * The options are passed through a loosely typed value on purpose: this
+ * block must COMPILE against a tree without the feature, so that its red
+ * proof reddens on these assertions rather than on an import.
+ */
+describe('short sessions, the filter and paging — the statement (card 0ac41d40)', () => {
+  /** One CTE's body, read out of a statement by its name. */
+  const cte = (sql: string, name: string): string | null => {
+    const match = new RegExp(`\\b${name} AS \\(([\\s\\S]*?)\\n {7}\\)`).exec(sql);
+    return match ? match[1] : null;
+  };
+  const listWith = async (options: Record<string, unknown>, scope: TelemetryReadScope = OWN) => {
+    const { statements, service } = recordingPool();
+    await service.sessions(scope, options as never);
+    return statements[0];
+  };
+
+  test('the short filter sits in the PAGE, ahead of its ORDER BY, its LIMIT and its OFFSET', async () => {
+    const statement = await listWith({ limit: 7, offset: 3 });
+    const page = cte(statement.text, 'page');
+    expect(page).not.toBeNull();
+    const at = (pattern: RegExp): number => page!.search(pattern);
+    const order = {
+      filter: at(/WHERE \$\d+::boolean OR NOT c\.is_short/),
+      orderBy: at(/ORDER BY/),
+      limit: at(/LIMIT \$\d+/),
+      offset: at(/OFFSET \$\d+/),
+    };
+    expect(Object.values(order).every((position) => position >= 0)).toBe(true);
+    expect(order.filter < order.orderBy && order.orderBy < order.limit && order.limit < order.offset).toBe(true);
+    // The page reads the classified set, and the bounds are BOUND, not inlined.
+    expect(page).toContain('FROM classified c');
+    const limitParam = Number(/LIMIT \$(\d+)/.exec(page!)![1]);
+    const offsetParam = Number(/OFFSET \$(\d+)/.exec(page!)![1]);
+    const includeParam = Number(/WHERE \$(\d+)::boolean/.exec(page!)![1]);
+    expect({
+      limit: statement.params[limitParam - 1],
+      offset: statement.params[offsetParam - 1],
+      includeShort: statement.params[includeParam - 1],
+    }).toEqual({ limit: 7, offset: 3, includeShort: false });
+  });
+
+  test('the counts read the UNLIMITED classified set, in the same statement as the page', async () => {
+    const statement = await listWith({ limit: 7 });
+    const tally = cte(statement.text, 'tally');
+    expect(tally).not.toBeNull();
+    expect(tally).toContain('FROM classified c');
+    expect(tally).toMatch(/FILTER \(WHERE c\.is_short\)\s+AS short_count/);
+    expect(tally).not.toMatch(/\b(LIMIT|OFFSET)\b/);
+    // And the statement is still a ROW-RETURNING one under the bound control
+    // above: no line of it opens with an aggregate count that would exempt it
+    // from the row cap.
+    expect(statement.text).not.toMatch(/^\s*SELECT COUNT\(\*\)/m);
+  });
+
+  test('the rule is written ONCE, and the list and the Stats split both use it', async () => {
+    const source = readFileSync(
+      path.join(__dirname, '..', 'services', 'TelemetryProjectionService.ts'), 'utf8');
+    expect((source.match(/AS is_short/g) ?? []).length).toBe(1);
+
+    const { statements, service } = recordingPool();
+    await service.sessions(OWN);
+    await service.stats(OWN);
+    const classifying = statements.filter((statement) => /AS is_short/.test(statement.text));
+    // The list's statement and the Stats split.
+    expect(classifying).toHaveLength(2);
+    for (const statement of classifying) {
+      expect(statement.text).toContain('e.observed_at >= $1');
+      expect(statement.text).toMatch(/BOOL_OR\(e\.event_kind = 'model_call'/);
+    }
+  });
+
+  test('the filters bind as PARAMETERS on the grouping read, after the narrowing', async () => {
+    const statement = await listWith({ connectorId: CONNECTOR, sourceProduct: PRODUCT });
+    const [grouping] = readsOf(statement.text);
+    expect(grouping).toMatch(/^\s*WHERE e\.schema_version IS NOT NULL\s+AND e\.account_id = \$\d+/);
+    const connector = /AND e\.connector_id = \$(\d+)/.exec(grouping);
+    const product = /AND e\.source_product = \$(\d+)/.exec(grouping);
+    expect(connector).not.toBeNull();
+    expect(product).not.toBeNull();
+    expect(statement.params[Number(connector![1]) - 1]).toBe(CONNECTOR);
+    expect(statement.params[Number(product![1]) - 1]).toBe(PRODUCT);
+    // Never spliced into the text.
+    expect(statement.text).not.toContain(CONNECTOR);
+    expect(statement.text).not.toContain(`'${PRODUCT}'`);
+    // And without a filter there is no filter predicate on the grouping read.
+    const [unfiltered] = readsOf((await listWith({})).text);
+    expect(unfiltered).not.toMatch(/AND e\.connector_id = \$\d+/);
+  });
+
+  test('includeShort is a bound boolean and only `true` sets it', async () => {
+    const include = (statement: { text: string; params: unknown[] }): unknown => {
+      const match = /WHERE \$(\d+)::boolean OR NOT c\.is_short/.exec(statement.text);
+      return match ? statement.params[Number(match[1]) - 1] : 'absent';
+    };
+    expect(include(await listWith({ includeShort: true }))).toBe(true);
+    expect(include(await listWith({}))).toBe(false);
+    expect(include(await listWith({ includeShort: 'true' }))).toBe(false);
+  });
+
+  test('the order is TOTAL: last seen, then the whole identity, byte-wise', async () => {
+    const statement = await listWith({});
+    const order = 'last_seen_at DESC, c.connector_id, c.source_product COLLATE "C", c.session_ref COLLATE "C"';
+    expect(cte(statement.text, 'page')).toContain(`ORDER BY c.${order}`);
+    expect(statement.text).toMatch(/ORDER BY g\.last_seen_at DESC, g\.connector_id, g\.source_product COLLATE "C", g\.session_ref COLLATE "C"\s*$/);
+  });
+
+  test('an offset is a whole number of rows or 0, never an error and never a widening', async () => {
+    const offsetOf = async (offset: unknown): Promise<unknown> => {
+      const statement = await listWith({ offset });
+      const page = cte(statement.text, 'page');
+      const match = page ? /OFFSET \$(\d+)/.exec(page) : null;
+      return match ? statement.params[Number(match[1]) - 1] : 'absent';
+    };
+    expect(await offsetOf(50)).toBe(50);
+    expect(await offsetOf(2.7)).toBe(2);
+    expect(await offsetOf('100')).toBe(100);
+    for (const junk of [-1, 0, 'nonsense', undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect({ junk: String(junk), offset: await offsetOf(junk) }).toEqual({ junk: String(junk), offset: 0 });
+    }
+    expect(await offsetOf(1e300)).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  test('an EMPTY page still reports its counts, and the last page has no next offset', async () => {
+    const counts = { short_count: 4, listed_total: 0, session_ref: null };
+    const { service } = recordingPool(() => [counts]);
+    const empty = await service.sessions(OWN, { offset: 0 } as never) as any;
+    expect({ sessions: empty.sessions, hiddenCount: empty.hiddenCount, shortCount: empty.shortCount, nextOffset: empty.nextOffset })
+      .toEqual({ sessions: [], hiddenCount: 4, shortCount: 4, nextOffset: null });
+
+    const shown = await recordingPool(() => [counts]).service.sessions(OWN, { includeShort: true } as never) as any;
+    expect({ hiddenCount: shown.hiddenCount, shortCount: shown.shortCount })
+      .toEqual({ hiddenCount: 0, shortCount: 4 });
+  });
+});

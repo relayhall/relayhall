@@ -102,7 +102,6 @@ import { taskManagerDB } from "../src/services/TaskManagerDB";
 import { taskElementService } from "../src/services/TaskElementService";
 import { TaskOrchestrationService, OrchestrationConflictError } from "../src/services/TaskOrchestrationService";
 import { telemetryService, TASK_STUCK_STALE_MINUTES } from "../src/services/TelemetryService";
-import { notificationManager } from "../src/services/NotificationManager";
 
 const ACTOR = { principalId: null as string | null, handle: "c3-lease-proof", authMethod: "system" as const };
 
@@ -603,8 +602,14 @@ async function main() {
     const stuckCount = async (taskId: string) => await scalar(
       \`SELECT count(*)::int FROM feed_events
         WHERE name = 'task.stuck' AND object_type = 'task' AND object_id = $1\`, [taskId]);
-    const noticesFor = async (taskId: string) =>
-      (await notificationManager.getNotifications()).filter((n: any) => n.taskId === taskId);
+    // Card 5854f0d6 (choice C10): the file notifier is gone. The notice IS the
+    // feed row, addressed to the shepherd, else the creator, else the
+    // Assignee (the Stuck action item and the history read the same rule).
+    const noticesFor = async (taskId: string) => (await pool.query(
+      \`SELECT COALESCE(t.shepherd_principal_id, t.creator_principal_id, t.owner_principal_id) AS "recipientPrincipalId",
+              jsonb_build_object('name', fe.name, 'reason', fe.payload->>'reason') AS exception
+         FROM feed_events fe JOIN tasks t ON t.id = fe.object_id
+        WHERE fe.name = 'task.stuck' AND fe.object_type = 'task' AND fe.object_id = $1\`, [taskId])).rows;
 
     // Only ONE of the three has a lapsed lease. The other two are the controls
     // that make the emission attributable to the lapse.
@@ -780,11 +785,6 @@ const result = spawnSync(path.join(__dirname, '..', 'node_modules', '.bin', 'tsx
     RELAYHALL_CREDENTIAL_KEYS: process.env.RELAYHALL_CREDENTIAL_KEYS
       || JSON.stringify({ livekey: Buffer.alloc(32, 9).toString('base64') }),
     RELAYHALL_CREDENTIAL_ACTIVE_KEY: process.env.RELAYHALL_CREDENTIAL_ACTIVE_KEY || 'livekey',
-    // Section 9 drives the production notification path, whose store is a
-    // FILE (default /data/task-notifications.json). Point it at a disposable
-    // path so a proof run never writes into a deployment's notification feed.
-    TASK_NOTIFICATIONS_FILE: process.env.TASK_NOTIFICATIONS_FILE
-      || path.join(require('os').tmpdir(), 'c3-proof-notifications.json'),
   },
   cwd: path.join(__dirname, '..'),
 });

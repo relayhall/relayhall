@@ -30,6 +30,7 @@
  * wire, not merely that a mix-up was refused.
  */
 import crypto from 'crypto';
+import type { PoolClient } from 'pg';
 import { pool } from '../../db/connection';
 import { auditService, type AuditActor } from '../AuditService';
 import { loginSessionService } from '../LoginSessionService';
@@ -38,6 +39,9 @@ import { decryptCredentialSecret } from '../../utils/credentialCrypto';
 import {
   IdentityProvider,
   identityProviderService,
+  stepUpEnabledFor,
+  stepUpRequestKnobs,
+  type StepUpRequestKnobs,
 } from './IdentityProviderService';
 import { identityLinkService, type IdentityLink } from './IdentityLinkService';
 import { ssoInvitationService } from './SsoInvitationService';
@@ -47,7 +51,7 @@ import {
   ssoDiscoveryService,
 } from './SsoDiscoveryService';
 import { SsoTransport, httpsSsoTransport } from './ssoOutbound';
-import { assertUserInfoSubject, validateIdToken } from './idTokenValidation';
+import { assertUserInfoSubject, IdTokenError, validateIdToken, type ValidatedIdToken } from './idTokenValidation';
 import { readGroupClaim, type GroupClaimReading } from './ssoGroupClaims';
 import { resolveGroupBindings } from './ssoGroupBinding';
 import { evaluateLoginWhitelist } from './ssoLoginWhitelist';
@@ -58,6 +62,8 @@ import {
   mintPkceVerifier,
   pkceChallengeFor,
   ssoAuthenticationRequestService,
+  type PendingAuthenticationRequest,
+  type StepUpBinding,
 } from './SsoAuthenticationRequestService';
 import { ssoRedirectUri } from './ssoRedirectUri';
 // The two answers every Account producer must give identically — the
@@ -86,8 +92,80 @@ export const SSO_REFUSALS = [
   'SSO_CLAIM_MATCH_REFUSED',
   /** SSO-R4: no membership admits login at this Identity provider. */
   'SSO_LOGIN_GROUP_REFUSED',
+  /**
+   * Card a3e76724: the calling Account holds no proven Identity link at an
+   * enabled Identity provider, so there is nobody the provider could prove.
+   */
+  'SSO_STEP_UP_UNAVAILABLE',
+  /**
+   * Card a3e76724: the Identity provider authenticated someone, but not the
+   * Account the step-up was requested for.
+   */
+  'SSO_STEP_UP_SUBJECT_MISMATCH',
+  /**
+   * Card 7a99d63e (SU-10): the Identity provider answered a STEP-UP with an
+   * error that means "I could not authenticate this person the way you
+   * asked" (`STEP_UP_DECLINE_ERRORS`). The login arm keeps
+   * `SSO_PROVIDER_ERROR` for the same strings.
+   */
+  'SSO_STEP_UP_PROVIDER_DECLINED',
 ] as const;
 export type SsoRefusal = (typeof SSO_REFUSALS)[number];
+
+/**
+ * Card 7a99d63e (SU-10): the provider `error` values that decline a step-up
+ * rather than fail it — OpenID Connect Core §3.1.2.6 (`login_required`,
+ * `interaction_required`), RFC 9470 §5 (`unmet_authentication_requirements`)
+ * and RFC 6749 §4.1.2.1 (`access_denied`). Any other value stays
+ * `SSO_PROVIDER_ERROR`. The value is compared, never rendered.
+ */
+export const STEP_UP_DECLINE_ERRORS: readonly string[] = [
+  'login_required',
+  'interaction_required',
+  'unmet_authentication_requirements',
+  'access_denied',
+];
+
+/**
+ * Card 7a99d63e (SU-11): why a consumed step-up row was refused, as the
+ * `reason` of its `auth.step_up.refused` audit row. `auth_time_future` and
+ * `strength_insufficient` belong to the strength slice and are not produced
+ * yet; `callback_refused` is every refusal that is not about the ID token's
+ * freshness or subject (a foreign browser, an issuer mismatch, a failed token
+ * exchange), named by its `refusal_code`.
+ */
+export type StepUpRefusalReason =
+  | 'auth_time_stale'
+  | 'provider_declined'
+  | 'subject_mismatch'
+  | 'other_id_token'
+  | 'callback_refused';
+
+/**
+ * Card 7a99d63e (SU-11): the step-up audit evidence about WHEN and HOW the
+ * provider authenticated. `auth_time_delta_seconds` is `auth_time` minus the
+ * row's `requested_at`: negative when the provider reused an older sign-in
+ * (refused), positive when it authenticated after the request. `acr` and
+ * `amr` are recorded only in their standard shapes (a string; an array of
+ * strings), bounded, never interpreted here.
+ */
+function stepUpTiming(
+  observed: { authTime: number | null; acr: unknown; amr: unknown },
+  requestedAt: Date,
+): Record<string, unknown> {
+  const requestedAtSeconds = requestedAt.getTime() / 1000;
+  return {
+    auth_time: observed.authTime,
+    requested_at: requestedAt.toISOString(),
+    auth_time_delta_seconds: observed.authTime === null
+      ? null
+      : Math.round((observed.authTime - requestedAtSeconds) * 1000) / 1000,
+    acr: typeof observed.acr === 'string' ? observed.acr.slice(0, 256) : null,
+    amr: Array.isArray(observed.amr)
+      ? observed.amr.filter((value): value is string => typeof value === 'string').slice(0, 16).map((value) => value.slice(0, 64))
+      : null,
+  };
+}
 
 export class SsoAuthenticationError extends Error {
   constructor(public readonly code: SsoRefusal, message: string) {
@@ -161,10 +239,27 @@ export interface StartAuthenticationInput {
   identityProviderId?: string;
   /** The invitation code a person carried in, if any (§6.3, `invited` mode). */
   invitationCode?: string | null;
-  /** §8.3 step-up: forces `prompt=login` and `max_age=0`. */
+  /**
+   * §8.3 step-up: asks for a fresh authentication — `prompt=login` and
+   * `max_age=0` unless the provider's step-up policy names other standard
+   * knobs (card 7a99d63e) — and refusal 9 holds `auth_time` to the request.
+   */
   stepUp?: boolean;
   /** A loopback port for the CLI browser flow (§8.4). Server-validated. */
   loopbackPort?: number | null;
+}
+
+/**
+ * Card a3e76724 — a step-up re-authentication for an Account whose proof is
+ * its Identity provider. The binding comes from the CALLING login session
+ * (the route resolves it); nothing here is a caller-composed value.
+ */
+export interface StartStepUpInput {
+  principalId: string;
+  action: string;
+  targetId: string;
+  /** The Identity provider that proved the calling session, when it was one. */
+  sessionIdentityProviderId?: string | null;
 }
 
 export interface StartedAuthentication {
@@ -216,6 +311,60 @@ export interface CompletedAuthentication {
   traversedEntryPoint: 'SsoAuthenticationService.completeAuthentication';
 }
 
+/**
+ * Card a3e76724: what a step-up callback proved. No session, no token: the
+ * proof is recorded on the pending row and exchanged for a single-use
+ * step-up token only by the same Account (`collectStepUp`).
+ */
+export interface ProvenStepUp {
+  requestId: string;
+  principalId: string;
+  action: string;
+  targetId: string;
+  identityProviderId: string;
+}
+
+/** One callback, two kinds of pending row. The route renders each. */
+export type CompletedCallback =
+  | { kind: 'login'; login: CompletedAuthentication }
+  | { kind: 'step_up'; stepUp: ProvenStepUp };
+
+/**
+ * Card a3e76724: a refusal of a callback whose pending row was a STEP-UP.
+ *
+ * The route needs to know the kind to land the person in the right place —
+ * the step-up window, not the login page — and it can only learn the kind
+ * from the row the callback consumed. The original refusal travels as
+ * `refusal` and is read only through the typed `instanceof` arms, never by
+ * its text.
+ */
+/**
+ * Card 72b8fb97: the `auth.step_up.refused` row of a refused step-up could
+ * not be written. Carried as the `refusal` of an `SsoStepUpCallbackError`;
+ * it maps to no named code, so the route answers the generic
+ * `SSO_STEP_UP_FAILED` (500, or the refused landing) with an error id.
+ */
+export class StepUpRefusalAuditError extends Error {
+  constructor(public readonly auditFailure: unknown, public readonly refusal: unknown) {
+    super('the step-up refusal could not be recorded');
+    this.name = 'StepUpRefusalAuditError';
+  }
+}
+
+export class SsoStepUpCallbackError extends Error {
+  constructor(public readonly requestId: string, public readonly refusal: unknown) {
+    super('the step-up re-authentication was refused');
+    this.name = 'SsoStepUpCallbackError';
+  }
+}
+
+interface VerifiedCallback {
+  pending: PendingAuthenticationRequest;
+  provider: IdentityProvider;
+  tokens: { idToken: string; accessToken: string | null };
+  validated: ValidatedIdToken;
+}
+
 export class SsoAuthenticationService {
   constructor(
     private readonly discovery: SsoDiscoveryService = ssoDiscoveryService,
@@ -258,6 +407,80 @@ export class SsoAuthenticationService {
       returnRef = composeReturnRef('invitation', invitation.id);
     }
 
+    return this.issueAuthorizationRequest(provider, metadata, {
+      returnRef,
+      stepUp: input.stepUp === true,
+      binding: null,
+    });
+  }
+
+  /**
+   * Card a3e76724 — begin a step-up re-authentication FOR one Account, one
+   * action and one target.
+   *
+   * The Identity provider is the one that proved the calling session when it
+   * still qualifies, otherwise the one enabled provider (SS-14a), and in
+   * either case only where the Account holds a PROVEN Identity link there: a
+   * re-authentication is a proof about a subject, and an Account with no
+   * linked subject has nobody the provider could prove. The request asks for
+   * a fresh authentication exactly as §8.3's step-up login does — by default
+   * `prompt=login` and `max_age=0`, or the standard question the provider's
+   * step-up policy names (card 7a99d63e) — with refusal 9 comparing
+   * `auth_time` against the row's `requested_at` either way, and the row
+   * carries the binding the callback must match.
+   */
+  async startStepUp(input: StartStepUpInput): Promise<StartedAuthentication> {
+    const provider = await this.stepUpProviderFor(input.principalId, input.sessionIdentityProviderId ?? null);
+    if (!provider) {
+      refuse('SSO_STEP_UP_UNAVAILABLE', 'this Account holds no proven Identity link at an enabled Identity provider');
+    }
+    const metadata = await this.discovery.metadata(providerConfig(provider));
+    return this.issueAuthorizationRequest(provider, metadata, {
+      returnRef: null,
+      stepUp: true,
+      binding: { principalId: input.principalId, action: input.action, targetId: input.targetId },
+    });
+  }
+
+  /**
+   * Card a3e76724 — the Identity provider a step-up for this Account would
+   * use, or null when there is none. Read by the route that tells the
+   * dashboard which step-up method applies, and by `startStepUp` itself, so
+   * the method offered and the method honoured are one decision.
+   */
+  async stepUpProviderFor(
+    principalId: string,
+    sessionIdentityProviderId: string | null,
+    queryable?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+  ): Promise<IdentityProvider | null> {
+    // Card 72b8fb97: `queryable` is a step-up consumer's held client (the
+    // SU-14 challenge); without one every read is the pool's, as before.
+    const on = queryable ? [queryable] as const : [] as const;
+    const candidates: IdentityProvider[] = [];
+    if (sessionIdentityProviderId) {
+      const sessionProvider = await identityProviderService.get(sessionIdentityProviderId, ...on);
+      if (sessionProvider) candidates.push(sessionProvider);
+    }
+    const active = await identityProviderService.activeProvider(...on);
+    if (active && !candidates.some((candidate) => candidate.id === active.id)) candidates.push(active);
+    for (const candidate of candidates) {
+      if (candidate.status !== 'active') continue;
+      // Card 7a99d63e (SU-17): a provider whose step-up policy says
+      // `sso_step_up: disabled` cannot be asked for a fresh sign-in at all,
+      // so it is neither offered (methods) nor started (start): one decision.
+      if (!stepUpEnabledFor(candidate)) continue;
+      const link = await identityLinkService.findByAccount(candidate.id, principalId, ...on);
+      if (link && link.state === 'proven') return candidate;
+    }
+    return null;
+  }
+
+  /** The §5.1 authorization request both entry points issue. */
+  private async issueAuthorizationRequest(
+    provider: IdentityProvider,
+    metadata: ValidatedProviderMetadata,
+    options: { returnRef: string | null; stepUp: boolean; binding: StepUpBinding | null },
+  ): Promise<StartedAuthentication> {
     const state = mintOpaqueValue();
     const nonce = mintOpaqueValue();
     const verifier = mintPkceVerifier();
@@ -269,8 +492,9 @@ export class SsoAuthenticationService {
       nonce,
       pkceVerifier: verifier,
       redirectUri,
-      returnRef,
-      maxAgeRequested: input.stepUp ? 0 : null,
+      returnRef: options.returnRef,
+      maxAgeRequested: options.stepUp ? 0 : null,
+      stepUp: options.binding,
       ttlSeconds: provider.authenticationRequestTtlSeconds,
     });
 
@@ -288,11 +512,22 @@ export class SsoAuthenticationService {
     url.searchParams.set('nonce', nonce);
     url.searchParams.set('code_challenge', pkceChallengeFor(verifier));
     url.searchParams.set('code_challenge_method', 'S256');
-    if (input.stepUp) {
-      // §8.3: both, together. `max_age=0` with an `auth_time` that predates the
-      // request is the refusal that DETECTS an Identity provider ignoring it.
-      url.searchParams.set('prompt', 'login');
-      url.searchParams.set('max_age', '0');
+    if (options.stepUp) {
+      // §8.3 with card 7a99d63e (SU-4): the provider's step-up policy chooses
+      // WHICH standard question is asked; with no policy it is §8.3's pair,
+      // `prompt=login` and `max_age=0`, byte for byte. Both parameters are
+      // removed first, so a value `extra_authorize_params` copied above (a
+      // `prompt=none`, a longer `max_age`) can never ride a step-up, and a
+      // knob the policy turns off is absent rather than inherited. The
+      // ANSWER is judged the same whatever was asked: refusal 9 holds
+      // `auth_time` to this row's `requested_at` (the row records
+      // `max_age_requested = 0` above), which is how a provider that ignored
+      // the question is DETECTED rather than trusted.
+      const knobs = stepUpRequestKnobs(provider.stepUpPolicy);
+      url.searchParams.delete('prompt');
+      url.searchParams.delete('max_age');
+      if (knobs.prompt_login) url.searchParams.set('prompt', 'login');
+      if (knobs.max_age !== null) url.searchParams.set('max_age', String(knobs.max_age));
     }
 
     return {
@@ -303,8 +538,141 @@ export class SsoAuthenticationService {
     };
   }
 
-  /** §5.2 — the callback, in the contract's order. */
+  /**
+   * §5.2 — the callback, in the contract's order, for a LOGIN.
+   *
+   * Card a3e76724: this is now the login arm of `completeCallback`, which is
+   * what the production route calls. Both traverse the same consume, the same
+   * five ordered steps and the same twelve refusals (`verifyCallback`), and
+   * the same post-validation login (`completeLogin`). What this entry adds is
+   * that it never admits a step-up row: a pending row created for a step-up
+   * can prove a step-up and nothing else, and in particular never mints a
+   * login session.
+   */
   async completeAuthentication(input: CompleteAuthenticationInput): Promise<CompletedAuthentication> {
+    const outcome = await this.completeCallback(input, { admitStepUp: false });
+    if (outcome.kind !== 'login') {
+      refuse('SSO_STATE_UNKNOWN', 'that authentication request is unknown, expired or already used');
+    }
+    return outcome.login;
+  }
+
+  /**
+   * The callback for EITHER kind of pending row (card a3e76724).
+   *
+   * The kind is a property of the row, so it is only known after the row is
+   * consumed — which is why one entry point serves both and the route renders
+   * the outcome. A refusal after a step-up row was consumed is re-thrown as
+   * `SsoStepUpCallbackError`, carrying the original refusal untouched, so the
+   * route can land the person in the step-up window rather than on the login
+   * page; and the row's outcome stops reading `attempted`, so the dashboard
+   * collecting the proof is told "refused" rather than "still in flight".
+   */
+  async completeCallback(
+    input: CompleteAuthenticationInput,
+    options: { admitStepUp?: boolean } = {},
+  ): Promise<CompletedCallback> {
+    const seen: { pending?: PendingAuthenticationRequest } = {};
+    try {
+      const verified = await this.verifyCallback(input, (pending) => { seen.pending = pending; });
+      const binding = verified.pending.stepUp;
+      if (binding) {
+        if (options.admitStepUp === false) {
+          await ssoAuthenticationRequestService.recordOutcome(verified.pending.id, 'step_up_not_admitted');
+          refuse('SSO_STATE_UNKNOWN', 'that authentication request is unknown, expired or already used');
+        }
+        return { kind: 'step_up', stepUp: await this.proveStepUp(verified, binding) };
+      }
+      return { kind: 'login', login: await this.completeLogin(input, verified) };
+    } catch (error) {
+      const pending = seen.pending;
+      if (pending?.stepUp) {
+        await ssoAuthenticationRequestService.recordStepUpRefusal(pending.id).catch(() => undefined);
+        try {
+          await this.auditStepUpRefusal(pending, pending.stepUp, error);
+        } catch (auditError) {
+          // Card 72b8fb97 (the knowledge write door's C.15 rule): a refusal
+          // that cannot be recorded FAILS the callback. The row was already
+          // marked refused above, so it still fails closed (nothing to
+          // prove or collect); what changes is the answer: not the named
+          // refusal, which would claim an audited refusal, but the generic
+          // step-up failure with an error id (the route's 500 / landing
+          // `SSO_STEP_UP_FAILED`). Both the insert's failure and the
+          // original refusal travel to the route, which logs them under the
+          // one failure id it answers with (review r1, change 1).
+          throw new SsoStepUpCallbackError(pending.id, new StepUpRefusalAuditError(auditError, error));
+        }
+        throw new SsoStepUpCallbackError(pending.id, error);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Card 7a99d63e (SU-11, repairing finding B.7-F1): EVERY refusal of a
+   * consumed step-up row is in the ledger. Before this, only the subject
+   * mismatch wrote `auth.step_up.refused`; a stale `auth_time` (the 9 Oct
+   * failure) left nothing but the request row and an access-log line.
+   *
+   * The subject-mismatch arm keeps writing its own row inside `proveStepUp`
+   * (it holds the subject), so it is not written twice here. The row carries
+   * the refusal's reason and code, the knobs the provider's policy asks with,
+   * and, for a stale `auth_time`, how far before the request it was: never
+   * the ID token, the code, the state or the nonce. A failed audit write
+   * RAISES (card 72b8fb97): the caller fails the callback rather than
+   * answering a refusal the ledger does not hold.
+   */
+  private async auditStepUpRefusal(pending: PendingAuthenticationRequest, binding: StepUpBinding, error: unknown): Promise<void> {
+    if (error instanceof SsoAuthenticationError && error.code === 'SSO_STEP_UP_SUBJECT_MISMATCH') return;
+    let reason: StepUpRefusalReason = 'callback_refused';
+    let refusalCode = 'SSO_STEP_UP_FAILED';
+    let observed: { authTime: number | null; acr: unknown; amr: unknown } | null = null;
+    if (error instanceof IdTokenError) {
+      reason = error.code === 'AUTH_TIME_STALE' ? 'auth_time_stale' : 'other_id_token';
+      refusalCode = error.code;
+      observed = error.detail;
+    } else if (error instanceof SsoAuthenticationError) {
+      reason = error.code === 'SSO_STEP_UP_PROVIDER_DECLINED' ? 'provider_declined' : 'callback_refused';
+      refusalCode = error.code;
+    } else if (error instanceof Error && (error.name === 'SsoDiscoveryError' || error.name === 'SsoOutboundError')) {
+      refusalCode = 'SSO_PROVIDER_UNREACHABLE';
+    }
+    const knobs = await this.stepUpKnobsFor(pending.identityProviderId);
+    await auditService.record({
+      action: 'auth.step_up.refused',
+      outcome: 'denied',
+      actor: { principalId: binding.principalId, handle: 'sso', authMethod: 'session' } as AuditActor,
+      resourceType: 'principal',
+      resourceId: binding.principalId,
+      metadata: {
+        method: 'oidc',
+        identity_provider_id: pending.identityProviderId,
+        request_id: pending.id,
+        action: binding.action,
+        target_id: binding.targetId,
+        reason,
+        refusal_code: refusalCode,
+        step_up_request: knobs,
+        ...(observed ? stepUpTiming(observed, pending.requestedAt) : {}),
+      },
+    });
+  }
+
+  /** The knobs this provider's step-up policy asks with, or null if it is gone. */
+  private async stepUpKnobsFor(identityProviderId: string): Promise<StepUpRequestKnobs | null> {
+    const provider = await identityProviderService.get(identityProviderId);
+    return provider ? stepUpRequestKnobs(provider.stepUpPolicy) : null;
+  }
+
+  /**
+   * §5.2 steps 1-5 and the §5.3 refusals — everything that decides whether
+   * these bytes are an authentication by THIS row's Identity provider. Shared
+   * verbatim by the login and the step-up arms.
+   */
+  private async verifyCallback(
+    input: CompleteAuthenticationInput,
+    onConsumed: (pending: PendingAuthenticationRequest) => void,
+  ): Promise<VerifiedCallback> {
     // ── 1. state, cookie, and ONE pending row; consumed on the attempt ──────
     if (!input.state) refuse('SSO_STATE_MISSING', 'the callback carries no state');
     // T-SS3: the cookie and the row must AGREE. A callback whose `state`
@@ -314,6 +682,7 @@ export class SsoAuthenticationService {
     const consumed = await ssoAuthenticationRequestService.consume(input.state);
     if (!consumed) refuse('SSO_STATE_UNKNOWN', 'that authentication request is unknown, expired or already used');
     const { request: pending, pkceVerifier } = consumed;
+    onConsumed(pending);
 
     if (!input.cookieState || !timingSafeEquals(input.cookieState, input.state)) {
       await ssoAuthenticationRequestService.recordOutcome(pending.id, 'cookie_mismatch');
@@ -336,6 +705,12 @@ export class SsoAuthenticationService {
         outcome: 'denied',
         metadata: { error: String(input.error).slice(0, 200), description: String(input.errorDescription ?? '').slice(0, 500) },
       });
+      // Card 7a99d63e (SU-10): on a STEP-UP row, an error that means "could
+      // not authenticate this person the way you asked" is named, so the
+      // dialog can say so. The login arm is unchanged.
+      if (pending.stepUp && STEP_UP_DECLINE_ERRORS.includes(String(input.error))) {
+        refuse('SSO_STEP_UP_PROVIDER_DECLINED', 'the Identity provider declined to re-authenticate the person as the step-up asked');
+      }
       refuse('SSO_PROVIDER_ERROR', 'the Identity provider refused the authentication');
     }
 
@@ -394,6 +769,76 @@ export class SsoAuthenticationService {
       assertUserInfoSubject(userInfo, validated.subject);
     }
 
+    return { pending, provider, tokens, validated };
+  }
+
+  /**
+   * Card a3e76724 — the step-up arm. The Identity provider has authenticated
+   * someone freshly (refusal 9 already held `auth_time` to the row's
+   * `requested_at`); this decides whether it was THE SAME Account.
+   *
+   * Only an existing, PROVEN Identity link counts. Nothing is provisioned,
+   * promoted, bound by invitation or matched by claim: those are ways a new
+   * subject becomes an Account, and a step-up is a question about an Account
+   * that already exists. No login session is minted, no group claim is
+   * applied, and no profile is refreshed — the person is already signed in,
+   * and a step-up changes nothing about who they are on the board.
+   */
+  private async proveStepUp(verified: VerifiedCallback, binding: StepUpBinding): Promise<ProvenStepUp> {
+    const { pending, provider, validated } = verified;
+    const link = await identityLinkService.findBySubject(provider.id, validated.subject);
+    const authTime = typeof validated.claims.auth_time === 'number' ? validated.claims.auth_time : null;
+    const evidence = {
+      method: 'oidc',
+      identity_provider_id: provider.id,
+      request_id: pending.id,
+      action: binding.action,
+      target_id: binding.targetId,
+      subject: validated.subject,
+      // Card 7a99d63e (SU-11): how far after the request the provider
+      // authenticated, what it said about the method, and which question
+      // the provider's policy asked. `strength` is `fresh_only` until the
+      // strength slice adds rungs: freshness is the only thing proven here.
+      ...stepUpTiming({ authTime, acr: validated.claims.acr, amr: validated.claims.amr }, pending.requestedAt),
+      strength: 'fresh_only',
+      step_up_request: stepUpRequestKnobs(provider.stepUpPolicy),
+    };
+    if (!link || link.state !== 'proven' || link.accountPrincipalId !== binding.principalId) {
+      await auditService.record({
+        action: 'auth.step_up.refused',
+        outcome: 'denied',
+        actor: { principalId: binding.principalId, handle: 'sso', authMethod: 'session' } as AuditActor,
+        resourceType: 'principal',
+        resourceId: binding.principalId,
+        metadata: { ...evidence, reason: 'subject_mismatch' },
+      });
+      await ssoAuthenticationRequestService.recordOutcome(pending.id, 'step_up_subject_mismatch');
+      refuse('SSO_STEP_UP_SUBJECT_MISMATCH', 'the Identity provider authenticated a different Account');
+    }
+    // The ledger first: a proof the dashboard can collect never exists
+    // without its audit row, so a failed write leaves the row unproven.
+    await auditService.record({
+      action: 'auth.step_up.reauthenticated',
+      actor: { principalId: binding.principalId, handle: 'sso', authMethod: 'session' } as AuditActor,
+      resourceType: 'principal',
+      resourceId: binding.principalId,
+      metadata: { ...evidence, identity_link_id: link.id },
+    });
+    const proven = await ssoAuthenticationRequestService.markStepUpProven(pending.id, binding.principalId);
+    if (!proven) refuse('SSO_STATE_UNKNOWN', 'that authentication request is unknown, expired or already used');
+    await identityLinkService.touch(link.id);
+    return {
+      requestId: pending.id,
+      principalId: binding.principalId,
+      action: binding.action,
+      targetId: binding.targetId,
+      identityProviderId: provider.id,
+    };
+  }
+
+  /** §5.2 after validation — the login: link, group claim, whitelist, session. */
+  private async completeLogin(input: CompleteAuthenticationInput, verified: VerifiedCallback): Promise<CompletedAuthentication> {
+    const { pending, provider, tokens, validated } = verified;
     const link = await this.resolveOrProvisionLink(provider, validated.subject, validated.claims, pending.returnRef);
 
     // ── §7.2 / SS-13 — the group claim, READ then APPLIED ───────────────────
@@ -756,13 +1201,13 @@ export class SsoAuthenticationService {
           kind: 'human',
           displayName: claimString(claims, provider.displayNameClaim) ?? handle,
           role: FIXED_MINIMAL_ACCOUNT_ROLE,
-        });
+        }, client);
         if (!created) {
           await client.query('ROLLBACK');
           refuse('SSO_HANDLE_COLLISION', 'that handle is already taken; two people sharing a handle is an operator decision');
         }
         accountId = created.id;
-        await this.storeEmailAttribute(created.id, claimString(claims, provider.emailClaim));
+        await this.storeEmailAttribute(created.id, claimString(claims, provider.emailClaim), client);
       }
       if (!accountId) {
         await client.query('ROLLBACK');
@@ -788,25 +1233,36 @@ export class SsoAuthenticationService {
     subject: string,
     claims: Record<string, unknown>,
   ): Promise<IdentityLink> {
-    const handle = deriveHandle(provider, claims, subject);
-    const created = await principalService.createPrincipal({
-      handle,
-      kind: 'human',
-      displayName: claimString(claims, provider.displayNameClaim) ?? handle,
-      // Minimal role, no groups until claims say otherwise, no elevated
-      // anything. `jit` is appropriate where the issuer IS the organisation's
-      // boundary; `required_claims` is how a deployment pins that.
-      role: FIXED_MINIMAL_ACCOUNT_ROLE,
-    });
-    if (!created) {
-      refuse('SSO_HANDLE_COLLISION', 'that handle is already taken; collisions are refused rather than silently suffixed');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const handle = deriveHandle(provider, claims, subject);
+      const created = await principalService.createPrincipal({
+        handle,
+        kind: 'human',
+        displayName: claimString(claims, provider.displayNameClaim) ?? handle,
+        // Minimal role, no groups until claims say otherwise, no elevated
+        // anything. `jit` is appropriate where the issuer IS the organisation's
+        // boundary; `required_claims` is how a deployment pins that.
+        role: FIXED_MINIMAL_ACCOUNT_ROLE,
+      }, client);
+      if (!created) {
+        refuse('SSO_HANDLE_COLLISION', 'that handle is already taken; collisions are refused rather than silently suffixed');
+      }
+      await this.storeEmailAttribute(created.id, claimString(claims, provider.emailClaim), client);
+      const link = await identityLinkService.establishProven({
+        accountPrincipalId: created.id,
+        identityProviderId: provider.id,
+        subject,
+      }, client);
+      await client.query('COMMIT');
+      return link;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
     }
-    await this.storeEmailAttribute(created.id, claimString(claims, provider.emailClaim));
-    return identityLinkService.establishProven({
-      accountPrincipalId: created.id,
-      identityProviderId: provider.id,
-      subject,
-    });
   }
 
   /**
@@ -891,9 +1347,9 @@ export class SsoAuthenticationService {
    * match arm would be structurally unreachable and its acceptance vector
    * would pass vacuously.
    */
-  private async storeEmailAttribute(accountPrincipalId: string, email: string | null): Promise<void> {
+  private async storeEmailAttribute(accountPrincipalId: string, email: string | null, client: PoolClient | typeof pool = pool): Promise<void> {
     if (!email) return;
-    await pool.query(
+    await client.query(
       `UPDATE principals
           SET metadata = metadata || jsonb_build_object('email', $2::text), updated_at = now()
         WHERE id = $1`,

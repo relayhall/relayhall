@@ -52,6 +52,7 @@ export interface OwnConnectorAgent {
 }
 
 export interface OwnConnector {
+  ownerControl?: boolean;
   /** The Connector principal (layer 2 of the identity chain). */
   principalId: string;
   handle: string;
@@ -152,7 +153,7 @@ export class OwnConnectorsService {
    */
   async listForAccount(accountId: string, now: number = Date.now()): Promise<OwnConnector[]> {
     const connectorRows = await pool.query(
-      `SELECT p.id, p.handle, p.display_name, p.status, p.last_seen_at, p.purpose,
+      `SELECT p.id, p.handle, p.display_name, p.status, p.last_seen_at, p.purpose, p.owner_control_account_id,
               s.id AS service_id, s.slug, s.name, s.description,
               s.status AS service_status, s.runtime_mode, s.created_at AS service_created_at
          FROM principals p
@@ -212,6 +213,7 @@ export class OwnConnectorsService {
 
     return connectorRows.rows.map((row) => ({
       principalId: String(row.id),
+      ownerControl: row.owner_control_account_id === accountId,
       handle: String(row.handle),
       displayName: row.display_name === null ? null : String(row.display_name),
       status: String(row.status),

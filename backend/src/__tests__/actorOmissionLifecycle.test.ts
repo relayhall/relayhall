@@ -2,7 +2,7 @@ import { TaskManagerDB } from '../services/TaskManagerDB';
 import fs from 'fs';
 import path from 'path';
 
-const reviewer = { principalId: null, handle: 'reviewer-test', role: 'reviewer' };
+const reviewer = { principalId: null, handle: 'reviewer-test', role: 'reviewer', authMethod: 'system' as const };
 
 function managerHarness() {
   const pool = {
@@ -56,6 +56,8 @@ describe('completion actor omission fails closed before SQL', () => {
     const source = fs.readFileSync(path.join(process.cwd(), 'src/services/TaskReviewerService.ts'), 'utf8');
     expect(source).toContain("handle: 'task-reviewer-service'");
     expect(source).toContain("role: 'reviewer'");
-    expect(source).toContain('updateTask(taskId, updates, INTERNAL_REVIEWER_ACTOR)');
+    // Card 5854f0d6, round 2: a manual rejection's person rides as the feed
+    // actor only; the authority actor stays the explicit internal Verifier.
+    expect(source).toContain('updateTask(taskId, updates, INTERNAL_REVIEWER_ACTOR, undefined, undefined, undefined, undefined, feedActor)');
   });
 });

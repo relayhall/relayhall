@@ -24,7 +24,7 @@
 // deliberately do NOT count as coverage: they are act-identity/read-time
 // arms (AZ-26), not delegable object authority — a request the algebra
 // cannot prove contained REFUSES, loudly, per T2. Determinism beats
-// cleverness (the sol M8 principle §6.3 applies to selection; the same
+// cleverness (the review M8 principle §6.3 applies to selection; the same
 // principle governs containment).
 import type { GrantVerb, GrantResourceType } from '../services/GrantService';
 import { SELECTOR_FORMS, type ProfileRule, type SelectorForm } from '../services/AccessProfileService';
@@ -149,6 +149,32 @@ export function ruleCovered(sources: AuthoritySource[], rule: ProfileRule): bool
 export function rulesCovered(sources: AuthoritySource[], rules: ProfileRule[]): { covered: boolean; failing: ProfileRule | null } {
   for (const rule of rules) {
     if (!ruleCovered(sources, rule)) return { covered: false, failing: rule };
+  }
+  return { covered: true, failing: null };
+}
+
+/** AZ-A10 clause 5: an exact Task or Phase may be proved inside an
+ * all-in-project ceiling only by reading its current project coordinate.
+ * This deliberately adds no broad selector implication for other objects. */
+export async function rulesCoveredWithCoordinates(
+  queryable: { query: (sql: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+  sources: AuthoritySource[], rules: ProfileRule[],
+): Promise<{ covered: boolean; failing: ProfileRule | null }> {
+  for (const rule of rules) {
+    if (ruleCovered(sources, rule)) continue;
+    if (rule.selectorForm !== 'exact' || !['task', 'phase'].includes(rule.resourceType)
+      || rule.selectorIds.length === 0) return { covered: false, failing: rule };
+    const table = rule.resourceType === 'task' ? 'tasks' : 'phases';
+    const coordinates = await queryable.query(
+      `SELECT id::text, project_id::text FROM ${table} WHERE id = ANY($1::uuid[])`, [rule.selectorIds],
+    );
+    const projects = new Map(coordinates.rows.map(row => [String(row.id), String(row.project_id)]));
+    if (!rule.verbs.every(verb => sources.some(source =>
+      source.resourceType === rule.resourceType && source.selectorForm === 'all-in-project'
+      && source.verbs.includes(verb)
+      && rule.selectorIds.every(id => projects.has(id) && source.selectorIds.includes(projects.get(id)!))))) {
+      return { covered: false, failing: rule };
+    }
   }
   return { covered: true, failing: null };
 }

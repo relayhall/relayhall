@@ -62,14 +62,14 @@ describe('report origin header plumbing', () => {
   it('defaults origin to api when the header is absent', async () => {
     await withServer(async base => {
       expect((await post(base)).status).toBe(201);
-      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ origin: 'api' }));
+      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ origin: 'api' }), expect.objectContaining({ principalId: null }));
     });
   });
 
   it('records a valid X-RelayHall-Origin (case-normalized)', async () => {
     await withServer(async base => {
       expect((await post(base, { 'X-RelayHall-Origin': 'CLI' })).status).toBe(201);
-      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ origin: 'cli' }));
+      expect(manager.create).toHaveBeenCalledWith(expect.objectContaining({ origin: 'cli' }), expect.objectContaining({ principalId: null }));
     });
   });
 
@@ -107,13 +107,13 @@ describe('ReportManager origin persistence', () => {
   it('INSERT persists origin and defaults to api', async () => {
     const pool = fakePool();
     const mgr = new ReportManager(pool as never);
-    await mgr.create({ title: 'T', content: 'C', origin: 'dashboard' });
+    await mgr.create({ title: 'T', content: 'C', origin: 'dashboard' }, {});
     let insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.text).toContain('origin');
     expect(insert.params).toContain('dashboard');
 
     pool.queries.length = 0;
-    await mgr.create({ title: 'T', content: 'C' });
+    await mgr.create({ title: 'T', content: 'C' }, {});
     insert = pool.queries.find(q => /INSERT INTO reports/i.test(q.text))!;
     expect(insert.params).toContain('api');
   });

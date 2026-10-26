@@ -140,3 +140,69 @@ describe('the Charter rides every compiled Brief', () => {
     expect(charterIdx).toBeLessThan(footerIdx);
   });
 });
+
+
+describe('transport-neutral task workflow in the compiled Brief', () => {
+  it.each([
+    ['no project', { project: undefined }],
+    ['project context', {}],
+    ['connector execution profile', { executionProfile: {
+      serviceId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      descriptorVersion: 1, options: { runner: 'fixture' },
+    } }],
+    ['legacy execution profile', { legacyExecutionProfile: { harness: 'fixture-harness' } }],
+  ])('%s retains stable IDs, atomic finish and independent verification', async (_label, extra) => {
+    const compiled = await generateTaskPromptWithSkills({
+      ...task, ...extra,
+      definitionOfDone: ['Evidence verified'],
+      subtasks: [{ id: '903', index: 0, text: 'First item', completed: false },
+        { id: '41', index: 1, text: 'Second item', completed: true }],
+    });
+    const footer = compiled.slice(compiled.indexOf(FOOTER_HEADING));
+    expect(compiled.split(FOOTER_HEADING)).toHaveLength(2);
+    expect(compiled).toContain('First item (stable id: 903)');
+    expect(compiled).toContain('Second item (stable id: 41)');
+    expect(footer).toContain(`**Task ID:** ${task.id}`);
+    expect(footer).toContain('MCP, CLI, or REST API');
+    expect(footer).toContain('Do not switch transports or identities to bypass a refusal');
+    expect(footer).toContain('relayhall_subtask_set');
+    expect(footer).toContain(`relayhall set-subtask ${task.id} <STABLE_SUBTASK_ID>`);
+    expect(footer).toContain(`/api/tasks/${task.id}/subtasks/by-id/<STABLE_SUBTASK_ID>/status`);
+    expect(footer).toContain('relayhall_task_finish');
+    expect(footer).toContain(`relayhall finish ${task.id}`);
+    expect(footer).toContain(`POST /api/tasks/${task.id}/finish`);
+    expect(footer).toContain('Finish atomically appends the handover, creates or links the Report, and moves the Task to Review');
+    expect(footer).toContain('independent assigned Verifier, distinct from the Assignee');
+    expect(footer).toContain('Never self-approve');
+    expect(footer).toContain('Session exit alone does not establish handover or notification delivery');
+    expect(footer).toContain('read the Task and linked Report before retrying');
+    expect(footer).toContain('A dry run is validation only');
+    for (const legacy of ['<INDEX>', '$CB', 'RELAYHALL_AGENT=1', 'Use the CLI, never raw API',
+      'automatically notify the orchestrator', 'before calling `review`']) {
+      expect(compiled).not.toContain(legacy);
+    }
+    if (!Object.prototype.hasOwnProperty.call(extra, 'project')) {
+      for (const context of ['Fixture project description', CHARTER_SENTINEL, 'skill text']) {
+        expect(compiled.indexOf(context)).toBeGreaterThan(-1);
+        expect(compiled.indexOf(context)).toBeLessThan(compiled.indexOf(FOOTER_HEADING));
+      }
+    } else {
+      for (const context of ['## Project Context', CHARTER_SENTINEL, 'skill text']) {
+        expect(compiled).not.toContain(context);
+      }
+    }
+    if (_label === 'connector execution profile') {
+      const profileAt = compiled.indexOf('**Execution profile**');
+      expect(profileAt).toBeGreaterThan(-1);
+      expect(profileAt).toBeLessThan(compiled.indexOf(FOOTER_HEADING));
+      expect(compiled).toContain('"serviceId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"');
+      expect(compiled).toContain('"runner": "fixture"');
+      expect(compiled).not.toContain('**Model:**');
+    }
+    if (_label === 'legacy execution profile') {
+      const profileAt = compiled.indexOf('**Harness:** fixture-harness');
+      expect(profileAt).toBeGreaterThan(-1);
+      expect(profileAt).toBeLessThan(compiled.indexOf(FOOTER_HEADING));
+    }
+  });
+});

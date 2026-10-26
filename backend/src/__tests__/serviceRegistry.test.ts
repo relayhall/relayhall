@@ -100,6 +100,8 @@ function armPool(): void {
         state.head = headRow({ ...state.head, status: 'retired', retired_at: 'now', revision: 'rotated' });
       } else if (sql.includes('current_descriptor_version = $2')) {
         state.head = headRow({ ...state.head, current_descriptor_version: params[1], revision: 'rotated' });
+      } else if (/SET status = \$2/.test(sql)) {
+        state.head = headRow({ ...state.head, status: params[1], revision: 'rotated-status' });
       } else {
         state.head = headRow({ ...state.head, revision: 'rotated' });
       }
@@ -233,6 +235,87 @@ describe('registration', () => {
     const service = await registry.register({ slug: 's1', name: 'S1' }, 'p');
     expect(service.deliveryMode).toBe('none');
     expect(service.visibilityTier).toBe('assigned-only');
+  });
+});
+
+describe('registration with a first descriptor (connector wizard, E462 S1)', () => {
+  const HARNESS = { options: [], telemetry: { tier: 'full', products: ['claude-code'] } };
+
+  it('registers, publishes version 1 and moves to published in ONE transaction', async () => {
+    const service = await registry.register(
+      { slug: 'laptop-claude', name: 'Laptop Claude', kind: 'connector', descriptor: HARNESS },
+      'principal-1',
+    );
+    expect(service.status).toBe('published');
+    expect(service.currentDescriptorVersion).toBe(1);
+    // The registry column follows the declared tier, so the two cannot disagree.
+    expect(service.telemetryTier).toBe('full');
+    expect(state.versions).toHaveLength(1);
+    expect(state.versions[0].descriptor.telemetry).toEqual({ tier: 'full', products: ['claude-code'] });
+    // One BEGIN, one COMMIT, and the writes between them in the only order that works.
+    expect(state.mutations).toEqual([
+      'BEGIN', 'INSERT service', 'INSERT version', 'UPDATE service', 'UPDATE service', 'COMMIT',
+    ]);
+  });
+
+  it('an explicit telemetryTier on the registration is kept, not overwritten by the descriptor', async () => {
+    const service = await registry.register(
+      { slug: 'laptop-codex', name: 'Laptop Codex', kind: 'connector', telemetryTier: 'presence', descriptor: HARNESS },
+      'principal-1',
+    );
+    expect(service.telemetryTier).toBe('presence');
+  });
+
+  it('an invalid descriptor is refused BEFORE a transaction opens: nothing is written at all', async () => {
+    await expect(registry.register(
+      { slug: 'bad-one', name: 'Bad', kind: 'connector', descriptor: { options: [], telemetry: { tier: 'loud' } } },
+      'principal-1',
+    )).rejects.toBeInstanceOf(DescriptorError);
+    expect(state.mutations).toEqual([]);
+    expect(state.versions).toHaveLength(0);
+  });
+
+  it('a failure AFTER the service row exists rolls the whole registration back', async () => {
+    // Fault injection on the seam: the registry row is written first, then the
+    // publication fails. The row must not survive, and nothing may commit.
+    const spy = jest.spyOn(registry, 'publishDescriptor').mockRejectedValueOnce(new Error('injected'));
+    try {
+      await expect(registry.register(
+        { slug: 'half-made', name: 'Half', kind: 'connector', descriptor: HARNESS },
+        'principal-1',
+      )).rejects.toThrow('injected');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(state.mutations).toContain('INSERT service');
+    expect(state.mutations).toContain('ROLLBACK');
+    expect(state.mutations).not.toContain('COMMIT');
+  });
+
+  it('a descriptor on a plain service is refused by name, before anything is written', async () => {
+    await expectError(
+      registry.register({ slug: 'plain-svc', name: 'Plain', kind: 'service', descriptor: HARNESS }, 'p'),
+      422,
+      'INVALID_SERVICE_VALUE',
+    );
+    expect(state.mutations).not.toContain('INSERT service');
+  });
+
+  it('a dry run validates and rehearses the publication and writes nothing durable', async () => {
+    await registry.register(
+      { slug: 'rehearse', name: 'Rehearse', kind: 'connector', descriptor: HARNESS },
+      'p',
+      { dryRun: true },
+    );
+    expect(state.mutations).toContain('ROLLBACK');
+    expect(state.mutations).not.toContain('COMMIT');
+  });
+
+  it('CONTROL: registering with no descriptor stays a draft with no version', async () => {
+    const service = await registry.register({ slug: 'no-descriptor', name: 'None', kind: 'connector' }, 'p');
+    expect(service.status).toBe('draft');
+    expect(service.currentDescriptorVersion).toBeNull();
+    expect(state.versions).toHaveLength(0);
   });
 });
 

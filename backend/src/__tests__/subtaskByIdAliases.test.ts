@@ -12,6 +12,14 @@ import fs from 'fs';
 import path from 'path';
 import type { AddressInfo } from 'net';
 
+// Owner ruling E462 S4b: the Verifier identity check reads the chain guard in
+// SQL (covered live by verificationModesLive); this suite models only the
+// identity half of it.
+jest.mock('../services/VerificationModes', () => ({
+  ...jest.requireActual('../services/VerificationModes'),
+  verifierStanding: jest.fn(async (_q: unknown, task: { verifier_principal_id?: string | null }, principalId: string | null) =>
+    (principalId && task.verifier_principal_id === principalId ? 'exact' : null)),
+}));
 jest.mock('../db/connection', () => ({ pool: { query: jest.fn(async () => ({ rows: [] })) } }));
 jest.mock('../services/TaskManagerDB', () => {
   const actual = jest.requireActual('../services/TaskManagerDB');
@@ -36,7 +44,6 @@ jest.mock('../services/TaskElementService', () => {
   return { ...actual, taskElementService: { listStream: jest.fn(async () => []), listReferences: jest.fn(async () => []) } };
 });
 jest.mock('../services/taskAnalyzer', () => ({ taskAnalyzer: {} }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: {} }));
 jest.mock('../services/TaskReviewerService', () => ({ taskReviewerService: {} }));
 jest.mock('../services/TaskOrchestrationService', () => ({
   taskOrchestrationService: {},
@@ -63,12 +70,16 @@ jest.mock('../middleware/sharedAuthorization', () => ({
 import tasksRouter from '../routes/tasks';
 import { taskManagerDB } from '../services/TaskManagerDB';
 import { authorizationRepository } from '../services/AuthorizationRepository';
+import { NotFoundFault, InvalidRequestFault } from '../utils/httpErrors';
+import { sharedAuthorizationMiddleware } from '../middleware/sharedAuthorization';
+import { authorizationService } from '../services/AuthorizationService';
 
 const TASK = '11111111-1111-4111-8111-111111111111';
 let server: ReturnType<typeof express.application.listen>;
 let base: string;
 let principalRole: string | null = null;
 let handle = 'test-agent';
+let useSurfaceGate = false;
 
 beforeAll((done) => {
   const app = express();
@@ -79,11 +90,12 @@ beforeAll((done) => {
     (req as any).scopes = ['tasks:write'];
     next();
   });
+  app.use((req, res, next) => { if (useSurfaceGate) void sharedAuthorizationMiddleware(req, res, next); else next(); });
   app.use('/tasks', tasksRouter);
   server = app.listen(0, () => { base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`; done(); });
 });
 afterAll((done) => { server.close(() => done()); });
-afterEach(() => { jest.clearAllMocks(); principalRole = null; handle = 'test-agent'; });
+afterEach(() => { jest.clearAllMocks(); jest.restoreAllMocks(); useSurfaceGate = false; principalRole = null; handle = 'test-agent'; });
 
 const call = async (method: string, pathname: string, body?: unknown) => {
   const response = await fetch(`${base}${pathname}`, {
@@ -107,7 +119,9 @@ describe('stable-id Subtask verb aliases (228441cf)', () => {
     expect(ok.status).toBe(200);
     expect(authorizationRepository.authorizePoint).toHaveBeenCalledWith(
       expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }), 'task', TASK, 'verify');
-    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'reviewer');
+    // Card 5854f0d6, round 2: the request principal rides as the feed actor only.
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'reviewer',
+      undefined, undefined, undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
     expect(ok.body.subtaskId).toBe('7');
   });
 
@@ -116,17 +130,22 @@ describe('stable-id Subtask verb aliases (228441cf)', () => {
     principalRole = 'admin';
     const ok = await call('POST', `/tasks/${TASK}/subtasks/by-id/7/reject`, { note: 'not quite' });
     expect(ok.status).toBe(200);
-    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'empty', 'orchestrator', 'REJECTED: not quite');
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'empty', 'orchestrator', 'REJECTED: not quite',
+      undefined, undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
   });
 
   test('skip by id delegates with the fixed orchestrator role', async () => {
     handle = 'dashboard_user'; principalRole = 'admin';
     const ok = await call('POST', `/tasks/${TASK}/subtasks/by-id/7/skip`);
     expect(ok.status).toBe(200);
-    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'skipped', 'orchestrator');
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'skipped', 'orchestrator',
+      undefined, undefined, undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
   });
 
   test('PUT by id: legacy {completed} body maps; identity-derived authority (no body escape hatch)', async () => {
+    // The manager now checks actual owner/Main authority under its row lock.
+    // This route test checks propagation of that refusal and trusted actor.
+    (taskManagerDB.updateSubtaskStatusById as jest.Mock).mockRejectedValueOnce(new (jest.requireActual('../utils/httpErrors').ForbiddenFault)('No owner control'));
     handle = 'some-agent'; // agent may not complete
     const denied = await call('PUT', `/tasks/${TASK}/subtasks/by-id/7`, { completed: true, role: 'orchestrator' });
     expect(denied.status).toBe(403);
@@ -134,10 +153,10 @@ describe('stable-id Subtask verb aliases (228441cf)', () => {
     handle = 'dashboard_user'; // reviewer
     const ok = await call('PUT', `/tasks/${TASK}/subtasks/by-id/7`, { completed: true });
     expect(ok.status).toBe(200);
-    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'reviewer', undefined, undefined);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'reviewer', undefined, undefined, expect.objectContaining({ handle: 'dashboard_user' }));
     // status-form body works too
     await call('PUT', `/tasks/${TASK}/subtasks/by-id/7`, { status: 'review' });
-    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenLastCalledWith(TASK, '7', 'review', 'reviewer', undefined, undefined);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenLastCalledWith(TASK, '7', 'review', 'reviewer', undefined, undefined, expect.objectContaining({ handle: 'dashboard_user' }));
   });
 
   test('non-numeric subtaskId gets the typed 400 on every alias', async () => {
@@ -175,5 +194,183 @@ describe('stable-id Subtask verb aliases (228441cf)', () => {
     const manager = fs.readFileSync(path.join(__dirname, '..', 'services', 'TaskManagerDB.ts'), 'utf-8');
     const byId = manager.slice(manager.indexOf('async updateSubtaskStatusById'));
     expect(byId.slice(0, 1500)).toContain('FOR UPDATE OF s');
+  });
+});
+
+/**
+ * Task f075e779: the stable approve route is the MCP completion path. Its gate
+ * is the Task's assigned Verifier + a fresh point `verify` check, never the
+ * global automation role a connector handle resolves to.
+ */
+describe('stable approve: assigned independent Verifier gate and optional evidence (f075e779)', () => {
+  const ME = '99999999-9999-4999-8999-999999999999';
+  const OWNER = '22222222-2222-4222-8222-222222222222';
+  const OTHER = '33333333-3333-4333-8333-333333333333';
+  const approve = (body?: unknown) => call('POST', `/tasks/${TASK}/subtasks/by-id/7/approve`, body);
+  const taskWith = (ownerPrincipalId: string | null, verifierPrincipalId: string | null) => {
+    (taskManagerDB.getTask as jest.Mock).mockResolvedValueOnce({ id: TASK, ownerPrincipalId, verifierPrincipalId });
+  };
+
+  test('arbitrary connector handle with null principalRole succeeds when it is the assigned Verifier', async () => {
+    handle = 'connector-0083180e'; principalRole = null; // global role resolves to agent
+    taskWith(OWNER, ME);
+    const ok = await approve();
+    expect(ok.status).toBe(200);
+    expect(authorizationRepository.authorizePoint).toHaveBeenCalledTimes(1);
+    expect(authorizationRepository.authorizePoint).toHaveBeenCalledWith(
+      expect.objectContaining({ principalId: ME }), 'task', TASK, 'verify');
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledTimes(1);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'reviewer',
+      undefined, undefined, undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
+  });
+
+  test('owner who is also named Verifier is refused before any write', async () => {
+    handle = 'connector-0083180e';
+    taskWith(ME, ME);
+    const denied = await approve({ reviewNote: 'self-approval' });
+    expect(denied.status).toBe(403);
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+
+  test('a different assigned Verifier refuses even a reviewer-role handle (no global-role widening)', async () => {
+    handle = 'dashboard_user'; // resolves to reviewer
+    taskWith(OWNER, OTHER);
+    const denied = await approve();
+    expect(denied.status).toBe(403);
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+
+  test('revoked verify authority refuses; authority is re-read on every call', async () => {
+    handle = 'connector-0083180e';
+    taskWith(OWNER, ME);
+    expect((await approve()).status).toBe(200);
+    taskWith(OWNER, ME);
+    (authorizationRepository.authorizePoint as jest.Mock).mockResolvedValueOnce({ allowed: false });
+    const denied = await approve();
+    expect(denied.status).toBe(403);
+    expect(authorizationRepository.authorizePoint).toHaveBeenCalledTimes(2);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledTimes(1);
+  });
+
+  test('optional reviewNote/blockedReason reach the single row-locked manager call unchanged', async () => {
+    handle = 'connector-0083180e';
+    taskWith(OWNER, ME);
+    const ok = await approve({ reviewNote: 'verified against spec', blockedReason: 'none' });
+    expect(ok.status).toBe(200);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledTimes(1);
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(
+      TASK, '7', 'completed', 'reviewer', 'verified against spec', 'none', undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
+
+    taskWith(OWNER, ME);
+    await approve({ reviewNote: 'note only' });
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenLastCalledWith(
+      TASK, '7', 'completed', 'reviewer', 'note only', undefined, undefined, false, expect.objectContaining({ principalId: '99999999-9999-4999-8999-999999999999' }));
+  });
+
+  test('malformed optional evidence is refused with a typed 400 and nothing is written', async () => {
+    handle = 'connector-0083180e';
+    for (const body of [{ reviewNote: 42 }, { reviewNote: null }, { blockedReason: { x: 1 } }, { reviewNote: 'ok', blockedReason: ['a'] }]) {
+      taskWith(OWNER, ME);
+      const r = await approve(body);
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('INVALID_SUBTASK_EVIDENCE');
+    }
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+
+  test('malformed evidence from a non-Verifier still gets the authorization refusal first', async () => {
+    handle = 'connector-0083180e';
+    taskWith(OWNER, OTHER);
+    const denied = await approve({ reviewNote: 42 });
+    expect(denied.status).toBe(403);
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+
+  test('generic PATCH keeps the handle-derived role: an assigned Verifier connector is NOT upgraded there', async () => {
+    handle = 'connector-0083180e'; principalRole = null;
+    await call('PATCH', `/tasks/${TASK}/subtasks/by-id/7/status`, { status: 'completed' });
+    expect(taskManagerDB.updateSubtaskStatusById).toHaveBeenCalledWith(TASK, '7', 'completed', 'agent', undefined, undefined, expect.objectContaining({ handle: 'connector-0083180e' }), false);
+    expect(authorizationRepository.authorizePoint).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('stable-id integer-domain boundary', () => {
+  test.each(['2147483648', '999999999999', '9'.repeat(1000), '-1', '1.5', '1e2', '1\n', 'nope'])('rejects %s with typed 400 before the mutation manager', async (subtaskId) => {
+    handle = 'dashboard_user'; principalRole = 'admin';
+    for (const [method, suffix, body] of [
+      ['PATCH', '/status', { status: 'review' }],
+      ['POST', '/approve', undefined],
+      ['POST', '/reject', undefined],
+      ['POST', '/skip', undefined],
+      ['PUT', '', { status: 'review' }],
+    ] as const) {
+      const r = await call(method, `/tasks/${TASK}/subtasks/by-id/${encodeURIComponent(subtaskId)}${suffix}`, body);
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('INVALID_SUBTASK_ID');
+    }
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('stable-id valid-domain compatibility', () => {
+  test.each(['0', '1', '2147483647', '0002147483647', '0000'])('preserves decimal %s and resolves inside the manager', async (subtaskId) => {
+    handle = 'dashboard_user'; principalRole = 'admin';
+    for (const [method, suffix, body] of [
+      ['PATCH', '/status', { status: 'review' }], ['POST', '/approve', undefined],
+      ['POST', '/reject', { note: 'redo' }], ['POST', '/skip', undefined],
+      ['PUT', '', { status: 'review' }],
+    ] as const) {
+      expect((await call(method, `/tasks/${TASK}/subtasks/by-id/${encodeURIComponent(subtaskId)}${suffix}`, body)).status).toBe(200);
+      expect((taskManagerDB.updateSubtaskStatusById as jest.Mock).mock.calls.at(-1).slice(0, 2)).toEqual([TASK, subtaskId]);
+    }
+  });
+  test('ordinary unknown in-range id retains the typed 404 on all stable verbs', async () => {
+    handle = 'dashboard_user'; principalRole = 'admin';
+    for (const [method, suffix, body] of [
+      ['PATCH', '/status', { status: 'review' }], ['POST', '/approve', undefined],
+      ['POST', '/reject', undefined], ['POST', '/skip', undefined], ['PUT', '', { status: 'review' }],
+    ] as const) {
+      (taskManagerDB.updateSubtaskStatusById as jest.Mock).mockRejectedValueOnce(new NotFoundFault('Subtask not found: 99', 'SUBTASK_NOT_FOUND'));
+      const r = await call(method, `/tasks/${TASK}/subtasks/by-id/99${suffix}`, body);
+      expect(r.status).toBe(404); expect(r.body.code).toBe('SUBTASK_NOT_FOUND');
+    }
+  });
+  test('independent Verifier refusal still precedes id validation and mutation', async () => {
+    handle = 'connector-other';
+    const r = await call('POST', `/tasks/${TASK}/subtasks/by-id/999999999999/approve`);
+    expect(r.status).toBe(403);
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
+  });
+  test('direct manager refuses overflow before acquiring a database connection', async () => {
+    const { TaskManagerDB } = jest.requireActual('../services/TaskManagerDB');
+    const isolatedPool = { connect: jest.fn(() => { throw new Error('must not touch database'); }) };
+    const manager = new TaskManagerDB(isolatedPool);
+    for (const id of ['2147483648', '999999999999', '9'.repeat(1000), '-1', 'nope']) {
+      await expect(manager.updateSubtaskStatusById(TASK, id, 'completed', 'reviewer')).rejects.toMatchObject({ status: 400, code: 'INVALID_SUBTASK_ID' });
+      await expect(manager.updateSubtaskStatusById(TASK, id, 'completed', 'reviewer')).rejects.toBeInstanceOf(InvalidRequestFault);
+    }
+    expect(isolatedPool.connect).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('parent concealment precedes stable-id validation at the production middleware', () => {
+  test.each([false, true])('absent/concealed parent (concealed=%s) keeps 404 for valid, missing and overflowing child ids', async (concealed) => {
+    useSurfaceGate = true; handle = 'dashboard_user'; principalRole = 'admin';
+    jest.spyOn(authorizationService, 'authorizeRoute').mockReturnValue({ allowed: true } as any);
+    for (const subtaskId of ['7', '99', '999999999999']) {
+      for (const [method, suffix, body] of [
+        ['PATCH', '/status', { status: 'review' }], ['POST', '/approve', undefined],
+        ['POST', '/reject', undefined], ['POST', '/skip', undefined], ['PUT', '', { status: 'review' }],
+      ] as const) {
+        (authorizationRepository.authorizePoint as jest.Mock).mockResolvedValueOnce({ exists: concealed, concealed, allowed: false });
+        const r = await call(method, `/tasks/${TASK}/subtasks/by-id/${subtaskId}${suffix}`, body);
+        expect(r.status).toBe(404); expect(r.body.code).toBe('RESOURCE_NOT_FOUND');
+      }
+    }
+    expect(taskManagerDB.getTask).not.toHaveBeenCalled();
+    expect(taskManagerDB.updateSubtaskStatusById).not.toHaveBeenCalled();
   });
 });

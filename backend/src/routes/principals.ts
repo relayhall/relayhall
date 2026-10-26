@@ -1,3 +1,4 @@
+import { sessionIdleMs } from '../services/LoginSessionService';
 // Principal + credential management (spec b48bb799 §3.3).
 // Phase 1 (CB-2) delivered the read endpoints the board UI consumes; CB-5 adds
 // issuance, rotation and revocation — the capability-contract primitive.
@@ -5,18 +6,19 @@ import { auditChainFor } from '../utils/auditChain';
 import { pool } from '../db/connection';
 import { auditService } from '../services/AuditService';
 import { Router, Response } from 'express';
+import type { PoolClient } from 'pg';
 import { AuthRequest } from '../middleware/auth';
-import { principalService, isMissingRelationError, type Principal } from '../services/PrincipalService';
+import {
+  principalService, isMissingRelationError, PRINCIPAL_KINDS, type Principal, type PrincipalKind,
+} from '../services/PrincipalService';
 import { grantService, GrantError } from '../services/GrantService';
-import { accessProfileService } from '../services/AccessProfileService';
 import { credentialLifecycleService, CredentialLifecycleError } from '../services/CredentialLifecycleService';
 import { accountPasswordService } from '../services/AccountPasswordService';
 import { CredentialPolicyError } from '../services/PrincipalService';
 import { auditActorFromRequest } from '../utils/auditActor';
 import { resolveActorRole } from '../utils/taskAutomationRole';
+import { principalRoleService, RoleChangeError } from '../services/PrincipalRoleService';
 import {
-  ASSIGNABLE_ROLES,
-  ELEVATED_ROLES,
   canAssignRole,
   refusesCredentials,
   resolveIssuerAuthority,
@@ -24,10 +26,11 @@ import {
   validateRequestedScopes,
 } from '../utils/credentialAuthority';
 import {
-  PASSWORD_ACT, administratorSessionOf, classifyLoginSession, isLoginSessionKind,
+  AUTHORITY_EDIT_ACT, PASSWORD_ACT, administratorSessionOf, classifyLoginSession, isLoginSessionKind, isStoredLoginSessionKind,
 } from '../utils/administratorSession';
 import { homeGroupService, HomeGroupError } from '../services/HomeGroupService';
 import { sendApiError } from '../utils/apiErrors';
+import { RequestFaultError } from '../utils/httpErrors';
 import { delegableScopesForCaller } from '../utils/identityScopes';
 import { localAdministratorHandle } from '../config/localAdministrator';
 import { logCaughtFailure } from '../utils/secretSafeLog';
@@ -43,9 +46,14 @@ import { actorFromRequest } from '../middleware/sharedAuthorization';
 import { authorizationService } from '../services/AuthorizationService';
 import { accessSurfaceService } from '../services/AccessSurfaceService';
 import { ROOT_SCOPE } from '../utils/scopeMap';
+import { roleCatalogue } from '../utils/roleCatalogue';
+import { lensesFor } from '../utils/lenses';
+import { groupStewardService } from '../services/GroupStewardService';
 
-/** Authority of the calling identity — see utils/credentialAuthority. */
-function issuerAuthority(req: AuthRequest) {
+/** Authority of the calling identity — see utils/credentialAuthority.
+ * Exported for the Access Explorer's directory projection (card 1e56dbef),
+ * which lists hidden principals under exactly this guard. */
+export function issuerAuthority(req: AuthRequest) {
   return resolveIssuerAuthority({
     scopes: req.scopes,
     role: resolveActorRole({
@@ -66,6 +74,55 @@ function requireManageAuthority(req: AuthRequest, res: Response) {
   return authority;
 }
 
+/**
+ * AZ-A12 clause 2 (card 20f40e40): a Group principal's lifecycle runs ONLY
+ * through /groups, under that family's root ceiling. Every /principals/:id
+ * mutation therefore refuses one with this code, BEFORE any other check, and
+ * records the refusal as a durable audit row.
+ */
+export const GROUP_PRINCIPAL_MANAGED_BY_GROUPS = 'GROUP_PRINCIPAL_MANAGED_BY_GROUPS';
+
+const PRINCIPAL_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The guard each /principals/:id mutation runs first. It resolves the
+ * target's kind BY UUID in SQL (the column is a canonical uuid, so an
+ * uppercase path id reaches the same row), never by comparing id strings and
+ * never through the id-keyed read cache. A non-UUID id is not a principal id
+ * at all, so the guard steps aside and the route answers as it always has.
+ * Responds and returns true when it refused (or could not read the kind,
+ * which fails closed).
+ */
+async function refuseGroupPrincipal(req: AuthRequest, res: Response, route: string): Promise<boolean> {
+  const id = req.params.id;
+  if (typeof id !== 'string' || !PRINCIPAL_ID_PATTERN.test(id)) return false;
+  let kind: string | null;
+  try {
+    const row = await pool.query('SELECT kind FROM principals WHERE id = $1', [id]);
+    kind = row.rows[0]?.kind ?? null;
+  } catch (err) {
+    if (isMissingRelationError(err)) {
+      res.status(503).json({ error: 'Service Unavailable', message: 'Identity substrate is not migrated yet' });
+      return true;
+    }
+    const errorId = logCaughtFailure('[Principals API] principal kind lookup failed:', err);
+    sendApiError(res, 500, 'PRINCIPAL_KIND_UNREADABLE', 'Failed to read the principal', undefined, { errorId });
+    return true;
+  }
+  if (kind !== 'group') return false;
+  const targetPrincipalId = id.toLowerCase();
+  await auditService.record({
+    action: 'principal.mutation_refused', actor: auditActorFromRequest(req), outcome: 'denied',
+    resourceType: 'principal', resourceId: targetPrincipalId,
+    metadata: { refusal: GROUP_PRINCIPAL_MANAGED_BY_GROUPS, route, targetPrincipalId },
+  }).catch(() => undefined);
+  sendApiError(res, 422, GROUP_PRINCIPAL_MANAGED_BY_GROUPS,
+    'This principal is a Group. A Group principal is managed only through /groups: rename, delete and '
+    + 'PUT /groups/{id}/ownership-status (AZ-A12 clause 2).',
+    undefined, { groupId: targetPrincipalId });
+  return true;
+}
+
 const router = Router();
 
 /**
@@ -81,8 +138,10 @@ const CREDENTIAL_PLACEHOLDER = '<paste your connection credential here>';
 /** The seam every role-act audit row names, success or refusal. */
 const ROLE_ACT_SEAM = 'POST /principals/:id/role';
 
-/** Public shape: never expose metadata (it can carry spawn session keys). */
-function toApiPrincipal(p: {
+/** Public shape: never expose metadata (it can carry spawn session keys).
+ * Exported for the Access Explorer's directory projection (card 1e56dbef),
+ * which shows a principal exactly as this list does. */
+export function toApiPrincipal(p: {
   id: string;
   kind: string;
   handle: string;
@@ -115,13 +174,79 @@ function toApiPrincipal(p: {
   };
 }
 
+/** A human appoints or revokes Main only for their direct Service child.
+ * This changes no credential scope or object selector. */
+router.post('/:id/owner-control', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!isStoredLoginSessionKind(req.authMethod) || !req.sessionId || !req.principal
+    || req.principal.kind !== 'human' || req.principal.parentPrincipalId) {
+    res.status(403).json({ success: false, code: 'OWNER_SESSION_REQUIRED',
+      error: 'The owning human account must appoint its Main connector' }); return;
+  }
+  if (typeof req.body?.enabled !== 'boolean' || typeof req.body?.reason !== 'string'
+    || !req.body.reason.trim() || req.body.reason.length > 2000
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    res.status(400).json({ success: false, code: 'OWNER_CONTROL_INPUT_REQUIRED',
+      error: 'A connector ID, enabled boolean and reason are required' }); return;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rows = await client.query(
+      'SELECT id, kind, status, parent_principal_id, legacy_identity, bound_task_id FROM principals WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE',
+      [[req.principal.id, req.params.id]]);
+    const session = await client.query(
+      `SELECT id FROM auth_sessions WHERE id=$1 AND principal_id=$2
+       AND revoked_at IS NULL AND expires_at > clock_timestamp()
+       AND last_seen_at > clock_timestamp() - ($3::double precision * interval '1 millisecond')`,
+      [req.sessionId, req.principal.id, sessionIdleMs()]);
+    if (session.rows.length !== 1) {
+      await client.query('ROLLBACK');
+      res.status(403).json({ success: false, code: 'OWNER_SESSION_REQUIRED',
+        error: 'A current owner session is required' }); return;
+    }
+    const human = rows.rows.find(row => row.id === req.principal!.id);
+    const connector = rows.rows.find(row => row.id === req.params.id);
+    if (!human || human.kind !== 'human' || human.status !== 'active' || human.parent_principal_id
+      || human.legacy_identity || !connector || connector.kind !== 'service'
+      || connector.parent_principal_id !== human.id || connector.legacy_identity || connector.bound_task_id
+      || req.body.enabled && connector.status !== 'active') {
+      await client.query('ROLLBACK');
+      res.status(403).json({ success: false, code: 'OWN_CONNECTOR_REQUIRED',
+        error: 'Only a direct Service connector of this account can hold owner control' }); return;
+    }
+    await client.query('UPDATE principals SET owner_control_account_id=$2 WHERE id=$1',
+      [connector.id, req.body.enabled ? human.id : null]);
+    await auditService.record({ action: 'principal.owner_control', actor: auditActorFromRequest(req),
+      resourceType: 'principal', resourceId: connector.id,
+      metadata: { accountPrincipalId: human.id, enabled: req.body.enabled, reason: req.body.reason.trim() } }, client);
+    await client.query('COMMIT');
+    res.json({ success: true, connectorId: connector.id, ownerControlAccountId: req.body.enabled ? human.id : null });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    const errorId = logCaughtFailure('[Owner control] Appointment failed:', error);
+    res.status(500).json({ success: false, code: 'OWNER_CONTROL_FAILED', error: 'The Main appointment could not be updated', errorId });
+  } finally { client.release(); }
+});
+
 // GET /principals — list configured principals. Hidden compatibility rows are
 // available only to callers with management authority.
 router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const includeHidden = req.query.includeHidden === 'true' || req.query.includeHidden === '1';
     if (includeHidden && !requireManageAuthority(req, res)) return;
-    const principals = await principalService.listPrincipals(includeHidden);
+    // AZ-A12 clause 3(h): Group principals are not people and are not listed
+    // as principals unless the caller asks for kind=group. includeHidden never
+    // adds them.
+    const requestedKind = req.query.kind;
+    let kind: PrincipalKind | undefined;
+    if (requestedKind !== undefined) {
+      if (typeof requestedKind !== 'string' || !(PRINCIPAL_KINDS as readonly string[]).includes(requestedKind)) {
+        sendApiError(res, 400, 'INVALID_PRINCIPAL_KIND', `kind must be one of: ${PRINCIPAL_KINDS.join(', ')}`);
+        return;
+      }
+      kind = requestedKind as PrincipalKind;
+    }
+    const principals = await principalService.listPrincipals(includeHidden, kind);
     res.json({ success: true, principals: principals.map(toApiPrincipal) });
   } catch (err) {
     if (isMissingRelationError(err)) {
@@ -131,6 +256,15 @@ router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
     const errorId = logCaughtFailure('[Principals API] Error listing principals:', err);
     res.status(500).json({ error: 'Internal Server Error', code: 'PRINCIPALS_READ_FAILED', message: 'Failed to list principals', errorId });
   }
+});
+
+// GET /principals/roles — THE ROLE CATALOGUE (card a2d1e317): one entry per
+// assignable role, its purpose, the kinds it is meant for, and its scope
+// ceiling as derived from `scopesForRole`. Read-only and identical for every
+// caller, so it rides the `/principals` family GET ceiling (`principals:read`)
+// with no handler gate of its own; it names no principal and no object.
+router.get('/roles', (_req: AuthRequest, res: Response): void => {
+  res.json({ success: true, roles: roleCatalogue() });
 });
 
 // GET /principals/me — the caller's resolved principal. Legacy identities that
@@ -195,6 +329,42 @@ router.get('/me', async (req: AuthRequest, res: Response): Promise<void> => {
     // nothing — see `utils/identityScopes.delegableScopesForCaller`.
     delegableScopes: delegableScopesForCaller(req.authMethod, req.scopes),
   });
+});
+
+// GET /principals/me/lenses — THE LENS CONTRACT (RH-LENSES-d, card 4e159741;
+// design v7.1 `96f0bd3d` §8.3). Which dashboard sections this caller is
+// OFFERED: `member` always, `admin` for a root LOGIN SESSION. Ceiling
+// `authenticated` (its scopeMap rule sits above the /principals family), and
+// self-only by construction: there is no identifier in the path.
+//
+// A LENS GRANTS NOTHING (I-L2). It is recomputed here on every request from
+// two facts the request already carries - the server-derived authentication
+// kind and the route stage's own answer to "would this request pass a root
+// ceiling?" - and it is read by no other route: every section it leads to
+// keeps its own ceiling. Nothing is stored, cached or written to a token, and
+// the read is not audited (the effective-access class of read).
+//
+// LENSES-c c1-B (card b5c83682; design delta C.8): the MANAGER arm. The
+// Groups in which this principal holds a LIVE owner or manager row (the shared
+// fragment, read per request) are handed to the derivation, which emits the
+// arm - `manager` in `lenses` and `manager.stewardedGroups`, owners first -
+// only when there is at least one. With none, the payload carries no `manager`
+// key at all (A-L53). The arm confers nothing either (I-L2, control R-8-c).
+router.get('/me/lenses', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!req.principal) {
+    res.status(404).json({ error: 'Not Found', message: 'No principal resolved for this identity' });
+    return;
+  }
+  try {
+    // The ROUTE STAGE's own decision, asked of the same service the stage asks,
+    // exactly as GET /principals/me asks it for the Settings menu.
+    const rootAuthorized = authorizationService.authorizeRoute(actorFromRequest(req), ROOT_SCOPE).allowed;
+    const stewardedGroups = await groupStewardService.stewardedGroupsFor(req.principal.id);
+    res.json(lensesFor({ authMethod: req.authMethod, rootAuthorized, stewardedGroups }));
+  } catch (e) {
+    const errorId = logCaughtFailure('[Principals API] lenses unavailable', e);
+    sendApiError(res, 500, 'INTERNAL_ERROR', 'The lenses could not be read', undefined, { errorId });
+  }
 });
 
 // GET /principals/me/effective-access — the SELF preview (AZ-S2, design
@@ -290,11 +460,17 @@ router.get('/me/effective-access', async (req: AuthRequest, res: Response): Prom
     return;
   }
   try {
-    const access = await accessProfileService.effectiveAccess(req.principal.id);
+    const { authorityPreviewService, previewOptions } = await import('../services/AuthorityPreviewService');
+    const access = await authorityPreviewService.self(req, previewOptions(req.query));
     res.json({ success: true, access });
   } catch (e) {
+    // AuthorityPreviewError is a RequestFaultError: developer-authored refusals.
+    if (e instanceof RequestFaultError) {
+      res.status(e.status).json({ error: e.code, code: e.code, message: e.message });
+      return;
+    }
     const errorId = logCaughtFailure('[Principals API] effective-access failed:', e);
-    res.status(500).json({ error: 'Internal Server Error', code: 'EFFECTIVE_ACCESS_FAILED', message: 'Failed to compute effective access', errorId });
+    res.status(503).json({ error: 'Service Unavailable', code: 'EFFECTIVE_ACCESS_FAILED', message: 'Failed to compute effective access', errorId });
   }
 });
 
@@ -392,6 +568,7 @@ router.delete('/me/home-group', async (req: AuthRequest, res: Response): Promise
  * AZ-18 refuses.
  */
 router.put('/:id/home-group', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'PUT /principals/:id/home-group')) return;
   const session = classifyLoginSession(req.authMethod, "Setting another Account's home group");
   if (!session.ok) {
     sendApiError(res, session.status, session.code, session.message);
@@ -494,9 +671,20 @@ router.get('/me/connectors', async (req: AuthRequest, res: Response): Promise<vo
     res.json({
       success: true,
       connectors,
+      // The editor's transport menu needs the server's session decision. A
+      // principal role alone cannot distinguish a login from a bearer caller.
+      mayLoosenCredentialTransport: Boolean(req.scopes?.includes('root')) || administratorSessionOf({
+        authMethod: req.authMethod,
+        handle: req.userId,
+        principalRole: req.principal.role ?? null,
+        sessionRole: req.sessionRole ?? null,
+      }, resolveActorRole, AUTHORITY_EDIT_ACT).ok,
       instructions: {
         boardEndpoint: instructionPack.boardEndpoint,
         bootstrapLine: instructionPack.bootstrapLine,
+        // Card 94e8bb0b: credential-free by construction, so re-shown verbatim.
+        bootstrapPrompt: instructionPack.bootstrapPrompt,
+        configurationGuidance: instructionPack.configurationGuidance,
         mcpConfig: instructionPack.mcpConfig,
         cliEnv: instructionPack.cliEnv,
         previewPath: instructionPack.previewPath,
@@ -514,7 +702,7 @@ router.get('/me/connectors', async (req: AuthRequest, res: Response): Promise<vo
 });
 
 // GET /principals/remediation-queue — the §10 Access-manager remediation
-// queue (AZ-S4, design 4d961e37 §10, sol M9; owner plane — root by the
+// queue (AZ-S4, design 4d961e37 §10, review M9; owner plane — root by the
 // scope map): every legacy_identity row (frozen out of the new machinery,
 // evaluated under the Phase-2 arms until the owner-executed Phase-5
 // transition) and every parentless service Account still carrying the
@@ -578,6 +766,20 @@ router.get('/remediation-queue', async (_req: AuthRequest, res: Response): Promi
 
 // ── Management (CB-5) ───────────────────────────────────────────────────────
 
+/** Management writes and their audit row commit together; caches publish after COMMIT. */
+async function auditedPrincipalWrite<T>(write: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await write(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
 // POST /principals — create a human, service, or agent identity.
 router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
   if (!requireManageAuthority(req, res)) return;
@@ -635,17 +837,24 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
       return;
     }
 
-    const created = await principalService.createPrincipal({
-      purpose: purpose || null,
-      handle: handleCheck.handle,
-      kind,
-      displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : null,
-      role: requestedRole,
+    const created = await auditedPrincipalWrite(async client => {
+      const principal = await principalService.createPrincipal({
+        purpose: purpose || null,
+        handle: handleCheck.handle,
+        kind,
+        displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : null,
+        role: requestedRole,
+      }, client);
+      if (principal) await auditService.record({ action: 'principal.create', actor: auditActorFromRequest(req),
+        resourceType: 'principal', resourceId: principal.id,
+        metadata: { kind: principal.kind, handle: principal.handle, role: principal.role } }, client);
+      return principal;
     });
     if (!created) {
       res.status(409).json({ error: 'Conflict', message: 'A principal with that handle already exists' });
       return;
     }
+    principalService.cachePrincipal(created);
     res.status(201).json({ success: true, principal: toApiPrincipal(created) });
   } catch (err) {
     if (isMissingRelationError(err)) {
@@ -662,6 +871,7 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
 // credential whose principal is not active, so this invalidates every key the
 // principal holds without touching the credential rows.
 router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'PATCH /principals/:id')) return;
   if (!requireManageAuthority(req, res)) return;
   try {
     const status = req.body?.status;
@@ -693,10 +903,17 @@ router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
       });
       return;
     }
-    const updated = await principalService.updatePrincipal(req.params.id, {
+    // The account-status seam (E325 section 3 `identity.status`, section 12
+    // Q31 (a)): the same function the decision of an approved identity.status
+    // change calls. A disable now also revokes the principal's stored login
+    // sessions and lapses the pending requests naming it as grantee, in this
+    // transaction (the declared tightening of AZ-A4's reversible disable).
+    const updated = await auditedPrincipalWrite(async client => (await principalService.applyAccountStatus(client, {
+      principalId: req.params.id,
       displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
-      status,
-    });
+      status, actor: auditActorFromRequest(req),
+    })).principal);
+    if (updated && (typeof req.body?.displayName === 'string' || status !== undefined)) principalService.cachePrincipal(updated);
     res.json({ success: true, principal: updated ? toApiPrincipal(updated) : null });
   } catch (err) {
     const errorId = logCaughtFailure('[Principals API] update failed:', err);
@@ -769,6 +986,7 @@ router.patch('/:id', async (req: AuthRequest, res: Response): Promise<void> => {
  * leaving the caller to guess.
  */
 router.post('/:id/role', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'POST /principals/:id/role')) return;
   const deny = async (status: number, code: string, message: string, targetId: string | null): Promise<void> => {
     await auditService.record({
       action: 'principal.role.changed', actor: auditActorFromRequest(req), outcome: 'denied',
@@ -792,62 +1010,17 @@ router.post('/:id/role', async (req: AuthRequest, res: Response): Promise<void> 
 
     // The identifier is caller data on a route whose column is a canonical
     // `uuid`: a malformed value is a 404, never a driver error.
-    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
       await deny(404, 'PRINCIPAL_NOT_FOUND', 'Principal not found', null);
       return;
     }
 
-    const requestedRole = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
-    if (!requestedRole) {
-      await deny(400, 'ROLE_REQUIRED', 'role is required', req.params.id);
-      return;
-    }
-    if (!ASSIGNABLE_ROLES.has(requestedRole)) {
-      await deny(400, 'UNKNOWN_ROLE',
-        `'${requestedRole}' is not a role. Assignable roles: ${[...ASSIGNABLE_ROLES].sort().join(', ')}.`,
-        req.params.id);
-      return;
-    }
-
-    const target = await principalService.getPrincipalById(req.params.id);
-    if (!target) {
-      await deny(404, 'PRINCIPAL_NOT_FOUND', 'Principal not found', req.params.id);
-      return;
-    }
-
-    if (req.principal?.id && req.principal.id === target.id) {
-      await deny(403, 'SELF_ROLE_CHANGE_REFUSED',
-        'An administrator does not change their own role — ask another administrator.',
-        target.id);
-      return;
-    }
-    if (refusesCredentials(target.handle)) {
-      await deny(422, 'PRINCIPAL_REFUSES_ROLE_CHANGE',
-        `'${target.handle}' is the request-less internal actor and carries no assignable role`,
-        target.id);
-      return;
-    }
-    if (target.handle === localAdministratorHandle()) {
-      await deny(422, 'LOCAL_ADMINISTRATOR_ROLE_FIXED',
-        'The named local administrator is the break-glass identity; its role is fixed so the deployment always has a way back in (the same rule that refuses to disable it).',
-        target.id);
-      return;
-    }
-    if (!canAssignRole(session.issuerRole, requestedRole)) {
-      await deny(403, 'ROLE_ABOVE_YOUR_AUTHORITY',
-        `Cannot assign role '${requestedRole}' — it is above your own authority ('${session.issuerRole}').`,
-        target.id);
-      return;
-    }
-    if (ELEVATED_ROLES.has(requestedRole) && (target.kind !== 'human' || target.parentPrincipalId !== null)) {
-      await deny(422, 'ELEVATED_ROLE_REQUIRES_ACCOUNT',
-        `An elevated role belongs only to a parentless human Account; '${target.handle}' is a ${target.kind}${target.parentPrincipalId ? ' with a parent' : ''} (design 4d961e37 §7.1; migration 096 principals_elevated_parentless).`,
-        target.id);
-      return;
-    }
-
-    const previousRole = target.role;
-
+    // THE CHECKS, THE WRITE AND ITS LEDGER ROW are the one role-change seam
+    // (`PrincipalRoleService.change`, lifted for the universal change request,
+    // E325 section 3 `identity.role`): the decision of an approved request
+    // calls the same function with the decider as the issuer, so the two doors
+    // onto the role axis refuse by the same codes and write the same row.
+    //
     // THE WRITE AND ITS LEDGER ROW COMMIT TOGETHER, OR NEITHER DOES (review
     // verdict 2c284891 B2). Before this, the UPDATE autocommitted and the audit
     // row followed on its own connection: a ledger that rejected left the role
@@ -859,30 +1032,34 @@ router.post('/:id/role', async (req: AuthRequest, res: Response): Promise<void> 
     // The REFUSALS above deliberately keep their fire-and-forget audit: they
     // change nothing, so a ledger outage must not convert a refusal into a 500 —
     // the caller is refused either way, which is the safe direction.
-    const client = await pool.connect();
-    let updated: Principal | undefined;
+    let prepared;
     try {
-      await client.query('BEGIN');
-      updated = await principalService.updatePrincipal(target.id, { role: requestedRole }, client);
-      if (!updated) {
-        await client.query('ROLLBACK');
-        await deny(404, 'PRINCIPAL_NOT_FOUND', 'Principal not found', target.id);
+      prepared = await principalRoleService.prepare({
+        targetId: req.params.id, role: req.body?.role,
+        issuer: { principalId: req.principal?.id ?? null, issuerRole: session.issuerRole },
+      });
+    } catch (err) {
+      if (err instanceof RoleChangeError) {
+        await deny(err.status, err.code, err.message, err.targetId);
         return;
       }
-      await auditService.record({
-        action: 'principal.role.changed', actor: auditActorFromRequest(req),
-        resourceType: 'principal', resourceId: updated.id,
-        metadata: {
-          targetHandle: updated.handle,
-          before: previousRole,
-          after: updated.role,
-          issuerRole: session.issuerRole,
-          seam: ROLE_ACT_SEAM,
-        },
-      }, client);
+      throw err;
+    }
+    const client = await pool.connect();
+    let updated: Principal;
+    let previousRole: string | null;
+    try {
+      await client.query('BEGIN');
+      ({ updated, previousRole } = await principalRoleService.apply(client, prepared, {
+        actor: auditActorFromRequest(req), seam: ROLE_ACT_SEAM,
+      }));
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
+      if (err instanceof RoleChangeError) {
+        await deny(err.status, err.code, err.message, err.targetId);
+        return;
+      }
       throw err;
     } finally {
       client.release();
@@ -923,9 +1100,10 @@ router.get('/:id/credentials', async (req: AuthRequest, res: Response): Promise<
   // Agents' rows (secrets excluded; reveal keeps its own step-up gate).
   // Bearer callers keep the pre-S4 own/manage split.
   const inSubtree = !isOwn && isLoginSessionKind(req.authMethod) && req.principal?.id != null
-    && /^[0-9a-f-]{36}$/i.test(req.params.id)
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)
     && await credentialLifecycleService.isDescendant(req.principal.id, req.params.id);
   if (!isOwn && !inSubtree && !requireManageAuthority(req, res)) return;
+  if (!PRINCIPAL_ID_PATTERN.test(req.params.id)) { sendApiError(res, 400, 'INVALID_PRINCIPAL_ID', 'principal id must be a full UUID'); return; } // card 9cdc6b27
   try {
     const credentials = await principalService.listCredentials(req.params.id);
     res.json({ success: true, credentials });
@@ -968,6 +1146,7 @@ router.get('/:id/grants', async (req: AuthRequest, res: Response): Promise<void>
 // POST /principals/:id/credentials — mint a key. The full key appears in this
 // response and nowhere else, ever: not in a log line, not in any later read.
 router.post('/:id/credentials', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'POST /principals/:id/credentials')) return;
   const authority = requireManageAuthority(req, res);
   if (!authority) return;
   try {
@@ -1035,7 +1214,7 @@ router.post('/:id/credentials', async (req: AuthRequest, res: Response): Promise
 
     // Deliberately no logging of issued.fullKey on any path.
     console.log(`[Principals API] issued credential ${issued.keyId} for ${target.handle} (${scopeCheck.scopes.join(', ')})`);
-    // §7.4 (RH-P3.AZ-S5, sol m11): a CONNECTOR credential issuance carries
+    // §7.4 (RH-P3.AZ-S5, review m11): a CONNECTOR credential issuance carries
     // the one-time onboarding pack — board endpoint, MCP snippets, the
     // §2.10 bootstrap line, CLI env and the authority summary. Rendered
     // once, never stored.
@@ -1203,7 +1382,7 @@ async function authorizePasswordAct(req: AuthRequest, res: Response): Promise<Pa
 
   // Caller data on a route whose column is a canonical `uuid`: a malformed
   // value is a 404, never a driver error.
-  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
     return deny(404, 'PRINCIPAL_NOT_FOUND', 'Principal not found', null);
   }
   const target = await principalService.getPrincipalById(req.params.id);
@@ -1222,6 +1401,7 @@ async function authorizePasswordAct(req: AuthRequest, res: Response): Promise<Pa
 }
 
 router.put('/:id/password', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'PUT /principals/:id/password')) return;
   const authority = await authorizePasswordAct(req, res);
   if (!authority.ok) return;
   const self = authority.self;
@@ -1276,6 +1456,7 @@ router.put('/:id/password', async (req: AuthRequest, res: Response): Promise<voi
 });
 
 router.delete('/:id/password', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'DELETE /principals/:id/password')) return;
   // The same guard, for the reason in its header: clearing a password is how a
   // person loses their way in, and a verb that only tightened one direction
   // would open a bigger hole than it closed.
@@ -1307,7 +1488,9 @@ function sendCredentialLifecycleError(res: Response, e: unknown): boolean {
 }
 
 router.post('/:id/terminate', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (await refuseGroupPrincipal(req, res, 'POST /principals/:id/terminate')) return;
   if (!requireManageAuthority(req, res)) return;
+  if (!PRINCIPAL_ID_PATTERN.test(req.params.id)) { sendApiError(res, 400, 'INVALID_PRINCIPAL_ID', 'principal id must be a full UUID'); return; } // card 9cdc6b27
   try {
     const result = await credentialLifecycleService.terminate(req.params.id, auditActorFromRequest(req));
     res.json({ success: true, ...result });

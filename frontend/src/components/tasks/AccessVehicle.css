@@ -83,3 +83,9 @@
   color: var(--text-secondary);
   font-style: italic;
 }
+
+/* AZ-A10 clause 6: when a grant row ends. A standalone rule, so the rendered
+   class is owned by this sheet. */
+.access-vehicle-expiry {
+  color: var(--text-secondary);
+}

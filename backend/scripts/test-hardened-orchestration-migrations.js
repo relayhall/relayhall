@@ -224,7 +224,7 @@ async function assertDbBackedReviewVerdict(database) {
         { id: '1', text: 'reviewed slice', status: 'review', reviewNote: 'commit 0123456789012345678901234567890123456789' },
         { id: '2', text: 'future slice', status: 'empty' },
       ],
-      links: [], tags: [], blockedBy: [], autoCreated: false, autoStart: false,
+      links: [], tags: [], blockedBy: [], autoStart: false,
       created: taskRow.rows[0].updated_at.toISOString(),
       updated: taskRow.rows[0].updated_at.toISOString(),
       attemptCount: 0,

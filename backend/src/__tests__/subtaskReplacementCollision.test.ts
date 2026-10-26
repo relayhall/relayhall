@@ -17,7 +17,6 @@
 import { TaskManagerDB } from '../services/TaskManagerDB';
 
 jest.mock('../db/connection', () => ({ pool: { query: jest.fn(async () => ({ rows: [] })) } }));
-jest.mock('../services/NotificationManager', () => ({ notificationManager: { notifyStatusChange: jest.fn() } }));
 jest.mock('../services/AuditService', () => ({ auditService: { record: jest.fn() } }));
 jest.mock('../services/LifecyclePolicyService', () => ({ lifecyclePolicyService: { evaluate: jest.fn() } }));
 jest.mock('../services/TaskHistoryService', () => ({
@@ -39,8 +38,8 @@ class FakeDb {
     this.taskRow = {
       id: TASK_ID, title: 'Fixture task', description: '', status: 'todo', priority: 'normal',
       project_id: null, phase_id: null, notes: null, auto_start: false, blocked_reason: null,
-      status_reason: null, active_agent: null, completed_by: null, attempt_count: 0,
-      session_refs: '[]', parent_id: null, personality_id: null,
+      status_reason: null, attempt_count: 0,
+      parent_id: null, personality_id: null,
       created_at: '2026-08-21T00:00:00Z', updated_at: '2026-08-21T00:00:00Z',
       started_at: null, completed_at: null, archived_at: null, archive_disposition: null,
     };

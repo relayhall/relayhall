@@ -149,3 +149,65 @@
     font-size: var(--text-xl);
   }
 }
+
+/* ==========================================================================
+   THE HOST'S OWN FLOATING MOBILE CHROME, RESERVED BY THE HOST
+   ==========================================================================
+   Below 1280px the shell floats two FIXED controls over whatever the route
+   renders (Sidebar.css): `.sidebar-hamburger`, top/left 14px and 44x44, which
+   occupies y 14..58; and `.sidebar-mobile-account`, top/right 14px and 44px
+   tall, on the same row (y 14..58). Every core page reserves its own space
+   for them by hand — the `padding-left: 76px` and `padding-top: 60px`
+   declarations in TasksPage.css, ProjectsPage.css, AboutPage.css and the rest.
+
+   A plugin ROUTE has no such page. It renders this container and an iframe
+   whose interior the host neither owns nor can read, so the reservation has to
+   be made HERE: once, by the host, as a full-width band that is correct for
+   every plugin present and future. Asking plugins to do it would repeat the
+   same workaround in every plugin and still be missing from the next one.
+
+   OPT-IN, AND ONLY FOR THE ROUTE. `.plugin-frame-container` is not the route's
+   class: `PluginSettingsPage` embeds the very same container halfway down the
+   settings hub (`PluginSettingsPage.tsx`), where the chrome is hundreds of
+   pixels away and a band is a hole in the page. So the geometry hangs off a
+   modifier the frame emits only when it IS the route's page, declared
+   standalone so the ownership gate can attribute it, and a third consumer of
+   the shared class inherits nothing. `PluginFrame` takes the surface as a
+   REQUIRED prop, so a new call site cannot forget to say which it is. */
+.plugin-frame-container--route {
+  --plugin-chrome-safe-top: 4rem;
+}
+
+@media (max-width: 1279px) {
+  .plugin-frame-container--route {
+    /* Measured from the VIEWPORT, so the frame's top lands on the band whatever
+       `--page-inset` happens to be at this width. */
+    margin-top: max(0px, calc(var(--plugin-chrome-safe-top) - var(--page-inset, 0px)));
+    /* Gives back `.main-content`'s bottom inset. Without it the frame overflows
+       `.main-content`, `.main-content` scrolls, and a scroll slides the plugin
+       straight back under the fixed chrome this band exists to clear. */
+    margin-bottom: calc(-1 * var(--page-inset, 0px));
+    /* THE HEIGHT IS DERIVED FROM THE BAND, not left to coincide with it. The
+       desktop rule subtracts a 4rem that happens to equal this band at one
+       viewport and stops being enough at another: at 390x640 the 600px floor
+       below made the frame overflow, `.main-content` scrolled, and one scroll
+       put the menu back over the iframe — the exact failure the band exists to
+       prevent. Reserving the band and then filling what is left cannot have a
+       window: the frame runs from the band to the bottom of the viewport at
+       every size, which is why the floors are dropped here rather than clamped.
+       `svh` and not `vh`: on a phone `100vh` is the viewport with the URL bar
+       HIDDEN, so a frame sized to it hangs under the bar the moment the bar is
+       showing. `svh` is the height that is always visible. On a desktop, in
+       headless Chrome and anywhere without retracting browser chrome the two
+       are identical, so this changes no measurement below and is not something
+       this pass can claim to have proved. */
+    height: calc(100svh - var(--plugin-chrome-safe-top));
+    min-height: 0;
+  }
+
+  .plugin-frame-container--route .plugin-iframe {
+    /* Same reason: a 400/600px floor on the iframe would re-create the overflow
+       inside a frame that now fits the viewport exactly. */
+    min-height: 0;
+  }
+}

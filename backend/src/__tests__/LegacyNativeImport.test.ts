@@ -1,0 +1,8 @@
+import {validateLegacyNativeImport} from '../services/LegacyNativeImport';
+const task='11111111-1111-4111-8111-111111111111';
+const original=()=>({schemaVersion:1,deploymentId:task,storeId:'22222222-2222-4222-8222-222222222222',snapshotSha256:'a'.repeat(64),taskId:task,legacyReservation:{taskId:task,reservationId:'33333333-3333-4333-8333-333333333333',cursor:'9',descriptionSha256:'b'.repeat(64),reservedAt:'2026-09-01T00:00:00Z',expiresAt:'2026-09-01T00:10:00Z'},bindRows:[],consumeRows:[],jobs:[],outbox:[{id:'44444444-4444-4444-8444-444444444444',body:'{"kind":"retained"}',status:'accepted',tries:1,next:0}],artifacts:[{path:'edit-custody/retained.dpapi',sha256:'c'.repeat(64),byteLength:12,encrypted:true}]});
+test('quarantine preserves exact original values and expired evidence is not live authority',()=>{const x=original(),raw=JSON.stringify(x);validateLegacyNativeImport(x);expect(JSON.stringify(x)).toBe(raw);});
+test.each(['unknown','root','cursor','expiry','body','status','tries','artifact','duplicates','orphan'])('quarantine refuses %s',kind=>{const x:any=original();
+ if(kind==='unknown')x.runnable=true;if(kind==='root')x.legacyReservation={};if(kind==='cursor')x.legacyReservation.cursor='09';if(kind==='expiry')x.legacyReservation.expiresAt=x.legacyReservation.reservedAt;
+ if(kind==='body')x.outbox[0].body='{';if(kind==='status')x.outbox[0].status='invented';if(kind==='tries')x.outbox[0].tries=true;if(kind==='artifact')x.artifacts[0].path='../foreign';if(kind==='duplicates')x.artifacts.push(x.artifacts[0]);if(kind==='orphan')x.consumeRows.push({reservationId:task,bindId:task,consumedAt:'2026-09-01T00:01:00Z'});
+ expect(()=>validateLegacyNativeImport(x)).toThrow();});

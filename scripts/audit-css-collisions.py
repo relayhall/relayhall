@@ -109,7 +109,7 @@ GLOBAL_DOMAIN = "styles/ + index.css + App.css (global domain)"
 
 
 def domain_of(rel: str) -> str:
-    parts = rel.split("/")
+    parts = rel.replace("\\", "/").split("/")
     if parts[-2] == "styles" or parts[-1] in ("index.css", "App.css"):
         return GLOBAL_DOMAIN
     return rel

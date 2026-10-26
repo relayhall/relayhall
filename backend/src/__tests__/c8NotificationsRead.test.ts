@@ -1,66 +1,55 @@
 /**
- * c8NotificationsRead.test.ts — RH-P3.C8 round 2 (review 4243b06e B1): the
- * notification READ MODEL, driven over the production route with TWO
- * differently-granted principals through the REAL shared-authorization
- * middleware:
- *  - the entitled human sees a useful task.stuck notification;
- *  - an under-granted principal gets neither the title nor any other
- *    private content of a Task their grants do not cover (the never-waived
- *    concealment class);
- *  - addressing: a notification addressed to principal B never reaches
- *    principal A; broadcasts reach whoever passes the grant filter; root
- *    sees the addressed set it is entitled to (everything, by blanket).
+ * c8NotificationsRead.test.ts — RH-P3.C8 round 2 (review 4243b06e B1), the
+ * notification READ MODEL's route, re-pointed at its new source (card
+ * b1e3b16d, hub lane L2).
+ *
+ * WHERE EACH ASSERTION LIVES NOW. The read model used to be a JSON file the
+ * route filtered in memory, so this file could prove the addressing and grant
+ * filters with a mocked store. Lane L2 moved both filters INTO SQL (the shared
+ * task predicate as a semi-join; the stuck notice addressed to
+ * COALESCE(shepherd, creator, owner)), and a mocked pool cannot evaluate SQL.
+ * The four C8 assertions are therefore measured on a REAL PostgreSQL in
+ * `notificationReadStateLive.test.ts`, under the same names:
+ *  - the entitled human sees the notice addressed to them   -> (5) first test;
+ *  - an under-granted principal is concealed: no title, no row -> (4) and (5);
+ *  - a caller with NO grants sees nothing                     -> (4) "C, with no grant at all";
+ *  - root sees the full addressed set                         -> (5) "root sees the full addressed set".
+ *
+ * What THIS file still proves, with no database: the production route hands
+ * the CALLER's identity — principal, root, session — to the read model and no
+ * one else's; `who` defaults to "My work" (E44 Q4); a filter outside the
+ * grammar is a 400, never a silently wider list; an identity with no principal
+ * is refused rather than shown an empty list it could mistake for "nothing new";
+ * and the envelope reports exactly what the read model returned.
  */
 import express from 'express';
 import type { AddressInfo } from 'net';
 
-const TASK_VISIBLE = '11111111-1111-4111-8111-111111111111';
-const TASK_PRIVATE = '22222222-2222-4222-8222-222222222222';
 const ALICE = '99999999-9999-4999-8999-999999999999';
-const BOB = '88888888-8888-4888-8888-888888888888';
+const TASK = '11111111-1111-4111-8111-111111111111';
 
-const grants = new Map<string, Set<string>>();
+const calls: { list: any[]; count: any[]; read: any[]; readAll: any[] } = { list: [], count: [], read: [], readAll: [] };
+const ROW = {
+  id: 'feed:42', type: 'stuck', event: 'exception', taskId: TASK, taskTitle: 'Shared fixture task',
+  from: null, to: null, timestamp: '2026-10-10T04:01:00.000Z', read: false, actorHandle: null,
+  exception: { name: 'task.stuck', reason: 'status_stale' }, cursor: '1760068860000000.feed:42',
+};
 
 jest.mock('../db/connection', () => ({
   pool: { query: jest.fn(async () => ({ rows: [] })), connect: jest.fn() },
 }));
-jest.mock('../services/AuthorizationRepository', () => ({
-  authorizationRepository: {
-    authorizedIds: jest.fn(async (actor: any, _type: string, ids: string[]) => {
-      const allowed = grants.get(String(actor?.principalId)) ?? new Set<string>();
-      return new Set(ids.filter((id) => allowed.has(id)));
-    }),
-  },
-}));
-jest.mock('../services/NotificationManager', () => ({
-  notificationManager: {
-    getUnreadNotifications: jest.fn(async () => [
-      {
-        id: 'n-broadcast', taskId: TASK_VISIBLE, taskTitle: 'Shared fixture task',
-        event: 'status_changed', from: 'todo', to: 'in-progress',
-        changedBy: 'system', timestamp: '2026-08-22T04:00:00.000Z', read: false,
-        recipientPrincipalId: null,
-      },
-      {
-        id: 'n-alice', taskId: TASK_VISIBLE, taskTitle: 'Shared fixture task',
-        event: 'exception', from: 'in-progress', to: 'in-progress',
-        changedBy: 'system', timestamp: '2026-08-22T04:01:00.000Z', read: false,
-        exception: { name: 'task.stuck', reason: 'status_stale' },
-        recipientPrincipalId: ALICE,
-      },
-      {
-        id: 'n-private', taskId: TASK_PRIVATE, taskTitle: 'SECRET private task title',
-        event: 'exception', from: 'in-progress', to: 'in-progress',
-        changedBy: 'system', timestamp: '2026-08-22T04:02:00.000Z', read: false,
-        exception: { name: 'task.stuck', reason: 'lease_expired' },
-        recipientPrincipalId: null,
-      },
-    ]),
-    getNotifications: jest.fn(async () => []),
-    markAsRead: jest.fn(async () => true),
-    markAllAsRead: jest.fn(async () => 0),
-  },
-}));
+jest.mock('../services/NotificationHistoryService', () => {
+  const actual = jest.requireActual('../services/NotificationHistoryService');
+  return {
+    ...actual,
+    notificationHistoryService: {
+      list: jest.fn(async (viewer: any, query: any) => { calls.list.push({ viewer, query }); return { notifications: [ROW], nextCursor: null, hasMore: false }; }),
+      unreadCount: jest.fn(async (viewer: any, query: any) => { calls.count.push({ viewer, query }); return 1; }),
+      markRead: jest.fn(async (viewer: any, key: string) => { calls.read.push({ viewer, key }); return key === 'feed:42'; }),
+      markAllRead: jest.fn(async (viewer: any, query: any) => { calls.readAll.push({ viewer, query }); return 3; }),
+    },
+  };
+});
 jest.mock('../services/TaskManagerDB', () => {
   const actual = jest.requireActual('../services/TaskManagerDB');
   return {
@@ -92,7 +81,8 @@ import tasksRouter from '../routes/tasks';
 
 const identity = {
   principal: { id: ALICE, handle: 'alice' } as { id: string; handle: string } | null,
-  scopes: ['tasks:read'] as string[],
+  scopes: ['tasks:read', 'tasks:write'] as string[],
+  authMethod: 'session' as string | undefined,
 };
 
 let server: ReturnType<typeof express.application.listen>;
@@ -104,6 +94,7 @@ beforeAll((done) => {
   app.use((req, _res, next) => {
     (req as any).principal = identity.principal;
     (req as any).scopes = identity.scopes;
+    (req as any).authMethod = identity.authMethod;
     (req as any).userId = identity.principal?.handle ?? 'anon';
     next();
   });
@@ -115,52 +106,80 @@ beforeAll((done) => {
 });
 afterAll((done) => { server.close(() => done()); });
 beforeEach(() => {
-  grants.clear();
+  calls.list = []; calls.count = []; calls.read = []; calls.readAll = [];
   identity.principal = { id: ALICE, handle: 'alice' };
-  identity.scopes = ['tasks:read'];
+  identity.scopes = ['tasks:read', 'tasks:write'];
+  identity.authMethod = 'session';
 });
 
-const read = async () => {
-  const response = await fetch(`${base}/tasks/notifications?unread=true`);
+const get = async (query = '') => {
+  const response = await fetch(`${base}/tasks/notifications${query}`);
   return { status: response.status, body: (await response.json()) as any };
 };
 
-describe('GET /tasks/notifications — recipient-addressed, grant-filtered (4243b06e B1)', () => {
-  test('the entitled human sees the broadcast AND the notice addressed to them', async () => {
-    grants.set(ALICE, new Set([TASK_VISIBLE]));
-    const { status, body } = await read();
+describe('GET /tasks/notifications — the route hands the CALLER to the read model', () => {
+  test('the caller\'s principal, root flag and session standing reach the read model; My work is the default', async () => {
+    const { status, body } = await get('?unread=true');
     expect(status).toBe(200);
-    const ids = body.notifications.map((n: any) => n.id).sort();
-    expect(ids).toEqual(['n-alice', 'n-broadcast']);
-    const stuck = body.notifications.find((n: any) => n.id === 'n-alice');
-    expect(stuck.exception).toEqual({ name: 'task.stuck', reason: 'status_stale' });
-    expect(stuck.taskTitle).toBe('Shared fixture task');
-    expect(body.unreadCount).toBe(2);
+    expect(calls.list).toHaveLength(1);
+    const { viewer, query } = calls.list[0];
+    expect({ principalId: viewer.principalId, isRoot: viewer.isRoot, isSession: viewer.isSession })
+      .toEqual({ principalId: ALICE, isRoot: false, isSession: true });
+    expect(viewer.taskScope.type).toBe('task');
+    expect(query).toMatchObject({ who: 'mine', types: [], unreadOnly: true, before: null, limit: 50 });
+    expect(body).toMatchObject({ success: true, count: 1, unreadCount: 1, unreadCountCapped: false, who: 'mine', hasMore: false });
+    expect(body.notifications).toEqual([ROW]);
   });
 
-  test('an under-granted principal is concealed from the private Task — no title, no row', async () => {
-    grants.set(BOB, new Set([TASK_VISIBLE]));
-    identity.principal = { id: BOB, handle: 'bob' };
-    const { body } = await read();
-    const ids = body.notifications.map((n: any) => n.id);
-    // The broadcast about the readable Task arrives; the notice ADDRESSED to
-    // alice does not; the private-Task broadcast is concealed entirely.
-    expect(ids).toEqual(['n-broadcast']);
-    expect(JSON.stringify(body)).not.toContain('SECRET private task title');
+  test('a bearer caller is not a session: the read model is told so (approval rows are session-only)', async () => {
+    identity.authMethod = 'principal_api_key';
+    await get();
+    expect(calls.list[0].viewer.isSession).toBe(false);
+    expect(calls.list[0].viewer.isAdministrator).toBe(false);
   });
 
-  test('a caller with NO grants sees nothing — and no private content leaks through the envelope', async () => {
-    identity.principal = { id: BOB, handle: 'bob' };
-    const { body } = await read();
-    expect(body.notifications).toEqual([]);
-    expect(body.count).toBe(0);
-    expect(JSON.stringify(body)).not.toContain('SECRET');
-  });
-
-  test('root sees the full addressed set (blanket entitlement)', async () => {
-    grants.set(ALICE, new Set([TASK_VISIBLE, TASK_PRIVATE]));
+  test('root is passed as root', async () => {
     identity.scopes = ['root'];
-    const { body } = await read();
-    expect(body.notifications.map((n: any) => n.id).sort()).toEqual(['n-alice', 'n-broadcast', 'n-private']);
+    await get('?who=all');
+    expect(calls.list[0].viewer.isRoot).toBe(true);
+    expect(calls.list[0].query.who).toBe('all');
+  });
+
+  test('filters outside the grammar are refused by name, never widened', async () => {
+    expect((await get('?type=bogus')).body.code).toBe('INVALID_NOTIFICATION_FILTER');
+    expect((await get('?who=everyone')).body.code).toBe('INVALID_NOTIFICATION_FILTER');
+    expect((await get('?before=1.nope')).body.code).toBe('INVALID_NOTIFICATION_CURSOR');
+    expect((await get('?limit=0')).body.code).toBe('INVALID_NOTIFICATION_LIMIT');
+    expect(calls.list).toHaveLength(0);
+    await get('?type=status,stuck');
+    expect(calls.list[0].query.types).toEqual(['status', 'stuck']);
+  });
+
+  test('an identity with no principal is refused, not shown an empty list', async () => {
+    identity.principal = null;
+    const { status, body } = await get();
+    expect([status, body.code]).toEqual([403, 'PRINCIPAL_REQUIRED']);
+    expect(calls.list).toHaveLength(0);
+  });
+});
+
+describe('POST /tasks/notifications/:id/read and /read-all — the caller\'s own state', () => {
+  test('mark read passes the caller and the key; an unseen key answers 404', async () => {
+    const ok = await fetch(`${base}/tasks/notifications/feed:42/read`, { method: 'POST' });
+    expect(ok.status).toBe(200);
+    expect(calls.read[0]).toMatchObject({ key: 'feed:42', viewer: { principalId: ALICE } });
+    const missing = await fetch(`${base}/tasks/notifications/feed:43/read`, { method: 'POST' });
+    expect([missing.status, ((await missing.json()) as any).code]).toEqual([404, 'NOTIFICATION_NOT_FOUND']);
+    const malformed = await fetch(`${base}/tasks/notifications/not-a-key/read`, { method: 'POST' });
+    expect(malformed.status).toBe(404);
+    // A malformed key never reaches the read model.
+    expect(calls.read.map((call) => call.key)).toEqual(['feed:42', 'feed:43']);
+  });
+
+  test('read-all carries the filters (default My work) and the caller', async () => {
+    const answer = await fetch(`${base}/tasks/notifications/read-all?type=stuck`, { method: 'POST' });
+    expect(answer.status).toBe(200);
+    expect(((await answer.json()) as any).markedCount).toBe(3);
+    expect(calls.readAll[0]).toMatchObject({ viewer: { principalId: ALICE }, query: { who: 'mine', types: ['stuck'] } });
   });
 });

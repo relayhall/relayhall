@@ -472,6 +472,20 @@ def test_project_update_sends_one_patch_with_if_match(rest):
     assert "Renamed" in out and "r2" in out
 
 
+def test_project_update_names_and_clears_the_inbox_phase(rest):
+    # Card b13e5ac9: the inbox phase - where a task created without --phase
+    # lands, status Ideas. --clear-inbox-phase sends null, never "".
+    phase = "cda0d15a-f194-405f-9e79-cdca158e0cfd"
+    rest.queue.append((200, envelope(project=sample_project(inboxPhaseId=phase, revision="r2"))))
+    _, _, code = run(cli.cmd_project_update, project_update_args(inbox_phase=phase))
+    assert code == 0
+    assert rest.calls[-1] == ("PATCH", f"/projects/{PROJECT_ID}", {"inboxPhaseId": phase}, {"If-Match": REVISION})
+    rest.queue.append((200, envelope(project=sample_project(inboxPhaseId=None, revision="r3"))))
+    _, _, code = run(cli.cmd_project_update, project_update_args(clear_inbox_phase=True))
+    assert code == 0
+    assert rest.calls[-1] == ("PATCH", f"/projects/{PROJECT_ID}", {"inboxPhaseId": None}, {"If-Match": REVISION})
+
+
 def test_project_update_stale_revision_maps_to_exit_5(rest):
     rest.queue.append((412, json.dumps(
         {"success": False, "error": "stale", "code": "REVISION_MISMATCH", "message": "stale"})))
@@ -591,3 +605,18 @@ def test_project_list_json_passthrough(rest):
     out, _, code = run(cli.cmd_project_list, _project_list_args(json=True))
     assert out == raw + "\n"
     assert code == 0
+
+def test_project_brief_uses_canonical_empty_body_and_exact_text(rest):
+    rest.queue.append((200, envelope(brief="Canonical awareness")))
+    out, err, code = run(cli.cmd_project_brief, Args(project=PROJECT_ID, json=False))
+    assert code == 0
+    assert out == "Canonical awareness\n"
+    assert rest.calls == [("POST", f"/projects/{PROJECT_ID}/brief", {}, None)]
+
+
+def test_project_brief_json_keeps_envelope(rest):
+    data = envelope(brief="Canonical awareness", scope="project-awareness-v1", limits={"tasks": 6})
+    rest.queue.append((200, data))
+    out, err, code = run(cli.cmd_project_brief, Args(project=PROJECT_ID, json=True))
+    assert code == 0
+    assert json.loads(out) == json.loads(data)

@@ -17,6 +17,7 @@ jest.mock('../db/connection', () => ({
 
 import { readFileSync } from 'fs';
 import path from 'path';
+import ts from 'typescript';
 import { pool } from '../db/connection';
 import { resolveExecutionProfileWrite } from '../routes/tasks';
 import { ProfileValidationError } from '../utils/executionProfile';
@@ -28,6 +29,43 @@ import { CLAUDE_CODE_DESCRIPTOR } from './fixtures/serviceDescriptors';
 const SERVICE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const WARRANT_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const SRC = path.resolve(__dirname, '..');
+
+
+// One internal advisory-lock parameter, classified at its AST use site. The
+// namespace remains unchanged: renaming it would split concurrent lock users.
+// The same literal in a return/error/audit/route is NOT an internal identifier.
+function vehicleLiteralOffenders(text: string, permitted: string[]): string[] {
+  const source = ts.createSourceFile('slice.ts', text, ts.ScriptTarget.Latest, true);
+  const internalPositions = new Set<number>();
+  function visit(node: ts.Node): void {
+    if (ts.isStringLiteral(node) && node.text === 'relayhall:vehicle-reference:') {
+      const binary = node.parent, array = binary.parent, call = array.parent;
+      let owner: ts.Node | undefined = node;
+      while (owner && !ts.isMethodDeclaration(owner)) owner = owner.parent;
+      if (owner && ts.isMethodDeclaration(owner) && owner.name.getText() === 'lockReferenceTarget'
+        && owner.modifiers?.some(m => m.kind === ts.SyntaxKind.PrivateKeyword)
+        && ts.isBinaryExpression(binary) && binary.getText() === '"relayhall:vehicle-reference:" + key'
+        && ts.isArrayLiteralExpression(array) && array.elements.length === 1
+        && ts.isCallExpression(call) && call.expression.getText() === 'client.query'
+        && call.arguments.length === 2 && call.arguments[1] === array
+        && ts.isNoSubstitutionTemplateLiteral(call.arguments[0])
+        && call.arguments[0].text.trim() === 'SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked') {
+        internalPositions.add(node.getStart());
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  const offenders: string[] = [];
+  for (const match of text.matchAll(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g)) {
+    const literal = match[0];
+    if (internalPositions.has(match.index!)) continue;
+    let residue = literal;
+    for (const allowed of permitted) residue = residue.split(allowed).join('');
+    if (/vehicle/i.test(residue)) offenders.push(literal.slice(0, 110));
+  }
+  return offenders;
+}
 
 function armPool(): void {
   (pool.query as jest.Mock).mockImplementation(async (text: string) => {
@@ -163,16 +201,64 @@ describe('the R4 idle grace is a deployment knob with a 6h default', () => {
   });
 });
 
-describe('what AZ-S7 deliberately did NOT do (ruling 7440b579 R1; AZ-A2)', () => {
-  // "the shared predicate 4d961e37 §1 is UNCHANGED; no service-assignment
-  // arm is added, now or later under this amendment." A structural check,
-  // because the whole ruling rests on it: the coupling had to be built
-  // WITHOUT touching the evaluator.
-  it('adds no arm to the shared predicate', () => {
-    const predicate = readFileSync(path.join(SRC, 'services/AuthorizationService.ts'), 'utf8');
-    expect(predicate).not.toMatch(/vehicle/i);
+/**
+ * The AZ-A10 clause 4 role arm, byte for byte: AuthorizationService.ts from
+ * `const roleGrantSql =` (exactly once) up to, not including, the newline
+ * before the first `    if (!chain)` after it, CRLF read as LF. The same
+ * text is pinned by section 14 of the live S7 script. A deliberate change
+ * re-ratifies the arm and updates both in the same commit.
+ */
+const RATIFIED_ROLE_ARM = [
+  "const roleGrantSql = (principalIds: string[]): string => {",
+  "      if (!principalIds.length) return 'FALSE';",
+  "      const accepted = (['read', 'write', 'use', 'invoke', 'admin'] as GrantVerb[])",
+  "        .filter(verb => grantAllows(verb, action));",
+  "      if (!accepted.length) return 'FALSE';",
+  "      const grantees = nextParam(principalIds);",
+  "      const resourceType = nextParam(resource.type);",
+  "      const verbs = nextParam(accepted);",
+  "      return `EXISTS (SELECT 1 FROM access_vehicle_links role_link",
+  "        JOIN grants role_grant ON role_grant.id = role_link.target_id",
+  "        JOIN tasks role_task ON role_task.id = role_link.task_id",
+  "        WHERE role_link.vehicle_kind = 'role' AND role_link.target_kind = 'grant'",
+  "          AND role_task.status NOT IN ('completed', 'archived')",
+  "          AND role_grant.grantee_type = 'principal'",
+  "          AND role_grant.grantee_id = ANY(${grantees}::uuid[])",
+  "          AND role_grant.resource_type = ${resourceType}",
+  "          AND role_grant.resource_id = ${resource.id}",
+  "          AND role_grant.verb = ANY(${verbs}::text[])",
+  "          AND (role_grant.expires_at IS NULL OR role_grant.expires_at > clock_timestamp())",
+  "          AND (role_link.expires_at IS NULL OR role_link.expires_at > clock_timestamp()))`;",
+  "    };",
+  "",
+].join('\n');
+
+describe('AZ-S7 assignment remains outside the predicate; later AZ-A10 role rows are bounded', () => {
+  // AZ-S7 added no service-assignment arm. AZ-A10 later added a separate,
+  // live role-grant source; pin it exactly (a warrant or auto-grant clause
+  // written inside it must fail here) without mistaking that source for
+  // assignment authority.
+  it('has no service-assignment arm and constrains the later role-grant source', () => {
+    const predicate = readFileSync(path.join(SRC, 'services/AuthorizationService.ts'), 'utf8')
+      .replace(/\r\n/g, '\n');
     expect(predicate).not.toMatch(/execution_service_id/);
-    expect(predicate).not.toMatch(/access_vehicle_links/);
+    expect(predicate.split('const roleGrantSql =')).toHaveLength(2);
+    const start = predicate.indexOf('const roleGrantSql =');
+    const end = predicate.indexOf('\n    if (!chain)', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const roleGrant = predicate.slice(start, end);
+    expect(roleGrant).toBe(RATIFIED_ROLE_ARM);
+    expect(roleGrant).toContain("role_link.vehicle_kind = 'role'");
+    expect(roleGrant).toContain("role_link.target_kind = 'grant'");
+    expect(roleGrant).toContain("role_task.status NOT IN ('completed', 'archived')");
+    expect(roleGrant).toContain('role_grant.grantee_id = ANY(${grantees}::uuid[])');
+    expect(roleGrant).toContain('role_grant.resource_type = ${resourceType}');
+    expect(roleGrant).toContain('role_grant.resource_id = ${resource.id}');
+    expect(roleGrant).toContain('role_grant.verb = ANY(${verbs}::text[])');
+    expect(roleGrant).toContain('role_grant.expires_at > clock_timestamp()');
+    expect(roleGrant).toContain('role_link.expires_at > clock_timestamp()');
+    expect(predicate).toContain('sides.push(`(${capSql} AND (${sourceParts.join(\' OR \')}))`);');
   });
 
   it('mints no scope string', () => {
@@ -274,15 +360,26 @@ describe('what AZ-S7 deliberately did NOT do (ruling 7440b579 R1; AZ-A2)', () =>
         // Comments may name the machinery — the ruling itself does.
         .replace(/\/\*[\s\S]*?\*\//g, '')
         .replace(/\/\/.*$/gm, '');
-      const literals = source.match(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g) ?? [];
-      for (const literal of literals) {
-        if (!/vehicle/i.test(literal)) continue;
-        let residue = literal;
-        for (const allowed of PERMITTED) residue = residue.split(allowed).join('');
-        if (/vehicle/i.test(residue)) offenders.push(`${file}: ${literal.slice(0, 110)}`);
-      }
+      offenders.push(...vehicleLiteralOffenders(source, PERMITTED).map(literal => `${file}: ${literal}`));
     }
     expect(offenders).toEqual([]);
+  });
+
+
+  it('classifies only the exact advisory-lock parameter as internal, never its vocabulary elsewhere', () => {
+    const internal = 'class Slice { private async lockReferenceTarget(client: any, key: string) { await client.query(`SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked`, ["relayhall:vehicle-reference:" + key]); } }';
+    expect(vehicleLiteralOffenders(internal, [])).toEqual([]);
+    for (const bad of [
+      internal.replace('private async', 'async'),
+      internal.replace('lockReferenceTarget', 'publicResponse'),
+      internal.replace('client.query', 'audit.emit'),
+      internal.replace(' + key', ' + userInput'),
+      internal.replace('vehicle-reference:', 'vehicle-reference:public'),
+      internal + ' const response = "relayhall:vehicle-reference:";',
+      internal + ' const route = "/vehicle";',
+      internal + ' const refusal = "VEHICLE_BUSY";',
+      internal + ' const audit = {action: "relayhall:vehicle-reference:"};',
+    ]) expect(vehicleLiteralOffenders(bad, []).length).toBeGreaterThan(0);
   });
 
   // And the refusals specifically, because they are the surface a caller
@@ -364,7 +461,7 @@ describe('the coupling lives at the single write choke point', () => {
   it('requires a linker identity for every link-edit recompute', () => {
     const vehicle = readFileSync(path.join(SRC, 'services/AccessVehicleService.ts'), 'utf8');
     expect(vehicle).toMatch(/async recompute\([\s\S]{0,400}?linker: AuthorizationActor,/);
-    expect(vehicle).toContain('permittedReferences(client, taskId, linker)');
+    expect(vehicle).toContain('permittedReferences(client, taskId, linker, actor)');
     for (const call of manager.match(/accessVehicleService\.recompute\([^;]*\)/g) ?? []) {
       expect(call).toMatch(/linkerAuthorizationFor\(/);
     }

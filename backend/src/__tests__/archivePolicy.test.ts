@@ -24,9 +24,6 @@ jest.mock('../db/connection', () => ({
   pool: { query: jest.fn(), connect: jest.fn() },
 }));
 
-jest.mock('../services/NotificationManager', () => ({
-  notificationManager: { notifyStatusChange: jest.fn().mockResolvedValue(undefined) },
-}));
 
 jest.mock('../services/TaskHistoryService', () => ({
   taskHistoryService: { recordChange: jest.fn() },
@@ -61,14 +58,10 @@ function makeFakeDb(opts: FixtureOptions) {
     execution_profile: null,
     definition_of_done: null,
     constraints: null,
-    auto_created: false,
     auto_start: false,
     blocked_reason: null,
     status_reason: null,
-    active_agent: null,
-    completed_by: null,
     attempt_count: 0,
-    session_refs: [],
     parent_id: null,
     personality_id: null,
     created_at: '2026-07-01T00:00:00.000Z',

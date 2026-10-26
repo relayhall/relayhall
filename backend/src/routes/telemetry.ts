@@ -42,15 +42,75 @@ import { PRODUCT_RE, telemetryAcceptedMajorsAdvertisement } from '../utils/telem
 import { auditService } from '../services/AuditService';
 import { logCaughtFailure, logCaughtWarning } from '../utils/secretSafeLog';
 import { actorFromRequest } from '../middleware/sharedAuthorization';
-import { telemetryProjectionService } from '../services/TelemetryProjectionService';
+import {
+  telemetryProjectionService,
+  type TelemetrySessionListOptions,
+} from '../services/TelemetryProjectionService';
 import {
   describeTelemetryReadScope,
   telemetryReadScopeFor,
   type TelemetryReadScope,
 } from '../services/TelemetryReadScope';
 import { isTelemetryPseudonym } from '../utils/telemetryPepper';
+import { registerOtlpRoutes } from './telemetryOtlp';
+import {
+  telemetryAdapterHealthService,
+  TELEMETRY_ADAPTER_SOURCES,
+} from '../services/TelemetryAdapterHealthService';
+import { TELEMETRY_ENVELOPE_SCHEMA_VERSION } from '../types/TelemetryEnvelope';
 
+import { usageQuotaService } from '../services/UsageQuotaService';
+import { validateUsageQuota } from '../types/UsageQuota';
+import { activePluginAccount } from '../services/PluginAccountScope';
+import { pluginMetricsService, validateServiceMetrics } from '../services/PluginMetricsService';
 const router = Router();
+
+router.post('/service-metrics', async (req: Request,res:Response) => {
+  try {
+    const auth=req as AuthRequest;
+    const derived=await telemetryPrincipalService.derive({actingPrincipalId:auth.principal?.id,delegationLinks:auth.delegationLinks});
+    if(!derived.ok){res.status(403).json({code:derived.code});return;}
+    let snapshot;
+    try{snapshot=validateServiceMetrics(req.body);}catch{res.status(400).json({code:'INVALID_SERVICE_METRICS'});return;}
+    if(!productIsDeclared(derived.descriptor,snapshot.sourceProduct)){res.status(403).json({code:'TELEMETRY_PRODUCT_NOT_DECLARED'});return;}
+    const limit=await telemetryRateLimitService.tryAccept(derived.binding.connectorId,'events');
+    if(!limit.accepted){res.status(429).json({code:'RATE_LIMITED'});return;}
+    const outcome=await pluginMetricsService.store(derived.binding.accountId,derived.binding.connectorId,snapshot);
+    res.status(outcome==='conflict'?409:200).json({outcome});
+  }catch(err){const errorId=logCaughtFailure('[Telemetry] service metrics failed',err);res.status(503).json({code:'METRICS_UNAVAILABLE',errorId});}
+});
+
+router.get('/quotas', async (req: Request, res: Response) => {
+  try {
+    const accountId = await activePluginAccount(req as AuthRequest);
+    if (!accountId) { res.status(403).json({code:'ACCOUNT_REQUIRED'}); return; }
+    res.json(await usageQuotaService.read(accountId));
+  } catch (err) {
+    const errorId = logCaughtFailure('[Telemetry] quota read failed', err);
+    res.status(503).json({code:'QUOTA_UNAVAILABLE',errorId});
+  }
+});
+router.post('/quotas', async (req: Request, res: Response) => {
+  try {
+    const auth = req as AuthRequest;
+    const derived = await telemetryPrincipalService.derive({actingPrincipalId:auth.principal?.id,delegationLinks:auth.delegationLinks});
+    if (!derived.ok) { res.status(403).json({code:derived.code}); return; }
+    let snapshot;
+    try { snapshot = validateUsageQuota(req.body); }
+    catch { res.status(400).json({code:'INVALID_QUOTA_SNAPSHOT'}); return; }
+    if (!productIsDeclared(derived.descriptor, snapshot.sourceProduct)) {
+      res.status(403).json({code:'TELEMETRY_PRODUCT_NOT_DECLARED'}); return;
+    }
+    const limit = await telemetryRateLimitService.tryAccept(derived.binding.connectorId, 'events');
+    if (!limit.accepted) { res.status(429).json({code:'RATE_LIMITED'}); return; }
+    const outcome = await usageQuotaService.store(derived.binding.accountId, derived.binding.connectorId, snapshot);
+    res.status(outcome === 'conflict' ? 409 : 200).json({schemaVersion:'rh.usage-quota/1',outcome});
+  } catch (err) {
+    const errorId = logCaughtFailure('[Telemetry] quota write failed', err);
+    res.status(503).json({code:'QUOTA_UNAVAILABLE',errorId});
+  }
+});
+
 
 router.post('/frames', async (req: Request, res: Response): Promise<void> => {
   try {
@@ -204,6 +264,11 @@ router.post('/events', async (req: Request, res: Response): Promise<void> => {
 
     // ---- 4. the ONE normalization entry point (candidate A) ------------
     const outcome = await telemetryEnvelopeStore.store(derived.binding, body);
+    await recordNativeHealth(derived.binding.connectorId, {
+      accepted: outcome.accepted && !outcome.duplicate ? 1 : 0,
+      duplicates: outcome.accepted && outcome.duplicate ? 1 : 0,
+      rejectedBy: outcome.accepted ? {} : { [outcome.code]: 1 },
+    });
     if (!outcome.accepted) {
       // ---- 5. §6.5.2 quarantine, for MALFORMED input only ---------------
       // Design §3 pipeline step 3 and §4.8: input the validator refused still
@@ -443,6 +508,14 @@ router.post(
         });
       }
 
+      const rejectedBy: Record<string, number> = {};
+      for (const result of results) {
+        if (result.accepted === false && typeof result.code === 'string') {
+          rejectedBy[result.code] = (rejectedBy[result.code] ?? 0) + 1;
+        }
+      }
+      await recordNativeHealth(derived.binding.connectorId, { accepted, duplicates, rejectedBy });
+
       res.json({
         success: true,
         received: lines.length,
@@ -493,9 +566,37 @@ router.get('/presence', async (req: Request, res: Response): Promise<void> => {
     telemetryProjectionService.presence(scope, projectionOptions(req)).then((sources) => ({ sources })));
 });
 
+/**
+ * The Sessions LIST, one page at a time (card `0ac41d40`, owner ruling E89 (b)).
+ *
+ * Query parameters, every one optional: `windowDays` and `limit` (narrow-only,
+ * as on every projection route), `offset` (rows to skip, rounded down;
+ * anything that is not a positive number reads the first page),
+ * `includeShort` (exactly `true` lists short sessions too; anything else
+ * hides them and counts them as `hiddenCount`), and the reporter filter
+ * `connectorId` and product filter `sourceProduct` — the names the point
+ * route already uses for the same two members.
+ *
+ * A filter is checked by SHAPE before anything is read, with its own code, and
+ * then becomes one more predicate AFTER the caller's narrowing: a well-formed
+ * filter naming another Account's Connector reads nothing and answers exactly
+ * as one naming no Connector at all. The same `serveProjection` derives the
+ * narrowing, so the scope, the refusal and the concealment are the ones every
+ * other read route has.
+ */
 router.get('/sessions', async (req: Request, res: Response): Promise<void> => {
-  await serveProjection(req, res, 'sessions', (scope) =>
-    telemetryProjectionService.sessions(scope, projectionOptions(req)).then((sessions) => ({ sessions })));
+  const options = sessionListOptions(req);
+  if (!options) {
+    res.status(400).json({
+      success: false,
+      code: 'INVALID_SESSION_FILTER',
+      error:
+        'connectorId must be a UUID and sourceProduct must match the ingest product grammar '
+        + 'when either filter is given.',
+    });
+    return;
+  }
+  await serveProjection(req, res, 'sessions', (scope) => telemetryProjectionService.sessions(scope, options));
 });
 
 /**
@@ -585,6 +686,28 @@ function numericQuery(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+/**
+ * The Sessions list's options, or null when a filter is malformed.
+ *
+ * Shape only: `isValidTaskId` is the UUID predicate the point route asks of a
+ * Connector id, and `PRODUCT_RE` is the ingest product grammar, imported
+ * rather than restated. An absent or empty filter is no filter.
+ */
+function sessionListOptions(req: Request): TelemetrySessionListOptions | null {
+  const connectorId = stringQuery(req.query.connectorId);
+  const sourceProduct = stringQuery(req.query.sourceProduct);
+  const connectorMalformed = connectorId !== null && !isValidTaskId(connectorId);
+  const productMalformed = sourceProduct !== null && !PRODUCT_RE.test(sourceProduct);
+  if (connectorMalformed || productMalformed) return null;
+  return {
+    ...projectionOptions(req),
+    offset: numericQuery(req.query.offset),
+    includeShort: stringQuery(req.query.includeShort) === 'true',
+    connectorId,
+    sourceProduct,
+  };
+}
+
 /** Narrow-only request bounds; the service clamps them against its ceilings. */
 function projectionOptions(req: Request): { windowDays?: number; limit?: number } {
   return {
@@ -634,5 +757,43 @@ async function serveProjection(
     });
   }
 }
+
+/**
+ * Adapter health for the NATIVE envelope path (§3.1: an unknown-major
+ * rejection is "surfaced on adapter health"; §8.3). One row per Connector under
+ * the constant source `native-envelope`, written after the receiver limit, and
+ * never able to change the answer: a health write that fails is a warning.
+ */
+async function recordNativeHealth(
+  connectorId: string,
+  tally: { accepted: number; duplicates: number; rejectedBy: Record<string, number> },
+): Promise<void> {
+  const rejected = Object.values(tally.rejectedBy).reduce((sum, n) => sum + n, 0);
+  const counts: Record<string, number> = {
+    requests: 1,
+    'records.accepted': tally.accepted,
+    'records.duplicate': tally.duplicates,
+    'records.rejected': rejected,
+    'unsupported.major': tally.rejectedBy.UNSUPPORTED_SCHEMA_MAJOR ?? 0,
+  };
+  for (const [code, count] of Object.entries(tally.rejectedBy)) {
+    if (/^[A-Z][A-Z0-9_]{2,63}$/.test(code)) counts[`rejected.${code}`] = count;
+  }
+  await telemetryAdapterHealthService.record({
+    source: TELEMETRY_ADAPTER_SOURCES.nativeEnvelope,
+    connectorId,
+    adapterVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION,
+    counts,
+    reasonCode: Object.entries(tally.rejectedBy).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null,
+    accepted: tally.accepted + tally.duplicates,
+    rejected,
+    lastSourceAt: null,
+    clockSkewMs: null,
+  }).catch((err) => logCaughtWarning('[Telemetry API] adapter health write failed:', err));
+}
+
+// RH-TW1b slice 1 (card dac2ca71): the OTLP/HTTP receivers and the discovery
+// response, added to THIS router flat (see routes/telemetryOtlp.ts).
+registerOtlpRoutes(router);
 
 export default router;

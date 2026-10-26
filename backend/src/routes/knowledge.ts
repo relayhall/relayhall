@@ -1,3 +1,5 @@
+import { knowledgeAccountPrincipalId } from '../services/KnowledgeArmEvaluator';
+import { normalizeV2Query, KnowledgeSelectorError } from '../services/KnowledgeV2';
 /**
  * routes/knowledge.ts — RH-KW1 (card `0b4b779b`), the ONE router module of
  * owner decision D8, mounted at the pinned knowledge paths.
@@ -45,6 +47,9 @@ import { oauthIssuer } from '../utils/oauthMetadata';
 import { boardEndpointFor } from '../utils/onboardingPack';
 import { sendApiError } from '../utils/apiErrors';
 import { logCaughtFailure } from '../utils/secretSafeLog';
+import { executeKnowledgeWrite } from '../services/KnowledgeWriteExecutor';
+import type { KnowledgeWriteOp } from '../services/KnowledgeArmEvaluator';
+import { idempotent } from '../middleware/idempotency';
 
 const router = Router();
 
@@ -145,7 +150,7 @@ export const knowledgeContentsRouter = Router();
  * own public API endpoint, exactly as the OAuth issuer is derived, so a source
  * can tie an assertion to the deployment it already talks to.
  */
-function knowledgeAssertionIssuer(req: AuthRequest): string {
+export function knowledgeAssertionIssuer(req: AuthRequest): string {
   return oauthIssuer(boardEndpointFor(req));
 }
 
@@ -154,8 +159,8 @@ function knowledgeAssertionIssuer(req: AuthRequest): string {
  * `knowledge_relevant_groups` (§5.3 minimization) — a source never learns a
  * group its owner did not declare relevant.
  */
-async function callerGroupIds(req: AuthRequest): Promise<string[]> {
-  const principalId = req.principal?.id;
+export async function callerGroupIds(req: AuthRequest): Promise<string[]> {
+  const principalId = knowledgeAccountPrincipalId(req);
   if (!principalId) return [];
   const result = await pool.query(
     `SELECT gm.group_id FROM group_members gm
@@ -188,6 +193,7 @@ knowledgeContentsRouter.get('/', async (req: AuthRequest, res: Response): Promis
       req,
       {
         handle: req.query.handle,
+        continuation: req.query.continuation,
         continueFrom: req.query.continueFrom === undefined ? undefined : Number(req.query.continueFrom),
         contentHash: typeof req.query.contentHash === 'string' ? req.query.contentHash : undefined,
         ifNoneMatch: typeof req.query.ifNoneMatch === 'string' ? req.query.ifNoneMatch : undefined,
@@ -195,7 +201,7 @@ knowledgeContentsRouter.get('/', async (req: AuthRequest, res: Response): Promis
       { issuer: knowledgeAssertionIssuer(req), callerGroupIds: await callerGroupIds(req) },
     );
     if (!outcome.ok) {
-      res.status(403).json({ success: false, refused: outcome.refused });
+      res.status(403).json({ success: false, refused: outcome.refused, ...(outcome.protocol_version === 2 ? { protocol_version: 2, status: outcome.status, code: outcome.code, auditRef: outcome.auditRef } : {}) });
       return;
     }
     res.json({ success: true, ...outcome });
@@ -230,6 +236,7 @@ knowledgeContentsRouter.get('/', async (req: AuthRequest, res: Response): Promis
  */
 export const knowledgeQueriesRouter = Router();
 
+
 /** §7.1's `sources?: uuid[]`, in canonical form. */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -237,6 +244,13 @@ knowledgeQueriesRouter.post('/', async (req: AuthRequest, res: Response): Promis
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
 
+    if (body.protocol_version !== undefined && body.protocol_version !== 2) throw new KnowledgeSelectorError('INVALID_SELECTOR');
+    const v2 = body.protocol_version === 2 ? normalizeV2Query(body) : undefined;
+    if (body.categories !== undefined && !v2) throw new KnowledgeSelectorError('INVALID_SELECTOR');
+    // Card 40e0e542: `includeArchive` is a v2 selector field like `categories`
+    // (the archive is a category declaration, and a v1 request never reaches a
+    // v2 source), so a v1 body carrying it is refused the same way.
+    if (body.includeArchive !== undefined && !v2) throw new KnowledgeSelectorError('INVALID_SELECTOR');
     const q = body.q;
     if (typeof q !== 'string' || q.length < 1 || q.length > KNOWLEDGE_QUERY_MAX_LENGTH) {
       sendApiError(res, 422, 'KNOWLEDGE_QUERY_INVALID',
@@ -308,7 +322,7 @@ knowledgeQueriesRouter.post('/', async (req: AuthRequest, res: Response): Promis
 
     const outcome = await executeKnowledgeQuery(
       req,
-      { q, kinds, ...(sources ? { sources } : {}), limitPerSource, timeoutMs },
+      { q, kinds, ...(sources ? { sources } : {}), limitPerSource, timeoutMs, ...(v2 ? { ...v2, protocol_version: 2 as const } : {}) },
       { issuer: knowledgeAssertionIssuer(req), callerGroupIds: await callerGroupIds(req) },
     );
 
@@ -317,6 +331,14 @@ knowledgeQueriesRouter.post('/', async (req: AuthRequest, res: Response): Promis
     // on how many sources answered.
     res.json({ success: true, ...outcome });
   } catch (e) {
+    if (e instanceof KnowledgeSelectorError) {
+      if (e.auditRef) {
+        res.status(e.status).json({ success: false, error: e.message, code: e.code, message: e.message, auditRef: e.auditRef });
+      } else {
+        sendApiError(res, e.status, e.code, e.message);
+      }
+      return;
+    }
     const errorId = logCaughtFailure('run knowledge query', e);
     sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to run knowledge query', undefined, { errorId });
   }
@@ -329,5 +351,65 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   if (!Number.isInteger(numeric) || numeric < min || numeric > max) return null;
   return numeric;
 }
+
+/**
+ * POST /api/knowledge-writes/{propose,preview,commit} — RB-11 Governor v0
+ * (card `b796067e`; ratified design C.12, answer E1; declared change D-8).
+ *
+ * The REST twins of the three `relayhall_knowledge_note_*` MCP tools, on the
+ * SAME module as the read paths (the "same module" note of the route
+ * registry), and on a router of their own for the reason stated above: one
+ * Express router per mounted path. The scope map routes exactly these three
+ * POSTs to `knowledge-contents:write` and everything else under the mount to
+ * `root`.
+ *
+ * A DOOR RELAY, not a core write: the executor relays each verb to the
+ * source's own write surface and answers with the source's answer; the core
+ * stores no note content. Refusals carry `refusedBy` so a caller can tell the
+ * core's door from the source's Governor: the core's tokens are its own, and
+ * the source's C.11 codes pass through with their status unchanged.
+ *
+ * Only COMMIT is retry-keyed (`knowledge.note.commit`, credential scope,
+ * replay `return`): its receipt is a sealed handle and a digest. Propose and
+ * preview answer with the rendered bytes, and a stored receipt would put note
+ * content in the core.
+ */
+export const knowledgeWritesRouter = Router();
+
+async function relayKnowledgeWrite(req: AuthRequest, res: Response, op: KnowledgeWriteOp): Promise<void> {
+  try {
+    const outcome = await executeKnowledgeWrite(req, op, req.body ?? {}, {
+      issuer: knowledgeAssertionIssuer(req),
+      callerGroupIds: await callerGroupIds(req),
+    });
+    if (outcome.ok) {
+      res.status(200).json({ success: true, ...outcome.body });
+      return;
+    }
+    res.status(outcome.status).json({
+      success: false,
+      error: outcome.fromSource
+        ? 'Refused by the knowledge source'
+        : outcome.status >= 500 ? 'Knowledge write unavailable' : 'Refused',
+      code: outcome.code,
+      message: outcome.message,
+      protocol_version: 1,
+      status: 'refused',
+      refusedBy: outcome.fromSource ? 'source' : 'core',
+      ...(outcome.field ? { field: outcome.field } : {}),
+      ...(outcome.auditRef ? { auditRef: outcome.auditRef } : {}),
+      ...(outcome.handle ? { handle: outcome.handle } : {}),
+      ...(outcome.errorId ? { details: { errorId: outcome.errorId } } : {}),
+    });
+  } catch (e) {
+    const errorId = logCaughtFailure(`relay knowledge ${op}`, e);
+    sendApiError(res, 500, 'INTERNAL_ERROR', 'Failed to relay the knowledge write', undefined, { errorId });
+  }
+}
+
+knowledgeWritesRouter.post('/propose', (req: AuthRequest, res: Response) => relayKnowledgeWrite(req, res, 'propose'));
+knowledgeWritesRouter.post('/preview', (req: AuthRequest, res: Response) => relayKnowledgeWrite(req, res, 'preview'));
+knowledgeWritesRouter.post('/commit', idempotent('knowledge.note.commit'),
+  (req: AuthRequest, res: Response) => relayKnowledgeWrite(req, res, 'commit'));
 
 export default router;

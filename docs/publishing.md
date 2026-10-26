@@ -29,6 +29,26 @@ For an exact committed source it:
 6. builds a deterministic public commit linked to the private source SHA;
 7. prints the complete public diff and writes a mode-`0600` receipt.
 
+What a dry run does, precisely:
+
+- **It contacts the target.** Even in the default dry-run mode it runs
+  `git ls-remote` against the target and an anonymous single-branch clone of its
+  `main`, and builds the public commit on top of that `main`. Without network
+  access, or when the target cannot be read, it models an initial root commit
+  instead and says so only on stderr (`Dry-run note: target is absent or
+  inaccessible`); such a commit is not the one a push would make.
+- **Gitleaks runs one of three ways**, in this order: a local `gitleaks` binary
+  (refused unless it reports exactly `8.28.0`), else the Gitleaks container image
+  pinned by digest (with no network), else the `8.28.0` release archive
+  downloaded with `curl` and checked against a pinned SHA-256.
+- **The receipt** (schema 3) records `sourceSha`, `publicCommit`, `target`,
+  `pushRef`, `releaseTag` and `allowlistSha256`. It does not record the public
+  tree SHA or the scan results; those appear only in the `--initial-bundle`
+  artifact, which is valid only for an empty target.
+- **Nothing else is kept.** The working directory, the built public commit
+  included, is deleted on exit. The commit is deterministic: running the same
+  dry run against the same target `main` builds the identical commit SHA.
+
 A production push additionally requires all of:
 
 - the canonical GitHub URL;
@@ -139,9 +159,33 @@ With explicit owner authorization and an appropriately scoped token,
 `--prepare` creates or updates only an empty public repository, topics, merge policy,
 and private vulnerability reporting. After the first import, `--protect` makes
 `main` require one independent approval, conversation resolution, strict success
-from all four CI jobs, administrator enforcement, and force-push/deletion denial.
-The helper reads the protection object back and fails closed unless every required
-setting matches.
+from the main CI jobs, administrator enforcement, and force-push/deletion
+denial. The required status contexts are four job names in
+`.github/workflows/ci.yml`:
+
+- `Repository and deployment contract`
+- `Backend type check and mocked tests`
+- `Frontend build and tests`
+- `CLI tests`
+
+The three `Frontend unit tests (shard N of 3)` jobs are not required, and neither
+is `Changed areas`. A shard is one value of a matrix: when its job is skipped,
+GitHub reports the check under the unexpanded name
+(`Frontend unit tests (shard ${{ matrix.shard }} of 3)`), which no run ever
+satisfies, so requiring the shards could block a merge that has nothing wrong
+with it. The shards still run on every push that runs `Frontend build and tests`
+and still show red when a test fails; they are a signal on the pull request,
+not a merge condition. Their coverage of the whole test file set is proved inside
+`Frontend build and tests` (the shard coverage check), which is required.
+`Repository and deployment contract` has no `needs` and runs on every push, so at
+least one required check always reports a real result.
+
+The helper reads the protection object back and fails closed unless every
+required setting matches, including a context list that has a shard added or a
+main job missing. `scripts/test-github-config.sh` derives the non-matrix jobs
+from the workflow (less `Changed areas`) and fails when a named job is renamed or
+removed, or a new non-matrix job appears that the list does not name; it also
+proves each of those refusals.
 
 ## Community changes and reverse synchronization
 

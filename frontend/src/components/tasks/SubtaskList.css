@@ -15,9 +15,9 @@
 
 .subtask-progress-bar {
   flex: 1;
-  height: 4px;
+  height: var(--space-1);
   background: var(--overlay-medium);
-  border-radius: 2px;
+  border-radius: var(--radius-full);
   overflow: hidden;
 }
 
@@ -97,7 +97,11 @@
   color: var(--text-tertiary);
 }
 
-/* Subtask items */
+/* Subtask items. E388 (owner, 20 Oct 2026): each subtask sits in its own
+   container, its state selector sits ABOVE the text so the text gets the full
+   card width, and the state is a stripe plus the selector's "Current: ..."
+   words - never colour alone. Replaces the 2026-08-16 fixed-width select
+   column, whose notes were indented to match it. */
 .subtask-items {
   list-style: none;
   padding: 0;
@@ -108,18 +112,30 @@
 }
 
 .subtask-item {
-  display: flex;
-  align-items: flex-start;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  padding: var(--space-2) 0;
-  border-radius: var(--radius-sm);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "status actions" "text text" "context context";
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
   transition: background-color 0.15s ease;
 }
 
 .subtask-item:hover {
-  background: var(--overlay-weak);
+  background: var(--bg-surface-hover);
 }
+
+/* The state stripe: ui-class pairs on --bg-surface. */
+.subtask-item.subtask-status-completed { border-inline-start-color: var(--status-success); }
+.subtask-item.subtask-status-in-progress { border-inline-start-color: var(--status-info); }
+.subtask-item.subtask-status-review { border-inline-start-color: var(--status-warning); }
+.subtask-item.subtask-status-blocked { border-inline-start-color: var(--status-danger); }
+.subtask-item.subtask-status-skipped,
+.subtask-item.subtask-status-empty { border-inline-start-color: var(--border-strong); }
 
 .subtask-editing:is(.subtask-item) {
   background: var(--accent-soft);
@@ -206,12 +222,14 @@
   border-color: var(--status-success-strong);
 }
 
-/* Text */
+/* Text: the full card width, one ink for every state (E388). */
 .subtask-text {
-  flex: 1;
+  grid-area: text;
+  min-width: 0;
   font-size: var(--text-sm);
-  color: var(--text-secondary);
-  line-height: 1.4;
+  color: var(--text-primary);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
 }
 
 .subtask-text-editable {
@@ -241,21 +259,6 @@
   color: var(--text-tertiary);
 }
 
-.subtask-status-review .subtask-text {
-  color: var(--text-warning);
-}
-
-.subtask-status-in-progress .subtask-text {
-  color: var(--text-info);
-}
-
-.subtask-status-blocked .subtask-text {
-  color: var(--text-error);
-}
-
-.subtask-status-empty .subtask-text {
-  color: var(--text-secondary);
-}
 
 /* Legacy support */
 .subtask-completed .subtask-text {
@@ -264,26 +267,18 @@
   opacity: 0.6;
 }
 
-/* Blocked reason indicator */
-.subtask-blocked-reason {
-  margin-left: 6px;
-  cursor: help;
-  opacity: 0.8;
-}
-
 /* Has blocked subtasks indicator */
 .has-blocked:is(.subtask-list) {
   border-left: 3px solid var(--danger-color);
   padding-left: var(--space-2);
 }
 
-/* Visible lifecycle context and role-aware action control */
-.subtask-review-note {
-  color: var(--text-warning);
-}
-
+/* Role-aware action control: above the text, sized to its words. */
 .subtask-status-select {
-  flex: 0 0 190px;
+  grid-area: status;
+  justify-self: start;
+  inline-size: auto;
+  min-inline-size: 12rem;
   max-width: 100%;
   min-height: var(--control-compact);
   padding: var(--space-1) var(--space-2);
@@ -306,37 +301,55 @@
 }
 
 .subtask-status-indicator {
-  flex: 0 0 24px;
+  grid-area: status;
+  justify-self: start;
   min-height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
 
+/* Visible lifecycle context: notes start at the card's content edge, as the
+   text does, so they align without an indent. */
 .subtask-lifecycle-context {
-  /* Owner ruling 2026-08-16: the notes align with the subtask TEXT column.
-     The indent equals the select basis + row gap, and collapses with the
-     select on the narrow-viewport stack below. */
-  flex: 1 0 calc(100% - 214px);
-  min-width: 220px;
-  margin-left: calc(190px + var(--space-3));
-  margin-top: calc(-1 * var(--space-2));
+  grid-area: context;
+  min-width: 0;
+  margin: 0;
   display: grid;
-  gap: 3px;
-  color: var(--text-tertiary);
+  gap: var(--space-1);
+}
+
+/* E388: the review note (and the stuck reason) is a note block on its own
+   background with a status stripe. Text pairs are matrix pairs on
+   --bg-elevated in all three Themes. */
+.subtask-review-note,
+.subtask-blocked-reason,
+.subtask-skipped-note {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--status-warning);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
   font-size: var(--text-xs);
-  line-height: 1.45;
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.subtask-review-note strong {
+  color: var(--text-warning);
 }
 
 .subtask-blocked-reason {
-  margin-left: 0;
+  border-inline-start-color: var(--status-danger);
+}
+
+.subtask-blocked-reason strong {
   color: var(--text-error);
-  cursor: default;
-  opacity: 1;
 }
 
 .subtask-skipped-note {
-  color: var(--text-tertiary);
+  border-inline-start-color: var(--border-strong);
 }
 
 .subtask-transition-error {
@@ -351,7 +364,8 @@
 
 /* Inline edit input */
 .subtask-edit-input {
-  flex: 1;
+  grid-area: text;
+  min-width: 0;
   background: var(--scrim-weak);
   border: 1px solid var(--accent-color);
   border-radius: var(--radius-sm);
@@ -367,19 +381,28 @@
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
-/* Action buttons */
+/* Action buttons: top-right of the card, never a row of their own; shown on
+   hover and whenever focus is inside the card (a focused control is never
+   invisible), and always on coarse pointers and narrow screens. */
 .subtask-actions {
+  grid-area: actions;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-1);
+  margin: 0;
   opacity: 0;
   transition: opacity 0.15s ease;
-  margin-left: auto;
-  flex-shrink: 0;
 }
 
-.subtask-item:hover .subtask-actions {
+.subtask-item:hover .subtask-actions,
+.subtask-item:focus-within .subtask-actions {
   opacity: 1;
+}
+
+@media (pointer: coarse), (max-width: 767px) {
+  .subtask-actions {
+    opacity: 1;
+  }
 }
 
 .subtask-action-btn {
@@ -425,7 +448,7 @@
 }
 
 .subtask-list-compact .subtask-item {
-  padding: var(--space-1) 0;
+  padding: var(--space-1) var(--space-2);
 }
 
 .subtask-list-compact .subtask-text {
@@ -437,19 +460,12 @@
 }
 
 @media (max-width: 640px) {
+  .subtask-item {
+    padding: var(--space-2);
+  }
+
   .subtask-status-select {
-    flex-basis: 100%;
-    width: 100%;
-  }
-
-  .subtask-lifecycle-context {
-    margin-left: 0;
-  }
-
-  .subtask-lifecycle-context {
-    flex-basis: 100%;
-    min-width: 0;
-    margin-left: 0;
-    margin-top: 0;
+    inline-size: 100%;
+    min-inline-size: 0;
   }
 }

@@ -11,17 +11,18 @@ jest.mock('../services/BlueprintProvenanceService', () => ({ blueprintProvenance
 jest.mock('../services/AuditService', () => ({ auditService: { record: jest.fn() } }));
 import { pool } from '../db/connection';
 import { projectService } from '../services/ProjectService';
+import { taskManagerDB } from '../services/TaskManagerDB';
 import { BlueprintInstantiationService, BlueprintCreationCaller } from '../services/BlueprintInstantiationService';
 import { BlueprintRegistryService } from '../services/BlueprintRegistryService';
 import { blueprintRequestHash } from '../services/BlueprintPlanService';
-import { BLUEPRINT_SCHEMA } from '../utils/blueprintDocument';
+import { BLUEPRINT_SCHEMA, type BlueprintDocument } from '../utils/blueprintDocument';
 const principalId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const identity = { principalId, handle: 'caller', role: 'user', scopes: ['blueprints:use','projects:write'], authenticated: true };
 const caller: BlueprintCreationCaller = { actor: identity, audit: { principalId, handle: 'caller', authMethod: 'session' }, rootSession: false,
   taskActor: { principalId, handle: 'caller', authMethod: 'session', authorization: identity } };
 const key = 'one-stable-retry-key';
 function fixture(options: { replay?: boolean; archived?: boolean; hidden?: boolean; retired?: boolean; noWriteAuthority?: boolean; changed?: boolean } = {}) {
-  const doc = { schemaVersion: BLUEPRINT_SCHEMA, blueprint: { key: 'minimal-project', name: 'Minimal', version: 1, summary: '', description: '', tags: [], provenance: 'human-authored' },
+  const doc: BlueprintDocument = { schemaVersion: BLUEPRINT_SCHEMA, blueprint: { key: 'minimal-project', name: 'Minimal', version: 1, summary: '', description: '', tags: [], provenance: 'human-authored' },
     parameters: [{ key: 'name', label: 'Name', promptText: 'Which name?', type: 'string', required: false, default: 'Example' }],
     target: { mode: 'new-project', project: { name: '{{name}}' } }, phases: [], tasks: [], dependencies: [], references: [], humanGates: [], reports: [] };
   const snapshot = { status: 201, projectId: 'project', instantiationId: 'instance', blueprint: { key: 'minimal-project', version: 1 } };
@@ -39,10 +40,61 @@ function fixture(options: { replay?: boolean; archived?: boolean; hidden?: boole
   const resolve = jest.fn(); const authorize = jest.fn(async () => !options.noWriteAuthority);
   const context = jest.fn(() => ({ target: { mode: 'new-project' as const }, resolve, authorize }));
   const service = new BlueprintInstantiationService(registry as unknown as BlueprintRegistryService, context);
-  return { service, registry, client, request, snapshot, events, context, resolve, authorize };
+  return { service, registry, client, request, snapshot, events, context, resolve, authorize, doc };
 }
 describe('ordered Blueprint instantiation boundary', () => {
   beforeEach(() => jest.clearAllMocks());
+  test.each([0, 11, 100])('legacy published maxRetries %s refuses by name before any canonical write', async maxRetries => {
+    const f = fixture(); f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries } }];
+    await expect(f.service.instantiate('minimal-project', f.request, key, caller)).rejects.toMatchObject({
+      status: 422, code: 'BLUEPRINT_DOCUMENT_REFUSED', field: 'maxRetries', message: expect.stringContaining('1..10'),
+    });
+    expect(projectService.create).not.toHaveBeenCalled(); expect(taskManagerDB.createTask).not.toHaveBeenCalled();
+    expect(f.events.some(sql => sql.startsWith('INSERT'))).toBe(false); expect(f.events.at(-1)).toBe('ROLLBACK');
+  });
+  test.each([1, 10])('instantiation passes maxRetries boundary %s unchanged to the Task writer', async maxRetries => {
+    const f = fixture(); f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries } }];
+    (taskManagerDB.createTask as jest.Mock).mockResolvedValue({ id: 'task' });
+    await f.service.instantiate('minimal-project', f.request, key, caller);
+    expect(taskManagerDB.createTask).toHaveBeenCalledWith(expect.objectContaining({ maxRetries }), caller.taskActor, expect.any(Function), expect.objectContaining({ client: f.client }));
+    expect(f.events.at(-1)).toBe('COMMIT');
+  });
+  test.each([[0, 10], [1, 11], [0, 100]])('legacy retry placeholder %s..%s refuses even with an in-range answer', async (min, max) => {
+    const f = fixture();
+    f.doc.parameters.push({ key: 'retry_limit', label: 'Retries', promptText: 'How many retries?', type: 'integer', required: true, constraints: { min, max } });
+    f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries: '{{retry_limit}}' } }];
+    await expect(f.service.instantiate('minimal-project', { ...f.request, parameterValues: { retry_limit: 3 } }, key, caller)).rejects.toMatchObject({
+      status: 422, code: 'BLUEPRINT_DOCUMENT_REFUSED', field: 'maxRetries', message: expect.stringContaining('1..10'),
+    });
+    expect(projectService.create).not.toHaveBeenCalled(); expect(taskManagerDB.createTask).not.toHaveBeenCalled();
+    expect(f.events.some(sql => sql.startsWith('INSERT'))).toBe(false); expect(f.events.at(-1)).toBe('ROLLBACK');
+  });
+  test.each([0, 11, 100])('committed retry with legacy maxRetries %s preserves its original receipt', async maxRetries => {
+    const f = fixture({ replay: true, retired: true });
+    f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries } }];
+    expect(await f.service.instantiate('minimal-project', f.request, key, caller)).toBe(f.snapshot);
+    expect(f.context).not.toHaveBeenCalled(); expect(projectService.create).not.toHaveBeenCalled(); expect(taskManagerDB.createTask).not.toHaveBeenCalled();
+    expect(f.events.at(-1)).toBe('COMMIT');
+  });
+  test.each([0, 11, 100])('out-of-range retry answer %s refuses before any canonical write', async maxRetries => {
+    const f = fixture();
+    f.doc.parameters.push({ key: 'retry_limit', label: 'Retries', promptText: 'How many retries?', type: 'integer', required: true, constraints: { min: 1, max: 10 } });
+    f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries: '{{retry_limit}}' } }];
+    await expect(f.service.instantiate('minimal-project', { ...f.request, parameterValues: { retry_limit: maxRetries } }, key, caller)).rejects.toMatchObject({
+      status: 422, code: 'PARAMETER_VALUE_REFUSED', field: 'retry_limit',
+    });
+    expect(projectService.create).not.toHaveBeenCalled(); expect(taskManagerDB.createTask).not.toHaveBeenCalled();
+    expect(f.events.some(sql => sql.startsWith('INSERT'))).toBe(false); expect(f.events.at(-1)).toBe('ROLLBACK');
+  });
+  test.each([1, 10])('instantiation materializes retry answer boundary %s as an integer', async maxRetries => {
+    const f = fixture();
+    f.doc.parameters.push({ key: 'retry_limit', label: 'Retries', promptText: 'How many retries?', type: 'integer', required: true, constraints: { min: 1, max: 10 } });
+    f.doc.tasks = [{ key: 'bounded-task', title: 'Bounded task', defaults: { maxRetries: '{{retry_limit}}' } }];
+    (taskManagerDB.createTask as jest.Mock).mockResolvedValue({ id: 'task' });
+    await f.service.instantiate('minimal-project', { ...f.request, parameterValues: { retry_limit: maxRetries } }, key, caller);
+    expect(taskManagerDB.createTask).toHaveBeenCalledWith(expect.objectContaining({ maxRetries }), caller.taskActor, expect.any(Function), expect.objectContaining({ client: f.client }));
+    expect(f.events.at(-1)).toBe('COMMIT');
+  });
   test.each([undefined, '', 'short', 'x'.repeat(129)])('invalid key refuses before connection acquisition', async key => {
     const f = fixture(); await expect(f.service.instantiate('minimal-project', f.request, key, caller)).rejects.toThrow('Idempotency-Key');
     expect(pool.connect).not.toHaveBeenCalled();

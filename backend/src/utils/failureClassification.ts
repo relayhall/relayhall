@@ -81,6 +81,8 @@ export type FailureCode = (typeof FAILURE_CODES)[number];
  * registering it fails the suite rather than silently degrading the logs.
  */
 export const ERROR_CLASS_NAMES = [
+  // Owner ruling E462 S4b: verification modes (services/VerificationModes.ts), a RequestFaultError.
+  'VerificationModeError',
   // Platform and driver.
   'Error',
   'TypeError',
@@ -100,11 +102,31 @@ export const ERROR_CLASS_NAMES = [
   'CredentialCryptoError',
   'CredentialLifecycleError',
   'CredentialPolicyError',
+  // Card 785e1eed P1-B-2 (AZ-A9 clause 13): the credential-issuance
+  // mechanism's refusals. Status, code and message are developer-authored in
+  // ConnectorCredentialIssuance by construction, or copied from a
+  // CredentialPolicyError; it never carries a driver's text or a secret.
+  'ConnectorCredentialIssueError',
+  // Card 1a38270d (AZ-A13, edit in place): the edit executor's refusals. Its
+  // status, code and message are developer-authored in AuthorityEditExecutor,
+  // or copied from a WarrantError, GrantError, CredentialPolicyError or
+  // StepUpError; it never carries a driver's text or a secret.
+  'AuthorityEditError',
+  // Card 41e24358: the default Verifier write's own refusals.
+  'DefaultVerifierRefusal',
+  // Card 80892045 (P2-D): the current-authority preview's refusals, a
+  // RequestFaultError subclass whose status, code and message are literals in
+  // AuthorityPreviewService; it never carries a driver's text or a secret.
+  'AuthorityPreviewError',
+  // Card 1e56dbef (AZ-A12 build 6): the Access Explorer read model's refusals.
+  'AccessExplorerError',
   'DelegationEvaluatorError',
+  'MetricsCollectorDenied',
   // Card 27322abb (owner ruling 60307311 §1.1): the first-run act's refusals.
   // Its status, code and message are developer-authored in FirstRunService by
   // construction; it never carries a driver's text.
   'FirstRunError',
+  'SessionAuthenticationUnavailableError',
   'StepUpError',
   'AppearanceValidationError',
   'AssetRejected',
@@ -114,10 +136,25 @@ export const ERROR_CLASS_NAMES = [
   'CarrierPrefixConfigError',
   'CharterError',
   'CharterLookupError',
+  'DependencyContextLookupError',
   'DependencyValidationError',
   'DescriptorError',
   'GrantError',
+  // Owner rulings E407 item 2 and E413: GrantEffectService's "the engine cannot
+  // evaluate this grant" outcome. Its messages are developer-authored
+  // constants; it is caught inside the service and answered as a verdict.
+  'GrantNotEvaluable',
   'GroupError',
+  // Card 20f40e40 (AZ-A12 build 1): createPrincipal's refusal of kind 'group'
+  // outside the Group writers. Its code and message are developer-authored
+  // constants; it never carries a driver's text.
+  'GroupPrincipalWriterError',
+  // Card 311229fd (AZ-A12 clause 9(e)): the Group ownership transfer act's
+  // refusals. Its status, code and message are developer-authored literals in
+  // GroupOwnershipTransfer and the ownership services, or copied from a
+  // StepUpError or the administratorSessionOf outcome; it never carries a
+  // driver's text or a secret.
+  'GroupOwnershipTransferError',
   // RH-LENSES-a (card 74e02a05): the directory-carriage refusals.
   'DirectoryCarriageError',
   'LifecyclePolicyConfigurationError',
@@ -136,6 +173,10 @@ export const ERROR_CLASS_NAMES = [
   'PhaseError',
   'PhaseFieldError',
   'PhaseLookupError',
+  // Card bedf50cc: the plugin host contract's load refusals. Its reason and
+  // message are developer-authored literals in PluginHostContract; it never
+  // carries manifest data, a driver's text or a secret.
+  'PluginContractError',
   'ConflictFault',
   'ForbiddenFault',
   'InvalidRequestFault',
@@ -151,12 +192,45 @@ export const ERROR_CLASS_NAMES = [
   // 94747de9 §4.2). They are re-raised as ServiceRegistryError at the
   // owner-plane act, but the dial client raises them directly.
   'KnowledgePolicyError',
+  // Native v2 selector refusal; only the canonical class label is logged.
+  'KnowledgeSelectorError',
   // RH-KW1 candidate B — the §5.2 signer and the §8.1 handle sealer. Both
   // raise NAMED refusals an operator has to be able to tell apart (a
   // rotated key from a forged handle, a stale arm evaluation from a jti
   // collision), so neither may classify as `unknown`.
   'KnowledgeAssertionError',
   'KnowledgeHandleError',
+  // RB-11 Governor v0 (card b796067e): the write door. The audit error carries
+  // a fixed sentence and the database cause only as `cause`; the input refusal
+  // carries a core-authored code and sentence about the caller's own input.
+  'KnowledgeWriteAuditError',
+  'KnowledgeWriteInputRefusal',
+  // Card 549cc51f: the shared-area writer list's refusals. Status, code, field
+  // and message are developer-authored literals in KnowledgeSharedWriterService;
+  // it never carries a driver's text, a reason or a secret.
+  'SharedWriterError',
+  // Card 08792425 (member N6): knowledge source registration's refusals.
+  // Status, code, field and message are developer-authored literals in
+  // KnowledgeSourceRegistration (or the descriptor and outbound-policy
+  // refusals it re-raises); it never carries a credential or a key.
+  'KnowledgeSourceRegistrationError',
+  // Card 502fb19e: the change decide's one-step-up evidence check. Status,
+  // code and message are developer-authored literals; it carries no token.
+  'DecisionEvidenceError',
+  // Card 9ce0b0b0 (S4): the role-change seam's and the account-status seam's
+  // refusals. Status, code and message are developer-authored literals in
+  // PrincipalRoleService and PrincipalService; they carry no driver text.
+  'RoleChangeError',
+  'AccountStatusError',
+  // Card 9ce0b0b0 (S5): the Report account-owner executor's refusals. Status,
+  // code and message are developer-authored literals; they carry no driver text.
+  'ReportAccountOwnershipError',
+  // Card bedf50cc (plugin availability and settings, E380): the plugin
+  // settings refusals. Status, code, field (a setting key, never a value) and
+  // message are developer-authored literals; none carries a value or a secret.
+  'PluginSettingsError',
+  'PluginRevisionError',
+  'PluginNotFoundError',
   // RH-KW1 candidate C — the coverage builder. It is raised only when a
   // CALLER of the builder tried to encode a state §7.5's partition forbids
   // (two outcomes for one source, a modifier on a source that did not answer,
@@ -176,6 +250,7 @@ export const ERROR_CLASS_NAMES = [
   // construction; no arm of it quotes a caught value.
   'HomeGroupError',
   'SkillContractError',
+  'SkillRefusalAuditError',
   'SkillDocumentError',
   'TaskElementError',
   // Cards 9c3a1aa4 / 7d38a6e0: the refusal of a Task body field that the
@@ -200,12 +275,22 @@ export const ERROR_CLASS_NAMES = [
   'SsoLogoutError',
   'SsoOutboundError',
   'SsoPublicOriginError',
+  // Card a3e76724 - a refused step-up callback. It carries the ORIGINAL typed
+  // refusal and a request id the server minted; its own message is a fixed
+  // sentence, never a caught value.
+  'SsoStepUpCallbackError',
+  // Card 72b8fb97 - the auth.step_up.refused row of a refused step-up could
+  // not be written; a fixed sentence, carried as the callback error's refusal.
+  'StepUpRefusalAuditError',
   // RH-TW1a — the telemetry envelope plane (design 7d5c0cdc). Both carry a
   // stable `code` and this file's own sentences; neither ever quotes a
   // reporter-supplied value, which is what lets them be logged at all.
   'TelemetryPepperError',
   'TelemetryPolicyError',
   'TelemetryQuarantineInputError',
+  // RH-TW1b (card dac2ca71) - an OTLP body the receiver cannot read. Carries a
+  // stable `code` and a fixed sentence of the decoder's own; never a payload byte.
+  'OtlpDecodeError',
   // Answers that are not class names.
   'UNKNOWN',
   'NonError',
@@ -277,7 +362,7 @@ const SQLSTATE_FAILURE_CODES: ReadonlyMap<string, FailureCode> = new Map<string,
  * Read a property only if it is an own DATA property. Returns undefined for an
  * accessor, so no caller-supplied getter is ever invoked.
  */
-function ownDataProperty(target: object, key: string): unknown {
+export function ownDataProperty(target: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(target, key);
   if (descriptor === undefined || !('value' in descriptor)) return undefined;
   return descriptor.value;

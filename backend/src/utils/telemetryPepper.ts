@@ -247,3 +247,13 @@ export function telemetryPepperCanary(env: NodeJS.ProcessEnv = process.env): { a
   }
   return { activePepperId: set.activePepperId, pepperCount: set.peppers.size };
 }
+
+/** The canonical native correlation seed, shared by ingest and Task attestation.
+ * A conversation ID takes precedence exactly as the envelope contract requires. */
+export function telemetrySessionReference(product: string,
+  correlation: { conversation_id?: string | null; session_id?: string | null } | null | undefined,
+  pepperId?: string): string | null {
+  const seed = correlation?.conversation_id ?? correlation?.session_id ?? null;
+  return typeof seed === 'string' && seed.length > 0
+    ? telemetryPseudonym(TELEMETRY_PSEUDONYM_DOMAINS.sessionRef, `${product}|${seed}`, pepperId) : null;
+}

@@ -40,11 +40,24 @@
 export type TransportClass = 'any' | 'mcp' | 'api';
 
 const ROUTE_TRANSPORT_CLASSES: Array<{ pattern: RegExp; transport: TransportClass }> = [
+  { pattern: /^\/tool-catalogue(\/|$)/, transport: 'any' },
   { pattern: /^\/appearance(\/|$)/, transport: 'any' },
   { pattern: /^\/plugins(\/|$)/, transport: 'any' },
+  // P02 bridge is classified like registry REST routes. Ingress still supplies
+  // the actual transport stamp; this declaration does not bypass credential pins.
+  { pattern: /^\/plugin-host(\/|$)/, transport: 'any' },
+  // Card bedf50cc (E380): plugin administration. Classified like the registry;
+  // its handler refuses every bearer anyway (C11), whatever its transport pin.
+  { pattern: /^\/plugin-admin(\/|$)/, transport: 'any' },
   { pattern: /^\/audit(\/|$)/, transport: 'any' },
   { pattern: /^\/events(\/|$)/, transport: 'any' },
+  // Card 5854f0d6: Needs your action and the Timeline, served over REST to the
+  // dashboard; no MCP tool composes them.
+  { pattern: /^\/notifications(\/|$)/, transport: 'any' },
   { pattern: /^\/telemetry(\/|$)/, transport: 'any' },
+  // E462 slice S3: read by the local connector over REST; no MCP tool composes it.
+  { pattern: /^\/connectors(\/|$)/, transport: 'any' },
+  { pattern: /^\/metrics$/, transport: 'any' },
   { pattern: /^\/notification-endpoints(\/|$)/, transport: 'any' },
   // RH-P5.SSO.W2 — the Identity provider owner-plane surface (A23.1, SS-3).
   { pattern: /^\/identity-providers(\/|$)/, transport: 'any' },
@@ -71,6 +84,16 @@ const ROUTE_TRANSPORT_CLASSES: Array<{ pattern: RegExp; transport: TransportClas
   { pattern: /^\/knowledge-sources(\/|$)/, transport: 'any' },
   { pattern: /^\/knowledge-contents(\/|$)/, transport: 'any' },
   { pattern: /^\/knowledge-queries(\/|$)/, transport: 'any' },
+  // RB-11 Governor v0: the three write verbs — REST twins of three MCP tools.
+  { pattern: /^\/knowledge-writes(\/|$)/, transport: 'any' },
+  // Card 549cc51f: the shared-area writer list, served over REST to the
+  // dashboard and the CLI and read by one MCP tool.
+  { pattern: /^\/knowledge-shared-writers(\/|$)/, transport: 'any' },
+  // Card 08792425 (member N6): knowledge source registration, served over
+  // REST to the dashboard's Services page. Classified like its siblings; its
+  // handler refuses every bearer anyway, whatever its transport pin, and no
+  // MCP tool names it.
+  { pattern: /^\/knowledge-source-registrations(\/|$)/, transport: 'any' },
   { pattern: /^\/grants(\/|$)/, transport: 'any' },
   { pattern: /^\/groups(\/|$)/, transport: 'any' },
   // RH-LENSES-a (card 74e02a05) -- the remote-group catalog. 'any', like
@@ -87,6 +110,9 @@ const ROUTE_TRANSPORT_CLASSES: Array<{ pattern: RegExp; transport: TransportClas
   // over that list.
   { pattern: /^\/directory-group-references(\/|$)/, transport: 'any' },
   { pattern: /^\/access-profiles(\/|$)/, transport: 'any' },
+  // AZ-A12 build 6 (card 1e56dbef): the Access Explorer read model, served
+  // over REST to the dashboard; no MCP tool reads it.
+  { pattern: /^\/access-explorer(\/|$)/, transport: 'any' },
   { pattern: /^\/warrants(\/|$)/, transport: 'any' },
   { pattern: /^\/approvals(\/|$)/, transport: 'any' },
   { pattern: /^\/delegation(\/|$)/, transport: 'any' },

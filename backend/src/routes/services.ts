@@ -20,10 +20,15 @@ import {
 import { auditActorFromRequest } from '../utils/auditActor';
 import { boardEndpointFor, composeOnboardingPack } from '../utils/onboardingPack';
 import { principalService, CredentialPolicyError } from '../services/PrincipalService';
+import { credentialKeysRefusal } from '../utils/credentialKeysRefusal';
 import { pool } from '../db/connection';
 import { lifecyclePolicyDenialEnvelope } from '../services/LifecyclePolicyService';
 
 const router = Router();
+
+// Descriptor Version shape is refused by sharedAuthorization after its route
+// ceiling and before the Service point lookup; ServiceRegistry independently
+// retains the int4 bound for every non-route consumer.
 
 function ifMatchRevision(req: Request): string {
   const raw = (req.headers['if-match'] as string | undefined) ?? '';
@@ -75,6 +80,15 @@ function sendServiceError(res: Response, e: unknown): boolean {
   // refusal nobody can explain to the person who hit it.
   if (e instanceof CredentialPolicyError) {
     sendApiError(res, e.status, e.code, e.message);
+    return true;
+  }
+  // A board with no credential key set cannot store the first credential of
+  // a connection. That is the server's configuration, not the request, and the
+  // operator can fix it: a named 503 that says how, instead of the anonymous
+  // 500 whose only clue was the backend log (utils/credentialKeysRefusal).
+  const keys = credentialKeysRefusal(e);
+  if (keys) {
+    sendApiError(res, keys.status, keys.code, keys.message);
     return true;
   }
   return false;
@@ -164,9 +178,9 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
     if (!checkQueryKeys(req, res, ['dryRun'])) return;
     const dry = parseDryRun(req, res);
     if (!dry.ok) return;
-    const body = checkBodyKeys(req, res, ['slug', 'name', 'description', 'kind', 'runtimeMode', 'telemetryTier', 'ownerAccountId', 'issueCredential']);
+    const body = checkBodyKeys(req, res, ['slug', 'name', 'description', 'kind', 'runtimeMode', 'telemetryTier', 'ownerAccountId', 'issueCredential', 'descriptor']);
     if (!body) return;
-    // §7.4 (RH-P3.AZ-S5, sol m11): "CONNECTOR packs return in the
+    // §7.4 (RH-P3.AZ-S5, review m11): "CONNECTOR packs return in the
     // Connector-creation response" — an authenticated SESSION registering
     // a Connector may issue its FIRST credential in the same call and
     // receive the one-time onboarding pack. Self-service is the §9.2
@@ -246,6 +260,7 @@ router.post('/', async (req: AuthRequest, res: Response): Promise<void> => {
       runtimeMode: body.runtimeMode,
       telemetryTier: body.telemetryTier,
       ownerAccountId: body.ownerAccountId,
+      descriptor: body.descriptor,
     };
 
     let service: Awaited<ReturnType<typeof serviceRegistry.register>>;

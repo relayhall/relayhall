@@ -100,8 +100,8 @@ if (ARM === 'spawn') {
   const answers = [];
   for (const [g, p, label] of handed) {
     const env = {};
-    if (g !== 'unlimited') env.CLAWBEAT_MAX_ACTIVE_GLOBAL = String(g);
-    if (p !== 'unlimited') env.CLAWBEAT_MAX_ACTIVE_PER_PROJECT = String(p);
+    if (g !== 'unlimited') env.RELAYHALL_MAX_ACTIVE_GLOBAL = String(g);
+    if (p !== 'unlimited') env.RELAYHALL_MAX_ACTIVE_PER_PROJECT = String(p);
     const run = await runCompiledServer(env);
     const answer = run.code === 0 ? parseProbeLine(run.stdout) : null;
     answers.push(answer);
@@ -119,6 +119,18 @@ if (ARM === 'spawn') {
       ? judgeEffectiveConfiguration(parseProbeLine(unset.stdout), { maxActiveGlobal: 'unlimited', maxActivePerProject: 'unlimited' })
       : { ok: false, reason: `compiled server exited ${unset.code}: ${unset.stderr.slice(-300)}` },
     { exit: unset.code });
+
+  // Deployments written before the variables were renamed keep working: the
+  // same bound handed under the former names must reach the compiled process,
+  // and the boot must report the former names once.
+  const former = await runCompiledServer({ CLAWBEAT_MAX_ACTIVE_GLOBAL: '6', CLAWBEAT_MAX_ACTIVE_PER_PROJECT: '2' });
+  const notices = `${former.stdout}\n${former.stderr}`.split('\n').filter((line) => line.includes('[config] deprecated environment variable name')).length;
+  const formerJudged = former.code === 0
+    ? judgeEffectiveConfiguration(parseProbeLine(former.stdout), { maxActiveGlobal: 6, maxActivePerProject: 2 })
+    : { ok: false, reason: `compiled server exited ${former.code}: ${former.stderr.slice(-300)}` };
+  record('the former variable names still reach the process, with one deprecation notice',
+    formerJudged.ok && notices !== 1 ? { ok: false, reason: `expected exactly one deprecation notice, saw ${notices}` } : formerJudged,
+    { exit: former.code, notices });
 
   // Sensitivity: the oracle must tell the arms apart, or a process that
   // ignored its environment would pass them all.

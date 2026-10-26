@@ -18,6 +18,7 @@
 import { taskManagerDB as taskManager } from './TaskManagerDB';
 import { projectService } from './ProjectService';
 import type { AuthorizedTaskNarrowing } from '../middleware/sharedAuthorization';
+import { canonicalRuntimeSignalService } from './CanonicalRuntimeSignalService';
 
 export interface ProjectStats {
   total_tasks: number;
@@ -37,13 +38,12 @@ export class ProjectStatsService {
     const total = tasks.length;
     const completed = tasks.filter(t => t.status === 'completed').length;
     const inProgress = tasks.filter(t => t.status === 'in-progress').length;
-    const activeAgents = new Set(
-      tasks.filter(t => t.activeAgent).map(t => t.activeAgent!.name)
-    ).size;
+    const signals = await canonicalRuntimeSignalService.listTaskSignalsForTasks(tasks.map(task => task.id));
+    const activeAgents = new Set(signals.filter(signal => signal.state === 'active').map(signal => signal.attemptId)).size;
 
     let lastActivity: string | null = null;
     for (const t of tasks) {
-      const ts = t.completedAt || t.startedAt || t.lastChecked || t.created;
+      const ts = t.completedAt || t.startedAt || t.updated || t.created;
       if (ts && (!lastActivity || ts > lastActivity)) {
         lastActivity = ts;
       }
@@ -85,7 +85,7 @@ export class ProjectStatsService {
 
     return {
       tasks_created: tasks.filter(t => t.created && t.created >= cutoffStr).length,
-      tasks_updated: tasks.filter(t => t.lastChecked && t.lastChecked >= cutoffStr).length,
+      tasks_updated: tasks.filter(t => t.updated && t.updated >= cutoffStr).length,
       tasks_completed: tasks.filter(t => t.status === 'completed' && t.completedAt && t.completedAt >= cutoffStr).length,
     };
   }

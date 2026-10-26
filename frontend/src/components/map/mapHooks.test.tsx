@@ -23,9 +23,17 @@ import type { MapGraphQuery } from './mapGraphApi';
 import type { DetailBand } from './useMapData';
 import { DETAIL_MATRIX, DETAIL_THRESHOLDS, detailBandFor, useMapData } from './useMapData';
 import { useMapInteractions } from './useMapInteractions';
-import { DEFAULT_VIEW, planeFitScale, SCALE_MAX, SCALE_MIN, useMapViewState } from './useMapViewState';
+import { DEFAULT_VIEW, planeFitScale, readPersistedView, SCALE_MAX, SCALE_MIN, useMapViewState } from './useMapViewState';
 
-const STORAGE_KEY = 'relayhall_map_view';
+const STORAGE_KEY = 'relayhall_map_view_v2';
+
+test('the density revision inherits a released camera without deleting its record', () => {
+  sessionStorage.setItem('relayhall_map_view', JSON.stringify({
+    organization: 'horizontal', altitude: 'task', scale: 0.004, offsetY: -100_000,
+  }));
+  expect(readPersistedView()).toMatchObject({ organization: 'horizontal', scale: 0.004, offsetY: -100_000 });
+  expect(sessionStorage.getItem('relayhall_map_view')).not.toBeNull();
+});
 
 // ---------------------------------------------------------------------------
 // Harness (pattern copied from src/pages/TasksPage.windowing.test.tsx)
@@ -61,6 +69,16 @@ const UNKNOWN_NODE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const QUERY: MapGraphQuery = { includeArchived: false };
 
 let queryClient: QueryClient;
+// Production cache identity includes the mounted observer and authority epoch.
+// Inspect the one current query, never an obsolete two-part cache key.
+const activeMapKey = () => {
+  const active = queryClient.getQueryCache().findAll({
+    queryKey: ['map-graph', JSON.stringify(QUERY)], type: 'active',
+  });
+  expect(active).toHaveLength(1);
+  expect(active[0].state.data).toBeDefined();
+  return active[0].queryKey;
+};
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
 );
@@ -125,6 +143,23 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('useMapViewState', () => {
+  test.each(['zoomTo', 'zoomBy', 'panBy'] as const)('%s cancels pending arrival and explicit Fit but permits a later explicit Fit', action => {
+    const { result } = renderHook(() => useMapViewState());
+    const navigate = () => {
+      if (action === 'zoomTo') result.current.zoomTo(0.7, { x: 100, y: 80 });
+      else if (action === 'zoomBy') result.current.zoomBy(1.25, { x: 100, y: 80 });
+      else result.current.panBy(30, -20);
+    };
+    expect(result.current.needsFit()).toBe(true);
+    act(navigate);
+    expect(result.current.needsFit()).toBe(false);
+    act(() => result.current.requestRefit());
+    expect(result.current.needsFit()).toBe(true);
+    act(navigate);
+    expect(result.current.needsFit()).toBe(false);
+    act(() => result.current.requestRefit());
+    expect(result.current.needsFit()).toBe(true);
+  });
   test('1. a FRESH view owes exactly one fit, and applying it settles the debt', () => {
     // Pins: a fresh map that never fits opens at scale 1 / offset 0 with the
     // graph off-screen. needsFit() must be true before, false after.
@@ -334,6 +369,119 @@ describe('useMapData', () => {
     });
     expect(result.current.graph.nodes).toHaveLength(graphTaskFixture.nodes.length);
     expect(result.current.graph.nodes.map(node => node.id)).not.toContain(UNKNOWN_NODE_ID);
+  });
+
+  test.each(['ownership', 'focus', 'reconnect', 'manual'] as const)('%s full reload cannot be overwritten by an older in-flight Map delta', async trigger => {
+    const { result, rerender } = await renderMapData();
+    expect(result.current.graph.phases.length).toBeGreaterThan(0);
+
+    let resolveOldDelta!: (response: Response) => void;
+    const oldDelta = new Promise<Response>(resolve => { resolveOldDelta = resolve; });
+    const postTransfer = {
+      ...graphTaskFixture,
+      phases: [],
+      reports: [],
+      generatedAt: '2026-09-26T22:30:00.000Z',
+    };
+    fetchMock.mockImplementation(async (url: string) => {
+      requestUrls.push(url);
+      if (paramOf(url, 'updatedSince')) return oldDelta;
+      return new Response(JSON.stringify(postTransfer), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    vi.useFakeTimers();
+    await wsEvent('task.updated', { task: taskPayload(UNKNOWN_NODE_ID, 'Outside this Map') });
+    act(() => { vi.advanceTimersByTime(350); });
+    expect(requestUrls.some(url => paramOf(url, 'updatedSince') === RECORDED_GENERATED_AT)).toBe(true);
+    vi.useRealTimers();
+
+    const deltaSignal = fetchMock.mock.calls.find(([url]) => paramOf(String(url), 'updatedSince'))?.[1]?.signal;
+    expect(deltaSignal?.aborted).toBe(false);
+    if (trigger === 'ownership') await wsEvent('project.authority_changed', {});
+    else if (trigger === 'focus') act(() => { window.dispatchEvent(new Event('focus')); });
+    else if (trigger === 'reconnect') { wsState.connected = true; rerender(); }
+    else act(() => { result.current.refetch(); });
+    expect(deltaSignal?.aborted).toBe(true);
+    await waitFor(() => {
+      expect(result.current.graph.phases).toEqual([]);
+      expect(result.current.generatedAt).toBe(postTransfer.generatedAt);
+    });
+
+    // The old delta carried the pre-transfer Phase snapshot. It must
+    // never replace the newer authoritative read, even with equal node count.
+    await act(async () => {
+      resolveOldDelta(new Response(JSON.stringify({
+        ...graphDeltaFixture,
+        reports: [{ id: 'revoked-report', title: 'Must remain concealed', taskIds: [KNOWN_NODE_ID] }],
+      }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }));
+      // React Query batches observer notifications on a later task. Waiting
+      // only for fetch microtasks can inspect the old render and falsely pass.
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    expect(queryClient.getQueryData<{ phases: unknown[] }>(activeMapKey())?.phases).toEqual([]);
+    expect(result.current.graph.phases).toEqual([]);
+    expect(result.current.graph.reports).toEqual([]);
+    expect(result.current.generatedAt).toBe(postTransfer.generatedAt);
+  });
+
+  test('an older deletion fallback cannot restore authority after a full reload', async () => {
+    const { result } = await renderMapData();
+    let resolveFallback!: (response: Response) => void;
+    const fallback = new Promise<Response>(resolve => { resolveFallback = resolve; });
+    const current = { ...graphTaskFixture, phases: [], reports: [], generatedAt: '2026-09-26T22:31:00.000Z' };
+    let fullReads = 0;
+    fetchMock.mockImplementation(async (url: string) => {
+      requestUrls.push(url);
+      if (paramOf(url, 'updatedSince')) return new Response(JSON.stringify({ ...graphDeltaFixture, fullCount: 0 }), { status: 200 });
+      fullReads += 1;
+      if (fullReads === 1) return fallback;
+      return new Response(JSON.stringify(current), { status: 200 });
+    });
+    vi.useFakeTimers();
+    await wsEvent('tasks.updated', {});
+    act(() => { vi.advanceTimersByTime(350); });
+    vi.useRealTimers();
+    await waitFor(() => { expect(fullReads).toBe(1); });
+    await wsEvent('project.authority_changed', {});
+    await waitFor(() => { expect(result.current.generatedAt).toBe(current.generatedAt); });
+    await act(async () => {
+      resolveFallback(new Response(JSON.stringify(graphTaskFixture), { status: 200 }));
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    expect(queryClient.getQueryData<{ generatedAt: string }>(activeMapKey())?.generatedAt).toBe(current.generatedAt);
+    expect(result.current.graph.phases).toEqual([]);
+  });
+
+  test.each(['scope', 'unmount'] as const)('%s change discards a pending old-scope delta', async change => {
+    const { result, rerender, unmount } = renderHook(({ query }) => useMapData(query), { wrapper, initialProps: { query: QUERY } });
+    await waitFor(() => { expect(result.current.isLoading).toBe(false); });
+    let resolveDelta!: (response: Response) => void;
+    const delayed = new Promise<Response>(resolve => { resolveDelta = resolve; });
+    fetchMock.mockImplementation(async (url: string) => {
+      requestUrls.push(url);
+      if (paramOf(url, 'updatedSince')) return delayed;
+      return new Response(JSON.stringify({ ...graphTaskFixture, phases: [], generatedAt: '2026-09-26T22:32:00.000Z' }), { status: 200 });
+    });
+    vi.useFakeTimers();
+    await wsEvent('tasks.updated', {});
+    act(() => { vi.advanceTimersByTime(350); });
+    vi.useRealTimers();
+    const deltaSignal = fetchMock.mock.calls.find(([url]) => paramOf(String(url), 'updatedSince'))?.[1]?.signal;
+    expect(deltaSignal?.aborted).toBe(false);
+    const oldKey = activeMapKey();
+    if (change === 'scope') rerender({ query: { includeArchived: true } }); else unmount();
+    expect(deltaSignal?.aborted).toBe(true);
+    await act(async () => {
+      resolveDelta(new Response(JSON.stringify({ ...graphDeltaFixture, generatedAt: 'obsolete' }), { status: 200 }));
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
+    const oldCache = queryClient.getQueryData<{ generatedAt: string }>(oldKey);
+    expect(oldCache?.generatedAt).not.toBe('obsolete');
+    if (change === 'scope') expect(result.current.generatedAt).toBe('2026-09-26T22:32:00.000Z');
   });
 
   test('9. task.deleted carrying the production `{ id }` payload prunes the node AND every edge touching it', async () => {
@@ -628,10 +776,9 @@ describe('live taxonomy converges through the production reconcile paths', () =>
     });
   });
 
-  test('an agent pickup on an in-scope task patches liveness in place, name only', async () => {
-    // Pins: the WS patch rewrote five membership fields and never touched
-    // agent. A pickup moves NO membership field, so it also scheduled no
-    // reconcile — the every-zoom badge sat stale until something else moved.
+  test('an in-scope task patch preserves metadata without trusting a retired agent field', async () => {
+    // An old client may still send the retired field; it cannot manufacture
+    // agent identity or session liveness in a current graph.
     const { result } = await renderMapData();
     const before = result.current.graph.nodes.find(node => node.id === KNOWN_NODE_ID)!;
 
@@ -644,9 +791,9 @@ describe('live taxonomy converges through the production reconcile paths', () =>
     });
 
     await waitFor(() => {
-      expect(result.current.graph.nodes.find(n => n.id === KNOWN_NODE_ID)?.agent).toBe('Relay');
+      expect(result.current.graph.nodes.find(n => n.id === KNOWN_NODE_ID)?.agent).toBeNull();
     });
-    // The graph keeps the NAME and nothing else: session internals stay out.
+    // Neither the obsolete identity nor its private session locator is kept.
     expect(JSON.stringify(result.current.graph)).not.toContain('must-not-leak');
   });
 
@@ -848,7 +995,7 @@ describe('continuous plane fit floor', () => {
   test('fits the whole extent with ten percent margins and guards pathological planes', () => {
     expect(planeFitScale({ width: 4000, height: 1000 }, { width: 1000, height: 800 })).toBe(0.2);
     expect(planeFitScale({ width: 1000, height: 4000 }, { width: 1000, height: 800 })).toBe(0.16);
-    expect(planeFitScale({ width: 1e9, height: 1e9 }, { width: 1000, height: 800 })).toBe(0.05);
+    expect(planeFitScale({ width: 1e9, height: 1e9 }, { width: 1000, height: 800 })).toBe(0.0001);
   });
 
   test('every relative and absolute zoom respects a recomputed floor', () => {

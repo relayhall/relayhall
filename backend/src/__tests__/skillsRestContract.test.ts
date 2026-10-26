@@ -123,8 +123,8 @@ describe('/skills house REST contract', () => {
       });
       expect(deletion.status).toBe(200);
     });
-    expect(manager.update).toHaveBeenCalledWith(ID, expect.objectContaining({ description: 'new' }), REV, undefined);
-    expect(manager.delete).toHaveBeenCalledWith(ID, REV);
+    expect(manager.update).toHaveBeenCalledWith(ID, expect.objectContaining({ description: 'new' }), REV, undefined, expect.objectContaining({ authMethod: 'unknown', principalId: null }));
+    expect(manager.delete).toHaveBeenCalledWith(ID, REV, expect.objectContaining({ authMethod: 'unknown', principalId: null }));
   });
 
   it.each([
@@ -173,6 +173,26 @@ describe('/skills house REST contract', () => {
       const body = await response.json() as Record<string, unknown>;
       expect(body).toEqual(expect.objectContaining({
         success: false, code: 'REVISION_MISMATCH', error: expect.any(String), message: expect.any(String),
+      }));
+    });
+  });
+
+  // Card f87776ad: the provenance refusal names its field in `details`, which
+  // the house envelope must carry rather than drop.
+  it('carries a named provenance refusal with its field details', async () => {
+    const details = { field: 'provenance', provenance: 'agent-drafted', principalKind: 'human',
+      allowed: ['human-authored', 'imported'] };
+    manager.update.mockRejectedValue(new SkillContractError(422, 'INVALID_SKILL_VALUE',
+      "provenance 'agent-drafted' cannot be recorded by a human Principal", details));
+    await withServer(async base => {
+      const response = await fetch(`${base}/skills/${ID}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'If-Match': REV },
+        body: JSON.stringify({ description: 'new', provenance: 'agent-drafted' }),
+      });
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual(expect.objectContaining({
+        success: false, code: 'INVALID_SKILL_VALUE', details,
+        error: expect.stringContaining("provenance 'agent-drafted'"),
       }));
     });
   });

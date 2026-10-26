@@ -40,14 +40,15 @@ const PROBE_KILL_MS = 90_000;
  * $TMPDIR, so children sharing one collide there instead — a collision in the
  * harness, which would say nothing about the endpoint.
  *
- * The probe root differs from this process's os.tmpdir(), which is how the earlier
+ * Each probe directory differs from this process's os.tmpdir(), which is how the earlier
  * marker-file design was caught splitting one endpoint across two mutexes. The
  * present design has nothing that reads TMPDIR, and this arrangement keeps it
  * that way by making the difference the normal case rather than one the control
- * happens to avoid.
+ * happens to avoid. A short temporary root also keeps tsx's Unix socket below
+ * sun_path's limit regardless of the clone path length.
  */
 const PROBE_TMP_ROOT = process.env.RELAYHALL_TEST_PROBE_TMP_ROOT
-  || path.join(BACKEND_DIR, 'node_modules', '.cache', 'fixg-probe-tmp');
+  || fs.mkdtempSync(path.join(os.tmpdir(), 'rh-p-'));
 
 function probeTmpdir(index: number): string {
   return path.join(PROBE_TMP_ROOT, `probe-${index}`);
@@ -184,7 +185,8 @@ describe('the pinned boot-check endpoint is held by one process at a time', () =
     // Each child ran with a temporary directory of its own, none of them this
     // process's: nothing in the mechanism may depend on that agreeing.
     for (let i = 0; i < PROBES; i += 1) {
-      expect(probeTmpdir(i).startsWith(os.tmpdir())).toBe(false);
+      expect(probeTmpdir(i)).not.toBe(os.tmpdir());
+      expect(probeTmpdir(i).startsWith(BACKEND_DIR)).toBe(false);
     }
 
     for (const result of results) {

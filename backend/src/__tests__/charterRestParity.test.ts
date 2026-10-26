@@ -15,6 +15,8 @@ jest.mock('../db/connection', () => ({
 import { pool } from '../db/connection';
 import projectsRouter from '../routes/projects';
 import { requiredScopeFor } from '../utils/scopeMap';
+import { pointAuthorizationTarget } from '../middleware/sharedAuthorization';
+import { buildOpenApiSpec } from '../openapi/spec';
 
 const PROJECT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CHARTER_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
@@ -179,4 +181,36 @@ describe('versions', () => {
     expect(invalid.status).toBe(400);
     expect(invalid.json.code).toBe('INVALID_QUERY_VALUE');
   });
+});
+
+describe('named Charter approval route boundary', () => {
+  it('uses project write classification without changing root PUT or task verify', () => {
+    expect(requiredScopeFor('POST', `/projects/${PROJECT_ID}/charter/approve`)).toBe('projects:write');
+    expect(pointAuthorizationTarget('POST', `/projects/${PROJECT_ID}/charter/approve`)?.action).toBe('write');
+    expect(pointAuthorizationTarget('POST', `/PROJECTS/${PROJECT_ID}/CHARTER/APPROVE/`)?.action).toBe('write');
+    expect(requiredScopeFor('PUT', `/projects/${PROJECT_ID}/charter`)).toBe('root');
+    expect(pointAuthorizationTarget('POST', `/tasks/${PROJECT_ID}/subtasks/0/approve`)?.action).toBe('verify');
+  });
+  it('rejects an unauthenticated approval through the real route and performs no write', async () => {
+    const result = await call('POST', `/projects/${PROJECT_ID}/charter/approve`, { body: { content: '# Proposal' } });
+    expect(result.status).toBe(403);
+    expect(result.json.code).toBe('CHARTER_APPROVAL_FORBIDDEN');
+    expect(head).toBeNull();
+  });
+});
+
+it('advertises the approval path, revision and strict content body in OpenAPI', () => {
+  const spec = buildOpenApiSpec() as any;
+  const approval = spec.paths['/projects/{id}/charter/approve'].post;
+  expect(approval.parameters).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: 'id', in: 'path', required: true }),
+    expect.objectContaining({ name: 'If-Match', in: 'header' }),
+  ]));
+  expect(approval.requestBody.required).toBe(true);
+  expect(approval.requestBody.content['application/json'].schema).toMatchObject({
+    required: ['content'], additionalProperties: false,
+  });
+  for (const status of ['200', '201', '400', '403', '404', '409', '412', '422']) {
+    expect(approval.responses[status]).toBeDefined();
+  }
 });

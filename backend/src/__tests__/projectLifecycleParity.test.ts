@@ -63,12 +63,16 @@ function armPool(): void {
       nameLocks.push(String(params[0]));
       return { rows: [{ pg_advisory_xact_lock: null }] };
     }
+    // AZ-A12 clause 12 (card a9b1e69c): the point and list reads join the
+    // owner's kind and name onto the row (`p.*` plus two columns).
+    const ownerJoined = sql.startsWith('SELECT p.*, project_owner.kind AS owner_kind');
     if (sql.startsWith('SELECT * FROM projects WHERE id = $1 FOR UPDATE')
-      || sql.startsWith('SELECT * FROM projects WHERE id = $1')) {
+      || sql.startsWith('SELECT * FROM projects WHERE id = $1')
+      || (ownerJoined && sql.includes('WHERE p.id = $1'))) {
       const row = projects.get(params[0]);
       return { rows: row ? [row] : [] };
     }
-    if (sql.startsWith('SELECT * FROM projects')) {
+    if (sql.startsWith('SELECT * FROM projects') || ownerJoined) {
       let rows = Array.from(projects.values());
       if (sql.includes(`status != 'archived'`)) rows = rows.filter((r) => r.status !== 'archived');
       if (sql.includes('status = $1')) rows = rows.filter((r) => r.status === params[0]);
@@ -274,12 +278,15 @@ describe('canonical bounded reads (review c99117a1 finding 1)', () => {
       expect(serialized).not.toContain('"links"');
     }
     const single = await call('GET', `/projects/${P1}`);
-    // `goal` joined the canonical bounded record with migration 079 (RH-P2.4):
-    // the ratified Goal PROPERTY at the project altitude. Everything else the
-    // c99117a1 finding excluded stays excluded.
+    // Goal and the explicit nullable Project owner are canonical bounded
+    // fields. Compatibility-held filesystem and legacy values stay excluded.
+    // Card b13e5ac9: inboxPhaseId is a canonical bounded field (migration 141).
+    // Card 41e24358: so is defaultVerifierPrincipalId (migration 155).
+    // Card a9b1e69c (AZ-A12 clause 12): and the joined ownerKind and ownerDisplayName.
     expect(Object.keys(single.json.project).sort()).toEqual(
-      ['created_at', 'description', 'goal', 'id', 'is_hidden', 'name', 'revision', 'status', 'updated_at'],
+      ['created_at', 'defaultVerifierPrincipalId', 'description', 'goal', 'id', 'inboxPhaseId', 'is_hidden', 'name', 'ownerDisplayName', 'ownerKind', 'ownerPrincipalId', 'revision', 'status', 'updated_at'],
     );
+    expect(single.json.project.ownerPrincipalId).toBeNull();
   });
 });
 
@@ -321,11 +328,13 @@ describe('OpenAPI matches the runtime Project contract exactly (reviews 5d229bf1
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { buildOpenApiSpec } = require('../openapi/spec');
 
-  it('the Project schema requires exactly the nine runtime keys and forbids extras', () => {
+  // Card 41e24358: twelve since defaultVerifierPrincipalId (migration 155);
+  // card a9b1e69c (AZ-A12 clause 12): fourteen with ownerKind and ownerDisplayName.
+  it('the Project schema requires exactly the fourteen runtime keys and forbids extras', () => {
     const spec: any = buildOpenApiSpec();
     const schema = spec.components.schemas.Project;
     expect([...schema.required].sort()).toEqual(
-      ['created_at', 'description', 'goal', 'id', 'is_hidden', 'name', 'revision', 'status', 'updated_at'],
+      ['created_at', 'defaultVerifierPrincipalId', 'description', 'goal', 'id', 'inboxPhaseId', 'is_hidden', 'name', 'ownerDisplayName', 'ownerKind', 'ownerPrincipalId', 'revision', 'status', 'updated_at'],
     );
     expect(schema.additionalProperties).toBe(false);
     expect(Object.keys(schema.properties).sort()).toEqual([...schema.required].sort());

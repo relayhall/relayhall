@@ -45,6 +45,9 @@ export interface KnowledgeSourceSummary {
   subjectMode: KnowledgeSubjectMode;
   classes: DescriptorKnowledgeClass[];
   compartments: string[];
+  protocol_version?: 2;
+  compartment_mode?: string;
+  categories?: string[];
 }
 
 interface CandidateRow {
@@ -107,6 +110,7 @@ export class KnowledgeSourceService {
         subjectMode: row.knowledge_subject_mode,
         classes: block?.classes ?? [],
         compartments: block?.compartments ?? [],
+        ...(block?.protocol_version === 2 ? { protocol_version: 2 as const, compartment_mode: block.compartment_mode, categories: block.categories } : {}),
       });
     }
     return sources;

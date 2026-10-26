@@ -19,6 +19,8 @@ const render = (ui: React.ReactElement) => rtlRender(ui, { wrapper: MemoryRouter
 import { CreateIdentityWizard } from './CreateIdentityWizard';
 import { CREDENTIAL_TOKEN_PATTERN } from '../../types/connections';
 import { PURPOSE_REQUIRED_MESSAGE } from '../../types/identities';
+import catalogueFixture from '../access/roleCatalogue.generated.json';
+import { assignableBy } from '../../utils/administratorSession';
 
 const fetchMock = vi.fn();
 vi.mock('../../utils/auth', () => ({
@@ -26,6 +28,9 @@ vi.mock('../../utils/auth', () => ({
 }));
 
 const SESSION_SCOPES = ['tasks:read', 'tasks:write', 'reports:read'];
+/** The signed-in person's own role, and whether the role catalogue answers. */
+let meRole = 'user';
+let catalogueAnswers = true;
 const REAL_TOKEN = 'rh_dev_ab12cd34ef56.SECRETVALUE0000000000';
 
 const ok = (payload: unknown, status = 200) => ({ ok: true, status, json: async () => payload });
@@ -72,13 +77,18 @@ function mutationOrder(): string[] {
 }
 
 beforeEach(() => {
+  meRole = 'user';
+  catalogueAnswers = true;
   fetchMock.mockReset();
   fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     const target = String(url);
+    if (target.endsWith('/principals/roles')) {
+      return catalogueAnswers ? ok({ success: true, roles: catalogueFixture.roles }) : refused(500, { error: 'boom' });
+    }
     if (target.endsWith('/principals/me')) {
       return ok({
         success: true,
-        principal: { id: 'me', handle: 'ada', kind: 'human', role: 'user' },
+        principal: { id: 'me', handle: 'ada', kind: 'human', role: meRole },
         scopes: SESSION_SCOPES,
         delegableScopes: SESSION_SCOPES,
       });
@@ -281,5 +291,75 @@ describe('My connections — the same component, preset', () => {
     expect(await screen.findByRole('heading', { name: /Connect your agent/ })).toBeInTheDocument();
     expect(screen.queryByRole('radio', { name: /Human/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/belongs to somebody else/)).not.toBeInTheDocument();
+  });
+});
+
+describe('the role selector explains every role from the catalogue (card a2d1e317)', () => {
+  const offeredRoles = () => Array.from(
+    (screen.getByLabelText('Role') as HTMLSelectElement).querySelectorAll('option'),
+  ).map((option) => option.value);
+  const expectedFor = (kind: 'human' | 'service', issuerRole: string) => catalogueFixture.roles
+    .filter((entry) => (entry.meantFor as string[]).includes(kind) && assignableBy(issuerRole).includes(entry.role))
+    .map((entry) => entry.role);
+  const explanation = () => document.querySelector('#identity-role-explanation .role-expl');
+
+  it('Human: offers the catalogue roles meant for people that this session may assign', async () => {
+    render(<CreateIdentityWizard />);
+    await chooseKind('Human');
+    await waitFor(() => expect(explanation()).not.toBeNull());
+    await waitFor(() => expect(offeredRoles()).toEqual(expectedFor('human', 'user')));
+    expect(offeredRoles()).not.toContain('admin');
+    expect(offeredRoles()).not.toContain('agent');
+  });
+
+  it('Service: never an elevated role, whatever the session', async () => {
+    meRole = 'admin';
+    render(<CreateIdentityWizard />);
+    await chooseKind('Service');
+    await waitFor(() => expect(explanation()).not.toBeNull());
+    await waitFor(() => expect(offeredRoles()).toEqual(expectedFor('service', 'admin')));
+    for (const elevated of ['admin', 'operator', 'orchestrator']) expect(offeredRoles()).not.toContain(elevated);
+    expect(offeredRoles()).toContain('agent');
+  });
+
+  it('an admin creating a person is offered admin, with its entry', async () => {
+    meRole = 'admin';
+    render(<CreateIdentityWizard />);
+    await chooseKind('Human');
+    await waitFor(() => expect(explanation()).not.toBeNull());
+    await waitFor(() => expect(offeredRoles()).toEqual(expectedFor('human', 'admin')));
+    await userEvent.selectOptions(screen.getByLabelText('Role'), 'admin');
+    const admin = catalogueFixture.roles.find((entry) => entry.role === 'admin')!;
+    expect(explanation()?.getAttribute('data-role')).toBe('admin');
+    expect(explanation()).toHaveTextContent(admin.mayReach);
+  });
+
+  it('the text under the selector is the catalogue entry, for every offered role', async () => {
+    render(<CreateIdentityWizard />);
+    await chooseKind('Human');
+    await waitFor(() => expect(explanation()).not.toBeNull());
+    for (const role of offeredRoles()) {
+      await userEvent.selectOptions(screen.getByLabelText('Role'), role);
+      const entry = catalogueFixture.roles.find((candidate) => candidate.role === role)!;
+      expect(explanation()?.getAttribute('data-role')).toBe(role);
+      expect(explanation()?.querySelector('.role-expl-purpose')?.textContent).toBe(entry.purpose);
+      expect(explanation()).toHaveTextContent(entry.mayReach);
+      expect(explanation()).toHaveTextContent(entry.neverReaches);
+      expect(explanation()).toHaveTextContent(entry.meantForText);
+    }
+  });
+
+  it('an unreadable catalogue offers only the working default and says why', async () => {
+    catalogueAnswers = false;
+    render(<CreateIdentityWizard />);
+    await chooseKind('Human');
+    expect(await screen.findByText(/role catalogue could not be read/)).toBeInTheDocument();
+    expect(offeredRoles()).toEqual(['user']);
+  });
+
+  it('the Agent arm and My connections never read the catalogue', async () => {
+    render(<CreateIdentityWizard initialKind="agent" lockKind />);
+    await screen.findByRole('heading', { name: /Connect your agent/ });
+    expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith('/principals/roles'))).toBe(false);
   });
 });

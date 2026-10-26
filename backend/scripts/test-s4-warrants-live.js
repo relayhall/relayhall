@@ -8,7 +8,7 @@
  *   expiry refusals; version pinning at creation;
  *   warrant-mint: agent minted with parent = acting Connector (AZ-RT5),
  *   bound task, provenance FK, encrypted credential, minted_total counter,
- *   unique-warrant auto-select and multiplicity refusal (sol M8);
+ *   unique-warrant auto-select and multiplicity refusal (review M8);
  *   T4: foreign-task mint refuses on anchor containment;
  *   T23: republish the ceiling profile WIDER — the standing warrant stays
  *   pinned and the wider mint still refuses;

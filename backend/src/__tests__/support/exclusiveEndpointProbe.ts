@@ -18,11 +18,24 @@ const holdMs = Number(process.env.PROBE_HOLD_MS ?? '400');
 void (async (): Promise<void> => {
   try {
     await withPinnedBootCheckRecorder(async (recorder) => {
-      process.stdout.write(`HELD ${Date.now()} ${recorder.endpoint.host}:${recorder.endpoint.port}\n`);
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, holdMs);
-      });
-      process.stdout.write(`RELEASING ${Date.now()}\n`);
+      const heldAt = Date.now();
+      process.stdout.write(`HELD ${heldAt} ${recorder.endpoint.host}:${recorder.endpoint.port}\n`);
+      // Card d4315f28: the hold is measured on the clock that stamps it. A
+      // timer is not that clock: setTimeout counts the event loop's cached
+      // time in whole milliseconds, so it can resolve up to 1ms before
+      // Date.now() shows the full delay, and the control then read a 399ms
+      // window as a probe that did not hold. So the probe waits until
+      // Date.now() itself has advanced by holdMs, and prints the very reading
+      // it checked.
+      let releasingAt = Date.now();
+      while (releasingAt - heldAt < holdMs) {
+        const remaining = holdMs - (releasingAt - heldAt);
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, remaining);
+        });
+        releasingAt = Date.now();
+      }
+      process.stdout.write(`RELEASING ${releasingAt}\n`);
     });
     // The exit code is SET, not forced: process.exit() can truncate a pipe that
     // has not drained, and the two timestamps are the whole point of this

@@ -1,3 +1,4 @@
+import type { TaskActivity } from '../../hooks/useTaskActivity';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, ClipboardList, Handshake, Inbox, Lightbulb, LoaderCircle, PartyPopper, Plus, Search, Zap } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -45,7 +46,7 @@ interface TaskColumnProps {
   rovingTaskId?: string | null;
   onOpenerFocus?: (taskId: string) => void;
   onTagClick?: (tag: string) => void;
-  sessionActivityMap?: Map<string, number>;
+  taskActivity?: Map<string, TaskActivity>;
   deepLinkTaskId?: string | null;
   onDeepLinkHandled?: () => void;
   onRestoreArchived?: (taskId: string) => void;
@@ -53,32 +54,6 @@ interface TaskColumnProps {
   principalsById?: Map<string, Principal>;
   /** The viewing principal — being your own Assignee is the unremarkable case. */
   viewerPrincipalId?: string | null;
-}
-
-// Stale threshold: 10 minutes in milliseconds
-const STALE_THRESHOLD_MS = 10 * 60 * 1000;
-
-function getSessionActivityState(
-  task: Task,
-  sessionActivityMap?: Map<string, number>
-): 'active' | 'stale' | null {
-  if (task.status !== 'in-progress' || !task.activeAgent) return null;
-  
-  const sessionKey = typeof task.activeAgent === 'object' ? task.activeAgent.sessionKey : null;
-  if (!sessionKey || sessionKey === 'pending' || !sessionActivityMap) {
-    // Has activeAgent but no session data — treat as stale if in-progress
-    if (task.status === 'in-progress' && task.activeAgent) return 'stale';
-    return null;
-  }
-  
-  const lastActivity = sessionActivityMap.get(sessionKey);
-  if (lastActivity === undefined) {
-    // Session not found in gateway — agent may have finished, treat as stale
-    return 'stale';
-  }
-  
-  const elapsed = Date.now() - lastActivity;
-  return elapsed <= STALE_THRESHOLD_MS ? 'active' : 'stale';
 }
 
 export const TaskColumn: React.FC<TaskColumnProps> = ({
@@ -106,7 +81,7 @@ export const TaskColumn: React.FC<TaskColumnProps> = ({
   rovingTaskId,
   onOpenerFocus,
   onTagClick,
-  sessionActivityMap,
+  taskActivity,
   deepLinkTaskId,
   onDeepLinkHandled,
   onRestoreArchived,
@@ -274,7 +249,7 @@ export const TaskColumn: React.FC<TaskColumnProps> = ({
                     openerTabbable={rovingTaskId == null || rovingTaskId === task.id}
                     onOpenerFocus={onOpenerFocus}
                     onTagClick={onTagClick}
-                    sessionActivityState={getSessionActivityState(task, sessionActivityMap)}
+                    taskActivity={taskActivity?.get(task.id.toLowerCase())}
                     deepLinkTaskId={deepLinkTaskId}
                     onDeepLinkHandled={onDeepLinkHandled}
                     principalsById={principalsById}

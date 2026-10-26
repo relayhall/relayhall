@@ -1390,3 +1390,43 @@ describe('tree censuses the round-2 review asked for', () => {
     expect(importLine).toBeLessThan(firstUse);
   });
 });
+
+describe('card 549cc51f: the Shared-area writers surface (migration 157, E299 the F1 repair)', () => {
+  const MIGRATION_157 = readFileSync(join(__dirname, '..', 'migrations', '157_knowledge_shared_writers.sql'), 'utf8');
+  const CODE_157 = MIGRATION_157.replace(/--[^\n]*/g, '');
+
+  it('registers settings.shared-writers ALWAYS-SELF like settings.access-manager: no lock, no menu entry, core', () => {
+    expect(CODE_157).toContain("('settings.shared-writers', 'Shared-area writers', 'always-self', NULL,");
+    expect(CODE_157).toContain("ARRAY['GET /knowledge-shared-writers'],");
+    expect(CODE_157).toContain("ARRAY['POST /knowledge-shared-writers', 'POST /knowledge-shared-writers/remove'],");
+    // excluded_families, menu_path, origin: no menu entry, so the Settings menu
+    // (which shows an always-self surface with a menu path to EVERY login
+    // session) never lists it; the Access manager shows it to administrators.
+    expect(CODE_157).toContain("'[]'::jsonb, NULL, 'core')");
+    expect(CODE_157).toMatch(/ON CONFLICT \(key\) DO NOTHING;/);
+    // Not locked: a locked surface is root-only, and E299 admits an administrator.
+    expect(CODE_157).not.toMatch(/'settings\.shared-writers'[^)]*'locked'/);
+  });
+
+  it('writes NO Access-bundle membership and no authority row: no bundle names the surface', () => {
+    for (const table of ['access_bundle_members', 'access_bundles', 'access_profile_rules', 'access_profiles', 'grants']) {
+      expect({ table, written: new RegExp(`\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+${table}\b`, 'i').test(CODE_157) })
+        .toEqual({ table, written: false });
+    }
+  });
+
+  it('its families are served, at the requirements the in-handler gate relies on, and the census finds nothing in it', () => {
+    const registered = new Map(enumerateProtectedRouteFamilies().map((family) => [family.key, family.requirement]));
+    expect(registered.get('GET /knowledge-shared-writers')).toBe('services:read');
+    expect(registered.get('POST /knowledge-shared-writers')).toBe('authenticated');
+    expect(registered.get('POST /knowledge-shared-writers/remove')).toBe('authenticated');
+    const row = surface({
+      id: ID(9), key: 'settings.shared-writers', label: 'Shared-area writers', governance: 'always-self',
+      readFamilies: ['GET /knowledge-shared-writers'],
+      writeFamilies: ['POST /knowledge-shared-writers', 'POST /knowledge-shared-writers/remove'],
+      menuPath: null,
+    });
+    const findings = accessSurfaceService.censusFindings([...seededPair(), row]);
+    expect(findings.filter((finding) => /shared-writers/.test(finding))).toEqual([]);
+  });
+});

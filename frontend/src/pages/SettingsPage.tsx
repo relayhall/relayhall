@@ -1,7 +1,8 @@
 import React from 'react';
 import { Loader2, Settings } from 'lucide-react';
-import { Navigate, NavLink, Outlet, useLocation, useOutletContext } from 'react-router-dom';
+import { Link, Navigate, Outlet, useLocation, useOutletContext } from 'react-router-dom';
 import { useMyPrincipal } from '../hooks/usePrincipals';
+import { activeNavEntry } from '../utils/navActive';
 import {
   SettingsNavAudience,
   firstVisibleSettingsPath,
@@ -79,6 +80,11 @@ export const SettingsRouteAlias: React.FC<{ alias: (typeof SETTINGS_ROUTE_ALIASE
 export const SettingsPage: React.FC = () => {
   const { audience, loading, resolved, failed, reload } = useSettingsAudience();
   const sections = visibleSettingsGroups(audience);
+  // THE ONE CURRENT SECTION (owner bug report E406): decided once over every
+  // drawn entry by the same whole-segment, longest-match rule the sidebar
+  // uses (`utils/navActive`), instead of a matcher per link.
+  const { pathname } = useLocation();
+  const activeId = activeNavEntry(pathname, sections.flatMap(({ items }) => items))?.id ?? null;
 
   if (loading) {
     return (
@@ -127,8 +133,8 @@ export const SettingsPage: React.FC = () => {
         {/* A landmark of its own, named: a screen reader user tabbing into the
             shell is told which navigation this is, and the sidebar's "Main
             navigation" landmark keeps its own name. `aria-current="page"` on
-            the active entry is NavLink's default and is what announces the
-            position — the active class is decoration on top of it. */}
+            the ONE active entry is what announces the position — the active
+            class is decoration on top of it. */}
         <nav className="settings-nav" aria-label="Settings sections">
           {sections.map(({ group, items }) => (
             <div className="settings-nav-group" key={group.id}>
@@ -136,16 +142,17 @@ export const SettingsPage: React.FC = () => {
               <ul className="settings-nav-list" aria-labelledby={`settings-group-${group.id}`}>
                 {items.map(({ id, path, label, description, icon: Icon }) => (
                   <li key={id}>
-                    <NavLink
+                    <Link
                       to={path}
-                      className={({ isActive }) => (isActive ? 'settings-nav-link settings-nav-link--active' : 'settings-nav-link')}
+                      className={id === activeId ? 'settings-nav-link settings-nav-link--active' : 'settings-nav-link'}
+                      aria-current={id === activeId ? 'page' : undefined}
                     >
                       <Icon size={16} aria-hidden="true" className="settings-nav-icon" />
                       <span className="settings-nav-text">
                         <span className="settings-nav-label">{label}</span>
                         <span className="settings-nav-description">{description}</span>
                       </span>
-                    </NavLink>
+                    </Link>
                   </li>
                 ))}
               </ul>
